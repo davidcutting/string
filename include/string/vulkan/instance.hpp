@@ -31,7 +31,9 @@ namespace Vulkan {
 
 class Instance {
 public:
-    Instance(const std::string& application_name, const Version& application_version);
+    Instance(const std::string& application_name, const Version& application_version,
+             const std::vector<const char*>& required_extensions,
+             const std::vector<const char*>& required_layers = {"VK_LAYER_KHRONOS_validation"});
     Instance(VkInstance instance);
     ~Instance();
 
@@ -41,6 +43,27 @@ public:
     const std::vector<VkLayerProperties>& get_layer_properties() const noexcept;
 
 private:
+    void get_supported_layers() noexcept;
+    bool is_layer_supported(const char* layer_name) const noexcept;
+    void get_supported_extensions() noexcept;
+    bool is_extension_supported(const char* extension_name) const noexcept;
+
+private:
+    /** @brief Vulkan Instance handle */
+    VkInstance instance_handle_{VK_NULL_HANDLE};
+
+    /** @brief List of available and enabled Vulkan extensions */
+    std::vector<const char*> enabled_extensions_;
+    std::vector<VkExtensionProperties> available_instance_extensions_;
+
+    /** @brief List of available and enabled Vulkan layers */
+    std::vector<const char*> enabled_layers_{"VK_LAYER_KHRONOS_validation"};
+    std::vector<VkLayerProperties> available_validation_layers_;
+
+    /** @brief Vulkan validation callbacks and messenger for logging. */
+    VkDebugUtilsMessengerEXT debug_utils_messenger_{VK_NULL_HANDLE};
+
+    // Vulkan Debug Utils setup
     VkResult create_debug_utils_messenger_ext(VkInstance instance,
                                               const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
                                               const VkAllocationCallbacks* pAllocator,
@@ -48,18 +71,11 @@ private:
     void destroy_debug_utils_messenger_ext(VkInstance instance, VkDebugUtilsMessengerEXT debugMessenger,
                                            const VkAllocationCallbacks* pAllocator) noexcept;
 
-private:
-    /** @brief Vulkan Instance handle */
-    VkInstance instance_handle_{VK_NULL_HANDLE};
-
-    /** @brief List of enabled Vulkan extensions */
-    std::vector<const char*> enabled_extensions_;
-
-    /** @brief List of enabled Vulkan layers */
-    std::vector<const char*> enabled_layers_{"VK_LAYER_KHRONOS_validation"};
-
-    /** @brief Vulkan validation callbacks and messenger for logging. */
-    VkDebugUtilsMessengerEXT debug_utils_messenger_{VK_NULL_HANDLE};
+public:
+    static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+                                                         VkDebugUtilsMessageTypeFlagsEXT messageType,
+                                                         const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+                                                         void* pUserData);
 };
 
 }  // namespace Vulkan

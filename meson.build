@@ -41,6 +41,7 @@ build_args = [
 include_dir = include_directories('include')
 
 src = [
+    'src/vulkan/instance.cpp',
     'src/application.cpp'
 ]
 

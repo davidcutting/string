@@ -7,41 +7,28 @@
 namespace String {
 namespace Vulkan {
 
-namespace {
-
-static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
-                                                    VkDebugUtilsMessageTypeFlagsEXT /*messageType*/,
-                                                    const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
-                                                    void* /*pUserData*/) {
-    switch (messageSeverity) {
-        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT: {
-            STRING_LOG_ERROR(pCallbackData->pMessage);
-            break;
+Instance::Instance(const std::string& application_name, const Version& application_version,
+                   const std::vector<const char*>& required_extensions,
+                   const std::vector<const char*>& required_layers) {
+    // Check for supported extensions against list of provided extensions we require to be enabled
+    get_supported_extensions();
+    for (const char* extension_name : required_extensions) {
+        if (is_extension_supported(extension_name)) {
+            enabled_extensions_.push_back(extension_name);
         }
-        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT: {
-            STRING_LOG_INFO(pCallbackData->pMessage);
-            break;
-        }
-        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT: {
-            STRING_LOG_WARN(pCallbackData->pMessage);
-            break;
-        }
-        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT: {
-            STRING_LOG_TRACE(pCallbackData->pMessage);
-            break;
-        }
-        default:
-            STRING_LOG_INFO(pCallbackData->pMessage);
     }
-    return VK_FALSE;
-}
 
-}  // namespace
+    // Check for supported validation layers against list of provided layers we require to be enabled
+    get_supported_layers();
+    for (const char* layer_name : required_layers) {
+        if (is_layer_supported(layer_name)) {
+            enabled_layers_.push_back(layer_name);
+        }
+    }
 
-Instance::Instance(const std::string& application_name, const Version& application_version) {
     VkApplicationInfo application_info{
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pNext = nullptr,  // TODO: Point to extension information
+        .pNext = nullptr,
         .pApplicationName = application_name.c_str(),
         .applicationVersion =
             VK_MAKE_VERSION(application_version.major, application_version.minor, application_version.patch),
@@ -49,26 +36,6 @@ Instance::Instance(const std::string& application_name, const Version& applicati
         .engineVersion = VK_MAKE_VERSION(0, 0, 1),
         .apiVersion = VK_API_VERSION_1_3,
     };
-
-    // Setup Vulkan extensions
-    uint32_t extension_count = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr);
-
-    std::vector<VkExtensionProperties> available_instance_extensions(extension_count);
-    vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, available_instance_extensions.data());
-
-    // Get the extensions used by the GLFW windowing library
-    // TODO: Make generic to any windowing library
-    std::vector<const char*> required_extensions;
-    {
-        uint32_t glfw_extension_count = 0;
-        const char** glfw_extensions;
-        glfw_extensions = glfwGetRequiredInstanceExtensions(&glfw_extension_count);
-
-        for (uint32_t i = 0; i < glfw_extension_count; ++i) {
-            required_extensions.emplace_back(glfw_extensions[i]);
-        }
-    }
 
     // Set up DebugUtils to get validation messages during instance creation
     // and reuse to create main debug messenger.
@@ -111,9 +78,6 @@ Instance::Instance(VkInstance instance) : instance_handle_(instance) {}
 
 Instance::~Instance() {
     destroy_debug_utils_messenger_ext(instance_handle_, debug_utils_messenger_, nullptr);
-    if (debug_utils_messenger_ != VK_NULL_HANDLE) {
-        vkDestroyDebugUtilsMessengerEXT(instance_handle_, debug_utils_messenger_, nullptr);
-    }
     if (instance_handle_ != VK_NULL_HANDLE) {
         vkDestroyInstance(instance_handle_, nullptr);
     }
@@ -129,6 +93,42 @@ bool Instance::is_extension_enabled(const char* extension) const noexcept {
 }
 
 const std::vector<const char*>& Instance::get_extensions() const noexcept { return enabled_extensions_; }
+
+void Instance::get_supported_layers() noexcept {
+    uint32_t layer_count = 0;
+    vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
+
+    available_validation_layers_.reserve(layer_count);
+    vkEnumerateInstanceLayerProperties(&layer_count, available_validation_layers_.data());
+}
+
+bool Instance::is_layer_supported(const char* layer_name) const noexcept {
+    for (const auto& layer_properties : available_validation_layers_) {
+        if (strcmp(layer_name, layer_properties.layerName) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void Instance::get_supported_extensions() noexcept {
+    uint32_t extension_count = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr);
+
+    available_instance_extensions_.reserve(extension_count);
+    vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, available_instance_extensions_.data());
+}
+
+bool Instance::is_extension_supported(const char* extension_name) const noexcept {
+    for (const auto& extension_properties : available_instance_extensions_) {
+        if (strcmp(extension_name, extension_properties.extensionName) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 VkResult Instance::create_debug_utils_messenger_ext(VkInstance instance,
                                                     const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
@@ -148,6 +148,33 @@ void Instance::destroy_debug_utils_messenger_ext(VkInstance instance, VkDebugUti
     if (func != nullptr) {
         func(instance, debugMessenger, pAllocator);
     }
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL Instance::debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+                                                     VkDebugUtilsMessageTypeFlagsEXT /*messageType*/,
+                                                     const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+                                                     void* /*pUserData*/) {
+    switch (messageSeverity) {
+        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT: {
+            STRING_LOG_ERROR(pCallbackData->pMessage);
+            break;
+        }
+        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT: {
+            STRING_LOG_INFO(pCallbackData->pMessage);
+            break;
+        }
+        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT: {
+            STRING_LOG_WARN(pCallbackData->pMessage);
+            break;
+        }
+        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT: {
+            STRING_LOG_TRACE(pCallbackData->pMessage);
+            break;
+        }
+        default:
+            STRING_LOG_INFO(pCallbackData->pMessage);
+    }
+    return VK_FALSE;
 }
 
 }  // namespace Vulkan

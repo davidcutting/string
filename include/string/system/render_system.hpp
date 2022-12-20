@@ -2,45 +2,14 @@
 
 #include <bits/stdc++.h>
 #include <vulkan/vulkan.h>
-#include <vulkan/vulkan_core.h>
 
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <stdexcept>
 #include <string/component/render_components.hpp>
 #include <string/core/debug.hpp>
 #include <string/core/system.hpp>
 #include <string/vulkan/vulkan_window.hpp>
 #include <string/window.hpp>
-#include <vector>
-
-// Vulkan Debug
-
-#ifdef NDEBUG
-const bool enableValidationLayers = false;
-#else
-const bool enableValidationLayers = true;
-#endif
-
-inline VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
-                                             const VkAllocationCallbacks* pAllocator,
-                                             VkDebugUtilsMessengerEXT* pDebugMessenger) {
-    auto func = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
-    if (func != nullptr) {
-        return func(instance, pCreateInfo, pAllocator, pDebugMessenger);
-    } else {
-        return VK_ERROR_EXTENSION_NOT_PRESENT;
-    }
-}
-
-inline void DestroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerEXT debugMessenger,
-                                          const VkAllocationCallbacks* pAllocator) {
-    auto func = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
-    if (func != nullptr) {
-        func(instance, debugMessenger, pAllocator);
-    }
-}
+#include <string/core/version.hpp>
+#include <string/vulkan/instance.hpp>
 
 // End Vulkan Debug
 
@@ -61,9 +30,9 @@ struct SwapChainSupportDetails {
 
 class RenderSystem : public System {
 public:
+    RenderSystem() : instance_("String Application", Version{0, 0, 1}, get_required_extensions(true)) {}
+
     void init() {
-        createInstance();
-        setupDebugMessenger();
         createSurface();
         pickPhysicalDevice();
         createLogicalDevice();
@@ -101,12 +70,7 @@ public:
 
         vkDestroyDevice(device, nullptr);
 
-        if (enableValidationLayers) {
-            DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
-        }
-
-        vkDestroySurfaceKHR(instance, vulkan_surface, nullptr);
-        vkDestroyInstance(instance, nullptr);
+        vkDestroySurfaceKHR(instance_.get_handle(), vulkan_surface, nullptr);
     }
 
     void update(float dt) {
@@ -128,8 +92,7 @@ private:
 
     float frame_rate = 0.0f;
 
-    VkInstance instance;
-    VkDebugUtilsMessengerEXT debugMessenger;
+    Vulkan::Instance instance_;
     VkSurfaceKHR vulkan_surface;
 
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -174,112 +137,20 @@ private:
 
     // VULKAN SETUP
 
-    // Vulkan Debug
-
-    auto getDebugMessengerCreateInfo() const noexcept -> VkDebugUtilsMessengerCreateInfoEXT {
-        return VkDebugUtilsMessengerCreateInfoEXT{
-            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-            .pNext = nullptr,
-            .flags = 0,
-            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
-                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
-            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                           VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
-            .pfnUserCallback = debugCallback,
-            .pUserData = nullptr,
-        };
-    }
-
-    void setupDebugMessenger() {
-        if (!enableValidationLayers) return;
-
-        VkDebugUtilsMessengerCreateInfoEXT createInfo = getDebugMessengerCreateInfo();
-
-        if (CreateDebugUtilsMessengerEXT(instance, &createInfo, nullptr, &debugMessenger) != VK_SUCCESS) {
-            throw std::runtime_error("failed to set up debug messenger!");
-        }
-    }
-
-    // Instance
-    std::vector<const char*> getRequiredExtensions() {
+    // Get Extensions required by GLFW
+    std::vector<const char*> get_required_extensions(bool enable_validation = true) {
         uint32_t glfwExtensionCount = 0;
         const char** glfwExtensions;
         glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
 
         std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
-
-        if (enableValidationLayers) {
-            extensions.emplace_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-        }
+        if (enable_validation) extensions.emplace_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
         return extensions;
     }
 
-    bool checkValidationLayerSupport() {
-        uint32_t layerCount;
-        vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
-
-        std::vector<VkLayerProperties> availableLayers(layerCount);
-        vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
-
-        for (const char* layerName : validationLayers) {
-            bool layerFound = false;
-
-            for (const auto& layerProperties : availableLayers) {
-                if (strcmp(layerName, layerProperties.layerName) == 0) {
-                    layerFound = true;
-                    break;
-                }
-            }
-
-            if (!layerFound) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    void createInstance() {
-        if (enableValidationLayers && !checkValidationLayerSupport()) {
-            throw std::runtime_error("validation layers requested, but not available!");
-        }
-
-        VkApplicationInfo appInfo{
-            .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-            .pNext = nullptr,
-            .pApplicationName = "Hello Triangle",
-            .applicationVersion = VK_MAKE_VERSION(0, 0, 1),
-            .pEngineName = "String Engine",
-            .engineVersion = VK_MAKE_VERSION(0, 0, 1),
-            .apiVersion = VK_API_VERSION_1_3,
-        };
-
-        VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo = getDebugMessengerCreateInfo();
-        auto extensions = getRequiredExtensions();
-
-        VkInstanceCreateInfo createInfo{
-            .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-            .pNext = (VkDebugUtilsMessengerCreateInfoEXT*)&debugCreateInfo,
-            .flags = 0,
-            .pApplicationInfo = &appInfo,
-            .enabledLayerCount = static_cast<uint32_t>(validationLayers.size()),
-            .ppEnabledLayerNames = validationLayers.data(),
-            .enabledExtensionCount = static_cast<uint32_t>(extensions.size()),
-            .ppEnabledExtensionNames = extensions.data(),
-        };
-
-        if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create instance!");
-        }
-    }
-
-    // End Instance
-
     void createSurface() {
-        auto surface = vulkan_window->create_window_surface(instance);
+        auto surface = vulkan_window->create_window_surface(instance_.get_handle());
         if (!surface.has_value()) std::runtime_error("Could not create window surface.");
         vulkan_surface = surface.value();
     }
@@ -350,14 +221,14 @@ private:
 
     void pickPhysicalDevice() {
         uint32_t deviceCount = 0;
-        vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
+        vkEnumeratePhysicalDevices(instance_.get_handle(), &deviceCount, nullptr);
 
         if (deviceCount == 0) {
             throw std::runtime_error("failed to find GPUs with Vulkan support!");
         }
 
         std::vector<VkPhysicalDevice> devices(deviceCount);
-        vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data());
+        vkEnumeratePhysicalDevices(instance_.get_handle(), &deviceCount, devices.data());
 
         for (const auto& device : devices) {
             if (isDeviceSuitable(device)) {
@@ -1145,33 +1016,6 @@ private:
         STRING_ASSERT(queue_present_result == VK_SUCCESS || queue_present_result == VK_SUBOPTIMAL_KHR);
 
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
-    }
-
-    static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
-                                                        VkDebugUtilsMessageTypeFlagsEXT /*messageType*/,
-                                                        const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
-                                                        void* /*pUserData*/) {
-        switch (messageSeverity) {
-            case VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT: {
-                STRING_LOG_ERROR(pCallbackData->pMessage);
-                break;
-            }
-            case VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT: {
-                STRING_LOG_INFO(pCallbackData->pMessage);
-                break;
-            }
-            case VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT: {
-                STRING_LOG_WARN(pCallbackData->pMessage);
-                break;
-            }
-            case VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT: {
-                STRING_LOG_TRACE(pCallbackData->pMessage);
-                break;
-            }
-            default:
-                STRING_LOG_INFO(pCallbackData->pMessage);
-        }
-        return VK_FALSE;
     }
 };
 
