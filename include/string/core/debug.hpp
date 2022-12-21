@@ -28,7 +28,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
-#if STRING_RELEASE == 0
+#ifndef STRING_RELEASE
 #define STRING_STATIC_ASSERT(expression, message) static_assert(expression, message)
 #define STRING_ASSERT(...) assert(__VA_ARGS__)
 #endif
@@ -71,7 +71,7 @@ inline const std::shared_ptr<spdlog::logger>& Logger::get_logger() noexcept {
 
 }  // namespace String
 
-#if STRING_RELEASE == 0
+#ifndef STRING_RELEASE
 #define STRING_LOG_TRACE(...) ::String::Logger::get_logger()->trace(__VA_ARGS__)
 #define STRING_LOG_INFO(...) ::String::Logger::get_logger()->info(__VA_ARGS__)
 #define STRING_LOG_WARN(...) ::String::Logger::get_logger()->warn(__VA_ARGS__)

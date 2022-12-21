@@ -22,11 +22,11 @@
 
 #pragma once
 
-#include <vulkan/vulkan_core.h>
+#include <bits/stdc++.h>
+#include <vulkan/vulkan.h>
 
-#include <cstddef>
-#include <optional>
 #include <string/window.hpp>
+#include "string/core/debug.hpp"
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -77,6 +77,7 @@ inline std::optional<VkSurfaceKHR> VulkanWindow::create_window_surface(const VkI
     VkSurfaceKHR surface;
 
     if (glfwCreateWindowSurface(instance, window_handle_, nullptr, &surface) != VK_SUCCESS) {
+        STRING_LOG_WARN("Failed to create window surface!");
         return std::nullopt;
     }
     return surface;

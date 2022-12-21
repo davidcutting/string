@@ -8,6 +8,10 @@
 			"name": "Hello Triangle Example",
 			"path": "../../hello_triangle"
 		}
+		{
+			"name": "Vulkan Samples",
+			"path": "../../Vulkan-Samples"
+		}
 	],
 	"settings": {
 		"mesonbuild.configureOnOpen": true,

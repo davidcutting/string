@@ -6,12 +6,14 @@
 #include <string/component/render_components.hpp>
 #include <string/core/debug.hpp>
 #include <string/core/system.hpp>
-#include <string/vulkan/vulkan_window.hpp>
-#include <string/window.hpp>
 #include <string/core/version.hpp>
 #include <string/vulkan/instance.hpp>
+#include <string/vulkan/vulkan_window.hpp>
+#include <string/window.hpp>
+#include <vector>
 
-// End Vulkan Debug
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
 
 namespace String {
 
@@ -30,9 +32,10 @@ struct SwapChainSupportDetails {
 
 class RenderSystem : public System {
 public:
-    RenderSystem() : instance_("String Application", Version{0, 0, 1}, get_required_extensions(true)) {}
-
     void init() {
+        instance_ = std::make_unique<Vulkan::Instance>("String Application", Version{0, 0, 1}, get_glfw_required_extensions());
+        validationLayers = instance_->get_enabled_layers();
+
         createSurface();
         pickPhysicalDevice();
         createLogicalDevice();
@@ -70,7 +73,7 @@ public:
 
         vkDestroyDevice(device, nullptr);
 
-        vkDestroySurfaceKHR(instance_.get_handle(), vulkan_surface, nullptr);
+        vkDestroySurfaceKHR(instance_->get_handle(), vulkan_surface, nullptr);
     }
 
     void update(float dt) {
@@ -89,10 +92,10 @@ public:
 
 private:
     std::shared_ptr<Vulkan::VulkanWindow> vulkan_window;
+    std::unique_ptr<Vulkan::Instance> instance_;
 
     float frame_rate = 0.0f;
 
-    Vulkan::Instance instance_;
     VkSurfaceKHR vulkan_surface;
 
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -132,26 +135,25 @@ private:
     uint32_t currentFrame = 0;
     const uint32_t MAX_FRAMES_IN_FLIGHT = 2;
 
-    const std::vector<const char*> validationLayers = {"VK_LAYER_KHRONOS_validation"};
+    std::vector<const char*> validationLayers;
     const std::vector<const char*> deviceExtensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
     // VULKAN SETUP
 
     // Get Extensions required by GLFW
-    std::vector<const char*> get_required_extensions(bool enable_validation = true) {
+    std::vector<const char*> get_glfw_required_extensions() {
         uint32_t glfwExtensionCount = 0;
         const char** glfwExtensions;
         glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
 
         std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
-        if (enable_validation) extensions.emplace_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
         return extensions;
     }
 
     void createSurface() {
-        auto surface = vulkan_window->create_window_surface(instance_.get_handle());
-        if (!surface.has_value()) std::runtime_error("Could not create window surface.");
+        auto surface = vulkan_window->create_window_surface(instance_->get_handle());
+        if (!surface) throw std::runtime_error("Could not create window surface.");
         vulkan_surface = surface.value();
     }
 
@@ -221,14 +223,14 @@ private:
 
     void pickPhysicalDevice() {
         uint32_t deviceCount = 0;
-        vkEnumeratePhysicalDevices(instance_.get_handle(), &deviceCount, nullptr);
+        vkEnumeratePhysicalDevices(instance_->get_handle(), &deviceCount, nullptr);
 
         if (deviceCount == 0) {
             throw std::runtime_error("failed to find GPUs with Vulkan support!");
         }
 
         std::vector<VkPhysicalDevice> devices(deviceCount);
-        vkEnumeratePhysicalDevices(instance_.get_handle(), &deviceCount, devices.data());
+        vkEnumeratePhysicalDevices(instance_->get_handle(), &deviceCount, devices.data());
 
         for (const auto& device : devices) {
             if (isDeviceSuitable(device)) {

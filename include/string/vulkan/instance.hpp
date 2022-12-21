@@ -23,6 +23,7 @@
 
 #include <bits/stdc++.h>
 #include <vulkan/vulkan.h>
+#include <vulkan/vulkan_core.h>
 
 #include <string/core/version.hpp>
 
@@ -32,15 +33,19 @@ namespace Vulkan {
 class Instance {
 public:
     Instance(const std::string& application_name, const Version& application_version,
-             const std::vector<const char*>& required_extensions,
-             const std::vector<const char*>& required_layers = {"VK_LAYER_KHRONOS_validation"});
+             const std::vector<const char*>& required_extensions = {},
+             const std::vector<const char*>& required_layers = {});
     Instance(VkInstance instance);
+    Instance(const Instance&) = delete;
+    Instance(Instance&&) = delete;
     ~Instance();
+    Instance& operator=(const Instance&) = delete;
+    Instance& operator=(Instance&&) = delete;
 
     VkInstance get_handle() const noexcept;
     bool is_extension_enabled(const char* extension) const noexcept;
-    const std::vector<const char*>& get_extensions() const noexcept;
-    const std::vector<VkLayerProperties>& get_layer_properties() const noexcept;
+    const std::vector<const char*>& get_enabled_extensions() const noexcept;
+    const std::vector<const char*>& get_enabled_layers() const noexcept;
 
 private:
     void get_supported_layers() noexcept;
@@ -57,25 +62,11 @@ private:
     std::vector<VkExtensionProperties> available_instance_extensions_;
 
     /** @brief List of available and enabled Vulkan layers */
-    std::vector<const char*> enabled_layers_{"VK_LAYER_KHRONOS_validation"};
+    std::vector<const char*> enabled_layers_;
     std::vector<VkLayerProperties> available_validation_layers_;
 
     /** @brief Vulkan validation callbacks and messenger for logging. */
     VkDebugUtilsMessengerEXT debug_utils_messenger_{VK_NULL_HANDLE};
-
-    // Vulkan Debug Utils setup
-    VkResult create_debug_utils_messenger_ext(VkInstance instance,
-                                              const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
-                                              const VkAllocationCallbacks* pAllocator,
-                                              VkDebugUtilsMessengerEXT* pDebugMessenger) noexcept;
-    void destroy_debug_utils_messenger_ext(VkInstance instance, VkDebugUtilsMessengerEXT debugMessenger,
-                                           const VkAllocationCallbacks* pAllocator) noexcept;
-
-public:
-    static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
-                                                         VkDebugUtilsMessageTypeFlagsEXT messageType,
-                                                         const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
-                                                         void* pUserData);
 };
 
 }  // namespace Vulkan
