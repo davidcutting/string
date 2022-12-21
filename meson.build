@@ -42,6 +42,7 @@ include_dir = include_directories('include')
 
 src = [
     'src/vulkan/instance.cpp',
+    'src/vulkan/renderer.cpp',
     'src/application.cpp'
 ]
 

@@ -21,25 +21,27 @@
 // SOFTWARE.
 #pragma once
 
-#include <bits/stdc++.h>
+#include <string/vulkan/renderer.hpp>
 
-#include <string/graphics/renderer.hpp>
-#include <string/vulkan/instance.hpp>
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
 
 namespace String {
 namespace Vulkan {
 
-class Renderer : Graphics::Renderer {
-public:
-    virtual void initialize() noexcept;
+std::vector<const char*> get_glfw_required_extensions() {
+    uint32_t glfwExtensionCount = 0;
+    const char** glfwExtensions;
+    glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
 
-    virtual void shutdown() noexcept;
+    std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
 
-    virtual void draw() noexcept;
+    return extensions;
+}
 
-private:
-    std::unique_ptr<Instance> instance_;
-};
+void Renderer::initialize() noexcept {
+    instance_ = std::make_unique<Instance>("String Application", Version{0, 0, 1}, get_glfw_required_extensions());
+}
 
 }  // namespace Vulkan
 }  // namespace String
