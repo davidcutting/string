@@ -29,6 +29,9 @@ if get_option('buildtype') == 'release'
 elif get_option('buildtype') == 'debug'
     message('Building in Debug mode')
     release = ['-DSTRING_DEBUG']
+elif get_option('buildtype') == 'debugoptimized'
+    message('Building in RelWithDebInfo')
+    release = ['-DSTRING_DEBUG']
 endif
 
 add_project_arguments(release, language : 'cpp')
@@ -53,6 +56,7 @@ deps = [
     dependency('spdlog'),
     dependency('glm'),
     dependency('glfw3'),
+    dependency('entt'),
     dependency('vulkan')
 ]
 

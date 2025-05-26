@@ -1,7 +1,6 @@
 #include <GLFW/glfw3.h>
 
 #include <cstdint>
-#include <stdexcept>
 #include <string/core/logger.hpp>
 #include <string/window.hpp>
 
@@ -66,10 +65,16 @@ void Window::resize(const View::Extent& extent) {
 }
 
 void Window::key_action(int key, int scancode, int action, int mods) {
+    (void)key;
+    (void)scancode;
+    (void)action;
+    (void)mods;
     // impl
 }
 
 void Window::mouse_action(double xpos, double ypos) {
+    (void)xpos;
+    (void)ypos;
     // impl
 }
 
