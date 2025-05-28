@@ -1,7 +1,9 @@
 #pragma once
 
+#include <memory>
 #include <string/core/logger.hpp>
 #include <string/core/event.hpp>
+#include <string/scene.hpp>
 #include <string/renderer.hpp>
 #include <string/window.hpp>
 
@@ -24,6 +26,8 @@ private:
     std::shared_ptr<Window> window_;
     /// A handle for the application's renderer.
     std::unique_ptr<Renderer> renderer_;
+    /// A handle to the application's scene.
+    std::unique_ptr<Scene> scene_;
     /// A handle for the application's event manager.
     EventManager event_manager_;
 };
