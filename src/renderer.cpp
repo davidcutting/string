@@ -283,7 +283,12 @@ void Renderer::pickPhysicalDevice() {
                 physicalDevice = device;
                 break;
             }
-            // Fallback to use whatever device available if no discrete GPU
+            // Fallback to integrated
+            if (props.deviceType == VkPhysicalDeviceType::VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                physicalDevice = device;
+                break;
+            }
+            // Fallback to use whatever device available
             physicalDevice = device;
         }
     }
@@ -1228,9 +1233,9 @@ void Renderer::drawFrame() {
         throw std::runtime_error("failed to acquire swap chain image!");
     }
 
-    updateUniformBuffer(currentFrame);
-
     vkResetFences(device, 1, &inFlightFences[currentFrame]);
+
+    updateUniformBuffer(currentFrame);
 
     vkResetCommandBuffer(commandBuffers[currentFrame], /*VkCommandBufferResetFlagBits*/ 0);
     recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
@@ -1315,19 +1320,9 @@ VkPresentModeKHR Renderer::chooseSwapPresentMode(const std::vector<VkPresentMode
             case VK_PRESENT_MODE_MAILBOX_KHR:
                 STRING_LOG_INFO("Present Mode: Mailbox");
                 return present_mode;  // Mailbox
-            case VK_PRESENT_MODE_FIFO_KHR:
-                STRING_LOG_INFO("Present Mode: FIFO");
-                return present_mode;  // FIFO
-            case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
-                STRING_LOG_INFO("Present Mode: FIFO Relaxed");
-                return present_mode;  // FIFO Relaxed
-            case VK_PRESENT_MODE_IMMEDIATE_KHR:
-            //    STRING_LOG_INFO("Present Mode: Immediate");
-            //    return present_mode;  // Immediate
-            // Note: There are two other present modes as of this comment's authoring, but they will
-            //       not be supported as they require much more syncronization by the swapchain.
-            case VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR:      // Switch statement fall-through
-            case VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR:  // These are not supported by renderer
+            // Note: There are other present modes as of this comment's authoring, but they will
+            //       not be supported as they require much more syncronization by the swapchain,
+            //       and these cases are way more convenient.
             default:
                 STRING_LOG_INFO("Present Mode: FIFO");
                 return VK_PRESENT_MODE_FIFO_KHR;  // FIFO mode is required to be supported
