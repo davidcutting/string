@@ -204,6 +204,7 @@ private:
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
     uint32_t currentFrame = 0;
+    std::vector<VkFence> imagesInFlight;
 
     bool framebufferResized = false;
 

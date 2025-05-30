@@ -33,11 +33,16 @@ void Renderer::loadModel() {
         for (const auto& index : shape.mesh.indices) {
             Vertex vertex{};
 
-            vertex.pos = {attrib.vertices[3 * index.vertex_index + 0], attrib.vertices[3 * index.vertex_index + 1],
-                          attrib.vertices[3 * index.vertex_index + 2]};
+            vertex.pos = {
+                attrib.vertices[3 * index.vertex_index + 0],
+                attrib.vertices[3 * index.vertex_index + 1],
+                attrib.vertices[3 * index.vertex_index + 2]
+            };
 
-            vertex.texCoord = {attrib.texcoords[2 * index.texcoord_index + 0],
-                               1.0f - attrib.texcoords[2 * index.texcoord_index + 1]};
+            vertex.texCoord = {
+                attrib.texcoords[2 * index.texcoord_index + 0],
+                1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
+            };
 
             vertex.color = {1.0f, 1.0f, 1.0f};
 
@@ -419,6 +424,9 @@ void Renderer::createSwapChain() {
     vkGetSwapchainImagesKHR(device, swapChain, &imageCount, nullptr);
     swapChainImages.resize(imageCount);
     vkGetSwapchainImagesKHR(device, swapChain, &imageCount, swapChainImages.data());
+
+    // TODO(DCut): Fix hack :(
+    imagesInFlight.resize(swapChainImages.size(), VK_NULL_HANDLE);
 
     swapChainImageFormat = surfaceFormat.format;
     swapChainExtent = extent;
@@ -1233,6 +1241,13 @@ void Renderer::drawFrame() {
         throw std::runtime_error("failed to acquire swap chain image!");
     }
 
+    // TODO(DCut): Fix this ugly hack. Sometimes, vkAcquireNextImageKHR doesn't return the same index
+    // as our CPU counted index (currentFrame), so we need additional synchronization, which maps
+    // a fence using the swapchain image index, instead of currentFrame.
+    if (imagesInFlight[imageIndex] != VK_NULL_HANDLE) {
+        vkWaitForFences(device, 1, &imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX);
+    }
+    imagesInFlight[imageIndex] = inFlightFences[currentFrame];
     vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
     updateUniformBuffer(currentFrame);
