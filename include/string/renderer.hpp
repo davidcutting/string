@@ -218,8 +218,6 @@ private:
 
     void createInstance();
 
-    void populateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfoEXT& createInfo);
-
     void setupDebugMessenger();
 
     void createSurface();
@@ -303,24 +301,19 @@ private:
 
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities);
 
-    SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device);
+    SwapChainSupportDetails querySwapChainSupport(const VkPhysicalDevice& device);
 
-    bool isDeviceSuitable(VkPhysicalDevice device);
+    bool isDeviceSuitable(const VkPhysicalDevice& device);
 
-    bool checkDeviceExtensionSupport(VkPhysicalDevice device);
+    bool checkDeviceExtensionSupport(const VkPhysicalDevice& device);
 
-    QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device);
+    QueueFamilyIndices findQueueFamilies(const VkPhysicalDevice& device);
 
     std::vector<const char*> getRequiredExtensions();
 
     bool checkValidationLayerSupport();
 
     static std::vector<char> readFile(const std::string& filename);
-
-    static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
-                                                        VkDebugUtilsMessageTypeFlagsEXT /*messageType*/,
-                                                        const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
-                                                        void* /*pUserData*/);
 };
 
 }  // namespace String
