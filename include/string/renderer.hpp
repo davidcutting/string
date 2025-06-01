@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
@@ -16,8 +17,8 @@
 #include <string/core/logger.hpp>
 #include <string/vulkan_utils.hpp>
 #include <string/window.hpp>
+#include <string/device.hpp>
 #include <string>
-#include <optional>
 #include <vector>
 
 namespace String {
@@ -76,19 +77,6 @@ struct hash<String::Vertex> {
 
 namespace String {
 
-struct QueueFamilyIndices {
-    std::optional<uint32_t> graphicsFamily;
-    std::optional<uint32_t> presentFamily;
-
-    bool isComplete() { return graphicsFamily.has_value() && presentFamily.has_value(); }
-};
-
-struct SwapChainSupportDetails {
-    VkSurfaceCapabilitiesKHR capabilities;
-    std::vector<VkSurfaceFormatKHR> formats;
-    std::vector<VkPresentModeKHR> presentModes;
-};
-
 struct UniformBufferObject {
     alignas(16) glm::mat4 model;
     alignas(16) glm::mat4 view;
@@ -100,16 +88,6 @@ const std::string TEXTURE_PATH = "./assets/viking_room.png";
 
 const int MAX_FRAMES_IN_FLIGHT = 2;
 
-const std::vector<const char*> validationLayers = {"VK_LAYER_KHRONOS_validation"};
-
-const std::vector<const char*> deviceExtensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME};
-
-#ifdef NDEBUG
-const bool enableValidationLayers = false;
-#else
-const bool enableValidationLayers = true;
-#endif
-
 class Renderer {
 public:
     void initialize(const std::shared_ptr<Window>& window) {
@@ -118,12 +96,12 @@ public:
             std::bind(&Renderer::framebuffer_resize_callback, this, std::placeholders::_1));
         window_ = window;
 
+        // Device
+        device_ = std::make_unique<Device>(window);
+
         // Vulkan
-        createInstance();
-        setupDebugMessenger();
-        createSurface();
-        pickPhysicalDevice();
-        createLogicalDevice();
+//        createSurface();
+
         createSwapChain();
         createImageViews();
         createDescriptorSetLayout();
@@ -146,22 +124,13 @@ public:
     void update() { drawFrame(); }
 
     ~Renderer() {
-        vkDeviceWaitIdle(device);
+        vkDeviceWaitIdle(device_->get_device());
         cleanup();
     }
 
 private:
     std::shared_ptr<Window> window_;
-
-    VkInstance instance;
-    VkDebugUtilsMessengerEXT debugMessenger;
-    VkSurfaceKHR surface;
-
-    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
-    VkDevice device;
-
-    VkQueue graphicsQueue;
-    VkQueue presentQueue;
+    std::unique_ptr<Device> device_;
 
     VkSwapchainKHR swapChain;
     std::vector<VkImage> swapChainImages;
@@ -216,10 +185,6 @@ private:
 
     void recreateSwapChain();
 
-    void createInstance();
-
-    void setupDebugMessenger();
-
     void createSurface();
 
     void pickPhysicalDevice();
@@ -237,11 +202,6 @@ private:
     void createCommandPool();
 
     void createDepthResources();
-
-    VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling,
-                                 VkFormatFeatureFlags features);
-
-    VkFormat findDepthFormat();
 
     bool hasStencilComponent(VkFormat format);
 
@@ -281,8 +241,6 @@ private:
 
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
 
-    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
-
     void createCommandBuffers();
 
     void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex);
@@ -300,18 +258,6 @@ private:
     VkPresentModeKHR chooseSwapPresentMode(const std::vector<VkPresentModeKHR>& available_present_modes);
 
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities);
-
-    SwapChainSupportDetails querySwapChainSupport(const VkPhysicalDevice& device);
-
-    bool isDeviceSuitable(const VkPhysicalDevice& device);
-
-    bool checkDeviceExtensionSupport(const VkPhysicalDevice& device);
-
-    QueueFamilyIndices findQueueFamilies(const VkPhysicalDevice& device);
-
-    std::vector<const char*> getRequiredExtensions();
-
-    bool checkValidationLayerSupport();
 
     static std::vector<char> readFile(const std::string& filename);
 };
