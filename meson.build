@@ -49,6 +49,7 @@ src = [
     'src/renderer.cpp',
     'src/window.cpp',
     'src/device.cpp',
+    'src/allocator.cpp',
     'src/main.cpp'
 ]
 

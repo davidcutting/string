@@ -5,13 +5,13 @@
 #include <memory>
 #include <vector>
 #include <string/window.hpp>
+#include <string/allocator.hpp>
 #include <vulkan/vulkan.h>
-#include <vulkan/vulkan_core.h>
 
 #ifdef NDEBUG
-static constexpr bool ENABLE_VALIDATION_LAYERS = true;
-#else
 static constexpr bool ENABLE_VALIDATION_LAYERS = false;
+#else
+static constexpr bool ENABLE_VALIDATION_LAYERS = true;
 #endif
 
 namespace String
@@ -49,9 +49,11 @@ public:
     VkQueue get_graphics_queue() const;
     VkQueue get_present_queue() const;
     VkQueue get_compute_queue() const;
+    Allocator& get_allocator() const;
 
 private:
     std::shared_ptr<Window> window_;
+    std::unique_ptr<Allocator> allocator_;
     VkInstance instance_{VK_NULL_HANDLE};
     VkDebugUtilsMessengerEXT debug_messenger_{VK_NULL_HANDLE};
     VkSurfaceKHR surface_{VK_NULL_HANDLE};

@@ -1,4 +1,4 @@
-#include <vulkan/vulkan_core.h>
+#include <memory>
 #include <stdexcept>
 #include <string/device.hpp>
 #include <string/vulkan_utils.hpp>
@@ -16,11 +16,13 @@ Device::Device(const std::shared_ptr<Window>& window)
     create_surface();
     select_physical_device();
     create_logical_device();
+    allocator_ = std::make_unique<Allocator>(physical_device_, device_, instance_);
 }
 
 Device::~Device()
 {
     vkDeviceWaitIdle(device_);
+    allocator_.reset();
     if (device_ != VK_NULL_HANDLE)
         vkDestroyDevice(device_, nullptr);
     if (surface_ != VK_NULL_HANDLE)
@@ -414,6 +416,11 @@ VkQueue Device::get_present_queue() const
 VkQueue Device::get_compute_queue() const
 {
     return compute_queue_;
+}
+
+Allocator& Device::get_allocator() const
+{
+    return *allocator_.get();
 }
 
 #include <string.h>

@@ -427,7 +427,7 @@ void Renderer::createGraphicsPipeline() {
 }
 
 void Renderer::createCommandPool() {
-    QueueFamilyIndices queueFamilyIndices = device_->get_queue_families();;
+    QueueFamilyIndices queueFamilyIndices = device_->get_queue_families();
 
     // clang-format off
     VkCommandPoolCreateInfo pool_info = {
