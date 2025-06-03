@@ -27,6 +27,9 @@ public:
     std::unique_ptr<Buffer> create_uniform_buffer(const VkDeviceSize& buffer_size);
     std::unique_ptr<Buffer> create_staging_buffer(const VkDeviceSize& buffer_size);
 
+    void print_memory_stats();
+    void defragment_memory();
+
 private:
     VkPhysicalDevice& physical_device_;
     VkDevice& device_;

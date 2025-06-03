@@ -1,5 +1,6 @@
 #include <vulkan/vulkan.h>
 #include <string/renderer.hpp>
+#include "string/vulkan_utils.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <string/core/stb_image.h>
@@ -89,25 +90,6 @@ void Renderer::createTextureImage() {
     vkDestroyBuffer(device_->get_device(), stagingBuffer, nullptr);
     vkFreeMemory(device_->get_device(), stagingBufferMemory, nullptr);
 }
-
-std::vector<char> Renderer::readFile(const std::string& filename) {
-    std::ifstream file(filename, std::ios::ate | std::ios::binary);
-
-    if (!file.is_open()) {
-        throw std::runtime_error("failed to open file!");
-    }
-
-    size_t fileSize = (size_t)file.tellg();
-    std::vector<char> buffer(fileSize);
-
-    file.seekg(0);
-    file.read(buffer.data(), fileSize);
-
-    file.close();
-
-    return buffer;
-}
-
 
 void Renderer::cleanupSwapChain() {
     vkDestroyImageView(device_->get_device(), depthImageView, nullptr);
@@ -277,25 +259,23 @@ void Renderer::createDescriptorSetLayout() {
     }
 }
 
-void Renderer::createGraphicsPipeline() {
-    auto vertShaderCode = readFile("shaders/3d_shader.vert.spv");
-    auto fragShaderCode = readFile("shaders/3d_shader.frag.spv");
-
-    VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
-    VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
+void Renderer::createGraphicsPipeline()
+{
+    auto vertex_shader_module = vku::load_shader_from_disk(device_->get_device(), "shaders/3d_shader.vert.spv");
+    auto fragment_shade_module = vku::load_shader_from_disk(device_->get_device(), "shaders/3d_shader.frag.spv");
 
     // clang-format off
     VkPipelineShaderStageCreateInfo vertex_shader_stage_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .stage = VK_SHADER_STAGE_VERTEX_BIT,
-        .module = vertShaderModule,
+        .module = vertex_shader_module,
         .pName = "main"
     };
 
     VkPipelineShaderStageCreateInfo fragment_shader_stage_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .module = fragShaderModule,
+        .module = fragment_shade_module,
         .pName = "main"
     };
     // clang-format on
@@ -422,8 +402,8 @@ void Renderer::createGraphicsPipeline() {
     }
     // clang-format on
 
-    vkDestroyShaderModule(device_->get_device(), fragShaderModule, nullptr);
-    vkDestroyShaderModule(device_->get_device(), vertShaderModule, nullptr);
+    vkDestroyShaderModule(device_->get_device(), fragment_shade_module, nullptr);
+    vkDestroyShaderModule(device_->get_device(), vertex_shader_module, nullptr);
 }
 
 void Renderer::createCommandPool() {

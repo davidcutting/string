@@ -72,7 +72,7 @@ exe_target = executable(
     dependencies : deps,
     include_directories : include_dir,
     sources : src,
-    install : true,
+    install : false,
     cpp_args : build_args
 )
 

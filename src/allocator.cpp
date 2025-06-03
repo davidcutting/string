@@ -91,4 +91,42 @@ std::unique_ptr<Buffer> Allocator::create_staging_buffer(const VkDeviceSize& buf
     return create_buffer(buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
 }
 
+// void Allocator::print_memory_stats()
+// {
+//     VmaStats stats;
+//     vmaCalculateStats(allocator_, &stats);
+    
+//     std::cout << "\n=== VMA Memory Statistics ===\n";
+//     std::cout << "Total allocated: " << stats.total.usedBytes / 1024 / 1024 << " MB\n";
+//     std::cout << "Total unused: " << stats.total.unusedBytes / 1024 / 1024 << " MB\n";
+//     std::cout << "Allocation count: " << stats.total.allocationCount << "\n";
+    
+//     for (uint32_t i = 0; i < VK_MAX_MEMORY_HEAPS; ++i)
+//     {
+//         if (stats.memoryHeap[i].blockCount > 0)
+//         {
+//             std::cout << "Heap " << i << ": " 
+//                         << stats.memoryHeap[i].usedBytes / 1024 / 1024 << " MB used, "
+//                         << stats.memoryHeap[i].blockCount << " blocks\n";
+//         }
+//     }
+// }
+
+// void Allocator::defragment_memory() 
+// {
+//     VmaDefragmentationInfo2 defrag_info = {
+//         .flags = VMA_DEFRAGMENTATION_FLAG_INCREMENTAL,
+//         .maxCpuBytesToMove = 1024 * 1024 * 16, // 16MB max
+//         .maxCpuAllocationsToMove = 32
+//     };
+    
+//     VmaDefragmentationContext defrag_context;
+    
+//     if (vmaDefragmentationBegin(allocator_, &defrag_info, nullptr, &defrag_context) == VK_SUCCESS)
+//     {
+//         VmaDefragmentationPassInfo pass_info{};
+//         result = vmaDefragmentationEnd(allocator_, defrag_context, &pass_info);
+//     }
+// }
+
 }

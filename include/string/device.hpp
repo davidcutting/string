@@ -79,6 +79,8 @@ private:
     const std::vector<const char*> validation_layers = {"VK_LAYER_KHRONOS_validation"};
     const std::vector<const char*> device_extensions = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+        VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME,
+        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
         VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME};
 };
 

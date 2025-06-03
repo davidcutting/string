@@ -258,8 +258,6 @@ private:
     VkPresentModeKHR chooseSwapPresentMode(const std::vector<VkPresentModeKHR>& available_present_modes);
 
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities);
-
-    static std::vector<char> readFile(const std::string& filename);
 };
 
 }  // namespace String

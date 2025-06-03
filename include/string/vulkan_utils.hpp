@@ -3,10 +3,54 @@
 #include <vulkan/vulkan.h>
 #include <string>
 #include <string/core/logger.hpp>
+#include <vector>
+#include <fstream>
 
 namespace String {
 
 namespace vku {
+
+inline std::vector<char> read_file(const std::string& filename)
+{
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("failed to open file!");
+    }
+
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> buffer(fileSize);
+
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+
+    file.close();
+
+    return buffer;
+}
+
+inline VkShaderModule create_shader_module(const VkDevice& device, const std::vector<char>& code)
+{
+    VkShaderModuleCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = code.size(),
+        .pCode = reinterpret_cast<const uint32_t*>(code.data())
+    };
+
+    VkShaderModule shaderModule;
+    if (vkCreateShaderModule(device, &create_info, nullptr, &shaderModule) != VK_SUCCESS)
+    {
+        throw std::runtime_error("failed to create shader module!");
+    }
+
+    return shaderModule;
+}
+
+inline VkShaderModule load_shader_from_disk(const VkDevice& device, const std::string& filename)
+{
+    const auto binary = read_file(filename);
+    return create_shader_module(device, binary);
+}
 
 inline VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
                                              const VkAllocationCallbacks* pAllocator,
@@ -27,7 +71,7 @@ inline void DestroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMesse
     }
 }
 
-inline VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+inline VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
                                                     VkDebugUtilsMessageTypeFlagsEXT /*messageType*/,
                                                     const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
                                                     void* /*pUserData*/) {
@@ -58,7 +102,7 @@ inline void default_debug_messenger_create_info(VkDebugUtilsMessengerCreateInfoE
         .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
                        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
                        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
-        .pfnUserCallback = debugCallback
+        .pfnUserCallback = debug_callback
     };
     // clang-format on
 }
