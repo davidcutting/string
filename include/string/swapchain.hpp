@@ -21,6 +21,7 @@ public:
     VkSwapchainKHR get_swap_chain() const;
     std::vector<VkImageView> get_image_views() const;
     std::vector<VkImage> get_images() const;
+    uint32_t get_swap_chain_image_count() const;
     VkExtent2D get_extent() const;
     VkImageView get_image_view() const;
 
@@ -33,6 +34,7 @@ private:
     VkFormat image_format_;
     VkExtent2D extent_;
     image_index_t current_image_{0};
+    uint32_t swap_chain_image_count_{2};
 
     VkImageView create_image_view(VkImage image, VkFormat format, VkImageAspectFlags aspect_flags);
     VkSurfaceFormatKHR choose_swap_surface_format(const std::vector<VkSurfaceFormatKHR>& available_formats);

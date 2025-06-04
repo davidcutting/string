@@ -55,7 +55,7 @@ void Renderer::cleanup() {
     vkDestroyPipeline(device_->get_device(), graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(device_->get_device(), pipelineLayout, nullptr);
 
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+    for (size_t i = 0; i < swap_chain_image_count_; i++)
     {
         vmaUnmapMemory(device_->get_allocator().get_allocator(), uniform_buffers_[i]->allocation);
         device_->get_allocator().destroy_buffer(uniform_buffers_[i]);
@@ -75,10 +75,11 @@ void Renderer::cleanup() {
     device_->get_allocator().destroy_buffer(index_buffer_);
     device_->get_allocator().destroy_buffer(vertex_buffer_);
 
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-        vkDestroySemaphore(device_->get_device(), renderFinishedSemaphores[i], nullptr);
-        vkDestroySemaphore(device_->get_device(), imageAvailableSemaphores[i], nullptr);
-        vkDestroyFence(device_->get_device(), inFlightFences[i], nullptr);
+    for (size_t i = 0; i < swap_chain_image_count_; ++i)
+    {
+        vkDestroySemaphore(device_->get_device(), render_complete_semaphores_[i], nullptr);
+        vkDestroySemaphore(device_->get_device(), image_available_semaphores_[i], nullptr);
+        vkDestroyFence(device_->get_device(), frame_in_flight_fences_[i], nullptr);
     }
 
     vkDestroyCommandPool(device_->get_device(), commandPool, nullptr);
@@ -274,13 +275,13 @@ void Renderer::createGraphicsPipeline()
         .blendConstants = { 0.0f, 0.0f, 0.0f, 0.0f }
     };
 
-    std::vector<VkDynamicState> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    std::vector<VkDynamicState> dynamic_states = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic_state = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()),
-        .pDynamicStates = dynamicStates.data()
+        .dynamicStateCount = static_cast<uint32_t>(dynamic_states.size()),
+        .pDynamicStates = dynamic_states.data()
     };
 
     VkPipelineLayoutCreateInfo pipeline_layout_info = {
@@ -596,10 +597,10 @@ void Renderer::create_index_buffer()
 void Renderer::createUniformBuffers() {
     VkDeviceSize buffer_size = sizeof(UniformBufferObject);
 
-    uniform_buffers_.resize(MAX_FRAMES_IN_FLIGHT);
-    uniform_buffers_mapped_.resize(MAX_FRAMES_IN_FLIGHT);
+    uniform_buffers_.resize(swap_chain_image_count_);
+    uniform_buffers_mapped_.resize(swap_chain_image_count_);
 
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+    for (size_t i = 0; i < swap_chain_image_count_; i++)
     {
         uniform_buffers_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
         vmaMapMemory(device_->get_allocator().get_allocator(), uniform_buffers_[i]->allocation, &uniform_buffers_mapped_[i]);
@@ -609,15 +610,15 @@ void Renderer::createUniformBuffers() {
 void Renderer::createDescriptorPool() {;
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+    poolSizes[0].descriptorCount = static_cast<uint32_t>(swap_chain_image_count_);
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+    poolSizes[1].descriptorCount = static_cast<uint32_t>(swap_chain_image_count_);
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+    poolInfo.maxSets = static_cast<uint32_t>(swap_chain_image_count_);
 
     if (vkCreateDescriptorPool(device_->get_device(), &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("failed to create descriptor pool!");
@@ -625,19 +626,19 @@ void Renderer::createDescriptorPool() {;
 }
 
 void Renderer::createDescriptorSets() {
-    std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
+    std::vector<VkDescriptorSetLayout> layouts(swap_chain_image_count_, descriptorSetLayout);
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool = descriptorPool;
-    allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+    allocInfo.descriptorSetCount = static_cast<uint32_t>(swap_chain_image_count_);
     allocInfo.pSetLayouts = layouts.data();
 
-    descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+    descriptorSets.resize(swap_chain_image_count_);
     if (vkAllocateDescriptorSets(device_->get_device(), &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
         throw std::runtime_error("failed to allocate descriptor sets!");
     }
 
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+    for (size_t i = 0; i < swap_chain_image_count_; i++) {
         VkDescriptorBufferInfo bufferInfo{};
         bufferInfo.buffer = uniform_buffers_[i]->buffer;
         bufferInfo.offset = 0;
@@ -669,33 +670,6 @@ void Renderer::createDescriptorSets() {
         vkUpdateDescriptorSets(device_->get_device(), static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0,
                                nullptr);
     }
-}
-
-void Renderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer,
-                  VkDeviceMemory& bufferMemory) {
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = size;
-    bufferInfo.usage = usage;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-    if (vkCreateBuffer(device_->get_device(), &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create buffer!");
-    }
-
-    VkMemoryRequirements memRequirements;
-    vkGetBufferMemoryRequirements(device_->get_device(), buffer, &memRequirements);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = device_->get_memory_type(memRequirements.memoryTypeBits, properties);
-
-    if (vkAllocateMemory(device_->get_device(), &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate buffer memory!");
-    }
-
-    vkBindBufferMemory(device_->get_device(), buffer, bufferMemory, 0);
 }
 
 VkCommandBuffer Renderer::beginSingleTimeCommands() {
@@ -758,7 +732,7 @@ void Renderer::copy_buffer(const Buffer* src, const Buffer* dest) {
 }
 
 void Renderer::createCommandBuffers() {
-    commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+    commandBuffers.resize(swap_chain_image_count_);
 
     VkCommandBufferAllocateInfo alloc_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -883,7 +857,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     vkCmdBindIndexBuffer(commandBuffer, index_buffer_->buffer, 0, VK_INDEX_TYPE_UINT32);
 
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
-                            &descriptorSets[currentFrame], 0, nullptr);
+                            &descriptorSets[current_frame], 0, nullptr);
 
     vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
@@ -905,22 +879,30 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     }
 }
 
-void Renderer::createSyncObjects() {
-    imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
-    renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
-    inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+void Renderer::createSyncObjects()
+{
+    image_available_semaphores_.resize(swap_chain_image_count_);
+    render_complete_semaphores_.resize(swap_chain_image_count_);
+    frame_in_flight_fences_.resize(swap_chain_image_count_);
 
-    VkSemaphoreCreateInfo semaphoreInfo{};
-    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    VkSemaphoreCreateInfo semaphore_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0
+    };
 
-    VkFenceCreateInfo fenceInfo{};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT
+    };
 
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-        if (vkCreateSemaphore(device_->get_device(), &semaphoreInfo, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(device_->get_device(), &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS ||
-            vkCreateFence(device_->get_device(), &fenceInfo, nullptr, &inFlightFences[i]) != VK_SUCCESS) {
+    for (size_t i = 0; i < swap_chain_image_count_; i++)
+    {
+        if (vkCreateSemaphore(device_->get_device(), &semaphore_info, nullptr, &image_available_semaphores_[i]) != VK_SUCCESS ||
+            vkCreateSemaphore(device_->get_device(), &semaphore_info, nullptr, &render_complete_semaphores_[i]) != VK_SUCCESS ||
+            vkCreateFence(device_->get_device(), &fence_info, nullptr, &frame_in_flight_fences_[i]) != VK_SUCCESS) 
+        {
             throw std::runtime_error("Failed to create synchronization objects for a frame!");
         }
     }
@@ -946,9 +928,10 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
 }
 
 void Renderer::drawFrame() {
-    vkWaitForFences(device_->get_device(), 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
+    vkWaitForFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame], VK_TRUE, UINT64_MAX);
+    vkResetFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame]);
 
-    auto[result, image_index] = swap_chain_->acquire_next_frame(imageAvailableSemaphores[currentFrame]);
+    auto[result, image_index] = swap_chain_->acquire_next_frame(image_available_semaphores_[current_frame]);
 
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         recreateSwapChain();
@@ -957,30 +940,52 @@ void Renderer::drawFrame() {
         throw std::runtime_error("failed to acquire swap chain image!");
     }
 
-    vkResetFences(device_->get_device(), 1, &inFlightFences[currentFrame]);
+    updateUniformBuffer(current_frame);
+    vkResetCommandBuffer(commandBuffers[current_frame], 0);
+    recordCommandBuffer(commandBuffers[current_frame], image_index);
 
-    updateUniformBuffer(currentFrame);
-
-    vkResetCommandBuffer(commandBuffers[currentFrame], /*VkCommandBufferResetFlagBits*/ 0);
-    recordCommandBuffer(commandBuffers[currentFrame], image_index);
-
-    VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[currentFrame]};
-    VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[currentFrame]};
-    VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-
-    VkSubmitInfo submit_info = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = waitSemaphores,
-        .pWaitDstStageMask = waitStages,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &commandBuffers[currentFrame],
-        .signalSemaphoreCount = 1,
-        .pSignalSemaphores = signalSemaphores
+    const VkSemaphoreSubmitInfo wait_semaphore_infos[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .pNext = nullptr,
+            .semaphore = image_available_semaphores_[current_frame],
+            .value = 0,
+            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .deviceIndex = 0
+        }
     };
 
-    if (vkQueueSubmit(device_->get_graphics_queue(), 1, &submit_info, inFlightFences[currentFrame]) != VK_SUCCESS) {
+    const VkSemaphoreSubmitInfo signal_semaphore_infos[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .pNext = nullptr,
+            .semaphore = render_complete_semaphores_[current_frame],
+            .value = 0,
+            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .deviceIndex = 0
+        }
+    };
+
+    VkCommandBufferSubmitInfo command_buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .pNext = nullptr,
+        .commandBuffer = commandBuffers[current_frame],
+        .deviceMask = 0
+    };
+
+    VkSubmitInfo2 submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .pNext = nullptr,
+        .flags = 0,
+        .waitSemaphoreInfoCount = 1,
+        .pWaitSemaphoreInfos = wait_semaphore_infos,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &command_buffer_info,
+        .signalSemaphoreInfoCount = 1,
+        .pSignalSemaphoreInfos = signal_semaphore_infos
+    };
+
+    if (vkQueueSubmit2(device_->get_graphics_queue(), 1, &submit_info, frame_in_flight_fences_[current_frame]) != VK_SUCCESS) {
         throw std::runtime_error("failed to submit draw command buffer!");
     }
 
@@ -990,7 +995,7 @@ void Renderer::drawFrame() {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .pNext = nullptr,
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = signalSemaphores,
+        .pWaitSemaphores = &render_complete_semaphores_[current_frame],
         .swapchainCount = 1,
         .pSwapchains = swap_chains,
         .pImageIndices = &image_index,
@@ -1006,7 +1011,7 @@ void Renderer::drawFrame() {
         throw std::runtime_error("failed to present swap chain image!");
     }
 
-    currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+    current_frame = (current_frame + 1) % swap_chain_image_count_;
 }
 
 }  // namespace String

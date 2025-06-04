@@ -73,6 +73,7 @@ Swapchain::Swapchain(const std::shared_ptr<Device>& device, const VkExtent2D& de
     swap_chain_images_.resize(image_count);
     vkGetSwapchainImagesKHR(device_->get_device(), swap_chain_, &image_count, swap_chain_images_.data());
 
+    swap_chain_image_count_ = image_count;
     image_format_ = surface_format.format;
     extent_ = extent;
 
@@ -100,8 +101,7 @@ std::tuple<VkResult, image_index_t> Swapchain::acquire_next_frame(const VkSemaph
     static constexpr uint64_t acquisition_timeout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(1s).count();
 
     VkResult result = vkAcquireNextImageKHR(device_->get_device(), swap_chain_, acquisition_timeout_ns,
-                                            image_available_semaphore,
-                                            VK_NULL_HANDLE, &current_image_);
+                                            image_available_semaphore, VK_NULL_HANDLE, &current_image_);
 
     return {result, current_image_};
 }
@@ -120,6 +120,12 @@ std::vector<VkImage> Swapchain::get_images() const
 {
     return swap_chain_images_;
 }
+
+uint32_t Swapchain::get_swap_chain_image_count() const
+{
+    return swap_chain_image_count_;
+}
+
 
 VkExtent2D Swapchain::get_extent() const
 {
