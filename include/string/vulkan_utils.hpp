@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <string>
 #include <string/core/logger.hpp>
+#include <string/render_data.hpp>
 #include <vector>
 #include <fstream>
 
@@ -33,6 +34,8 @@ inline VkShaderModule create_shader_module(const VkDevice& device, const std::ve
 {
     VkShaderModuleCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
         .codeSize = code.size(),
         .pCode = reinterpret_cast<const uint32_t*>(code.data())
     };
@@ -62,6 +65,8 @@ inline VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugU
         return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
 }
+
+void load_model(const std::string& model_path, std::vector<Vertex>& vertex_buffer, std::vector<uint32_t>& index_buffer);
 
 inline void DestroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerEXT debugMessenger,
                                           const VkAllocationCallbacks* pAllocator) {
@@ -102,7 +107,8 @@ inline void default_debug_messenger_create_info(VkDebugUtilsMessengerCreateInfoE
         .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
                        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
                        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
-        .pfnUserCallback = debug_callback
+        .pfnUserCallback = debug_callback,
+        .pUserData = nullptr
     };
     // clang-format on
 }

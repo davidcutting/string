@@ -258,8 +258,8 @@ void Device::create_logical_device()
     VkPhysicalDeviceVulkan13Features vulkan13_features = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
         .pNext = &vulkan12_features,
-        .dynamicRendering = VK_TRUE,
-        .synchronization2 = VK_TRUE
+        .synchronization2 = VK_TRUE,
+        .dynamicRendering = VK_TRUE
     };
     VkPhysicalDeviceFeatures enabled_device_features{};
     enabled_device_features.samplerAnisotropy = VK_TRUE;

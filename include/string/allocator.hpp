@@ -7,6 +7,13 @@
 namespace String
 {
 
+struct Image {
+    VkImage image;
+    VkDeviceSize buffer_size;
+    VmaAllocation allocation;
+    VmaAllocationInfo allocationInfo;
+};
+
 struct Buffer {
     VkBuffer buffer;
     VkDeviceSize buffer_size;
@@ -24,8 +31,13 @@ public:
     void destroy_buffer(std::unique_ptr<Buffer>& buffer);
 
     std::unique_ptr<Buffer> create_vertex_buffer(const VkDeviceSize& buffer_size);
+    std::unique_ptr<Buffer> create_index_buffer(const VkDeviceSize& buffer_size);
     std::unique_ptr<Buffer> create_uniform_buffer(const VkDeviceSize& buffer_size);
     std::unique_ptr<Buffer> create_staging_buffer(const VkDeviceSize& buffer_size);
+
+    void copy_data_to_buffer(void* data, const Buffer* buffer) const;
+    
+    VmaAllocator get_allocator() const;
 
     void print_memory_stats();
     void defragment_memory();

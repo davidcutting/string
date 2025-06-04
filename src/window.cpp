@@ -17,10 +17,10 @@ static void glfw_key_callback(GLFWwindow* window, int key, int scancode, int act
     window_ptr->key_action(key, scancode, action, mods);
 }
 
-static void glfw_mouse_callback(GLFWwindow* window, double xpos, double ypos) {
-    auto window_ptr = reinterpret_cast<Window*>(glfwGetWindowUserPointer(window));
-    window_ptr->mouse_action(xpos, ypos);
-}
+// static void glfw_mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+//     auto window_ptr = reinterpret_cast<Window*>(glfwGetWindowUserPointer(window));
+//     window_ptr->mouse_action(xpos, ypos);
+// }
 
 Window::Window(const Properties& properties) : properties_(properties) {
     attempt_wayland_init();

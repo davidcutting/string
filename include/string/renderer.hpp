@@ -5,75 +5,20 @@
 #include <GLFW/glfw3.h>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
-#define GLM_ENABLE_EXPERIMENTAL
-#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtx/hash.hpp>
 #include <string/core/logger.hpp>
 #include <string/vulkan_utils.hpp>
 #include <string/window.hpp>
 #include <string/device.hpp>
+#include <string/swapchain.hpp>
+#include <string/render_data.hpp>
 #include <string>
 #include <vector>
-
-namespace String {
-
-struct Vertex {
-    glm::vec3 pos;
-    glm::vec3 color;
-    glm::vec2 texCoord;
-
-    static VkVertexInputBindingDescription getBindingDescription() {
-        VkVertexInputBindingDescription bindingDescription{};
-        bindingDescription.binding = 0;
-        bindingDescription.stride = sizeof(Vertex);
-        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-        return bindingDescription;
-    }
-
-    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions() {
-        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
-
-        attributeDescriptions[0].binding = 0;
-        attributeDescriptions[0].location = 0;
-        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-        attributeDescriptions[0].offset = offsetof(Vertex, pos);
-
-        attributeDescriptions[1].binding = 0;
-        attributeDescriptions[1].location = 1;
-        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-        attributeDescriptions[1].offset = offsetof(Vertex, color);
-
-        attributeDescriptions[2].binding = 0;
-        attributeDescriptions[2].location = 2;
-        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
-        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
-
-        return attributeDescriptions;
-    }
-
-    bool operator==(const Vertex& other) const {
-        return pos == other.pos && color == other.color && texCoord == other.texCoord;
-    }
-};
-
-}  // namespace String
-
-namespace std {
-template <>
-struct hash<String::Vertex> {
-    size_t operator()(String::Vertex const& vertex) const {
-        return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^
-               (hash<glm::vec2>()(vertex.texCoord) << 1);
-    }
-};
-}  // namespace std
 
 namespace String {
 
@@ -86,6 +31,14 @@ struct UniformBufferObject {
 const std::string MODEL_PATH = "./assets/viking_room.obj";
 const std::string TEXTURE_PATH = "./assets/viking_room.png";
 
+// struct FrameData {
+// 	VkCommandPool command_pool;
+// 	VkCommandBuffer main_command_buffer;
+//     VkSemaphore swapchain_semaphore;
+//     VkSemaphore render_semaphore;
+// 	VkFence render_fence;
+// };
+
 const int MAX_FRAMES_IN_FLIGHT = 2;
 
 class Renderer {
@@ -97,13 +50,13 @@ public:
         window_ = window;
 
         // Device
-        device_ = std::make_unique<Device>(window);
+        device_ = std::make_shared<Device>(window);
+        VkExtent2D extent = {
+            .width = window->get_properties().extent.width,
+            .height = window->get_properties().extent.height
+        };
+        swap_chain_ = std::make_unique<Swapchain>(device_, extent);
 
-        // Vulkan
-//        createSurface();
-
-        createSwapChain();
-        createImageViews();
         createDescriptorSetLayout();
         createGraphicsPipeline();
         createCommandPool();
@@ -111,9 +64,11 @@ public:
         createTextureImage();
         createTextureImageView();
         createTextureSampler();
-        loadModel();
-        createVertexBuffer();
-        createIndexBuffer();
+
+        vku::load_model(MODEL_PATH, vertices, indices);
+        create_vertex_buffer();
+        create_index_buffer();
+
         createUniformBuffers();
         createDescriptorPool();
         createDescriptorSets();
@@ -130,13 +85,8 @@ public:
 
 private:
     std::shared_ptr<Window> window_;
-    std::unique_ptr<Device> device_;
-
-    VkSwapchainKHR swapChain;
-    std::vector<VkImage> swapChainImages;
-    VkFormat swapChainImageFormat;
-    VkExtent2D swapChainExtent;
-    std::vector<VkImageView> swapChainImageViews;
+    std::shared_ptr<Device> device_;
+    std::unique_ptr<Swapchain> swap_chain_;
 
     VkDescriptorSetLayout descriptorSetLayout;
     VkPipelineLayout pipelineLayout;
@@ -155,14 +105,11 @@ private:
 
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
-    VkBuffer vertexBuffer;
-    VkDeviceMemory vertexBufferMemory;
-    VkBuffer indexBuffer;
-    VkDeviceMemory indexBufferMemory;
+    std::unique_ptr<Buffer> vertex_buffer_;
+    std::unique_ptr<Buffer> index_buffer_;
 
-    std::vector<VkBuffer> uniformBuffers;
-    std::vector<VkDeviceMemory> uniformBuffersMemory;
-    std::vector<void*> uniformBuffersMapped;
+    std::vector<std::unique_ptr<Buffer>> uniform_buffers_;
+    std::vector<void*> uniform_buffers_mapped_;
 
     VkDescriptorPool descriptorPool;
     std::vector<VkDescriptorSet> descriptorSets;
@@ -173,27 +120,14 @@ private:
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
     uint32_t currentFrame = 0;
-    std::vector<VkFence> imagesInFlight;
 
     bool framebufferResized = false;
 
     void framebuffer_resize_callback(const String::View::Extent& /*extent*/) { framebufferResized = true; }
 
-    void cleanupSwapChain();
-
     void cleanup();
 
     void recreateSwapChain();
-
-    void createSurface();
-
-    void pickPhysicalDevice();
-
-    void createLogicalDevice();
-
-    void createSwapChain();
-
-    void createImageViews();
 
     void createDescriptorSetLayout();
 
@@ -222,9 +156,9 @@ private:
 
     void loadModel();
 
-    void createVertexBuffer();
+    void create_vertex_buffer();
 
-    void createIndexBuffer();
+    void create_index_buffer();
 
     void createUniformBuffers();
 
@@ -239,7 +173,7 @@ private:
 
     void endSingleTimeCommands(VkCommandBuffer commandBuffer);
 
-    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
+    void copy_buffer(const Buffer* src, const Buffer* dest);
 
     void createCommandBuffers();
 
@@ -250,14 +184,6 @@ private:
     void updateUniformBuffer(uint32_t currentImage);
 
     void drawFrame();
-
-    VkShaderModule createShaderModule(const std::vector<char>& code);
-
-    VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& availableFormats);
-
-    VkPresentModeKHR chooseSwapPresentMode(const std::vector<VkPresentModeKHR>& available_present_modes);
-
-    VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities);
 };
 
 }  // namespace String

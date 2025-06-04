@@ -50,6 +50,8 @@ src = [
     'src/window.cpp',
     'src/device.cpp',
     'src/allocator.cpp',
+    'src/swapchain.cpp',
+    'src/vulkan_utils.cpp',
     'src/main.cpp'
 ]
 

@@ -63,6 +63,9 @@ std::unique_ptr<Buffer> Allocator::create_buffer(const VkDeviceSize& buffer_size
         &buffer_data->allocationInfo
     );
 
+    // Don't forget to throw the buffer size in there for tracking :^)
+    buffer_data->buffer_size = buffer_size;
+
     if (result != VK_SUCCESS) {
         throw std::runtime_error("Failed to create vertex buffer with VMA");
     }
@@ -81,6 +84,11 @@ std::unique_ptr<Buffer> Allocator::create_vertex_buffer(const VkDeviceSize& buff
     return create_buffer(buffer_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
 }
 
+std::unique_ptr<Buffer> Allocator::create_index_buffer(const VkDeviceSize& buffer_size)
+{
+    return create_buffer(buffer_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+}
+
 std::unique_ptr<Buffer> Allocator::create_uniform_buffer(const VkDeviceSize& buffer_size)
 {
     return create_buffer(buffer_size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
@@ -89,6 +97,19 @@ std::unique_ptr<Buffer> Allocator::create_uniform_buffer(const VkDeviceSize& buf
 std::unique_ptr<Buffer> Allocator::create_staging_buffer(const VkDeviceSize& buffer_size)
 {
     return create_buffer(buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
+}
+
+void Allocator::copy_data_to_buffer(void* data, const Buffer* buffer) const
+{
+    void* mapped_memory;
+    vmaMapMemory(allocator_, buffer->allocation, &mapped_memory);
+    memcpy(mapped_memory, data, buffer->buffer_size);
+    vmaUnmapMemory(allocator_, buffer->allocation);
+}
+
+VmaAllocator Allocator::get_allocator() const
+{
+    return allocator_;
 }
 
 // void Allocator::print_memory_stats()
