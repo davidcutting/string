@@ -28,6 +28,11 @@ namespace String {
 const std::string MODEL_PATH = "./assets/viking_room.obj";
 const std::string TEXTURE_PATH = "./assets/viking_room.png";
 
+struct UIShaderConfig {
+    glm::vec2 screenSize;
+    glm::uint primitiveCount;
+};
+
 struct Camera3D {
     alignas(16) glm::mat4 model;
     alignas(16) glm::mat4 view;
@@ -71,8 +76,16 @@ public:
         swap_chain_ = std::make_unique<Swapchain>(device_, extent);
         swap_chain_image_count_ = swap_chain_->get_swap_chain_image_count();
 
+        create_ssbo_buffer();
+
         createDescriptorSetLayout();
-        pipeline_3d_ = std::make_unique<Pipeline3D>(device_, descriptorSetLayout);
+        pipeline_3d_ = std::make_unique<Pipeline3D>(device_, descriptor_set_layout_3d_);
+        ui_push_constant_range_ = {
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(UIShaderConfig)
+        };
+        ui_pipeline_ = std::make_unique<Pipeline2D>(device_, ui_descriptor_set_layout_, ui_push_constant_range_);
 
         createCommandPool();
         createDepthResources();
@@ -109,13 +122,20 @@ private:
     Scene3D scene_3d_;
     Scene2D scene_ui_;
 
-    std::vector<std::unique_ptr<Buffer>> uniform_buffers_;
+    std::vector<std::unique_ptr<Buffer>> camera_3d_ubo_;
     std::vector<void*> uniform_buffers_mapped_;
+    std::vector<std::unique_ptr<Buffer>> camera_2d_ubo_;
+    std::vector<void*> camera_2d_mapped_;
+    std::vector<std::unique_ptr<Buffer>> ui_shapes_ssbo_;
+    std::vector<void*> ui_shapes_mapped_;
 
-    VkDescriptorSetLayout descriptorSetLayout;
+    VkDescriptorSetLayout descriptor_set_layout_3d_;
+    VkDescriptorSetLayout ui_descriptor_set_layout_;
+    VkPushConstantRange ui_push_constant_range_;
     std::unique_ptr<Pipeline3D> pipeline_3d_;
     std::unique_ptr<Pipeline2D> ui_pipeline_;
 
+    VkDescriptorPool descriptorPool;
     VkCommandPool commandPool;
 
     std::unique_ptr<Image> depth_image_;
@@ -125,10 +145,9 @@ private:
     VkImageView textureImageView;
     VkSampler textureSampler;
 
-    VkDescriptorPool descriptorPool;
-    std::vector<VkDescriptorSet> descriptorSets;
-
     std::vector<VkCommandBuffer> commandBuffers;
+    std::vector<VkDescriptorSet> descriptor_sets_3d_;
+    std::vector<VkDescriptorSet> ui_descriptor_sets_;
 
     uint32_t swap_chain_image_count_{2};
     uint32_t current_frame = 0;
@@ -172,6 +191,8 @@ private:
     void create_index_buffer();
 
     void createUniformBuffers();
+
+    void create_ssbo_buffer();
 
     void createDescriptorPool();
 

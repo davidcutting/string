@@ -1,12 +1,14 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_core.h>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string/renderer.hpp>
 #include <string/vulkan_utils.hpp>
 #include <string/allocator.hpp>
 #include <string/device.hpp>
 #include <string/pipeline_2d.hpp>
+#include <string/render_data.hpp>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <string/core/stb_image.h>
@@ -54,8 +56,14 @@ void Renderer::cleanup() {
 
     for (size_t i = 0; i < swap_chain_image_count_; i++)
     {
-        vmaUnmapMemory(device_->get_allocator().get_allocator(), uniform_buffers_[i]->allocation);
-        device_->get_allocator().destroy_buffer(uniform_buffers_[i]);
+        vmaUnmapMemory(device_->get_allocator().get_allocator(), camera_3d_ubo_[i]->allocation);
+        device_->get_allocator().destroy_buffer(camera_3d_ubo_[i]);
+
+        vmaUnmapMemory(device_->get_allocator().get_allocator(), camera_2d_ubo_[i]->allocation);
+        device_->get_allocator().destroy_buffer(camera_2d_ubo_[i]);
+
+        vmaUnmapMemory(device_->get_allocator().get_allocator(), ui_shapes_ssbo_[i]->allocation);
+        device_->get_allocator().destroy_buffer(ui_shapes_ssbo_[i]);
     }
 
     vkDestroyDescriptorPool(device_->get_device(), descriptorPool, nullptr);
@@ -65,7 +73,8 @@ void Renderer::cleanup() {
 
     device_->get_allocator().destroy_image(texture_image_);
 
-    vkDestroyDescriptorSetLayout(device_->get_device(), descriptorSetLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device_->get_device(), descriptor_set_layout_3d_, nullptr);
+    vkDestroyDescriptorSetLayout(device_->get_device(), ui_descriptor_set_layout_, nullptr);
 
     device_->get_allocator().destroy_buffer(scene_3d_.index_buffer);
     device_->get_allocator().destroy_buffer(scene_3d_.vertex_buffer);
@@ -105,39 +114,78 @@ void Renderer::recreateSwapChain() {
     createDepthResources();
 }
 
-void Renderer::createDescriptorSetLayout() {
-    // clang-format off
-    VkDescriptorSetLayoutBinding ubo_layout_binding = {
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-        .pImmutableSamplers = nullptr
-    };
+void Renderer::createDescriptorSetLayout()
+{
+    {
+        // clang-format off
+        VkDescriptorSetLayoutBinding ubo_layout_binding = {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+            .pImmutableSamplers = nullptr
+        };
 
-    VkDescriptorSetLayoutBinding sampler_layout_binding = {
-        .binding = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .pImmutableSamplers = nullptr
-    };
-    // clang-format on
+        VkDescriptorSetLayoutBinding sampler_layout_binding = {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr
+        };
+        // clang-format on
 
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings = {ubo_layout_binding, sampler_layout_binding};
+        std::vector<VkDescriptorSetLayoutBinding> bindings = {ubo_layout_binding, sampler_layout_binding};
 
-    // clang-format off
-    VkDescriptorSetLayoutCreateInfo layout_info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .bindingCount = static_cast<uint32_t>(bindings.size()),
-        .pBindings = bindings.data()
-    };
-    // clang-format on
+        // clang-format off
+        VkDescriptorSetLayoutCreateInfo layout_info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<uint32_t>(bindings.size()),
+            .pBindings = bindings.data()
+        };
+        // clang-format on
 
-    if (vkCreateDescriptorSetLayout(device_->get_device(), &layout_info, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create descriptor set layout!");
+        if (vkCreateDescriptorSetLayout(device_->get_device(), &layout_info, nullptr, &descriptor_set_layout_3d_) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor set layout!");
+        }
+    }
+
+    {
+        // clang-format off
+        VkDescriptorSetLayoutBinding ubo_layout_binding = {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr
+        };
+
+        VkDescriptorSetLayoutBinding ssbo_layout_binding = {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr
+        };
+        // clang-format on
+
+        std::vector<VkDescriptorSetLayoutBinding> bindings = {ubo_layout_binding, ssbo_layout_binding};
+
+        // clang-format off
+        VkDescriptorSetLayoutCreateInfo layout_info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<uint32_t>(bindings.size()),
+            .pBindings = bindings.data()
+        };
+        // clang-format on
+
+        if (vkCreateDescriptorSetLayout(device_->get_device(), &layout_info, nullptr, &ui_descriptor_set_layout_) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor set layout!");
+        }
     }
 }
 
@@ -391,16 +439,46 @@ void Renderer::create_index_buffer()
     device_->get_allocator().destroy_buffer(staging_buffer);
 }
 
-void Renderer::createUniformBuffers() {
-    VkDeviceSize buffer_size = sizeof(Camera3D);
+void Renderer::createUniformBuffers()
+{
+    {
+        VkDeviceSize buffer_size = sizeof(Camera3D);
 
-    uniform_buffers_.resize(swap_chain_image_count_);
-    uniform_buffers_mapped_.resize(swap_chain_image_count_);
+        camera_3d_ubo_.resize(swap_chain_image_count_);
+        uniform_buffers_mapped_.resize(swap_chain_image_count_);
+
+        for (size_t i = 0; i < swap_chain_image_count_; i++)
+        {
+            camera_3d_ubo_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+            vmaMapMemory(device_->get_allocator().get_allocator(), camera_3d_ubo_[i]->allocation, &uniform_buffers_mapped_[i]);
+        }
+    }
+    
+    {
+        VkDeviceSize buffer_size = sizeof(Camera2D);
+
+        camera_2d_ubo_.resize(swap_chain_image_count_);
+        camera_2d_mapped_.resize(swap_chain_image_count_);
+
+        for (size_t i = 0; i < swap_chain_image_count_; i++)
+        {
+            camera_2d_ubo_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+            vmaMapMemory(device_->get_allocator().get_allocator(), camera_2d_ubo_[i]->allocation, &camera_2d_mapped_[i]);
+        }
+    }
+}
+
+void Renderer::create_ssbo_buffer()
+{
+    VkDeviceSize buffer_size = sizeof(UIShape) * 2;
+
+    ui_shapes_ssbo_.resize(swap_chain_image_count_);
+    ui_shapes_mapped_.resize(swap_chain_image_count_);
 
     for (size_t i = 0; i < swap_chain_image_count_; i++)
     {
-        uniform_buffers_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
-        vmaMapMemory(device_->get_allocator().get_allocator(), uniform_buffers_[i]->allocation, &uniform_buffers_mapped_[i]);
+        ui_shapes_ssbo_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+        vmaMapMemory(device_->get_allocator().get_allocator(), ui_shapes_ssbo_[i]->allocation, &ui_shapes_mapped_[i]);
     }
 }
 
@@ -414,14 +492,22 @@ void Renderer::createDescriptorPool()
         {
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount = static_cast<uint32_t>(swap_chain_image_count_)
-        }
+        },
+        {
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = static_cast<uint32_t>(swap_chain_image_count_)
+        },
+        {
+            .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = static_cast<uint32_t>(swap_chain_image_count_)
+        },
     };
 
     VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .maxSets = static_cast<uint32_t>(swap_chain_image_count_),
+        .maxSets = static_cast<uint32_t>(swap_chain_image_count_) * 2,
         .poolSizeCount = static_cast<uint32_t>(pool_sizes.size()),
         .pPoolSizes = pool_sizes.data(),
     };
@@ -433,26 +519,27 @@ void Renderer::createDescriptorPool()
 
 void Renderer::createDescriptorSets()
 {
-    std::vector<VkDescriptorSetLayout> layouts(swap_chain_image_count_, descriptorSetLayout);
-
-    VkDescriptorSetAllocateInfo alloc_info = {
+    // 3D Scene Descriptor Sets
+    std::vector<VkDescriptorSetLayout> layouts_3d(swap_chain_image_count_, descriptor_set_layout_3d_);
+    VkDescriptorSetAllocateInfo descriptor_set_3d_alloc_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .pNext = nullptr,
         .descriptorPool = descriptorPool,
         .descriptorSetCount = static_cast<uint32_t>(swap_chain_image_count_),
-        .pSetLayouts = layouts.data()
+        .pSetLayouts = layouts_3d.data()
     };
+    descriptor_sets_3d_.resize(swap_chain_image_count_);
 
-    descriptorSets.resize(swap_chain_image_count_);
-    if (vkAllocateDescriptorSets(device_->get_device(), &alloc_info, descriptorSets.data()) != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate descriptor sets!");
+    if (vkAllocateDescriptorSets(device_->get_device(), &descriptor_set_3d_alloc_info, descriptor_sets_3d_.data()) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to allocate 3D descriptor sets!");
     }
 
     for (size_t i = 0; i < swap_chain_image_count_; i++) {
         VkDescriptorBufferInfo buffer_info = {
-            .buffer = uniform_buffers_[i]->buffer,
+            .buffer = camera_3d_ubo_[i]->buffer,
             .offset = 0,
-            .range = sizeof(Camera3D)
+            .range = VK_WHOLE_SIZE
         };
 
         VkDescriptorImageInfo image_info = {
@@ -460,13 +547,12 @@ void Renderer::createDescriptorSets()
             .imageView = textureImageView,
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
         };
-        
 
         std::vector<VkWriteDescriptorSet> descriptor_writes = {
             {
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .pNext = nullptr,
-                .dstSet = descriptorSets[i],
+                .dstSet = descriptor_sets_3d_[i],
                 .dstBinding = 0,
                 .dstArrayElement = 0,
                 .descriptorCount = 1,
@@ -478,13 +564,76 @@ void Renderer::createDescriptorSets()
             {
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .pNext = nullptr,
-                .dstSet = descriptorSets[i],
+                .dstSet = descriptor_sets_3d_[i],
                 .dstBinding = 1,
                 .dstArrayElement = 0,
                 .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 .pImageInfo = &image_info,
                 .pBufferInfo = nullptr,
+                .pTexelBufferView = nullptr,
+            }
+        };
+
+        vkUpdateDescriptorSets(
+            device_->get_device(),
+            static_cast<uint32_t>(descriptor_writes.size()),
+            descriptor_writes.data(), 0,
+            nullptr);
+    }
+
+    // UI Scene Descriptor Sets
+    std::vector<VkDescriptorSetLayout> ui_layouts(swap_chain_image_count_, ui_descriptor_set_layout_);
+    VkDescriptorSetAllocateInfo ui_descriptor_set_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .pNext = nullptr,
+        .descriptorPool = descriptorPool,
+        .descriptorSetCount = static_cast<uint32_t>(swap_chain_image_count_),
+        .pSetLayouts = ui_layouts.data()
+    };
+    ui_descriptor_sets_.resize(swap_chain_image_count_);
+
+    if (vkAllocateDescriptorSets(device_->get_device(), &ui_descriptor_set_alloc_info, ui_descriptor_sets_.data()) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to allocate UI descriptor sets!");
+    }
+
+    for (size_t i = 0; i < swap_chain_image_count_; i++) {
+        VkDescriptorBufferInfo camera_2d_ubo_info = {
+            .buffer = camera_2d_ubo_[i]->buffer,
+            .offset = 0,
+            .range = camera_2d_ubo_[i]->buffer_size
+        };
+
+        VkDescriptorBufferInfo ui_shapes_ssbo_info = {
+            .buffer = ui_shapes_ssbo_[i]->buffer,
+            .offset = 0,
+            .range = ui_shapes_ssbo_[i]->buffer_size
+        };
+
+        std::vector<VkWriteDescriptorSet> descriptor_writes = {
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = ui_descriptor_sets_[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &camera_2d_ubo_info,
+                .pTexelBufferView = nullptr,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = ui_descriptor_sets_[i],
+                .dstBinding = 1,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &ui_shapes_ssbo_info,
                 .pTexelBufferView = nullptr,
             }
         };
@@ -688,22 +837,50 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
 
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
-                            &descriptorSets[current_frame], 0, nullptr);
+                            &descriptor_sets_3d_[current_frame], 0, nullptr);
 
     vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
 
+    // Test
+
+    VkClearAttachment clear_attachment = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .colorAttachment = 0,
+        .clearValue = {
+            .color = {{0.0f, 1.0f, 0.0f, 1.0f}}
+        },
+    };
+
+
+    VkClearRect clear_rect = {
+        .rect = {
+            .offset = {0, 0},
+            .extent = swap_chain_extent,
+        },
+        .baseArrayLayer = 0,
+        .layerCount = 1
+    };
+    
+
+    vkCmdClearAttachments(commandBuffer, 1, &clear_attachment, 1, &clear_rect);
+
     // Draw UI
 
-    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_);
-    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-
-    // VkBuffer vertex_buffers_3d[] = { vertex_buffer_->buffer };
-    // VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
-    // vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
-    // vkCmdBindIndexBuffer(commandBuffer, index_buffer_->buffer, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline());
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline_layout(),
+        0, 1, &ui_descriptor_sets_[current_frame], 0, nullptr);
+    
+    UIShaderConfig ui_push_constant = {
+        .screenSize = { swap_chain_extent.width, swap_chain_extent.height },
+        .primitiveCount = 2,
+    };
+    vkCmdPushConstants(commandBuffer, ui_pipeline_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        0, sizeof(ui_push_constant), &ui_push_constant);
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
 
@@ -762,15 +939,42 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
 
     const auto swap_chain_extent = swap_chain_->get_extent();
 
-    Camera3D camera = {
-        .model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
-        .view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
-        .proj = glm::perspective(glm::radians(45.0f), swap_chain_extent.width / (float)swap_chain_extent.height, 0.1f, 10.0f)
-    };
+    {
+        Camera3D camera = {
+            .model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
+            .view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
+            .proj = glm::perspective(glm::radians(45.0f), swap_chain_extent.width / (float)swap_chain_extent.height, 0.1f, 10.0f)
+        };
 
-    camera.proj[1][1] *= -1;
+        camera.proj[1][1] *= -1;
 
-    memcpy(uniform_buffers_mapped_[currentImage], &camera, sizeof(camera));
+        memcpy(uniform_buffers_mapped_[currentImage], &camera, sizeof(camera));
+    }
+    
+    {
+        std::vector<UIShape> shapes = {
+            { // Giant blue rectangle covering most of screen
+                .center = {400, 300},
+                .size = {600, 400},
+                .color = {0.0f, 0.0f, 1.0f, 1.0f},
+                .cornerRadius = 0.0f,
+                .strokeWidth = 0.0f,
+                .shapeType = 0,
+                .flags = 1
+            },
+            { // Little red square
+                .center = {400, 300},
+                .size = {100, 100},
+                .color = {1.0f, 0.0f, 0.0f, 1.0f},
+                .cornerRadius = 0.0f,
+                .strokeWidth = 0.0f,
+                .shapeType = 0,
+                .flags = 1
+            }
+        };
+
+        memcpy(ui_shapes_mapped_[currentImage], shapes.data(), sizeof(UIShape) * shapes.size());
+    }
 }
 
 void Renderer::drawFrame() {

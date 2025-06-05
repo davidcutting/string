@@ -77,6 +77,19 @@ PipelineBuilder::PipelineBuilder(const std::shared_ptr<Device>& device, const Pi
         .blendConstants = { 0.0f, 0.0f, 0.0f, 0.0f }
     };
     color_blending_info_ = color_blending_info;
+
+    // clang-format off
+    VkPipelineVertexInputStateCreateInfo vertex_input_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions = nullptr,
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions = nullptr
+    };
+    vertex_input_info_ = vertex_input_info;
+    // clang-format on
 }
 
 PipelineBuilder& PipelineBuilder::add_vertex_shader(const std::string& resource_path)
@@ -229,10 +242,10 @@ PipelineBuilder& PipelineBuilder::enable_color_blending()
         .blendEnable = VK_TRUE,
         .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-        .colorBlendOp = {},
-        .srcAlphaBlendFactor = {},
-        .dstAlphaBlendFactor = {},
-        .alphaBlendOp = {},
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
                           VK_COLOR_COMPONENT_G_BIT |
                           VK_COLOR_COMPONENT_B_BIT |

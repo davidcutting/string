@@ -29,6 +29,7 @@ Pipeline3D::Pipeline3D(
         .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT)
         .set_multisampling()
         .enable_depth_stencil()
+        .enable_color_blending()
         .build(pipeline_layout_);
 }
 
