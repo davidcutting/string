@@ -1,3 +1,5 @@
+#include <vulkan/vulkan_core.h>
+#include <memory>
 #include <stdexcept>
 #include <string/allocator.hpp>
 #define VMA_IMPLEMENTATION
@@ -73,10 +75,63 @@ std::unique_ptr<Buffer> Allocator::create_buffer(const VkDeviceSize& buffer_size
     return buffer_data;
 }
 
+std::unique_ptr<Image> Allocator::create_image(const uint32_t& width, const uint32_t& height, const VkFormat& format, const VkImageTiling& tiling, const VkImageUsageFlags& image_usage, const VmaMemoryUsage& memory_usage)
+{
+    auto image_data = std::make_unique<Image>();
+
+    image_data->width = width;
+    image_data->height = height;
+
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent = {
+            .width = width,
+            .height = height,
+            .depth = 1
+        },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = tiling,
+        .usage = image_usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+
+    VmaAllocationCreateInfo alloc_info = {};
+    alloc_info.usage = memory_usage;
+
+    VkResult result = vmaCreateImage(
+        allocator_,
+        &image_info,
+        &alloc_info,
+        &image_data->image,
+        &image_data->allocation,
+        &image_data->allocationInfo
+    );
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create vertex buffer with VMA");
+    }
+
+    return image_data;
+}
+
 void Allocator::destroy_buffer(std::unique_ptr<Buffer>& buffer)
 {
     vmaDestroyBuffer(allocator_, buffer->buffer, buffer->allocation);
     buffer.reset();
+}
+
+void Allocator::destroy_image(std::unique_ptr<Image>& image)
+{
+    vmaDestroyImage(allocator_, image->image, image->allocation);
 }
 
 std::unique_ptr<Buffer> Allocator::create_vertex_buffer(const VkDeviceSize& buffer_size)

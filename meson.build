@@ -52,6 +52,9 @@ src = [
     'src/allocator.cpp',
     'src/swapchain.cpp',
     'src/vulkan_utils.cpp',
+    'src/pipeline_builder.cpp',
+    'src/pipeline_2d.cpp',
+    'src/pipeline_3d.cpp',
     'src/main.cpp'
 ]
 

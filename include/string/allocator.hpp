@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <vulkan/vulkan.h>
 #include "vk_mem_alloc.h"
@@ -9,7 +10,8 @@ namespace String
 
 struct Image {
     VkImage image;
-    VkDeviceSize buffer_size;
+    uint32_t width;
+    uint32_t height;
     VmaAllocation allocation;
     VmaAllocationInfo allocationInfo;
 };
@@ -28,7 +30,10 @@ public:
     ~Allocator();
 
     std::unique_ptr<Buffer> create_buffer(const VkDeviceSize& buffer_size, const VkBufferUsageFlags& buffer_usage, const VmaMemoryUsage& memory_usage);
+    std::unique_ptr<Image> create_image(const uint32_t& width, const uint32_t& height, const VkFormat& format,
+        const VkImageTiling& tiling, const VkImageUsageFlags& image_usage, const VmaMemoryUsage& memory_usage);
     void destroy_buffer(std::unique_ptr<Buffer>& buffer);
+    void destroy_image(std::unique_ptr<Image>& image);
 
     std::unique_ptr<Buffer> create_vertex_buffer(const VkDeviceSize& buffer_size);
     std::unique_ptr<Buffer> create_index_buffer(const VkDeviceSize& buffer_size);

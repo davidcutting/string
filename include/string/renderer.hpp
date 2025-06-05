@@ -2,6 +2,8 @@
 
 #include <vulkan/vulkan_core.h>
 #include <memory>
+#include "string/pipeline_2d.hpp"
+#include "string/pipeline_3d.hpp"
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
@@ -23,14 +25,34 @@
 
 namespace String {
 
-struct UniformBufferObject {
+const std::string MODEL_PATH = "./assets/viking_room.obj";
+const std::string TEXTURE_PATH = "./assets/viking_room.png";
+
+struct Camera3D {
     alignas(16) glm::mat4 model;
     alignas(16) glm::mat4 view;
     alignas(16) glm::mat4 proj;
 };
 
-const std::string MODEL_PATH = "./assets/viking_room.obj";
-const std::string TEXTURE_PATH = "./assets/viking_room.png";
+struct Camera2D {
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+};
+
+struct Scene3D
+{
+    std::unique_ptr<Buffer> vertex_buffer;
+    std::unique_ptr<Buffer> index_buffer;
+    Camera3D camera;
+};
+
+struct Scene2D
+{
+    std::unique_ptr<Buffer> vertex_buffer;
+    std::unique_ptr<Buffer> index_buffer;
+    Camera2D camera;
+};
 
 class Renderer {
 public:
@@ -50,18 +72,19 @@ public:
         swap_chain_image_count_ = swap_chain_->get_swap_chain_image_count();
 
         createDescriptorSetLayout();
-        createGraphicsPipeline();
+        pipeline_3d_ = std::make_unique<Pipeline3D>(device_, descriptorSetLayout);
+
         createCommandPool();
         createDepthResources();
+
         createTextureImage();
         createTextureImageView();
         createTextureSampler();
-
         vku::load_model(MODEL_PATH, vertices, indices);
         create_vertex_buffer();
         create_index_buffer();
-
         createUniformBuffers();
+
         createDescriptorPool();
         createDescriptorSets();
         createCommandBuffers();
@@ -82,24 +105,23 @@ private:
 
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
-    std::unique_ptr<Buffer> vertex_buffer_;
-    std::unique_ptr<Buffer> index_buffer_;
+
+    Scene3D scene_3d_;
+    Scene2D scene_ui_;
 
     std::vector<std::unique_ptr<Buffer>> uniform_buffers_;
     std::vector<void*> uniform_buffers_mapped_;
 
     VkDescriptorSetLayout descriptorSetLayout;
-    VkPipelineLayout pipelineLayout;
-    VkPipeline graphicsPipeline;
+    std::unique_ptr<Pipeline3D> pipeline_3d_;
+    std::unique_ptr<Pipeline2D> ui_pipeline_;
 
     VkCommandPool commandPool;
 
-    VkImage depthImage;
-    VkDeviceMemory depthImageMemory;
+    std::unique_ptr<Image> depth_image_;
     VkImageView depthImageView;
 
-    VkImage textureImage;
-    VkDeviceMemory textureImageMemory;
+    std::unique_ptr<Image> texture_image_;
     VkImageView textureImageView;
     VkSampler textureSampler;
 
@@ -123,8 +145,6 @@ private:
     void recreateSwapChain();
 
     void createDescriptorSetLayout();
-
-    void createGraphicsPipeline();
 
     void createCommandPool();
 
