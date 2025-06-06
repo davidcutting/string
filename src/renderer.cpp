@@ -539,7 +539,7 @@ void Renderer::createDescriptorSets()
         VkDescriptorBufferInfo buffer_info = {
             .buffer = camera_3d_ubo_[i]->buffer,
             .offset = 0,
-            .range = VK_WHOLE_SIZE
+            .range = camera_3d_ubo_[i]->buffer_size
         };
 
         VkDescriptorImageInfo image_info = {
@@ -845,26 +845,26 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     // Test
 
-    VkClearAttachment clear_attachment = {
-        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .colorAttachment = 0,
-        .clearValue = {
-            .color = {{0.0f, 1.0f, 0.0f, 1.0f}}
-        },
-    };
+    // VkClearAttachment clear_attachment = {
+    //     .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+    //     .colorAttachment = 0,
+    //     .clearValue = {
+    //         .color = {{0.0f, 1.0f, 0.0f, 1.0f}}
+    //     },
+    // };
 
 
-    VkClearRect clear_rect = {
-        .rect = {
-            .offset = {0, 0},
-            .extent = swap_chain_extent,
-        },
-        .baseArrayLayer = 0,
-        .layerCount = 1
-    };
+    // VkClearRect clear_rect = {
+    //     .rect = {
+    //         .offset = {0, 0},
+    //         .extent = swap_chain_extent,
+    //     },
+    //     .baseArrayLayer = 0,
+    //     .layerCount = 1
+    // };
     
 
-    vkCmdClearAttachments(commandBuffer, 1, &clear_attachment, 1, &clear_rect);
+    // vkCmdClearAttachments(commandBuffer, 1, &clear_attachment, 1, &clear_rect);
 
     // Draw UI
 
@@ -874,12 +874,8 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline_layout(),
         0, 1, &ui_descriptor_sets_[current_frame], 0, nullptr);
     
-    UIShaderConfig ui_push_constant = {
-        .screenSize = { swap_chain_extent.width, swap_chain_extent.height },
-        .primitiveCount = 2,
-    };
     vkCmdPushConstants(commandBuffer, ui_pipeline_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        0, sizeof(ui_push_constant), &ui_push_constant);
+        0, sizeof(ui_push_constant_), &ui_push_constant_);
     vkCmdDraw(commandBuffer, 3, 1, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
@@ -952,6 +948,12 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
     }
     
     {
+        ui_push_constant_ = {
+            .screen_size = { swap_chain_extent.width, swap_chain_extent.height },
+            .num_shapes = 2,
+            .delta_time = time
+        };
+
         std::vector<UIShape> shapes = {
             { // Giant blue rectangle covering most of screen
                 .center = {400, 300},

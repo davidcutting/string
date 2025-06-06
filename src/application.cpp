@@ -5,7 +5,7 @@ namespace String {
 void Application::initialize() {
     String::Logger::initialize();
 
-    window_ = std::make_shared<Window>(Window::Properties{.title = "Vulkan Test Bed"});
+    window_ = std::make_shared<Window>(Window::Properties{.title = "Vulkan Test Bed", .extent = {800, 800}});
     renderer_ = std::make_unique<Renderer>();
     renderer_->initialize(window_);
 }

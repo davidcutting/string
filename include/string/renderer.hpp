@@ -29,8 +29,9 @@ const std::string MODEL_PATH = "./assets/viking_room.obj";
 const std::string TEXTURE_PATH = "./assets/viking_room.png";
 
 struct UIShaderConfig {
-    glm::vec2 screenSize;
-    glm::uint primitiveCount;
+    glm::vec2 screen_size;
+    glm::uint num_shapes;
+    float delta_time;
 };
 
 struct Camera3D {
@@ -120,6 +121,7 @@ private:
     std::vector<uint32_t> indices;
 
     Scene3D scene_3d_;
+    UIShaderConfig ui_push_constant_;
     Scene2D scene_ui_;
 
     std::vector<std::unique_ptr<Buffer>> camera_3d_ubo_;
