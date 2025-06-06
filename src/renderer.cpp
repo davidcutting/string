@@ -473,12 +473,12 @@ void Renderer::create_ssbo_buffer()
     VkDeviceSize buffer_size = sizeof(UIShape) * 2;
 
     ui_shapes_ssbo_.resize(swap_chain_image_count_);
-    ui_shapes_mapped_.resize(swap_chain_image_count_);
+    ui_elements_mapped_.resize(swap_chain_image_count_);
 
     for (size_t i = 0; i < swap_chain_image_count_; i++)
     {
         ui_shapes_ssbo_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
-        vmaMapMemory(device_->get_allocator().get_allocator(), ui_shapes_ssbo_[i]->allocation, &ui_shapes_mapped_[i]);
+        vmaMapMemory(device_->get_allocator().get_allocator(), ui_shapes_ssbo_[i]->allocation, &ui_elements_mapped_[i]);
     }
 }
 
@@ -954,28 +954,24 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
             .delta_time = time
         };
 
-        std::vector<UIShape> shapes = {
-            { // Giant blue rectangle covering most of screen
-                .center = {400, 300},
-                .size = {600, 400},
-                .color = {0.0f, 0.0f, 1.0f, 1.0f},
-                .cornerRadius = 0.0f,
-                .strokeWidth = 0.0f,
-                .shapeType = 0,
-                .flags = 1
+        std::vector<UIElement> elements = {
+            { // Giant blue circle
+                .fill = {0.0f, 0.0f, 1.0f, 1.0f},
+                .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
+                .position = {400, 400},
+                .radius = 100.0f,
+                .stroke_width = 10.0f,
             },
-            { // Little red square
-                .center = {400, 300},
-                .size = {100, 100},
-                .color = {1.0f, 0.0f, 0.0f, 1.0f},
-                .cornerRadius = 0.0f,
-                .strokeWidth = 0.0f,
-                .shapeType = 0,
-                .flags = 1
+            { // Little red circle
+                .fill = {1.0f, 0.0f, 0.0f, 1.0f},
+                .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
+                .position = {100, 100},
+                .radius = 50.0f,
+                .stroke_width = 5.0f,
             }
         };
 
-        memcpy(ui_shapes_mapped_[currentImage], shapes.data(), sizeof(UIShape) * shapes.size());
+        memcpy(ui_elements_mapped_[currentImage], elements.data(), sizeof(UIElement) * elements.size());
     }
 }
 

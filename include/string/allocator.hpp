@@ -29,7 +29,7 @@ public:
     explicit Allocator(VkPhysicalDevice& physical_device, VkDevice& device, VkInstance& instance);
     ~Allocator();
 
-    std::unique_ptr<Buffer> create_buffer(const VkDeviceSize& buffer_size, const VkBufferUsageFlags& buffer_usage, const VmaMemoryUsage& memory_usage);
+    std::unique_ptr<Buffer> create_buffer(const VkDeviceSize& buffer_size, const VkBufferUsageFlags& buffer_usage, const VmaMemoryUsage& memory_usage, const VmaAllocatorCreateFlagBits& flags = {});
     std::unique_ptr<Image> create_image(const uint32_t& width, const uint32_t& height, const VkFormat& format,
         const VkImageTiling& tiling, const VkImageUsageFlags& image_usage, const VmaMemoryUsage& memory_usage);
     void destroy_buffer(std::unique_ptr<Buffer>& buffer);

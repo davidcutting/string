@@ -38,7 +38,7 @@ Allocator::~Allocator()
     }
 }
 
-std::unique_ptr<Buffer> Allocator::create_buffer(const VkDeviceSize& buffer_size, const VkBufferUsageFlags& buffer_usage, const VmaMemoryUsage& memory_usage)
+std::unique_ptr<Buffer> Allocator::create_buffer(const VkDeviceSize& buffer_size, const VkBufferUsageFlags& buffer_usage, const VmaMemoryUsage& memory_usage, const VmaAllocatorCreateFlagBits& flags)
 {
     auto buffer_data = std::make_unique<Buffer>();
 
@@ -55,6 +55,7 @@ std::unique_ptr<Buffer> Allocator::create_buffer(const VkDeviceSize& buffer_size
 
     VmaAllocationCreateInfo alloc_info = {};
     alloc_info.usage = memory_usage;
+    alloc_info.flags = flags;
 
     VkResult result = vmaCreateBuffer(
         allocator_,

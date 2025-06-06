@@ -34,6 +34,14 @@ struct UIShaderConfig {
     float delta_time;
 };
 
+struct UIElement {
+    glm::vec4 fill;
+    glm::vec4 stroke;
+    glm::vec2 position;
+    float radius;
+    float stroke_width;
+};
+
 struct Camera3D {
     alignas(16) glm::mat4 model;
     alignas(16) glm::mat4 view;
@@ -41,9 +49,9 @@ struct Camera3D {
 };
 
 struct Camera2D {
-    alignas(16) glm::mat4 model;
-    alignas(16) glm::mat4 view;
-    alignas(16) glm::mat4 proj;
+    glm::vec2 position;
+    float zoom;
+    float rotation;
 };
 
 struct Scene3D
@@ -129,7 +137,7 @@ private:
     std::vector<std::unique_ptr<Buffer>> camera_2d_ubo_;
     std::vector<void*> camera_2d_mapped_;
     std::vector<std::unique_ptr<Buffer>> ui_shapes_ssbo_;
-    std::vector<void*> ui_shapes_mapped_;
+    std::vector<void*> ui_elements_mapped_;
 
     VkDescriptorSetLayout descriptor_set_layout_3d_;
     VkDescriptorSetLayout ui_descriptor_set_layout_;

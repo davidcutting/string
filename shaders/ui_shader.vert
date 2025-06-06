@@ -6,6 +6,12 @@ layout(push_constant) uniform PushConstants {
     float delta_time;
 } pc;
 
+layout(set = 0, binding = 0) uniform Camera2D {
+    vec2 position;
+    float zoom;
+    float rotation;
+} camera;
+
 // A coordinate in image pixel space
 layout(location = 0) out vec2 pixel_loc;
 // A normalized coordinate from the screen center in clip space
