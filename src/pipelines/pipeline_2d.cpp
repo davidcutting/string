@@ -1,8 +1,6 @@
 #include <vulkan/vulkan.h>
-#include <vulkan/vulkan_core.h>
-#include <memory>
 #include <string/device.hpp>
-#include <string/pipeline_2d.hpp>
+#include <string/pipelines/pipeline_2d.hpp>
 #include <string/pipeline_builder.hpp>
 #include <string/render_data.hpp>
 

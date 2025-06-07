@@ -2,8 +2,8 @@
 
 #include <vulkan/vulkan_core.h>
 #include <memory>
-#include "string/pipeline_2d.hpp"
-#include "string/pipeline_3d.hpp"
+#include <string/pipelines/pipeline_2d.hpp>
+#include <string/pipelines/pipeline_3d.hpp>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 

@@ -53,8 +53,10 @@ src = [
     'src/swapchain.cpp',
     'src/vulkan_utils.cpp',
     'src/pipeline_builder.cpp',
-    'src/pipeline_2d.cpp',
-    'src/pipeline_3d.cpp',
+    'src/pipelines/pipeline_2d.cpp',
+    'src/pipelines/pipeline_3d.cpp',
+    'src/pipelines/pipeline_grid_2d.cpp',
+    'src/pipelines/pipeline_grid_3d.cpp',
     'src/main.cpp'
 ]
 

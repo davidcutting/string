@@ -5,8 +5,10 @@ shaders = [
     '2d_shader.vert',
     '3d_shader.frag',
     '3d_shader.vert',
-    'hello_triangle.frag',
-    'hello_triangle.vert',
+    # 'grid_2d_shader.vert',
+    # 'grid_2d_shader.frag',
+    # 'grid_3d_shader.vert',
+    # 'grid_3d_shader.frag',
     'ui_shader.frag',
     'ui_shader.vert'
 ]

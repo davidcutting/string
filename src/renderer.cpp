@@ -1,5 +1,4 @@
 #include <vulkan/vulkan.h>
-#include <vulkan/vulkan_core.h>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -7,8 +6,9 @@
 #include <string/vulkan_utils.hpp>
 #include <string/allocator.hpp>
 #include <string/device.hpp>
-#include <string/pipeline_2d.hpp>
+#include <string/pipelines/pipeline_2d.hpp>
 #include <string/render_data.hpp>
+#include "glm/fwd.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <string/core/stb_image.h>
@@ -825,6 +825,50 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     /// -----------------------------------------------------------------------------------------
 
+    // Clear screen
+
+    // const VkClearColorValue light_gray = {{ 0.557f, 0.557f, 0.576f, 1.0f }};
+    // const VkClearColorValue gray = {{ 0.388f, 0.388f, 0.4f, 1.0f }};
+    // const VkClearColorValue dark_gray = {{ 0.173, 0.173, 0.18, 1.0f }};
+    const VkClearColorValue darker_gray = {{ 0.11, 0.11, 0.118, 1.0f }};
+
+
+    VkClearAttachment clear_attachment = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .colorAttachment = 0,
+        .clearValue = {
+            .color = darker_gray
+        },
+    };
+
+
+    VkClearRect clear_rect = {
+        .rect = {
+            .offset = {0, 0},
+            .extent = swap_chain_extent,
+        },
+        .baseArrayLayer = 0,
+        .layerCount = 1
+    };
+
+    vkCmdClearAttachments(commandBuffer, 1, &clear_attachment, 1, &clear_rect);
+
+    /// -----------------------------------------------------------------------------------------
+
+    // Draw 2D Grid
+
+    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_grid_2d_->get_pipeline());
+    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    // vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_grid_2d_->get_pipeline_layout(),
+    //     0, 1, &grid_2d_descriptor_sets_[current_frame], 0, nullptr);
+    
+    // vkCmdPushConstants(commandBuffer, pipeline_grid_2d_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    //     0, sizeof(ui_push_constant_), &ui_push_constant_);
+    // vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+    /// -----------------------------------------------------------------------------------------
+
     // Draw 3D
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
@@ -842,29 +886,6 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
-
-    // Test
-
-    // VkClearAttachment clear_attachment = {
-    //     .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-    //     .colorAttachment = 0,
-    //     .clearValue = {
-    //         .color = {{0.0f, 1.0f, 0.0f, 1.0f}}
-    //     },
-    // };
-
-
-    // VkClearRect clear_rect = {
-    //     .rect = {
-    //         .offset = {0, 0},
-    //         .extent = swap_chain_extent,
-    //     },
-    //     .baseArrayLayer = 0,
-    //     .layerCount = 1
-    // };
-    
-
-    // vkCmdClearAttachments(commandBuffer, 1, &clear_attachment, 1, &clear_rect);
 
     // Draw UI
 
