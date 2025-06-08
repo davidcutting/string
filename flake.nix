@@ -54,6 +54,7 @@
               vulkan-tools-lunarg
               volk
               vulkan-memory-allocator
+              linuxPackages_latest.perf
             ];
             shellHook = "export LD_LIBRARY_PATH=${pkgs.wayland}/lib:$LD_LIBRARY_PATH";
           };

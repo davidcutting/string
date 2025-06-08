@@ -129,40 +129,36 @@ bool Device::is_device_suitable(const VkPhysicalDevice& device) {
     }
 
     // Set up feature query
-    VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
-        .pNext = nullptr,
-    };
-    VkPhysicalDeviceDynamicRenderingFeatures dynamic_rendering_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
-        .pNext = &buffer_device_address_features,
-    };
-    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT extended_dynamic_state2_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
-        .pNext = &dynamic_rendering_features,
-    };
-    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT extended_dynamic_state3_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
-        .pNext = &extended_dynamic_state2_features,
-    };
-    VkPhysicalDeviceDescriptorIndexingFeatures descriptor_indexing_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
-        .pNext = &extended_dynamic_state3_features,
-    };
+    VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features{};
+    buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+
+    VkPhysicalDeviceDynamicRenderingFeatures dynamic_rendering_features{};
+    dynamic_rendering_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
+    dynamic_rendering_features.pNext = &buffer_device_address_features;
+
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT extended_dynamic_state2_features{};
+    extended_dynamic_state2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
+    extended_dynamic_state2_features.pNext = &dynamic_rendering_features;
+
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT extended_dynamic_state3_features{};
+    extended_dynamic_state3_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT;
+    extended_dynamic_state3_features.pNext = &extended_dynamic_state2_features;
+
+    VkPhysicalDeviceDescriptorIndexingFeatures descriptor_indexing_features{};
+    descriptor_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+    descriptor_indexing_features.pNext = &extended_dynamic_state3_features;
 
 
-    VkPhysicalDeviceVulkan12Features vulkan12_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-        .pNext = &descriptor_indexing_features,
-    };
-    VkPhysicalDeviceVulkan13Features vulkan13_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .pNext = &vulkan12_features,
-    };
-    VkPhysicalDeviceFeatures2 supported_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = &vulkan13_features,
-    };
+    VkPhysicalDeviceVulkan12Features vulkan12_features{};
+    vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vulkan12_features.pNext = &extended_dynamic_state2_features;
+    VkPhysicalDeviceVulkan13Features vulkan13_features{};
+    vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    vulkan13_features.pNext = &vulkan12_features;
+
+    VkPhysicalDeviceFeatures2 supported_features{};
+    supported_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    supported_features.pNext = &vulkan13_features;
 
     // Query what features are supported
     vkGetPhysicalDeviceFeatures2(device, &supported_features);
@@ -243,26 +239,27 @@ void Device::create_logical_device()
         queueCreateInfos.push_back(queue_create_info);
     }
 
-    // clang-format off
-    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT extended_dynamic_state2_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
-        .pNext = nullptr,
-        .extendedDynamicState2 = VK_TRUE
-    };
-    VkPhysicalDeviceVulkan12Features vulkan12_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-        .pNext = &extended_dynamic_state2_features,
-        .timelineSemaphore = VK_TRUE,
-        .bufferDeviceAddress = VK_TRUE
-    };
-    VkPhysicalDeviceVulkan13Features vulkan13_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .pNext = &vulkan12_features,
-        .synchronization2 = VK_TRUE,
-        .dynamicRendering = VK_TRUE
-    };
+    // Only enable the features we want, and there are many:
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT extended_dynamic_state2_features{};
+    extended_dynamic_state2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
+    extended_dynamic_state2_features.extendedDynamicState2 = VK_TRUE;
+
+    VkPhysicalDeviceVulkan12Features vulkan12_features{};
+    vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vulkan12_features.pNext = &extended_dynamic_state2_features;
+    vulkan12_features.timelineSemaphore = VK_TRUE;
+    vulkan12_features.bufferDeviceAddress = VK_TRUE;
+
+    VkPhysicalDeviceVulkan13Features vulkan13_features{};
+    vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    vulkan13_features.pNext = &vulkan12_features;
+    vulkan13_features.synchronization2 = VK_TRUE;
+    vulkan13_features.dynamicRendering = VK_TRUE;
+
     VkPhysicalDeviceFeatures enabled_device_features{};
     enabled_device_features.samplerAnisotropy = VK_TRUE;
+
+    // clang-format off
     VkPhysicalDeviceFeatures2 enabled_device_features2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
         .pNext = &vulkan13_features,
