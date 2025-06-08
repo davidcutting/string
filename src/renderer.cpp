@@ -998,7 +998,6 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
 
 void Renderer::drawFrame() {
     vkWaitForFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame], VK_TRUE, UINT64_MAX);
-    vkResetFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame]);
 
     auto[result, image_index] = swap_chain_->acquire_next_frame(image_available_semaphores_[current_frame]);
 
@@ -1010,6 +1009,8 @@ void Renderer::drawFrame() {
     }
 
     updateUniformBuffer(current_frame);
+    vkResetFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame]);
+
     vkResetCommandBuffer(commandBuffers[current_frame], 0);
     recordCommandBuffer(commandBuffers[current_frame], image_index);
 
