@@ -9,11 +9,10 @@ namespace String
 
 PipelineGrid2D::PipelineGrid2D(
     std::shared_ptr<Device>& device,
-    const VkDescriptorSetLayout& descriptor_set_layout,
     const VkPushConstantRange& push_constant_range)
 : device_(device)
 {
-    std::vector<VkDescriptorSetLayout> descriptor_set_layouts{ descriptor_set_layout };
+    std::vector<VkDescriptorSetLayout> descriptor_set_layouts{};
     std::vector<VkPushConstantRange> push_constant_ranges{ push_constant_range };
 
     pipeline_layout_ = PipelineLayoutBuilder()

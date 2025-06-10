@@ -4,6 +4,7 @@
 #include <memory>
 #include <string/pipelines/pipeline_2d.hpp>
 #include <string/pipelines/pipeline_3d.hpp>
+#include <string/pipelines/pipeline_grid_2d.hpp>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
@@ -11,7 +12,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <functional>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <string/core/logger.hpp>
@@ -42,6 +42,23 @@ struct UIElement {
     float stroke_width;
 };
 
+struct Grid2DParams {
+    glm::vec4 background_color;
+    glm::vec4 grid_color;
+    glm::vec4 border_color;
+    glm::vec4 axis_color;
+    glm::vec2 grid_resolution;
+    glm::vec2 grid_center;
+    glm::vec2 grid_size;
+    glm::vec2 screen_size;
+    float line_width;
+    float fade_distance;
+    float border_width;
+    float axis_width;
+    float show_border;
+    float show_axes;
+};
+
 struct Camera3D {
     alignas(16) glm::mat4 model;
     alignas(16) glm::mat4 view;
@@ -70,55 +87,10 @@ struct Scene2D
 
 class Renderer {
 public:
-    void initialize(const std::shared_ptr<Window>& window) {
-        // Window
-        window->register_resize_event_callback(
-            std::bind(&Renderer::framebuffer_resize_callback, this, std::placeholders::_1));
-        window_ = window;
-
-        // Device
-        device_ = std::make_shared<Device>(window);
-        VkExtent2D extent = {
-            .width = window->get_properties().extent.width,
-            .height = window->get_properties().extent.height
-        };
-        swap_chain_ = std::make_unique<Swapchain>(device_, extent);
-        swap_chain_image_count_ = swap_chain_->get_swap_chain_image_count();
-
-        create_ssbo_buffer();
-
-        createDescriptorSetLayout();
-        pipeline_3d_ = std::make_unique<Pipeline3D>(device_, descriptor_set_layout_3d_);
-        ui_push_constant_range_ = {
-            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            .offset = 0,
-            .size = sizeof(UIShaderConfig)
-        };
-        ui_pipeline_ = std::make_unique<Pipeline2D>(device_, ui_descriptor_set_layout_, ui_push_constant_range_);
-
-        createCommandPool();
-        createDepthResources();
-
-        createTextureImage();
-        createTextureImageView();
-        createTextureSampler();
-        vku::load_model(MODEL_PATH, vertices, indices);
-        create_vertex_buffer();
-        create_index_buffer();
-        createUniformBuffers();
-
-        createDescriptorPool();
-        createDescriptorSets();
-        createCommandBuffers();
-        createSyncObjects();
-    }
-
-    void update() { drawFrame(); }
-
-    ~Renderer() {
-        vkDeviceWaitIdle(device_->get_device());
-        cleanup();
-    }
+    Renderer() = default;
+    ~Renderer();
+    void initialize(const std::shared_ptr<Window>& window);
+    void update();
 
 private:
     std::shared_ptr<Window> window_;
@@ -140,10 +112,12 @@ private:
     std::vector<void*> ui_elements_mapped_;
 
     VkDescriptorSetLayout descriptor_set_layout_3d_;
+    std::unique_ptr<Pipeline3D> pipeline_3d_;
     VkDescriptorSetLayout ui_descriptor_set_layout_;
     VkPushConstantRange ui_push_constant_range_;
-    std::unique_ptr<Pipeline3D> pipeline_3d_;
     std::unique_ptr<Pipeline2D> ui_pipeline_;
+    VkPushConstantRange grid_2d_push_constant_range_;
+    std::unique_ptr<PipelineGrid2D> pipeline_grid_2d_;
 
     VkDescriptorPool descriptorPool;
     VkCommandPool commandPool;
@@ -158,6 +132,7 @@ private:
     std::vector<VkCommandBuffer> commandBuffers;
     std::vector<VkDescriptorSet> descriptor_sets_3d_;
     std::vector<VkDescriptorSet> ui_descriptor_sets_;
+    std::vector<VkDescriptorSet> grid_2d_descriptor_sets_;
 
     uint32_t swap_chain_image_count_{2};
     uint32_t current_frame = 0;

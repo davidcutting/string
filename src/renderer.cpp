@@ -17,32 +17,62 @@
 
 namespace String {
 
-void Renderer::createTextureImage() {
-    int width, height, channels;
-    stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &width, &height, &channels, STBI_rgb_alpha);
-    VkDeviceSize image_size = width * height * 4;
+void Renderer::initialize(const std::shared_ptr<Window>& window)
+{
+    // Window
+    window->register_resize_event_callback(
+        std::bind(&Renderer::framebuffer_resize_callback, this, std::placeholders::_1));
+    window_ = window;
 
-    if (!pixels) {
-        throw std::runtime_error("failed to load texture image!");
-    }
+    // Device
+    device_ = std::make_shared<Device>(window);
+    VkExtent2D extent = {
+        .width = window->get_properties().extent.width,
+        .height = window->get_properties().extent.height
+    };
+    swap_chain_ = std::make_unique<Swapchain>(device_, extent);
+    swap_chain_image_count_ = swap_chain_->get_swap_chain_image_count();
 
-    // Allocate staging buffer and copy stbi image into staging buffer
-    auto staging_buffer = device_->get_allocator().create_staging_buffer(image_size);
-    device_->get_allocator().copy_data_to_buffer(pixels, staging_buffer.get());
+    create_ssbo_buffer();
 
-    // De-allocate stbi image
-    stbi_image_free(pixels);
+    createDescriptorSetLayout();
+    pipeline_3d_ = std::make_unique<Pipeline3D>(device_, descriptor_set_layout_3d_);
 
-    const auto image_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ui_push_constant_range_ = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(UIShaderConfig)
+    };
+    ui_pipeline_ = std::make_unique<Pipeline2D>(device_, ui_descriptor_set_layout_, ui_push_constant_range_);
 
-    texture_image_ = device_->get_allocator().create_image(width, height, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, image_usage, VMA_MEMORY_USAGE_GPU_ONLY);
+    grid_2d_push_constant_range_ = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(Grid2DParams)
+    };
+    pipeline_grid_2d_ = std::make_unique<PipelineGrid2D>(device_, grid_2d_push_constant_range_);
 
-    transitionImageLayout(texture_image_->image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    copyBufferToImage(staging_buffer->buffer, texture_image_->image, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
-    transitionImageLayout(texture_image_->image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    createCommandPool();
+    createDepthResources();
 
-    // Destroy staging buffer
-    device_->get_allocator().destroy_buffer(staging_buffer);
+    createTextureImage();
+    createTextureImageView();
+    createTextureSampler();
+    vku::load_model(MODEL_PATH, vertices, indices);
+    create_vertex_buffer();
+    create_index_buffer();
+    createUniformBuffers();
+
+    createDescriptorPool();
+    createDescriptorSets();
+    createCommandBuffers();
+    createSyncObjects();
+}
+
+Renderer::~Renderer()
+{
+    vkDeviceWaitIdle(device_->get_device());
+    cleanup();
 }
 
 void Renderer::cleanup() {
@@ -53,6 +83,8 @@ void Renderer::cleanup() {
     swap_chain_.reset();
 
     pipeline_3d_.reset();
+    ui_pipeline_.reset();
+    pipeline_grid_2d_.reset();
 
     for (size_t i = 0; i < swap_chain_image_count_; i++)
     {
@@ -89,6 +121,394 @@ void Renderer::cleanup() {
     vkDestroyCommandPool(device_->get_device(), commandPool, nullptr);
 
     device_.reset();
+}
+
+void Renderer::update()
+{
+    drawFrame();
+}
+
+void Renderer::drawFrame() {
+    vkWaitForFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame], VK_TRUE, UINT64_MAX);
+
+    auto[result, image_index] = swap_chain_->acquire_next_frame(image_available_semaphores_[current_frame]);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreateSwapChain();
+        return;
+    } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        throw std::runtime_error("failed to acquire swap chain image!");
+    }
+
+    updateUniformBuffer(current_frame);
+    vkResetFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame]);
+
+    vkResetCommandBuffer(commandBuffers[current_frame], 0);
+    recordCommandBuffer(commandBuffers[current_frame], image_index);
+
+    const VkSemaphoreSubmitInfo wait_semaphore_infos[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .pNext = nullptr,
+            .semaphore = image_available_semaphores_[current_frame],
+            .value = 0,
+            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .deviceIndex = 0
+        }
+    };
+
+    const VkSemaphoreSubmitInfo signal_semaphore_infos[] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .pNext = nullptr,
+            .semaphore = render_complete_semaphores_[current_frame],
+            .value = 0,
+            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .deviceIndex = 0
+        }
+    };
+
+    VkCommandBufferSubmitInfo command_buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .pNext = nullptr,
+        .commandBuffer = commandBuffers[current_frame],
+        .deviceMask = 0
+    };
+
+    VkSubmitInfo2 submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .pNext = nullptr,
+        .flags = 0,
+        .waitSemaphoreInfoCount = 1,
+        .pWaitSemaphoreInfos = wait_semaphore_infos,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &command_buffer_info,
+        .signalSemaphoreInfoCount = 1,
+        .pSignalSemaphoreInfos = signal_semaphore_infos
+    };
+
+    if (vkQueueSubmit2(device_->get_graphics_queue(), 1, &submit_info, frame_in_flight_fences_[current_frame]) != VK_SUCCESS) {
+        throw std::runtime_error("failed to submit draw command buffer!");
+    }
+
+    VkSwapchainKHR swap_chains[] = { swap_chain_->get_swap_chain() };
+
+    VkPresentInfoKHR present_info = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .pNext = nullptr,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &render_complete_semaphores_[current_frame],
+        .swapchainCount = 1,
+        .pSwapchains = swap_chains,
+        .pImageIndices = &image_index,
+        .pResults = nullptr
+    };
+
+    result = vkQueuePresentKHR(device_->get_present_queue(), &present_info);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
+        framebufferResized = false;
+        recreateSwapChain();
+    } else if (result != VK_SUCCESS) {
+        throw std::runtime_error("failed to present swap chain image!");
+    }
+
+    current_frame = (current_frame + 1) % swap_chain_image_count_;
+}
+
+void Renderer::updateUniformBuffer(uint32_t currentImage) {
+    static auto startTime = std::chrono::high_resolution_clock::now();
+
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+    const auto swap_chain_extent = swap_chain_->get_extent();
+
+    {
+        Camera3D camera = {
+            .model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
+            .view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
+            .proj = glm::perspective(glm::radians(45.0f), swap_chain_extent.width / (float)swap_chain_extent.height, 0.1f, 10.0f)
+        };
+
+        camera.proj[1][1] *= -1;
+
+        memcpy(uniform_buffers_mapped_[currentImage], &camera, sizeof(camera));
+    }
+    
+    {
+        UIElement dot = { // black dot, 5px size
+            .fill = {0.0f, 0.0f, 0.0f, 1.0f},
+            .stroke = {0.1f, 0.1f, 0.1f, 1.0f},
+            .position = { swap_chain_extent.width / 2, swap_chain_extent.height / 2 },
+            .radius = 5.0f,
+            .stroke_width = 1.0f,
+        };
+
+        const uint32_t samples = 100;
+        const float resolution = 0.1;
+        const auto pi2 = 2 * 3.1415;
+        std::vector<UIElement> elements;
+        elements.reserve(samples);
+
+        const uint32_t scale_factor_x = 50;
+        const uint32_t scale_factor_y = 10;
+
+        for (uint32_t s = 0; s < samples; ++s)
+        {
+            auto temp_shape = dot;
+            auto step = s / resolution;
+            temp_shape.position.x += pi2 * step * scale_factor_x;
+            temp_shape.position.y += std::sin(temp_shape.position.x) * scale_factor_y;
+            elements.push_back(temp_shape);
+        }
+
+        // for (uint32_t i = 0; i < resolution; ++i)
+        // {
+        //     auto temp_shape = dot;
+        //     temp_shape.position.x += i * scale_factor_x;
+        //     temp_shape.position.y += std::sin(i) * scale_factor_y;
+        //     elements.push_back(temp_shape);
+        // }
+
+        ui_push_constant_ = {
+            .screen_size = { swap_chain_extent.width, swap_chain_extent.height },
+            .num_shapes = samples,
+            .delta_time = time
+        };
+
+        // std::vector<UIElement> elements = {
+        //     { // Giant blue circle
+        //         .fill = {0.0f, 0.0f, 1.0f, 1.0f},
+        //         .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
+        //         .position = {400, 400},
+        //         .radius = 100.0f,
+        //         .stroke_width = 10.0f,
+        //     },
+        //     { // Little red circle
+        //         .fill = {1.0f, 0.0f, 0.0f, 1.0f},
+        //         .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
+        //         .position = {100, 100},
+        //         .radius = 50.0f,
+        //         .stroke_width = 5.0f,
+        //     }
+        // };
+
+        memcpy(ui_elements_mapped_[currentImage], elements.data(), sizeof(UIElement) * elements.size());
+    }
+}
+
+void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
+    // TODO(DCut): Refactor begin and end command buffer function because it is doing
+    // an additional allocation we may not always need
+    // Also, it isn't used here because those allocations can be reused and its a lot
+    // for one frame
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+        throw std::runtime_error("failed to begin recording command buffer!");
+    }
+
+    // TODO(DCut): Clean up image transition function and refactor this to use it
+    // Transition swapchain image from UNDEFINED to COLOR_ATTACHMENT_OPTIMAL
+    VkImageMemoryBarrier image_barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = swap_chain_->get_images()[imageIndex],
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        }
+    };
+
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &image_barrier);
+
+    VkRenderingAttachmentInfo color_attachment = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = swap_chain_->get_image_views()[imageIndex],
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .resolveMode = VK_RESOLVE_MODE_NONE,
+        .resolveImageView = VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = {
+            .color = {{ 0.0f, 0.0f, 0.0f, 0.0f }}
+        }
+    };
+
+    VkRenderingAttachmentInfo depth_attachment = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = depthImageView,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .resolveMode = VK_RESOLVE_MODE_NONE,
+        .resolveImageView = VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .clearValue = {
+            .depthStencil = {1.0f, 0}
+        }
+    };
+
+    const auto swap_chain_extent = swap_chain_->get_extent();
+
+    VkRenderingInfo rendering_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .renderArea = {{0 , 0}, swap_chain_extent},
+        .layerCount = 1,
+        .viewMask = 0,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &color_attachment,
+        .pDepthAttachment = &depth_attachment,
+        .pStencilAttachment = nullptr,
+    };
+
+    vkCmdBeginRendering(commandBuffer, &rendering_info);
+
+    /// -----------------------------------------------------------------------------------------
+
+    // Dynamic State
+
+    VkViewport viewport = {
+        .x = 0.0f,
+        .y = 0.0f,
+        .width = static_cast<float>(swap_chain_extent.width),
+        .height = static_cast<float>(swap_chain_extent.height),
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f
+    };
+    VkRect2D scissor = {
+        .offset = { 0, 0 },
+        .extent = swap_chain_extent
+    };
+
+    /// -----------------------------------------------------------------------------------------
+
+    // Clear screen
+
+    // const VkClearColorValue light_gray = {{ 0.557f, 0.557f, 0.576f, 1.0f }};
+    // const VkClearColorValue gray = {{ 0.388f, 0.388f, 0.4f, 1.0f }};
+    // const VkClearColorValue dark_gray = {{ 0.173, 0.173, 0.18, 1.0f }};
+    const VkClearColorValue darker_gray = {{ 0.11, 0.11, 0.118, 1.0f }};
+
+
+    VkClearAttachment clear_attachment = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .colorAttachment = 0,
+        .clearValue = {
+            .color = darker_gray
+        },
+    };
+
+
+    VkClearRect clear_rect = {
+        .rect = {
+            .offset = {0, 0},
+            .extent = swap_chain_extent,
+        },
+        .baseArrayLayer = 0,
+        .layerCount = 1
+    };
+
+    vkCmdClearAttachments(commandBuffer, 1, &clear_attachment, 1, &clear_rect);
+
+    /// -----------------------------------------------------------------------------------------
+
+    // Draw 2D Grid
+
+    Grid2DParams params = {
+        .background_color = {0.0f, 0.0f, 0.0f, 0.0f},
+        .grid_color = {0.4f, 0.4f, 0.4f, 1.0f},
+        .border_color = {0.8f, 0.8f, 0.8f, 1.0f},
+        .axis_color = {0.6f, 0.6f, 0.6f, 1.0f},
+        .grid_resolution = {50.0f, 50.0f},
+        .grid_center = { swap_chain_extent.width / 2, swap_chain_extent.height / 2 },
+        .grid_size = { 800.0f, 800.0f },
+        .screen_size = { swap_chain_extent.width, swap_chain_extent.height },
+        .line_width = 1.0f,
+        .fade_distance = 500.0f,
+        .border_width = 3.0f,
+        .axis_width = 2.0f,
+        .show_border = 1.0f,
+        .show_axes = 1.0f
+    };
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_grid_2d_->get_pipeline());
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    
+    vkCmdPushConstants(commandBuffer, pipeline_grid_2d_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        0, sizeof(params), &params);
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+    /// -----------------------------------------------------------------------------------------
+
+    // Draw 3D
+
+    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
+    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    // VkBuffer vertex_buffers_3d[] = { scene_3d_.vertex_buffer->buffer };
+    // VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
+    // vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
+    // vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
+
+    // vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
+    //                         &descriptor_sets_3d_[current_frame], 0, nullptr);
+
+    // vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+
+    /// -----------------------------------------------------------------------------------------
+
+    // Draw UI
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline());
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline_layout(),
+        0, 1, &ui_descriptor_sets_[current_frame], 0, nullptr);
+    
+    vkCmdPushConstants(commandBuffer, ui_pipeline_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        0, sizeof(ui_push_constant_), &ui_push_constant_);
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+    /// -----------------------------------------------------------------------------------------
+
+    vkCmdEndRendering(commandBuffer);
+
+    // Transition swapchain image from COLOR_ATTACHMENT_OPTIMAL to PRESENT_SRC_KHR
+    image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    image_barrier.dstAccessMask = 0;
+    image_barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    image_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &image_barrier);
+    
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+        throw std::runtime_error("failed to record command buffer!");
+    }
 }
 
 void Renderer::recreateSwapChain() {
@@ -251,6 +671,34 @@ void Renderer::createTextureSampler() {
     if (vkCreateSampler(device_->get_device(), &sampler_info, nullptr, &textureSampler) != VK_SUCCESS) {
         throw std::runtime_error("failed to create texture sampler!");
     }
+}
+
+void Renderer::createTextureImage() {
+    int width, height, channels;
+    stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+    VkDeviceSize image_size = width * height * 4;
+
+    if (!pixels) {
+        throw std::runtime_error("failed to load texture image!");
+    }
+
+    // Allocate staging buffer and copy stbi image into staging buffer
+    auto staging_buffer = device_->get_allocator().create_staging_buffer(image_size);
+    device_->get_allocator().copy_data_to_buffer(pixels, staging_buffer.get());
+
+    // De-allocate stbi image
+    stbi_image_free(pixels);
+
+    const auto image_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+
+    texture_image_ = device_->get_allocator().create_image(width, height, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, image_usage, VMA_MEMORY_USAGE_GPU_ONLY);
+
+    transitionImageLayout(texture_image_->image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    copyBufferToImage(staging_buffer->buffer, texture_image_->image, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    transitionImageLayout(texture_image_->image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // Destroy staging buffer
+    device_->get_allocator().destroy_buffer(staging_buffer);
 }
 
 VkImageView Renderer::createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags) {
@@ -470,7 +918,7 @@ void Renderer::createUniformBuffers()
 
 void Renderer::create_ssbo_buffer()
 {
-    VkDeviceSize buffer_size = sizeof(UIShape) * 2;
+    VkDeviceSize buffer_size = sizeof(UIShape) * 100;
 
     ui_shapes_ssbo_.resize(swap_chain_image_count_);
     ui_elements_mapped_.resize(swap_chain_image_count_);
@@ -721,204 +1169,6 @@ void Renderer::createCommandBuffers() {
     }
 }
 
-void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
-    // TODO(DCut): Refactor begin and end command buffer function because it is doing
-    // an additional allocation we may not always need
-    // Also, it isn't used here because those allocations can be reused and its a lot
-    // for one frame
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-
-    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
-        throw std::runtime_error("failed to begin recording command buffer!");
-    }
-
-    // TODO(DCut): Clean up image transition function and refactor this to use it
-    // Transition swapchain image from UNDEFINED to COLOR_ATTACHMENT_OPTIMAL
-    VkImageMemoryBarrier image_barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = 0,
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = swap_chain_->get_images()[imageIndex],
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        }
-    };
-
-    vkCmdPipelineBarrier(commandBuffer,
-                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &image_barrier);
-
-    VkRenderingAttachmentInfo color_attachment = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .pNext = nullptr,
-        .imageView = swap_chain_->get_image_views()[imageIndex],
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .resolveMode = VK_RESOLVE_MODE_NONE,
-        .resolveImageView = VK_NULL_HANDLE,
-        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = {
-            .color = {{ 0.0f, 0.0f, 0.0f, 0.0f }}
-        }
-    };
-
-    VkRenderingAttachmentInfo depth_attachment = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .pNext = nullptr,
-        .imageView = depthImageView,
-        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        .resolveMode = VK_RESOLVE_MODE_NONE,
-        .resolveImageView = VK_NULL_HANDLE,
-        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .clearValue = {
-            .depthStencil = {1.0f, 0}
-        }
-    };
-
-    const auto swap_chain_extent = swap_chain_->get_extent();
-
-    VkRenderingInfo rendering_info = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .renderArea = {{0 , 0}, swap_chain_extent},
-        .layerCount = 1,
-        .viewMask = 0,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &color_attachment,
-        .pDepthAttachment = &depth_attachment,
-        .pStencilAttachment = nullptr,
-    };
-
-    vkCmdBeginRendering(commandBuffer, &rendering_info);
-
-    /// -----------------------------------------------------------------------------------------
-
-    // Dynamic State
-
-    VkViewport viewport = {
-        .x = 0.0f,
-        .y = 0.0f,
-        .width = static_cast<float>(swap_chain_extent.width),
-        .height = static_cast<float>(swap_chain_extent.height),
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f
-    };
-    VkRect2D scissor = {
-        .offset = { 0, 0 },
-        .extent = swap_chain_extent
-    };
-
-    /// -----------------------------------------------------------------------------------------
-
-    // Clear screen
-
-    // const VkClearColorValue light_gray = {{ 0.557f, 0.557f, 0.576f, 1.0f }};
-    // const VkClearColorValue gray = {{ 0.388f, 0.388f, 0.4f, 1.0f }};
-    // const VkClearColorValue dark_gray = {{ 0.173, 0.173, 0.18, 1.0f }};
-    const VkClearColorValue darker_gray = {{ 0.11, 0.11, 0.118, 1.0f }};
-
-
-    VkClearAttachment clear_attachment = {
-        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .colorAttachment = 0,
-        .clearValue = {
-            .color = darker_gray
-        },
-    };
-
-
-    VkClearRect clear_rect = {
-        .rect = {
-            .offset = {0, 0},
-            .extent = swap_chain_extent,
-        },
-        .baseArrayLayer = 0,
-        .layerCount = 1
-    };
-
-    vkCmdClearAttachments(commandBuffer, 1, &clear_attachment, 1, &clear_rect);
-
-    /// -----------------------------------------------------------------------------------------
-
-    // Draw 2D Grid
-
-    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_grid_2d_->get_pipeline());
-    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-    // vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_grid_2d_->get_pipeline_layout(),
-    //     0, 1, &grid_2d_descriptor_sets_[current_frame], 0, nullptr);
-    
-    // vkCmdPushConstants(commandBuffer, pipeline_grid_2d_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-    //     0, sizeof(ui_push_constant_), &ui_push_constant_);
-    // vkCmdDraw(commandBuffer, 3, 1, 0, 0);
-
-    /// -----------------------------------------------------------------------------------------
-
-    // Draw 3D
-
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
-    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-
-    VkBuffer vertex_buffers_3d[] = { scene_3d_.vertex_buffer->buffer };
-    VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
-    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
-    vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
-
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
-                            &descriptor_sets_3d_[current_frame], 0, nullptr);
-
-    vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
-
-    /// -----------------------------------------------------------------------------------------
-
-    // Draw UI
-
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline());
-    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline_layout(),
-        0, 1, &ui_descriptor_sets_[current_frame], 0, nullptr);
-    
-    vkCmdPushConstants(commandBuffer, ui_pipeline_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        0, sizeof(ui_push_constant_), &ui_push_constant_);
-    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
-
-    /// -----------------------------------------------------------------------------------------
-
-    vkCmdEndRendering(commandBuffer);
-
-    // Transition swapchain image from COLOR_ATTACHMENT_OPTIMAL to PRESENT_SRC_KHR
-    image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    image_barrier.dstAccessMask = 0;
-    image_barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    image_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-    vkCmdPipelineBarrier(commandBuffer,
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &image_barrier);
-    
-    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
-        throw std::runtime_error("failed to record command buffer!");
-    }
-}
-
 void Renderer::createSyncObjects()
 {
     image_available_semaphores_.resize(swap_chain_image_count_);
@@ -946,142 +1196,6 @@ void Renderer::createSyncObjects()
             throw std::runtime_error("Failed to create synchronization objects for a frame!");
         }
     }
-}
-
-void Renderer::updateUniformBuffer(uint32_t currentImage) {
-    static auto startTime = std::chrono::high_resolution_clock::now();
-
-    auto currentTime = std::chrono::high_resolution_clock::now();
-    float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
-
-    const auto swap_chain_extent = swap_chain_->get_extent();
-
-    {
-        Camera3D camera = {
-            .model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
-            .view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
-            .proj = glm::perspective(glm::radians(45.0f), swap_chain_extent.width / (float)swap_chain_extent.height, 0.1f, 10.0f)
-        };
-
-        camera.proj[1][1] *= -1;
-
-        memcpy(uniform_buffers_mapped_[currentImage], &camera, sizeof(camera));
-    }
-    
-    {
-        ui_push_constant_ = {
-            .screen_size = { swap_chain_extent.width, swap_chain_extent.height },
-            .num_shapes = 2,
-            .delta_time = time
-        };
-
-        std::vector<UIElement> elements = {
-            { // Giant blue circle
-                .fill = {0.0f, 0.0f, 1.0f, 1.0f},
-                .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
-                .position = {400, 400},
-                .radius = 100.0f,
-                .stroke_width = 10.0f,
-            },
-            { // Little red circle
-                .fill = {1.0f, 0.0f, 0.0f, 1.0f},
-                .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
-                .position = {100, 100},
-                .radius = 50.0f,
-                .stroke_width = 5.0f,
-            }
-        };
-
-        memcpy(ui_elements_mapped_[currentImage], elements.data(), sizeof(UIElement) * elements.size());
-    }
-}
-
-void Renderer::drawFrame() {
-    vkWaitForFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame], VK_TRUE, UINT64_MAX);
-
-    auto[result, image_index] = swap_chain_->acquire_next_frame(image_available_semaphores_[current_frame]);
-
-    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-        recreateSwapChain();
-        return;
-    } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
-        throw std::runtime_error("failed to acquire swap chain image!");
-    }
-
-    updateUniformBuffer(current_frame);
-    vkResetFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame]);
-
-    vkResetCommandBuffer(commandBuffers[current_frame], 0);
-    recordCommandBuffer(commandBuffers[current_frame], image_index);
-
-    const VkSemaphoreSubmitInfo wait_semaphore_infos[] = {
-        {
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .pNext = nullptr,
-            .semaphore = image_available_semaphores_[current_frame],
-            .value = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .deviceIndex = 0
-        }
-    };
-
-    const VkSemaphoreSubmitInfo signal_semaphore_infos[] = {
-        {
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .pNext = nullptr,
-            .semaphore = render_complete_semaphores_[current_frame],
-            .value = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .deviceIndex = 0
-        }
-    };
-
-    VkCommandBufferSubmitInfo command_buffer_info = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-        .pNext = nullptr,
-        .commandBuffer = commandBuffers[current_frame],
-        .deviceMask = 0
-    };
-
-    VkSubmitInfo2 submit_info = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .pNext = nullptr,
-        .flags = 0,
-        .waitSemaphoreInfoCount = 1,
-        .pWaitSemaphoreInfos = wait_semaphore_infos,
-        .commandBufferInfoCount = 1,
-        .pCommandBufferInfos = &command_buffer_info,
-        .signalSemaphoreInfoCount = 1,
-        .pSignalSemaphoreInfos = signal_semaphore_infos
-    };
-
-    if (vkQueueSubmit2(device_->get_graphics_queue(), 1, &submit_info, frame_in_flight_fences_[current_frame]) != VK_SUCCESS) {
-        throw std::runtime_error("failed to submit draw command buffer!");
-    }
-
-    VkSwapchainKHR swap_chains[] = { swap_chain_->get_swap_chain() };
-
-    VkPresentInfoKHR present_info = {
-        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &render_complete_semaphores_[current_frame],
-        .swapchainCount = 1,
-        .pSwapchains = swap_chains,
-        .pImageIndices = &image_index,
-        .pResults = nullptr
-    };
-
-    result = vkQueuePresentKHR(device_->get_present_queue(), &present_info);
-
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
-        framebufferResized = false;
-        recreateSwapChain();
-    } else if (result != VK_SUCCESS) {
-        throw std::runtime_error("failed to present swap chain image!");
-    }
-
-    current_frame = (current_frame + 1) % swap_chain_image_count_;
 }
 
 }  // namespace String

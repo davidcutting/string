@@ -11,7 +11,6 @@ class PipelineGrid2D
 public:
     explicit PipelineGrid2D(
         std::shared_ptr<Device>& device,
-        const VkDescriptorSetLayout& descriptor_set_layout,
         const VkPushConstantRange& push_constant_range);
     ~PipelineGrid2D();
 

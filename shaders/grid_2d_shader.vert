@@ -1,10 +1,21 @@
 #version 450
 
-layout(set = 0, binding = 0) uniform Camera2D {
-    vec2 position;
-    float zoom;
-    float rotation;
-} camera;
+layout(push_constant) uniform Grid2DParams {
+    vec4 background_color;
+    vec4 grid_color;
+    vec4 border_color;
+    vec4 axis_color;
+    vec2 grid_resolution;
+    vec2 grid_center;
+    vec2 grid_size;
+    vec2 screen_size;
+    float line_width;
+    float fade_distance;
+    float border_width;
+    float axis_width;
+    float show_border;
+    float show_axes;
+} params;
 
 // A coordinate in image pixel space
 layout(location = 0) out vec2 pixel_loc;
@@ -23,8 +34,8 @@ void main() {
     
     uv = positions[gl_VertexIndex];
     // Apply aspect ratio correction to uv
-    uv *= pc.screen_size.x / pc.screen_size.y;
+    uv *= params.screen_size.x / params.screen_size.y;
 
     // Convert from clip space [-1,1] to screen space [0, screen_size]
-    pixel_loc = (positions[gl_VertexIndex] * 0.5 + 0.5) * pc.screen_size;
+    pixel_loc = (positions[gl_VertexIndex] * 0.5 + 0.5) * params.screen_size;
 }
