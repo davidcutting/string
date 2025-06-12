@@ -237,62 +237,54 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
     }
     
     {
-        UIElement dot = { // black dot, 5px size
-            .fill = {0.0f, 0.0f, 0.0f, 1.0f},
-            .stroke = {0.1f, 0.1f, 0.1f, 1.0f},
-            .position = { swap_chain_extent.width / 2, swap_chain_extent.height / 2 },
-            .radius = 5.0f,
-            .stroke_width = 1.0f,
-        };
+        // UIElement dot = { // black dot, 5px size
+        //     .fill = {0.0f, 0.0f, 0.0f, 1.0f},
+        //     .stroke = {0.1f, 0.1f, 0.1f, 1.0f},
+        //     .position = { swap_chain_extent.width / 2, swap_chain_extent.height / 2 },
+        //     .radius = 5.0f,
+        //     .stroke_width = 1.0f,
+        // };
 
-        const uint32_t samples = 100;
-        const float resolution = 0.1;
-        const auto pi2 = 2 * 3.1415;
-        std::vector<UIElement> elements;
-        elements.reserve(samples);
+        // const uint32_t samples = 100;
+        // const float resolution = 0.1;
+        // const auto pi2 = 2 * 3.1415;
+        // std::vector<UIElement> elements;
+        // elements.reserve(samples);
 
-        const uint32_t scale_factor_x = 50;
-        const uint32_t scale_factor_y = 10;
+        // const uint32_t scale_factor_x = 50;
+        // const uint32_t scale_factor_y = 10;
 
-        for (uint32_t s = 0; s < samples; ++s)
-        {
-            auto temp_shape = dot;
-            auto step = s / resolution;
-            temp_shape.position.x += pi2 * step * scale_factor_x;
-            temp_shape.position.y += std::sin(temp_shape.position.x) * scale_factor_y;
-            elements.push_back(temp_shape);
-        }
-
-        // for (uint32_t i = 0; i < resolution; ++i)
+        // for (uint32_t s = 0; s < samples; ++s)
         // {
         //     auto temp_shape = dot;
-        //     temp_shape.position.x += i * scale_factor_x;
-        //     temp_shape.position.y += std::sin(i) * scale_factor_y;
+        //     auto step = s / resolution;
+        //     temp_shape.position.x += pi2 * step * scale_factor_x;
+        //     temp_shape.position.y += std::sin(temp_shape.position.x) * scale_factor_y;
         //     elements.push_back(temp_shape);
         // }
 
-        ui_push_constant_ = {
-            .screen_size = { swap_chain_extent.width, swap_chain_extent.height },
-            .num_shapes = samples,
-            .delta_time = time
+        std::vector<UIElement> elements = {
+            { // Giant blue circle
+                .fill = {0.0f, 0.0f, 1.0f, 1.0f},
+                .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
+                .position = {400, 400},
+                .radius = 100.0f,
+                .stroke_width = 10.0f,
+            },
+            { // Little red circle
+                .fill = {1.0f, 0.0f, 0.0f, 1.0f},
+                .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
+                .position = {100, 100},
+                .radius = 50.0f,
+                .stroke_width = 5.0f,
+            }
         };
 
-        // std::vector<UIElement> elements = {
-        //     { // Giant blue circle
-        //         .fill = {0.0f, 0.0f, 1.0f, 1.0f},
-        //         .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
-        //         .position = {400, 400},
-        //         .radius = 100.0f,
-        //         .stroke_width = 10.0f,
-        //     },
-        //     { // Little red circle
-        //         .fill = {1.0f, 0.0f, 0.0f, 1.0f},
-        //         .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
-        //         .position = {100, 100},
-        //         .radius = 50.0f,
-        //         .stroke_width = 5.0f,
-        //     }
-        // };
+        ui_push_constant_ = {
+            .screen_size = { swap_chain_extent.width, swap_chain_extent.height },
+            .num_shapes = static_cast<uint32_t>(elements.size()),
+            .delta_time = time
+        };
 
         memcpy(ui_elements_mapped_[currentImage], elements.data(), sizeof(UIElement) * elements.size());
     }
@@ -463,19 +455,19 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     // Draw 3D
 
-    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
-    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    // VkBuffer vertex_buffers_3d[] = { scene_3d_.vertex_buffer->buffer };
-    // VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
-    // vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
-    // vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
+    VkBuffer vertex_buffers_3d[] = { scene_3d_.vertex_buffer->buffer };
+    VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
+    vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
 
-    // vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
-    //                         &descriptor_sets_3d_[current_frame], 0, nullptr);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
+                            &descriptor_sets_3d_[current_frame], 0, nullptr);
 
-    // vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
 
