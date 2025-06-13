@@ -27,7 +27,7 @@ class PipelineBuilder
 {
 public:
     explicit PipelineBuilder(const std::shared_ptr<Device>& device, const PipelineType& type = PipelineType::GRAPHICS);
-    ~PipelineBuilder() = default;
+    ~PipelineBuilder();
 
     // Non-copyable, movable
     PipelineBuilder(const PipelineBuilder&) = delete;
@@ -36,6 +36,7 @@ public:
     PipelineBuilder& operator=(PipelineBuilder&&) = default;
 
     // Shader stages
+    PipelineBuilder& add_compute_shader(const std::string& resource_path);
     PipelineBuilder& add_vertex_shader(const std::string& resource_path);
     PipelineBuilder& add_fragment_shader(const std::string& resource_path);
 
@@ -52,15 +53,18 @@ public:
     PipelineBuilder& enable_depth_stencil();
     PipelineBuilder& enable_color_blending();
 
-    VkPipeline build(const VkPipelineLayout& pipeline_layout);
+    VkPipeline build_graphics_pipeline(const VkPipelineLayout& pipeline_layout);
+    VkPipeline build_compute_pipeline(const VkPipelineLayout& pipeline_layout);
 
 private:
     PipelineType type_;
     std::shared_ptr<Device> device_;
-    VkShaderModule vertex_shader_module_;
-    VkShaderModule fragment_shader_module_;
+    VkShaderModule compute_shader_module_{VK_NULL_HANDLE};
+    VkShaderModule vertex_shader_module_{VK_NULL_HANDLE};
+    VkShaderModule fragment_shader_module_{VK_NULL_HANDLE};
 
     // Config
+    VkPipelineShaderStageCreateInfo compute_shader_stage_info_{};
     VkPipelineShaderStageCreateInfo vertex_shader_stage_info_{};
     VkPipelineShaderStageCreateInfo fragment_shader_stage_info_{};
     VkPipelineVertexInputStateCreateInfo vertex_input_info_{};

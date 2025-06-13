@@ -47,6 +47,7 @@
               glm
               glfw
               glslang
+              shader-slang
               vulkan-headers
               vulkan-loader
               vulkan-validation-layers

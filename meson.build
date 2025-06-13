@@ -57,6 +57,7 @@ src = [
     'src/pipelines/pipeline_3d.cpp',
     'src/pipelines/pipeline_grid_2d.cpp',
     'src/pipelines/pipeline_grid_3d.cpp',
+    'src/pipelines/hello_slang_pipeline.cpp',
     'src/main.cpp'
 ]
 

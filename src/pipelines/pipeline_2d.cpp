@@ -29,7 +29,7 @@ Pipeline2D::Pipeline2D(
         .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
         .set_multisampling()
         .enable_color_blending()
-        .build(pipeline_layout_);
+        .build_graphics_pipeline(pipeline_layout_);
 }
 
 Pipeline2D::~Pipeline2D()

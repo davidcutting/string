@@ -92,6 +92,35 @@ PipelineBuilder::PipelineBuilder(const std::shared_ptr<Device>& device, const Pi
     // clang-format on
 }
 
+PipelineBuilder::~PipelineBuilder()
+{
+    if (compute_shader_module_ != VK_NULL_HANDLE)
+        vkDestroyShaderModule(device_->get_device(), compute_shader_module_, nullptr);
+    if (vertex_shader_module_ != VK_NULL_HANDLE)
+        vkDestroyShaderModule(device_->get_device(), vertex_shader_module_, nullptr);
+    if (fragment_shader_module_ != VK_NULL_HANDLE)
+        vkDestroyShaderModule(device_->get_device(), fragment_shader_module_, nullptr);
+}
+
+PipelineBuilder& PipelineBuilder::add_compute_shader(const std::string& resource_path)
+{
+    compute_shader_module_ = vku::load_shader_from_disk(device_->get_device(), resource_path);
+
+    // clang-format off
+    VkPipelineShaderStageCreateInfo compute_shader_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = compute_shader_module_,
+        .pName = "main",
+        .pSpecializationInfo = nullptr
+    };
+    compute_shader_stage_info_ = compute_shader_stage_info;
+    // clang-format on
+    return *this;
+}
+
 PipelineBuilder& PipelineBuilder::add_vertex_shader(const std::string& resource_path)
 {
     vertex_shader_module_ = vku::load_shader_from_disk(device_->get_device(), resource_path);
@@ -267,7 +296,7 @@ PipelineBuilder& PipelineBuilder::enable_color_blending()
     return *this;
 }
 
-VkPipeline PipelineBuilder::build(const VkPipelineLayout& pipeline_layout)
+VkPipeline PipelineBuilder::build_graphics_pipeline(const VkPipelineLayout& pipeline_layout)
 {
     // Dynamic State
 
@@ -340,7 +369,39 @@ VkPipeline PipelineBuilder::build(const VkPipelineLayout& pipeline_layout)
     vkDestroyShaderModule(device_->get_device(), vertex_shader_module_, nullptr);
     vkDestroyShaderModule(device_->get_device(), fragment_shader_module_, nullptr);
 
+    vertex_shader_module_ = VK_NULL_HANDLE;
+    fragment_shader_module_ = VK_NULL_HANDLE;
+
     return pipeline;
 }
+
+VkPipeline PipelineBuilder::build_compute_pipeline(const VkPipelineLayout& pipeline_layout)
+{
+    // Create the pipeline
+    VkPipeline pipeline;
+
+    VkComputePipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage = compute_shader_stage_info_,
+        .layout = pipeline_layout,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = 0
+    };
+
+    if (vkCreateComputePipelines(device_->get_device(), VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create graphics pipeline!");
+    }
+    // clang-format on
+
+    // Pipeline baked, now de-allocate shader modules
+    vkDestroyShaderModule(device_->get_device(), compute_shader_module_, nullptr);
+
+    compute_shader_module_ = VK_NULL_HANDLE;
+
+    return pipeline;
+}
+
 
 }

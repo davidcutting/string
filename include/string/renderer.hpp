@@ -5,6 +5,7 @@
 #include <string/pipelines/pipeline_2d.hpp>
 #include <string/pipelines/pipeline_3d.hpp>
 #include <string/pipelines/pipeline_grid_2d.hpp>
+#include <string/pipelines/hello_slang_pipeline.hpp>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
@@ -111,6 +112,13 @@ private:
     std::vector<std::unique_ptr<Buffer>> ui_shapes_ssbo_;
     std::vector<void*> ui_elements_mapped_;
 
+    std::vector<std::unique_ptr<Buffer>> hello_slang_buffer0_;
+    std::vector<void*> hello_slang_buffer0_mapped_;
+    std::vector<std::unique_ptr<Buffer>> hello_slang_buffer1_;
+    std::vector<void*> hello_slang_buffer1_mapped_;
+    std::vector<std::unique_ptr<Buffer>> hello_slang_result_;
+    std::vector<void*> hello_slang_result_mapped_;
+
     VkDescriptorSetLayout descriptor_set_layout_3d_;
     std::unique_ptr<Pipeline3D> pipeline_3d_;
     VkDescriptorSetLayout ui_descriptor_set_layout_;
@@ -118,6 +126,9 @@ private:
     std::unique_ptr<Pipeline2D> ui_pipeline_;
     VkPushConstantRange grid_2d_push_constant_range_;
     std::unique_ptr<PipelineGrid2D> pipeline_grid_2d_;
+    // VkPushConstantRange hello_slang_pipeline_constant_range_;
+    VkDescriptorSetLayout hello_slang_descriptor_set_layout_;
+    std::unique_ptr<HelloSlangPipeline> hello_slang_pipeline_;
 
     VkDescriptorPool descriptorPool;
     VkCommandPool commandPool;
@@ -132,6 +143,7 @@ private:
     std::vector<VkCommandBuffer> commandBuffers;
     std::vector<VkDescriptorSet> descriptor_sets_3d_;
     std::vector<VkDescriptorSet> ui_descriptor_sets_;
+    std::vector<VkDescriptorSet> hello_slang_descriptor_sets_;
     std::vector<VkDescriptorSet> grid_2d_descriptor_sets_;
 
     uint32_t swap_chain_image_count_{2};

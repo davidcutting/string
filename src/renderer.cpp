@@ -52,15 +52,17 @@ void Renderer::initialize(const std::shared_ptr<Window>& window)
     };
     pipeline_grid_2d_ = std::make_unique<PipelineGrid2D>(device_, grid_2d_push_constant_range_);
 
+    hello_slang_pipeline_ = std::make_unique<HelloSlangPipeline>(device_, hello_slang_descriptor_set_layout_);
+
     createCommandPool();
     createDepthResources();
 
     createTextureImage();
     createTextureImageView();
     createTextureSampler();
-    vku::load_model(MODEL_PATH, vertices, indices);
-    create_vertex_buffer();
-    create_index_buffer();
+    //vku::load_model(MODEL_PATH, vertices, indices);
+    // create_vertex_buffer();
+    // create_index_buffer();
     createUniformBuffers();
 
     createDescriptorPool();
@@ -96,6 +98,16 @@ void Renderer::cleanup() {
 
         vmaUnmapMemory(device_->get_allocator().get_allocator(), ui_shapes_ssbo_[i]->allocation);
         device_->get_allocator().destroy_buffer(ui_shapes_ssbo_[i]);
+
+
+        vmaUnmapMemory(device_->get_allocator().get_allocator(), hello_slang_buffer0_[i]->allocation);
+        device_->get_allocator().destroy_buffer(hello_slang_buffer0_[i]);
+
+        vmaUnmapMemory(device_->get_allocator().get_allocator(), hello_slang_buffer1_[i]->allocation);
+        device_->get_allocator().destroy_buffer(hello_slang_buffer1_[i]);
+
+        vmaUnmapMemory(device_->get_allocator().get_allocator(), hello_slang_result_[i]->allocation);
+        device_->get_allocator().destroy_buffer(hello_slang_result_[i]);
     }
 
     vkDestroyDescriptorPool(device_->get_device(), descriptorPool, nullptr);
@@ -107,9 +119,10 @@ void Renderer::cleanup() {
 
     vkDestroyDescriptorSetLayout(device_->get_device(), descriptor_set_layout_3d_, nullptr);
     vkDestroyDescriptorSetLayout(device_->get_device(), ui_descriptor_set_layout_, nullptr);
+    vkDestroyDescriptorSetLayout(device_->get_device(), hello_slang_descriptor_set_layout_, nullptr);
 
-    device_->get_allocator().destroy_buffer(scene_3d_.index_buffer);
-    device_->get_allocator().destroy_buffer(scene_3d_.vertex_buffer);
+    // device_->get_allocator().destroy_buffer(scene_3d_.index_buffer);
+    // device_->get_allocator().destroy_buffer(scene_3d_.vertex_buffer);
 
     for (size_t i = 0; i < swap_chain_image_count_; ++i)
     {
@@ -213,6 +226,28 @@ void Renderer::drawFrame() {
         throw std::runtime_error("failed to present swap chain image!");
     }
 
+    // expected result -> result[i] == 2i;
+    // TODO(DCut): Check value
+    bool all_values_correct = false;
+    for (size_t i = 0; i < 1024; ++i)
+    {
+        const auto buffer_res = reinterpret_cast<float*>(hello_slang_result_mapped_[current_frame]);
+        if (buffer_res[i] != 2.0 * i)
+        {
+            all_values_correct = false;
+            break;
+        }
+    }
+
+    if (all_values_correct)
+    {
+        STRING_LOG_INFO("Woah, the result was correct!");
+    }
+    else
+    {
+        STRING_LOG_WARN("Woah, the result was correct!");
+    }
+
     current_frame = (current_frame + 1) % swap_chain_image_count_;
 }
 
@@ -287,6 +322,21 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
         };
 
         memcpy(ui_elements_mapped_[currentImage], elements.data(), sizeof(UIElement) * elements.size());
+    }
+
+    {
+        static constexpr size_t hello_buffer_size = 1024;
+        float buffer0[hello_buffer_size];
+        float buffer1[hello_buffer_size];
+
+        for (size_t i = 0; i < hello_buffer_size; ++i)
+        {
+            buffer0[i] = 1.0 * i;
+            buffer1[i] = 1.0 * i;
+        }
+
+        memcpy(hello_slang_buffer0_mapped_[currentImage], buffer0, sizeof(float) * hello_buffer_size);
+        memcpy(hello_slang_buffer1_mapped_[currentImage], buffer0, sizeof(float) * hello_buffer_size);
     }
 }
 
@@ -424,50 +474,67 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     /// -----------------------------------------------------------------------------------------
 
+    // Execute MATH
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hello_slang_pipeline_->get_pipeline());
+    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hello_slang_pipeline_->get_pipeline_layout(),
+        0, 1, &hello_slang_descriptor_sets_[current_frame], 0, nullptr);
+    
+    // vkCmdPushConstants(commandBuffer, hello_slang_pipeline_->get_pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT,
+    //     0, sizeof(ui_push_constant_), &ui_push_constant_);
+
+    const uint32_t element_count = 1024;
+    const uint32_t group_size = 64;
+	vkCmdDispatch(commandBuffer, (element_count + group_size - 1) / group_size, 1, 1);
+
+    /// -----------------------------------------------------------------------------------------
+
     // Draw 2D Grid
 
-    Grid2DParams params = {
-        .background_color = {0.0f, 0.0f, 0.0f, 0.0f},
-        .grid_color = {0.4f, 0.4f, 0.4f, 1.0f},
-        .border_color = {0.8f, 0.8f, 0.8f, 1.0f},
-        .axis_color = {0.6f, 0.6f, 0.6f, 1.0f},
-        .grid_resolution = {50.0f, 50.0f},
-        .grid_center = { swap_chain_extent.width / 2, swap_chain_extent.height / 2 },
-        .grid_size = { 800.0f, 800.0f },
-        .screen_size = { swap_chain_extent.width, swap_chain_extent.height },
-        .line_width = 1.0f,
-        .fade_distance = 500.0f,
-        .border_width = 3.0f,
-        .axis_width = 2.0f,
-        .show_border = 1.0f,
-        .show_axes = 1.0f
-    };
+    // Grid2DParams params = {
+    //     .background_color = {0.0f, 0.0f, 0.0f, 0.0f},
+    //     .grid_color = {0.4f, 0.4f, 0.4f, 1.0f},
+    //     .border_color = {0.8f, 0.8f, 0.8f, 1.0f},
+    //     .axis_color = {0.6f, 0.6f, 0.6f, 1.0f},
+    //     .grid_resolution = {50.0f, 50.0f},
+    //     .grid_center = { swap_chain_extent.width / 2, swap_chain_extent.height / 2 },
+    //     .grid_size = { 800.0f, 800.0f },
+    //     .screen_size = { swap_chain_extent.width, swap_chain_extent.height },
+    //     .line_width = 1.0f,
+    //     .fade_distance = 500.0f,
+    //     .border_width = 3.0f,
+    //     .axis_width = 2.0f,
+    //     .show_border = 1.0f,
+    //     .show_axes = 1.0f
+    // };
 
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_grid_2d_->get_pipeline());
-    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_grid_2d_->get_pipeline());
+    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
     
-    vkCmdPushConstants(commandBuffer, pipeline_grid_2d_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        0, sizeof(params), &params);
-    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    // vkCmdPushConstants(commandBuffer, pipeline_grid_2d_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    //     0, sizeof(params), &params);
+    // vkCmdDraw(commandBuffer, 3, 1, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
 
     // Draw 3D
 
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
-    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
+    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    VkBuffer vertex_buffers_3d[] = { scene_3d_.vertex_buffer->buffer };
-    VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
-    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
-    vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
+    // VkBuffer vertex_buffers_3d[] = { scene_3d_.vertex_buffer->buffer };
+    // VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
+    // vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
+    // vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
 
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
-                            &descriptor_sets_3d_[current_frame], 0, nullptr);
+    // vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
+    //                         &descriptor_sets_3d_[current_frame], 0, nullptr);
 
-    vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    // vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
 
@@ -596,6 +663,50 @@ void Renderer::createDescriptorSetLayout()
         // clang-format on
 
         if (vkCreateDescriptorSetLayout(device_->get_device(), &layout_info, nullptr, &ui_descriptor_set_layout_) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor set layout!");
+        }
+    }
+
+    {
+        // clang-format off
+        VkDescriptorSetLayoutBinding buffer0_layout_binding = {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr
+        };
+
+        VkDescriptorSetLayoutBinding buffer1_layout_binding = {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr
+        };
+
+        VkDescriptorSetLayoutBinding result_buffer_layout_binding = {
+            .binding = 2,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr
+        };
+        // clang-format on
+
+        std::vector<VkDescriptorSetLayoutBinding> bindings = {buffer0_layout_binding, buffer1_layout_binding, result_buffer_layout_binding};
+
+        // clang-format off
+        VkDescriptorSetLayoutCreateInfo layout_info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<uint32_t>(bindings.size()),
+            .pBindings = bindings.data()
+        };
+        // clang-format on
+
+        if (vkCreateDescriptorSetLayout(device_->get_device(), &layout_info, nullptr, &hello_slang_descriptor_set_layout_) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor set layout!");
         }
     }
@@ -910,15 +1021,44 @@ void Renderer::createUniformBuffers()
 
 void Renderer::create_ssbo_buffer()
 {
-    VkDeviceSize buffer_size = sizeof(UIShape) * 100;
-
-    ui_shapes_ssbo_.resize(swap_chain_image_count_);
-    ui_elements_mapped_.resize(swap_chain_image_count_);
-
-    for (size_t i = 0; i < swap_chain_image_count_; i++)
+    // Shapes
     {
-        ui_shapes_ssbo_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
-        vmaMapMemory(device_->get_allocator().get_allocator(), ui_shapes_ssbo_[i]->allocation, &ui_elements_mapped_[i]);
+        VkDeviceSize buffer_size = sizeof(UIShape) * 100;
+
+        ui_shapes_ssbo_.resize(swap_chain_image_count_);
+        ui_elements_mapped_.resize(swap_chain_image_count_);
+
+        for (size_t i = 0; i < swap_chain_image_count_; i++)
+        {
+            ui_shapes_ssbo_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+            vmaMapMemory(device_->get_allocator().get_allocator(), ui_shapes_ssbo_[i]->allocation, &ui_elements_mapped_[i]);
+        }
+    }
+
+    // Compute
+
+    // Three big beautiful buffers of floats size 100
+    {
+        VkDeviceSize buffer_size = sizeof(float) * 100;
+
+        hello_slang_buffer0_.resize(swap_chain_image_count_);
+        hello_slang_buffer0_mapped_.resize(swap_chain_image_count_);
+        hello_slang_buffer1_.resize(swap_chain_image_count_);
+        hello_slang_buffer1_mapped_.resize(swap_chain_image_count_);
+        hello_slang_result_.resize(swap_chain_image_count_);
+        hello_slang_result_mapped_.resize(swap_chain_image_count_);
+
+        for (size_t i = 0; i < swap_chain_image_count_; i++)
+        {
+            hello_slang_buffer0_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+            vmaMapMemory(device_->get_allocator().get_allocator(), hello_slang_buffer0_[i]->allocation, &hello_slang_buffer0_mapped_[i]);
+
+            hello_slang_buffer1_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+            vmaMapMemory(device_->get_allocator().get_allocator(), hello_slang_buffer1_[i]->allocation, &hello_slang_buffer1_mapped_[i]);
+
+            hello_slang_result_[i] = device_->get_allocator().create_buffer(buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+            vmaMapMemory(device_->get_allocator().get_allocator(), hello_slang_result_[i]->allocation, &hello_slang_result_mapped_[i]);
+        }
     }
 }
 
@@ -939,7 +1079,7 @@ void Renderer::createDescriptorPool()
         },
         {
             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = static_cast<uint32_t>(swap_chain_image_count_)
+            .descriptorCount = static_cast<uint32_t>(swap_chain_image_count_) * 4
         },
     };
 
@@ -947,7 +1087,7 @@ void Renderer::createDescriptorPool()
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .maxSets = static_cast<uint32_t>(swap_chain_image_count_) * 2,
+        .maxSets = 32,
         .poolSizeCount = static_cast<uint32_t>(pool_sizes.size()),
         .pPoolSizes = pool_sizes.data(),
     };
@@ -1074,6 +1214,86 @@ void Renderer::createDescriptorSets()
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .pImageInfo = nullptr,
                 .pBufferInfo = &ui_shapes_ssbo_info,
+                .pTexelBufferView = nullptr,
+            }
+        };
+
+        vkUpdateDescriptorSets(
+            device_->get_device(),
+            static_cast<uint32_t>(descriptor_writes.size()),
+            descriptor_writes.data(), 0,
+            nullptr);
+    }
+
+    std::vector<VkDescriptorSetLayout> hello_slang_layouts(swap_chain_image_count_, hello_slang_descriptor_set_layout_);
+    VkDescriptorSetAllocateInfo hello_slang_descriptor_set_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .pNext = nullptr,
+        .descriptorPool = descriptorPool,
+        .descriptorSetCount = static_cast<uint32_t>(swap_chain_image_count_),
+        .pSetLayouts = hello_slang_layouts.data()
+    };
+    hello_slang_descriptor_sets_.resize(swap_chain_image_count_);
+
+    if (vkAllocateDescriptorSets(device_->get_device(), &hello_slang_descriptor_set_alloc_info, hello_slang_descriptor_sets_.data()) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to allocate HelloSlang descriptor sets!");
+    }
+
+    for (size_t i = 0; i < swap_chain_image_count_; i++) {
+        VkDescriptorBufferInfo hello_slang_buffer0_info = {
+            .buffer = hello_slang_buffer0_[i]->buffer,
+            .offset = 0,
+            .range = hello_slang_buffer0_[i]->buffer_size
+        };
+
+        VkDescriptorBufferInfo hello_slang_buffer1_info = {
+            .buffer = hello_slang_buffer1_[i]->buffer,
+            .offset = 0,
+            .range = hello_slang_buffer1_[i]->buffer_size
+        };
+
+        VkDescriptorBufferInfo hello_slang_result_info = {
+            .buffer = hello_slang_result_[i]->buffer,
+            .offset = 0,
+            .range = hello_slang_result_[i]->buffer_size
+        };
+
+        std::vector<VkWriteDescriptorSet> descriptor_writes = {
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = hello_slang_descriptor_sets_[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &hello_slang_buffer0_info,
+                .pTexelBufferView = nullptr,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = hello_slang_descriptor_sets_[i],
+                .dstBinding = 1,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &hello_slang_buffer1_info,
+                .pTexelBufferView = nullptr,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = hello_slang_descriptor_sets_[i],
+                .dstBinding = 2,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &hello_slang_result_info,
                 .pTexelBufferView = nullptr,
             }
         };

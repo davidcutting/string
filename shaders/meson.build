@@ -12,6 +12,7 @@ shaders = [
     'ui_shader.frag',
     'ui_shader.vert'
 ]
+
 shader_targets = []
 foreach s : shaders
     shader_targets += custom_target(
@@ -23,3 +24,7 @@ foreach s : shaders
         install_dir : 'include/string/shaders'
     )
 endforeach
+
+if not meson.is_subproject()
+    subdir('slang')
+endif

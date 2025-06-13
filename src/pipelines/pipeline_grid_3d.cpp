@@ -35,7 +35,7 @@ PipelineGrid3D::PipelineGrid3D(
         .set_multisampling()
         .enable_depth_stencil()
         .enable_color_blending()
-        .build(pipeline_layout_);
+        .build_graphics_pipeline(pipeline_layout_);
 }
 
 PipelineGrid3D::~PipelineGrid3D()
