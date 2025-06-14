@@ -1,4 +1,3 @@
-#include <vulkan/vulkan_core.h>
 #include <chrono>
 #include <cstdint>
 #include <string/swapchain.hpp>
