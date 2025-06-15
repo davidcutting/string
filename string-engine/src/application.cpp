@@ -2,11 +2,11 @@
 
 namespace String {
 
-void Application::initialize() {
+void Application::initialize(const ApplicationInfo& info) {
     String::Logger::initialize();
 
-    window_ = std::make_shared<Window>(Window::Properties{.title = "Vulkan Test Bed", .extent = {800, 800}});
-    renderer_ = std::make_unique<Renderer>();
+    window_ = std::make_shared<Window>(Window::Properties{.title = info.application_name, .extent = {800, 800}});
+    renderer_ = std::make_unique<Renderer>(info);
     renderer_->initialize(window_);
 }
 

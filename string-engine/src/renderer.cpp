@@ -17,6 +17,12 @@
 
 namespace String {
 
+Renderer::Renderer(const ApplicationInfo& application_info)
+: application_info_(application_info)
+{
+    // constructor
+}
+
 void Renderer::initialize(const std::shared_ptr<Window>& window)
 {
     // Window
@@ -25,7 +31,7 @@ void Renderer::initialize(const std::shared_ptr<Window>& window)
     window_ = window;
 
     // Device
-    device_ = std::make_shared<Device>(window);
+    device_ = std::make_shared<Device>(application_info_, window);
     VkExtent2D extent = {
         .width = window->get_properties().extent.width,
         .height = window->get_properties().extent.height

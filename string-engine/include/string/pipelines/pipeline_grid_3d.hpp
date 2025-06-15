@@ -20,6 +20,8 @@ public:
 private:
     static constexpr char VERTEX_SHADER_PATH[] = "shaders/grid_3d_shader.vert.spv";
     static constexpr char FRAGMENT_SHADER_PATH[] = "shaders/grid_3d_shader.frag.spv";
+    std::string vertex_shader_path;
+    std::string fragment_shader_path;
 
     VkPipelineLayout pipeline_layout_;
     VkPipeline pipeline_;

@@ -6,6 +6,7 @@
 #include <string/scene.hpp>
 #include <string/renderer.hpp>
 #include <string/window.hpp>
+#include <string/core/app_info.hpp>
 
 namespace String {
 
@@ -15,7 +16,7 @@ namespace String {
 class Application {
 public:
     /// Lazy initialization of the application's major systems.
-    void initialize();
+    void initialize(const ApplicationInfo& info);
     /// Contains the application's main loop.
     void run();
 

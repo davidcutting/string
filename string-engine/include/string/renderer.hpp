@@ -23,6 +23,7 @@
 #include <string/render_data.hpp>
 #include <string>
 #include <vector>
+#include <string/core/app_info.hpp>
 
 namespace String {
 
@@ -88,12 +89,13 @@ struct Scene2D
 
 class Renderer {
 public:
-    Renderer() = default;
+    Renderer(const ApplicationInfo& application_info);
     ~Renderer();
     void initialize(const std::shared_ptr<Window>& window);
     void update();
 
 private:
+    ApplicationInfo application_info_;
     std::shared_ptr<Window> window_;
     std::shared_ptr<Device> device_;
     std::unique_ptr<Swapchain> swap_chain_;

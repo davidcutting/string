@@ -9,10 +9,10 @@
 namespace String
 {
 
-Device::Device(const std::shared_ptr<Window>& window)
+Device::Device(const ApplicationInfo& info, const std::shared_ptr<Window>& window)
 : window_(window)
 {
-    create_instance();
+    create_instance(info);
     setup_debug_messenger();
     create_surface();
     select_physical_device();
@@ -34,7 +34,7 @@ Device::~Device()
         vkDestroyInstance(instance_, nullptr);
 }
 
-void Device::create_instance()
+void Device::create_instance(const ApplicationInfo& info)
 {
     if (ENABLE_VALIDATION_LAYERS && !are_validation_layer_supported()) {
         throw std::runtime_error("validation layers requested, but not available!");
@@ -44,7 +44,7 @@ void Device::create_instance()
     VkApplicationInfo application_info = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pNext = nullptr,
-        .pApplicationName = "String Application",
+        .pApplicationName = info.application_name.c_str(),
         .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
         .pEngineName = "String Engine",
         .engineVersion = VK_MAKE_VERSION(0, 1, 0),

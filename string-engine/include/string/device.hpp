@@ -7,6 +7,7 @@
 #include <string/window.hpp>
 #include <string/allocator.hpp>
 #include <vulkan/vulkan.h>
+#include <string/core/app_info.hpp>
 
 #ifdef NDEBUG
 static constexpr bool ENABLE_VALIDATION_LAYERS = false;
@@ -34,7 +35,7 @@ struct QueueFamilyIndices {
 class Device
 {
 public:
-    explicit Device(const std::shared_ptr<Window>& window);
+    explicit Device(const ApplicationInfo& info, const std::shared_ptr<Window>& window);
     ~Device();
 
     SwapChainSupportDetails get_swap_chain_support();
@@ -63,7 +64,7 @@ private:
     VkQueue present_queue_{VK_NULL_HANDLE};
     VkQueue compute_queue_{VK_NULL_HANDLE};
 
-    void create_instance();
+    void create_instance(const ApplicationInfo& info);
     void setup_debug_messenger();
     void create_surface();
     void select_physical_device();
