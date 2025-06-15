@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <span>
 
 namespace String
 {
@@ -33,23 +32,6 @@ struct Style
 {
   uint8_t outline;
   Primitive primitive;
-};
-
-template <typename T>
-struct Node
-{
-  T* parent;
-  std::span<T> children;
-};
-
-template <typename T>
-class Tree
-{
-public:
-    
-private:
-    Node<T>* root;
-    Node<T> nodes_[2048];
 };
 
 }

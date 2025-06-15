@@ -57,8 +57,7 @@ src = [
     'src/pipelines/pipeline_3d.cpp',
     'src/pipelines/pipeline_grid_2d.cpp',
     'src/pipelines/pipeline_grid_3d.cpp',
-    'src/pipelines/hello_slang_pipeline.cpp',
-    'src/main.cpp'
+    'src/pipelines/hello_slang_pipeline.cpp'
 ]
 
 deps = [
@@ -75,32 +74,23 @@ build_args += [
     '-DPROJECT_VERSION=' + meson.project_version()
 ]
 
-exe_target = executable(
+shared_target = shared_library(
     meson.project_name(),
-    dependencies : deps,
+    dependencies: deps,
     include_directories : include_dir,
     sources : src,
-    install : false,
+    install : true,
     cpp_args : build_args
 )
 
-#shared_target = shared_library(
-#    meson.project_name(),
-#    dependencies: deps,
-#    include_directories : include_dir,
-#    sources : src,
-#    install : true,
-#    cpp_args : build_args
-#)
-#
-#static_target = static_library(
-#    meson.project_name(),
-#    dependencies: deps,
-#    include_directories : include_dir,
-#    sources : src,
-#    install : true,
-#    cpp_args : build_args
-#)
+static_target = static_library(
+    meson.project_name(),
+    dependencies: deps,
+    include_directories : include_dir,
+    sources : src,
+    install : true,
+    cpp_args : build_args
+)
 
 install_subdir('include/string', install_dir : 'include')
 install_subdir('assets', install_dir : 'assets')
@@ -111,9 +101,7 @@ install_subdir('assets', install_dir : 'assets')
 # Shaders
 # ======
 
-if not meson.is_subproject()
-    subdir('shaders')
-endif
+subdir('shaders')
 
 # --------------------------------------------------
 
@@ -121,21 +109,21 @@ endif
 # Project
 # ======
 
-#pkg_mod = import('pkgconfig')
-#pkg_mod.generate(
-#    name : meson.project_name(),
-#    filebase : meson.project_name(),
-#    description : project_description,
-#    subdirs : meson.project_name(),
-#    libraries : [ shared_target, static_target ]
-#)
-#
-#project_deps = declare_dependency(
-#    include_directories : include_dir,
-#    link_with : [ static_target ]
-#)
-#
-#set_variable(meson.project_name() + '_dep', project_deps)
+pkg_mod = import('pkgconfig')
+pkg_mod.generate(
+    name : meson.project_name(),
+    filebase : meson.project_name(),
+    description : project_description,
+    libraries : static_target, #[ shared_target, static_target ],
+    version : meson.project_version()
+)
+
+project_deps = declare_dependency(
+    include_directories : include_dir,
+    link_with : [ static_target ]
+)
+
+set_variable(meson.project_name() + '_dep', project_deps)
 
 # --------------------------------------------------
 
@@ -143,16 +131,16 @@ endif
 # Tests
 # ======
 
-#if not meson.is_subproject()
-#  add_languages('cpp')
-#  subdir('test')
-#
-#  test('all_tests',
-#    executable(
-#      'run_tests',
-#      test_files,
-#      dependencies : [project_deps, test_dep],
-#      install : false
-#    )
-#  )
-#endif
+if not meson.is_subproject()
+  add_languages('cpp')
+  subdir('test')
+
+  test('all_tests',
+    executable(
+      'run_tests',
+      test_files,
+      dependencies : [project_deps, test_dep],
+      install : false
+    )
+  )
+endif
