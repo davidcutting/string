@@ -8,6 +8,7 @@ namespace String
 {
 
 PipelineGrid2D::PipelineGrid2D(
+    const std::filesystem::path& resources_path,
     std::shared_ptr<Device>& device,
     const VkPushConstantRange& push_constant_range)
 : device_(device)
@@ -20,9 +21,12 @@ PipelineGrid2D::PipelineGrid2D(
         .set_push_constant_ranges(push_constant_ranges)
         .build(device_);
 
+    const auto vert_relative_path = std::filesystem::path(VERTEX_SHADER_PATH);
+    const auto frag_relative_path = std::filesystem::path(FRAGMENT_SHADER_PATH);
+
     pipeline_ = PipelineBuilder(device_)
-        .add_vertex_shader(VERTEX_SHADER_PATH)
-        .add_fragment_shader(FRAGMENT_SHADER_PATH)
+        .add_vertex_shader(resources_path / vert_relative_path)
+        .add_fragment_shader(resources_path / frag_relative_path)
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
         .set_tessellation()
         .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)

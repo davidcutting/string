@@ -10,6 +10,7 @@ class PipelineGrid2D
 {
 public:
     explicit PipelineGrid2D(
+        const std::filesystem::path& resources_path,
         std::shared_ptr<Device>& device,
         const VkPushConstantRange& push_constant_range);
     ~PipelineGrid2D();

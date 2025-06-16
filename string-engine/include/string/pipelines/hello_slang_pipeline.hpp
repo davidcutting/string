@@ -10,6 +10,7 @@ class HelloSlangPipeline
 {
 public:
     explicit HelloSlangPipeline(
+        const std::filesystem::path& resources_path,
         std::shared_ptr<Device>& device,
         const VkDescriptorSetLayout& descriptor_set_layout);
     ~HelloSlangPipeline();

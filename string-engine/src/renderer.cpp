@@ -41,24 +41,26 @@ void Renderer::initialize(const std::shared_ptr<Window>& window)
 
     create_ssbo_buffer();
 
+    const auto resources_path = application_info_.resources_directory;
+
     createDescriptorSetLayout();
-    pipeline_3d_ = std::make_unique<Pipeline3D>(device_, descriptor_set_layout_3d_);
+    pipeline_3d_ = std::make_unique<Pipeline3D>(resources_path, device_, descriptor_set_layout_3d_);
 
     ui_push_constant_range_ = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
         .size = sizeof(UIShaderConfig)
     };
-    ui_pipeline_ = std::make_unique<Pipeline2D>(device_, ui_descriptor_set_layout_, ui_push_constant_range_);
+    ui_pipeline_ = std::make_unique<Pipeline2D>(resources_path, device_, ui_descriptor_set_layout_, ui_push_constant_range_);
 
     grid_2d_push_constant_range_ = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
         .size = sizeof(Grid2DParams)
     };
-    pipeline_grid_2d_ = std::make_unique<PipelineGrid2D>(device_, grid_2d_push_constant_range_);
+    pipeline_grid_2d_ = std::make_unique<PipelineGrid2D>(resources_path, device_, grid_2d_push_constant_range_);
 
-    hello_slang_pipeline_ = std::make_unique<HelloSlangPipeline>(device_, hello_slang_descriptor_set_layout_);
+    hello_slang_pipeline_ = std::make_unique<HelloSlangPipeline>(resources_path, device_, hello_slang_descriptor_set_layout_);
 
     createCommandPool();
     createDepthResources();

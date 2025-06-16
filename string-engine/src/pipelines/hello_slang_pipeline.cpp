@@ -1,4 +1,5 @@
 #include <vulkan/vulkan.h>
+#include <filesystem>
 #include <string/device.hpp>
 #include <string/pipelines/hello_slang_pipeline.hpp>
 #include <string/pipeline_builder.hpp>
@@ -8,6 +9,7 @@ namespace String
 {
 
 HelloSlangPipeline::HelloSlangPipeline(
+    const std::filesystem::path& resources_path,
     std::shared_ptr<Device>& device,
     const VkDescriptorSetLayout& descriptor_set_layout)
 : device_(device)
@@ -20,8 +22,10 @@ HelloSlangPipeline::HelloSlangPipeline(
         .set_push_constant_ranges(push_constant_ranges)
         .build(device_);
 
+    const auto relative_path = std::filesystem::path(COMPUTE_SHADER_PATH);
+
     pipeline_ = PipelineBuilder(device_)
-        .add_compute_shader(COMPUTE_SHADER_PATH)
+        .add_compute_shader(resources_path / relative_path)
         .build_compute_pipeline(pipeline_layout_);
 }
 

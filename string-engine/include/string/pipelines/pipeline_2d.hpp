@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#include <filesystem>
 #include <memory>
 #include <string/device.hpp>
 
@@ -10,6 +11,7 @@ class Pipeline2D
 {
 public:
     explicit Pipeline2D(
+        const std::filesystem::path& resources_path,
         std::shared_ptr<Device>& device,
         const VkDescriptorSetLayout& descriptor_set_layout,
         const VkPushConstantRange& push_constant_range);

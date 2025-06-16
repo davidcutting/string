@@ -8,6 +8,7 @@ namespace String
 {
 
 Pipeline3D::Pipeline3D(
+    const std::filesystem::path& resources_path,
     std::shared_ptr<Device>& device,
     const VkDescriptorSetLayout& descriptor_set_layout)
 : device_(device)
@@ -20,9 +21,12 @@ Pipeline3D::Pipeline3D(
     auto binding_description = Vertex::getBindingDescription();
     auto attribute_descriptions = Vertex::getAttributeDescriptions();
 
+    const auto vert_relative_path = std::filesystem::path(VERTEX_SHADER_PATH);
+    const auto frag_relative_path = std::filesystem::path(FRAGMENT_SHADER_PATH);
+
     pipeline_ = PipelineBuilder(device_)
-        .add_vertex_shader(VERTEX_SHADER_PATH)
-        .add_fragment_shader(FRAGMENT_SHADER_PATH)
+        .add_vertex_shader(resources_path / vert_relative_path)
+        .add_fragment_shader(resources_path / frag_relative_path)
         .set_vertex_binding(binding_description, attribute_descriptions)
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
         .set_tessellation()
