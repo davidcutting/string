@@ -27,8 +27,8 @@
 
 namespace String {
 
-const std::string MODEL_PATH = "./assets/viking_room.obj";
-const std::string TEXTURE_PATH = "./assets/viking_room.png";
+const std::string MODEL_PATH = "assets/viking_room.obj";
+const std::string TEXTURE_PATH = "assets/viking_room.png";
 
 struct UIShaderConfig {
     glm::vec2 screen_size;

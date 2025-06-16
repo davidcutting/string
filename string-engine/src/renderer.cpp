@@ -1,6 +1,7 @@
 #include <vulkan/vulkan.h>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <string/renderer.hpp>
 #include <string/vulkan_utils.hpp>
@@ -786,7 +787,8 @@ void Renderer::createTextureSampler() {
 
 void Renderer::createTextureImage() {
     int width, height, channels;
-    stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+    const auto tex_path = application_info_.resources_directory / std::filesystem::path(TEXTURE_PATH);
+    stbi_uc* pixels = stbi_load(tex_path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
     VkDeviceSize image_size = width * height * 4;
 
     if (!pixels) {

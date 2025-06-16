@@ -5,7 +5,7 @@ int main() {
 
     String::ApplicationInfo app_info {
         .application_name = "String Sandbox",
-        .resources_directory = "~/.config/string/"
+        .resources_directory = "/home/dcutting/.config/string/"
     };
 
     try {
