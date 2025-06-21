@@ -6,26 +6,25 @@ project(
     default_options : [
         'cpp_std=c++20',
         'buildtype=debug',
-        'warning_level=3'
+        'warning_level=3',
+        'default_library=static'
     ]
 )
 
 project_description = 'Simple Tiny RenderING engine, my hobby engine.'
 
 build_args = [
+    '-DPROJECT_NAME=' + meson.project_name(),
+    '-DPROJECT_VERSION=' + meson.project_version()
 ]
 
 compiler = meson.get_compiler('cpp')
-if compiler.get_id() == 'gcc'
-    message('Compiler: GCC')
-elif compiler.get_id() == 'clang'
-    message('Compiler: LLVM/Clang')
-endif
+message('Compiler: ' + compiler.get_id())
 
 if get_option('buildtype') == 'release'
     message('Building in Release mode')
     release = ['-DSTRING_RELEASE']
-    build_args += ['-o3']
+    build_args += ['-O3']
 elif get_option('buildtype') == 'debug'
     message('Building in Debug mode')
     release = ['-DSTRING_DEBUG']
@@ -35,6 +34,21 @@ elif get_option('buildtype') == 'debugoptimized'
 endif
 
 add_project_arguments(release, language : 'cpp')
+
+# --------------------------------------------------
+
+# ======
+# Dependencies
+# ======
+
+deps = [
+    dependency('threads'),
+    dependency('spdlog', static: true),
+    dependency('glm'),
+    dependency('glfw3', static: true),
+    dependency('entt'),
+    dependency('vulkan')
+]
 
 # --------------------------------------------------
 
@@ -60,36 +74,13 @@ src = [
     'src/pipelines/hello_slang_pipeline.cpp'
 ]
 
-deps = [
-    dependency('threads'),
-    dependency('spdlog'),
-    dependency('glm'),
-    dependency('glfw3'),
-    dependency('entt'),
-    dependency('vulkan')
-]
-
-build_args += [
-    '-DPROJECT_NAME=' + meson.project_name(),
-    '-DPROJECT_VERSION=' + meson.project_version()
-]
-
-shared_target = shared_library(
-    meson.project_name(),
-    dependencies: deps,
-    include_directories : include_dir,
-    sources : src,
-    install : true,
-    cpp_args : build_args
-)
-
 static_target = static_library(
     meson.project_name(),
     dependencies: deps,
-    include_directories : include_dir,
-    sources : src,
-    install : true,
-    cpp_args : build_args
+    include_directories: include_dir,
+    sources: src,
+    install: true,
+    cpp_args: build_args
 )
 
 install_subdir('include/string', install_dir : 'include')
@@ -114,7 +105,7 @@ pkg_mod.generate(
     name : meson.project_name(),
     filebase : meson.project_name(),
     description : project_description,
-    libraries : static_target, #[ shared_target, static_target ],
+    libraries : static_target,
     version : meson.project_version()
 )
 

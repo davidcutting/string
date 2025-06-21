@@ -69,9 +69,9 @@ void Renderer::initialize(const std::shared_ptr<Window>& window)
     createTextureImage();
     createTextureImageView();
     createTextureSampler();
-    //vku::load_model(MODEL_PATH, vertices, indices);
-    // create_vertex_buffer();
-    // create_index_buffer();
+    vku::load_model(resources_path / std::filesystem::path(MODEL_PATH), vertices, indices);
+    create_vertex_buffer();
+    create_index_buffer();
     createUniformBuffers();
 
     createDescriptorPool();
@@ -130,8 +130,8 @@ void Renderer::cleanup() {
     vkDestroyDescriptorSetLayout(device_->get_device(), ui_descriptor_set_layout_, nullptr);
     vkDestroyDescriptorSetLayout(device_->get_device(), hello_slang_descriptor_set_layout_, nullptr);
 
-    // device_->get_allocator().destroy_buffer(scene_3d_.index_buffer);
-    // device_->get_allocator().destroy_buffer(scene_3d_.vertex_buffer);
+    device_->get_allocator().destroy_buffer(scene_3d_.index_buffer);
+    device_->get_allocator().destroy_buffer(scene_3d_.vertex_buffer);
 
     for (size_t i = 0; i < swap_chain_image_count_; ++i)
     {
@@ -235,28 +235,6 @@ void Renderer::drawFrame() {
         throw std::runtime_error("failed to present swap chain image!");
     }
 
-    // expected result -> result[i] == 2i;
-    // TODO(DCut): Check value
-    bool all_values_correct = false;
-    for (size_t i = 0; i < 1024; ++i)
-    {
-        const auto buffer_res = reinterpret_cast<float*>(hello_slang_result_mapped_[current_frame]);
-        if (buffer_res[i] != 2.0 * i)
-        {
-            all_values_correct = false;
-            break;
-        }
-    }
-
-    if (all_values_correct)
-    {
-        STRING_LOG_INFO("Woah, the result was correct!");
-    }
-    else
-    {
-        STRING_LOG_WARN("Woah, the result was correct!");
-    }
-
     current_frame = (current_frame + 1) % swap_chain_image_count_;
 }
 
@@ -324,6 +302,8 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
             }
         };
 
+        // Logic here to make rounded boxes
+
         ui_push_constant_ = {
             .screen_size = { swap_chain_extent.width, swap_chain_extent.height },
             .num_shapes = static_cast<uint32_t>(elements.size()),
@@ -333,20 +313,20 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
         memcpy(ui_elements_mapped_[currentImage], elements.data(), sizeof(UIElement) * elements.size());
     }
 
-    {
-        static constexpr size_t hello_buffer_size = 1024;
-        float buffer0[hello_buffer_size];
-        float buffer1[hello_buffer_size];
+    // {
+    //     static constexpr size_t hello_buffer_size = 1024;
+    //     float buffer0[hello_buffer_size];
+    //     float buffer1[hello_buffer_size];
 
-        for (size_t i = 0; i < hello_buffer_size; ++i)
-        {
-            buffer0[i] = 1.0 * i;
-            buffer1[i] = 1.0 * i;
-        }
+    //     for (size_t i = 0; i < hello_buffer_size; ++i)
+    //     {
+    //         buffer0[i] = 1.0 * i;
+    //         buffer1[i] = 1.0 * i;
+    //     }
 
-        memcpy(hello_slang_buffer0_mapped_[currentImage], buffer0, sizeof(float) * hello_buffer_size);
-        memcpy(hello_slang_buffer1_mapped_[currentImage], buffer0, sizeof(float) * hello_buffer_size);
-    }
+    //     memcpy(hello_slang_buffer0_mapped_[currentImage], buffer0, sizeof(float) * hello_buffer_size);
+    //     memcpy(hello_slang_buffer1_mapped_[currentImage], buffer0, sizeof(float) * hello_buffer_size);
+    // }
 }
 
 void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
@@ -485,18 +465,13 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     // Execute MATH
 
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hello_slang_pipeline_->get_pipeline());
-    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hello_slang_pipeline_->get_pipeline_layout(),
-        0, 1, &hello_slang_descriptor_sets_[current_frame], 0, nullptr);
-    
-    // vkCmdPushConstants(commandBuffer, hello_slang_pipeline_->get_pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT,
-    //     0, sizeof(ui_push_constant_), &ui_push_constant_);
+    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hello_slang_pipeline_->get_pipeline());
+    // vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hello_slang_pipeline_->get_pipeline_layout(),
+    //     0, 1, &hello_slang_descriptor_sets_[current_frame], 0, nullptr);
 
-    const uint32_t element_count = 1024;
-    const uint32_t group_size = 64;
-	vkCmdDispatch(commandBuffer, (element_count + group_size - 1) / group_size, 1, 1);
+    // const uint32_t element_count = 1024;
+    // const uint32_t group_size = 64;
+	// vkCmdDispatch(commandBuffer, (element_count + group_size - 1) / group_size, 1, 1);
 
     /// -----------------------------------------------------------------------------------------
 
@@ -531,19 +506,19 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     // Draw 3D
 
-    // vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
-    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    // VkBuffer vertex_buffers_3d[] = { scene_3d_.vertex_buffer->buffer };
-    // VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
-    // vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
-    // vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
+    VkBuffer vertex_buffers_3d[] = { scene_3d_.vertex_buffer->buffer };
+    VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
+    vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
 
-    // vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
-    //                         &descriptor_sets_3d_[current_frame], 0, nullptr);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
+                            &descriptor_sets_3d_[current_frame], 0, nullptr);
 
-    // vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
 
