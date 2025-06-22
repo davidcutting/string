@@ -47,12 +47,6 @@ class Window
 {
     class Impl;
     std::experimental::propagate_const<std::unique_ptr<Impl>> impl_;
-
-    WindowProperties properties_;
-    OnKeyCallback key_callback_;
-    OnMouseButtonCallback mouse_button_callback_;
-    OnMouseMoveCallback mouse_move_callback_;
-    OnMouseScrollCallback mouse_scroll_callback_;
 public:
     explicit Window(const WindowConfig& window_config);
     ~Window();
