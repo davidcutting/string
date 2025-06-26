@@ -11,14 +11,14 @@ namespace String
 namespace vku
 {
 
-void load_model(const std::string& model_path, std::vector<Vertex>& vertex_buffer, std::vector<uint32_t>& index_buffer)
+void load_model(const std::filesystem::path& model_path, std::vector<Vertex>& vertex_buffer, std::vector<uint32_t>& index_buffer)
 {
     tinyobj::attrib_t attrib;
     std::vector<tinyobj::shape_t> shapes;
     std::vector<tinyobj::material_t> materials;
     std::string warn, err;
 
-    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, model_path.c_str()))
+    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, model_path.string().c_str()))
     {
         throw std::runtime_error(warn + err);
     }

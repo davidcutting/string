@@ -42,7 +42,7 @@ void Renderer::initialize(const std::shared_ptr<Window>& window)
 
     create_ssbo_buffer();
 
-    const auto resources_path = application_info_.resources_directory;
+    const auto resources_path = std::filesystem::path(application_info_.resources_directory);
 
     createDescriptorSetLayout();
     pipeline_3d_ = std::make_unique<Pipeline3D>(resources_path, device_, descriptor_set_layout_3d_);
@@ -763,7 +763,7 @@ void Renderer::createTextureSampler() {
 void Renderer::createTextureImage() {
     int width, height, channels;
     const auto tex_path = application_info_.resources_directory / std::filesystem::path(TEXTURE_PATH);
-    stbi_uc* pixels = stbi_load(tex_path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+    stbi_uc* pixels = stbi_load(tex_path.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
     VkDeviceSize image_size = width * height * 4;
 
     if (!pixels) {

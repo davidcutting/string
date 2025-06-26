@@ -1,5 +1,6 @@
 #include <vulkan/vulkan_core.h>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string/device.hpp>
 #include <string/vulkan_utils.hpp>

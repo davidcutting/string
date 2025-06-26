@@ -11,12 +11,12 @@ namespace String {
 
 namespace vku {
 
-inline std::vector<char> read_file(const std::string& filename)
+inline std::vector<char> read_file(const std::filesystem::path& filepath)
 {
-    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+    std::ifstream file(filepath, std::ios::ate | std::ios::binary);
 
     if (!file.is_open()) {
-        throw std::runtime_error("Failed to open file: " + filename);
+        throw std::runtime_error("Failed to open file: " + filepath.string());
     }
 
     size_t fileSize = (size_t)file.tellg();
@@ -49,9 +49,9 @@ inline VkShaderModule create_shader_module(const VkDevice& device, const std::ve
     return shaderModule;
 }
 
-inline VkShaderModule load_shader_from_disk(const VkDevice& device, const std::string& filename)
+inline VkShaderModule load_shader_from_disk(const VkDevice& device, const std::filesystem::path& filepath)
 {
-    const auto binary = read_file(filename);
+    const auto binary = read_file(filepath);
     return create_shader_module(device, binary);
 }
 
@@ -66,7 +66,7 @@ inline VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugU
     }
 }
 
-void load_model(const std::string& model_path, std::vector<Vertex>& vertex_buffer, std::vector<uint32_t>& index_buffer);
+void load_model(const std::filesystem::path& model_path, std::vector<Vertex>& vertex_buffer, std::vector<uint32_t>& index_buffer);
 
 inline void DestroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerEXT debugMessenger,
                                           const VkAllocationCallbacks* pAllocator) {

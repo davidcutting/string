@@ -102,7 +102,7 @@ PipelineBuilder::~PipelineBuilder()
         vkDestroyShaderModule(device_->get_device(), fragment_shader_module_, nullptr);
 }
 
-PipelineBuilder& PipelineBuilder::add_compute_shader(const std::string& resource_path)
+PipelineBuilder& PipelineBuilder::add_compute_shader(const std::filesystem::path& resource_path)
 {
     compute_shader_module_ = vku::load_shader_from_disk(device_->get_device(), resource_path);
 
@@ -121,7 +121,7 @@ PipelineBuilder& PipelineBuilder::add_compute_shader(const std::string& resource
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::add_vertex_shader(const std::string& resource_path)
+PipelineBuilder& PipelineBuilder::add_vertex_shader(const std::filesystem::path& resource_path)
 {
     vertex_shader_module_ = vku::load_shader_from_disk(device_->get_device(), resource_path);
 
@@ -140,7 +140,7 @@ PipelineBuilder& PipelineBuilder::add_vertex_shader(const std::string& resource_
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::add_fragment_shader(const std::string& resource_path)
+PipelineBuilder& PipelineBuilder::add_fragment_shader(const std::filesystem::path& resource_path)
 {
     fragment_shader_module_ = vku::load_shader_from_disk(device_->get_device(), resource_path);
 

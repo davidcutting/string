@@ -1,4 +1,5 @@
 #include <string/application.hpp>
+#include <iostream>
 
 int main() {
     String::Application app;

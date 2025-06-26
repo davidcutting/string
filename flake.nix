@@ -21,6 +21,7 @@
             packages = with pkgs; [
               clang-tools
               cmake
+              zig
               pkg-config
               llvm
               lcov

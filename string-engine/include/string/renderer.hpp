@@ -1,13 +1,13 @@
 #pragma once
 
-#include <vulkan/vulkan_core.h>
 #include <memory>
 #include <string/pipelines/pipeline_2d.hpp>
 #include <string/pipelines/pipeline_3d.hpp>
 #include <string/pipelines/pipeline_grid_2d.hpp>
 #include <string/pipelines/hello_slang_pipeline.hpp>
-#define GLFW_INCLUDE_VULKAN
+#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
+#include <vulkan/vulkan.h>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <cstdint>

@@ -36,9 +36,9 @@ public:
     PipelineBuilder& operator=(PipelineBuilder&&) = default;
 
     // Shader stages
-    PipelineBuilder& add_compute_shader(const std::string& resource_path);
-    PipelineBuilder& add_vertex_shader(const std::string& resource_path);
-    PipelineBuilder& add_fragment_shader(const std::string& resource_path);
+    PipelineBuilder& add_compute_shader(const std::filesystem::path& resource_path);
+    PipelineBuilder& add_vertex_shader(const std::filesystem::path& resource_path);
+    PipelineBuilder& add_fragment_shader(const std::filesystem::path& resource_path);
 
     // Pipeline config
     PipelineBuilder& set_vertex_binding(
