@@ -46,8 +46,8 @@ add_project_arguments(release, language : 'cpp')
 include_dir = include_directories('include')
 
 src = [
-    'src/window.cpp',
-    'src/platform.cpp',
+    'src/platform/window.cpp',
+    'src/platform/platform.cpp',
 ]
 
 deps = [
@@ -86,4 +86,29 @@ pkg_mod.generate(
     description : project_description,
     libraries : static_target,
     version : meson.project_version()
+)
+
+project_deps = declare_dependency(
+    include_directories : include_dir,
+    link_with : [ static_target ]
+)
+
+set_variable(meson.project_name() + '_dep', project_deps)
+
+# --------------------------------------------------
+
+# ======
+# Test Exe
+# ======
+
+test_src = [
+    'test/main.cpp',
+]
+
+exe_target = executable(
+    meson.project_name() + '_test',
+    dependencies : project_deps,
+    sources : test_src,
+    install : true,
+    cpp_args : build_args
 )

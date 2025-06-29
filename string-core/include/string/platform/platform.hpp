@@ -1,6 +1,5 @@
 #pragma once
 
-#include <vulkan/vulkan_core.h>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -28,18 +27,26 @@ struct FileWatchEvent
 
 using FileEventCallback = std::function<void(const FileWatchEvent&)>;
 
-struct PlatformConfig
+struct Version
+{
+    uint8_t major;
+    uint8_t minor;
+    uint8_t patch;  
+};
+
+struct PlatformInfo
 {
     std::string application_name = "String Application";
-    uint32_t application_version = VK_MAKE_VERSION(0, 0, 1);
+    Version application_version = { 0, 0, 1 };
 };
 
 class Platform
 {
     class Impl;
-    std::experimental::propagate_const<std::unique_ptr<Impl>> impl_;
+    using impl_t = std::experimental::propagate_const<std::unique_ptr<Impl>>;
+    impl_t impl_;
 public:
-    explicit Platform(const PlatformConfig& platform_config);
+    explicit Platform(const PlatformInfo& platform_info);
     ~Platform();
 
     Platform(const Platform&) = delete;
@@ -47,8 +54,8 @@ public:
     Platform(Platform&&) = delete;
     Platform& operator=(Platform&&) = delete;
     
-    auto create_window(const WindowConfig& config) -> std::unique_ptr<Window>;
-    auto create_device(const DeviceConfig& desc) -> std::unique_ptr<Device>;
+    auto create_window(const WindowInfo& window_info) -> std::unique_ptr<Window>;
+    auto create_device(const DeviceInfo& device_info) -> std::unique_ptr<Device>;
 
     auto read_file(const std::filesystem::path& path) -> std::span<const std::byte>;
     void write_file(const std::filesystem::path& path, const std::span<const std::byte>& data);
