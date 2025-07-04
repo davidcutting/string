@@ -56,8 +56,7 @@ fn build_target(
     exe.addCSourceFiles(.{
         .files = &.{
             "src/main.cpp",
-            "src/platform/window.cpp",
-            "src/platform/platform.cpp",
+            "src/platform.cpp",
         },
         .flags = &.{
             "-std=c++23",
@@ -78,8 +77,8 @@ fn build_target(
                 .files = &.{
                     // "src/sdl_test.cpp",
                     // "src/sdl_test_2.cpp",
-                    "src/platform/impl/sdl_window.cpp",
-                    "src/platform/impl/sdl_platform.cpp",
+                    "src/platform/windows/sdl_window.cpp",
+                    "src/platform/windows/sdl_platform.cpp",
                 },
                 .flags = &.{
                     "-std=c++23",
@@ -98,21 +97,21 @@ fn build_target(
             exe.linkage = .static;
             exe.addCSourceFiles(.{
                 .files = &.{
-                    "src/platform/impl/glfw_window.cpp",
-                    "src/platform/impl/glfw_platform.cpp",
+                    "src/platform/linux/linux_window.cpp",
+                    "src/platform/linux/linux_platform.cpp",
                 },
                 .flags = &.{
                     "-std=c++23",
                 },
             });
-            const glfw_dep = b.dependency("glfw", .{
-                .target = target,
-                .optimize = optimize,
-                .include_src = true,
-                // .x11 = false,
-                .wayland = true,
-            });
-            exe.linkLibrary(glfw_dep.artifact("glfw"));
+            // const glfw_dep = b.dependency("glfw", .{
+            //     .target = target,
+            //     .optimize = optimize,
+            //     .include_src = true,
+            //     // .x11 = false,
+            //     .wayland = true,
+            // });
+            // exe.linkLibrary(glfw_dep.artifact("glfw"));
         },
         else => {
             @panic("Unsupported target!");

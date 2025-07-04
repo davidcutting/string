@@ -24,7 +24,7 @@ struct WindowInfo
 
 class Window
 {
-    class Impl;
+    struct Impl;
     std::unique_ptr<Impl> pimpl_;
     WindowInfo info_;
 public:

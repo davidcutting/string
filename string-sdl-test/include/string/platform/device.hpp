@@ -1,6 +1,6 @@
 #pragma once
 
-namespace String::Platform
+namespace String
 {
 
 struct DeviceInfo
