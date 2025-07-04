@@ -11,7 +11,7 @@ auto main() -> int
     auto platform = String::Platform::Platform();
 
     auto window = platform.create_window({
-        .title = "String SDL Test",
+        .title = "String Test",
         .extent = {800, 600},
         .mode = String::Platform::WindowMode::Windowed,
         .resizable = false,

@@ -4,7 +4,7 @@
 #include <string>
 #include <string/math.hpp>
 
-namespace String::Platform
+namespace String
 {
 
 enum class WindowMode

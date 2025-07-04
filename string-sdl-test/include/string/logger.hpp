@@ -78,8 +78,8 @@ private:
         }
         
         // Print with source location info
-        std::println("[{}] [{}] [{}:{}] {}", 
-                    timestamp, level_str, loc.file_name(), loc.line(), message);
+        std::println("[{}] [{}] {}", 
+                    timestamp, level_str, message);
     }
 
 public:

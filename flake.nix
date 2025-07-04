@@ -22,6 +22,7 @@
               clang-tools
               cmake
               zig
+              zls
               pkg-config
               llvm
               lcov

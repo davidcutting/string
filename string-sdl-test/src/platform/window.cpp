@@ -6,7 +6,7 @@
 #include <string/platform/impl/glfw_window.hpp>
 #endif
 
-namespace String::Platform
+namespace String
 {
 
 Window::Window(const WindowInfo& window_info)
