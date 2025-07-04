@@ -43,5 +43,7 @@ public:
     auto has_focus() const -> bool;
     auto show() -> void;
     auto hide() -> void;
+private:
+    friend class Platform;
 };
 }
