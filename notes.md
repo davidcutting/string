@@ -4,9 +4,13 @@
 
 I am creating a GPU-driven Vulkan 1.3 abstraction layer.
 
-The Instance is effectively the Vulkan context, it is used to select a physical device and create a Device, which is the primary object for Vulkan abstraction. A Device is used by all other components, as it holds the logical device and performs most of the major Vulkan functions.
+I am using C++20 at a minimum, and utilizing modern C++ paradigms. I will be supporting only Linux and Windows. No support for mobile, consoles, or Apple products. I'm using a modern Linux kernel and modern hardware. The build system is in meson.
 
-The swapchain integrates VRR, handles swapchain recreation, and fully encapsulates the presentation Vulkan presentation logic.
+I have the concept of a platform. The window is a WSI abstraction that handles keyboard, mouse, and window events. The window is ultimately part of the platform and is meant to be an abstraction point to allow for support of both Windows and Linux common OS functionalities. Additionally, file IO, networking, and audio is part of the platform. The platform could potentially include Vulkan instance, Vulkan surface, device, and presentation. However, I am open to clearer/better abstractions.
+
+A Device is used by all other components, as it holds the logical device and performs most of the major Vulkan functions.
+
+Presentation integrates VRR, handles swapchain recreation, and fully encapsulates the Vulkan presentation logic.
 
 Swapchain contains its semaphores for timing:
  - Acquire semaphores, one for each frame in flight,
@@ -14,6 +18,8 @@ Swapchain contains its semaphores for timing:
  - Timeline semaphore, used to limit frames in flight.
 
 The correct set of semaphores can be queried with member functions, as they are changed after every acquire call.  
+
+I would like help creating a platform abstraction. Ask any questions you need. How should I do this?
 
 At the highest level, the application interacts with a Scene which is composed of primitives. The scene is used to compose a TaskGraph, which handles various resource dependencies between Tasks. Everything is a Task, even the swapchain presentation is a Task. The TaskGraph is compiled to command buffers using a CommandRecorder.
 
@@ -34,8 +40,6 @@ Overview of TaskGraph workflow:
  - Execute task graph
 
 Task resources, namely TaskBuffer and TaskImage are assigned a bindless index on creation, which is valid for it's entire lifetime.
-
-Additionally, I have the concept of a window and a platform. The window is a WSI abstraction that handles keyboard, mouse, and window events. The window is ultimately part of the platform and is meant to be an abstraction point to allow for support of both Windows and Linux common OS functionalities.
 
 ## Allocator
 

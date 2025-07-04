@@ -46,8 +46,8 @@ add_project_arguments(release, language : 'cpp')
 include_dir = include_directories('include')
 
 src = [
-    'src/platform/window.cpp',
-    'src/platform/platform.cpp',
+    #'src/platform/window.cpp',
+    #'src/platform/platform.cpp',
 ]
 
 deps = [
@@ -101,14 +101,26 @@ set_variable(meson.project_name() + '_dep', project_deps)
 # Test Exe
 # ======
 
-test_src = [
-    'test/main.cpp',
+#render_test_src = [
+#    'test/render_test.cpp',
+#]
+#
+#render_test = executable(
+#    meson.project_name() + '_render_test',
+#    dependencies : project_deps,
+#    sources : render_test_src,
+#    install : true,
+#    cpp_args : build_args
+#)
+
+net_test_src = [
+    'test/net_test.cpp',
 ]
 
-exe_target = executable(
-    meson.project_name() + '_test',
+net_test = executable(
+    meson.project_name() + '_net_test',
     dependencies : project_deps,
-    sources : test_src,
+    sources : net_test_src,
     install : true,
     cpp_args : build_args
 )
