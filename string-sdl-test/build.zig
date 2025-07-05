@@ -55,7 +55,7 @@ fn build_target(
     });
     exe.addCSourceFiles(.{
         .files = &.{
-            "src/main.cpp",
+            // "src/main.cpp",
             "src/platform.cpp",
         },
         .flags = &.{
@@ -76,7 +76,7 @@ fn build_target(
             exe.addCSourceFiles(.{
                 .files = &.{
                     // "src/sdl_test.cpp",
-                    // "src/sdl_test_2.cpp",
+                    "src/sdl_test_2.cpp",
                     "src/platform/windows/sdl_window.cpp",
                     "src/platform/windows/sdl_platform.cpp",
                 },
@@ -97,6 +97,7 @@ fn build_target(
             exe.linkage = .static;
             exe.addCSourceFiles(.{
                 .files = &.{
+                    "src/wayland_test.cpp",
                     "src/platform/linux/linux_window.cpp",
                     "src/platform/linux/linux_platform.cpp",
                 },
@@ -104,14 +105,40 @@ fn build_target(
                     "-std=c++23",
                 },
             });
-            // const glfw_dep = b.dependency("glfw", .{
-            //     .target = target,
-            //     .optimize = optimize,
-            //     .include_src = true,
-            //     // .x11 = false,
-            //     .wayland = true,
-            // });
-            // exe.linkLibrary(glfw_dep.artifact("glfw"));
+
+            const wayland_protocols_dep = b.dependency("wayland_protocols", .{
+                .target = target,
+                .optimize = optimize,
+            });
+            const wayland_dep = b.dependency("wayland", .{
+                .target = target,
+                .optimize = optimize,
+            });
+            const wayland_client = wayland_dep.artifact("wayland-client");
+            exe.linkLibrary(wayland_client);
+
+            const scanner = wayland_dep.artifact("wayland-scanner");
+            const xdg_xml = wayland_protocols_dep.path("stable/xdg-shell/xdg-shell.xml");
+
+            // Create header
+            const gen_header = b.addRunArtifact(scanner);
+            gen_header.addArgs(&.{"client-header"});
+            gen_header.addFileArg(xdg_xml);
+            const xdg_header = gen_header.addOutputFileArg("xdg-shell-client-protocol.h");
+            b.default_step.dependOn(&gen_header.step);
+
+            // Create source
+            const gen_source = b.addRunArtifact(scanner);
+            gen_source.addArgs(&.{"private-code"});
+            gen_source.addFileArg(xdg_xml);
+            const xdg_source = gen_source.addOutputFileArg("xdg-shell-protocol.c");
+            b.default_step.dependOn(&gen_source.step);
+
+            exe.addIncludePath(xdg_header.dirname());
+            exe.addCSourceFile(.{
+                .file = xdg_source,
+                .flags = &.{},
+            });
         },
         else => {
             @panic("Unsupported target!");
