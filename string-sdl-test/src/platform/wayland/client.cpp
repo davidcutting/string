@@ -6,19 +6,29 @@
 #include <string_view>
 #include "string/platform/wayland/presenter.hpp"
 #include "string/platform/wayland/window.hpp"
+#include "wayland-client-protocol.h"
 
 static void wl_registry_global(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version)
 {
     auto* self = static_cast<wl::client*>(data);
     const auto interface_name = std::string_view(interface);
     if (interface_name == wl_compositor_interface.name)
+    {
         self->compositor = static_cast<wl_compositor*>(wl_registry_bind(registry, name, &wl_compositor_interface, 4));
+    }
     else if (interface_name == wl_shm_interface.name)
+    {
         self->shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
+    }
     else if (interface_name == xdg_wm_base_interface.name)
     {
         self->xdg_wm_base = static_cast<struct xdg_wm_base*>(wl_registry_bind(registry, name, &xdg_wm_base_interface, 1));
         xdg_wm_base_add_listener(self->xdg_wm_base, &self->xdg_wm_base_listener, self);
+    }
+    else if (interface_name == wl_seat_interface.name)
+    {
+        // self->seat = static_cast<struct wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, 1));
+        // wl_seat_add_listener(self->seat, &self->wl_seat_listener, self);
     }
 }
 
@@ -43,6 +53,7 @@ client::client()
 ,   xdg_wm_base_listener{
         .ping = xdg_wm_base_ping,
     }
+,   wl_seat_listener{}
 {
     STRING_LOG_DEBUG("Connecting to display...");
 

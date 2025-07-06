@@ -5,12 +5,24 @@
 #include <stdexcept>
 #include <span>
 #include <cstring>
+#include <thread>
+
+static void frame_ready_callback(void* data, wl_callback* cb, uint32_t)
+{
+    auto* self = static_cast<wl::presenter*>(data);
+    self->frame_ready = true;
+    wl_callback_destroy(cb);
+    self->frame_callback = nullptr;
+}
 
 namespace wl
 {
 
 presenter::presenter(wl_shm* shm, wl_surface* surface, uint32_t width, uint32_t height)
 : shm(shm), surface(surface), width_(width), height_(height)
+, frame_ready_listener{
+    .done = frame_ready_callback,
+}
 {
     stride_ = width_ * 4; // ARGB8888
     buffer_size_ = stride_ * height_;
@@ -93,11 +105,14 @@ void presenter::present()
 {
     shm_buffer& buf = buffers[current_index];
 
-    buf.in_flight = true;
-
     wl_surface_attach(surface, buf.wl_buffer, 0, 0);
     wl_surface_damage_buffer(surface, 0, 0, width_, height_);
     wl_surface_commit(surface);
+
+    // frame_callback = wl_surface_frame(surface);
+    // wl_callback_add_listener(frame_callback, &frame_ready_listener, this);
+
+    // frame_ready = false;
 
     // Flip buffer
     current_index = (current_index + 1) % 2;
