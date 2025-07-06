@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
         .cpu_arch = .x86_64,
         .os_tag = .linux,
         .abi = .musl,
+        .cpu_model = .baseline,
     });
     const windows_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
@@ -52,6 +53,9 @@ fn build_target(
         }),
         .name = name,
         .optimize = optimize,
+        .pic = true,
+        .strip = true,
+        .linkage = .static,
     });
     exe.addCSourceFiles(.{
         .files = &.{
@@ -94,10 +98,12 @@ fn build_target(
             exe.linkLibrary(sdl_dep.artifact("SDL3"));
         },
         .linux => {
-            exe.linkage = .static;
             exe.addCSourceFiles(.{
                 .files = &.{
                     "src/wayland_test.cpp",
+                    "src/platform/wayland/client.cpp",
+                    "src/platform/wayland/window.cpp",
+                    "src/platform/wayland/presenter.cpp",
                     "src/platform/linux/linux_window.cpp",
                     "src/platform/linux/linux_platform.cpp",
                 },

@@ -8,6 +8,8 @@
 #include <time.h>
 #include <unistd.h>
 
+namespace
+{
 static void randname(char *buf) {
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
@@ -35,6 +37,8 @@ static int anonymous_shm_open(void) {
 	} while (retries > 0 && errno == EEXIST);
 
 	return -1;
+}
+
 }
 
 inline int create_shm_file(off_t size) {
