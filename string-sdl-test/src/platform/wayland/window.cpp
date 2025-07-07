@@ -14,7 +14,12 @@ static void xdg_surface_configure(void* data, xdg_surface* surface, uint32_t ser
 
 static void xdg_toplevel_configure(void* data, xdg_toplevel* toplevel, int32_t width, int32_t height, wl_array*)
 {
-
+    auto* self = static_cast<wl::window*>(data);
+    if (self->width != width || self->height != height)
+    {
+        if (self->resize_callback)
+            std::invoke(self->resize_callback, width, height);
+    }
 }
 
 static void xdg_toplevel_close(void* data, xdg_toplevel* toplevel)
@@ -68,6 +73,21 @@ bool window::is_configured() const
 bool window::should_close() const
 {
     return !open;
+}
+
+void window::close()
+{
+    open = false;
+}
+
+auto window::get_surface() const -> struct wl_surface*
+{
+    return wl_surface;
+}
+
+auto window::get_xdg_surface() const -> struct xdg_surface*
+{
+    return xdg_surface;
 }
 
 };

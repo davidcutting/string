@@ -33,7 +33,7 @@ int main(int argc, char *argv[])
     STRING_LOG_INFO("Shutting down...");
 
     delete presenter;
-    delete window;
+    client.delete_window(window);
 
     return EXIT_SUCCESS;
 }

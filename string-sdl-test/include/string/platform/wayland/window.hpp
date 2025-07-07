@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <functional>
+#include "wayland-client-protocol.h"
 
 
 static void xdg_surface_configure(void* data, xdg_surface* surface, uint32_t serial);
@@ -40,6 +41,9 @@ public:
 
     bool is_configured() const;
     bool should_close() const;
+    void close();
+    auto get_surface() const -> struct wl_surface*;
+    auto get_xdg_surface() const -> struct xdg_surface*;
 
 private:
     friend class client;
