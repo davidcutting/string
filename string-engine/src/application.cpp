@@ -1,10 +1,10 @@
 #include <string/application.hpp>
+#include <thread>
 
 namespace String {
 
-void Application::initialize(const ApplicationInfo& info) {
-    String::Logger::initialize();
-
+void Application::initialize(const ApplicationInfo& info)
+{
     window_ = std::make_shared<Window>(Window::Properties{.title = info.application_name, .extent = {800, 800}});
     renderer_ = std::make_unique<Renderer>(info);
     renderer_->initialize(window_);

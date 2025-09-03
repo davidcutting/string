@@ -52,7 +52,10 @@
               wayland
               linuxPackages_latest.perf
             ];
-            shellHook = "export LD_LIBRARY_PATH=${pkgs.wayland}/lib:$LD_LIBRARY_PATH";
+            shellHook = ''
+            export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib:${pkgs.wayland}/lib:$LD_LIBRARY_PATH"
+            export VK_LAYER_PATH="${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d"
+            '';
           };
         };
       };

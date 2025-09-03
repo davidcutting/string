@@ -60,19 +60,18 @@ include_dir = include_directories('include')
 
 src = [
     'src/application.cpp',
-    'src/renderer.cpp',
     'src/window.cpp',
-    'src/device.cpp',
-    'src/allocator.cpp',
-    'src/swapchain.cpp',
-    'src/vulkan_utils.cpp',
-    'src/pipeline_builder.cpp',
-    'src/pipelines/pipeline_2d.cpp',
-    'src/pipelines/pipeline_3d.cpp',
-    'src/pipelines/pipeline_grid_2d.cpp',
-    'src/pipelines/pipeline_grid_3d.cpp',
-    'src/pipelines/hello_slang_pipeline.cpp',
-    'src/core/logger.cpp',
+    'src/vulkan/renderer.cpp',
+    'src/vulkan/device.cpp',
+    'src/vulkan/allocator.cpp',
+    'src/vulkan/swapchain.cpp',
+    'src/vulkan/vulkan_utils.cpp',
+    'src/vulkan/pipeline_builder.cpp',
+    'src/vulkan/pipelines/pipeline_2d.cpp',
+    'src/vulkan/pipelines/pipeline_3d.cpp',
+    'src/vulkan/pipelines/pipeline_grid_2d.cpp',
+    'src/vulkan/pipelines/pipeline_grid_3d.cpp',
+    'src/vulkan/pipelines/hello_slang_pipeline.cpp',
 ]
 
 static_target = static_library(

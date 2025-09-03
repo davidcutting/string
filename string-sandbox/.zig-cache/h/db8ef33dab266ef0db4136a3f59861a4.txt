@@ -1,3 +1,0 @@
-0
-107621 34612670 1748482915103685509 642170c670d95f3276a2fbd67c87e541 0 /home/dcutting/code/cpp/string/string-engine/include/string/core/tiny_obj_loader.h
-283010 34612669 1748482915103685509 da0de4b77a864a92ca0a84752ae64a25 0 /home/dcutting/code/cpp/string/string-engine/include/string/core/stb_image.h

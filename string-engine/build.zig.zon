@@ -5,21 +5,41 @@
     .minimum_zig_version = "0.14.1",
 
     .dependencies = .{
-        .spdlog = .{
-            .url = "https://github.com/gabime/spdlog/archive/refs/tags/v1.15.3.tar.gz",
-            .hash = "N-V-__8AAJQ8EgDzeZlwEXLTaVfJv-mmsc5kVpvmDQ7wy3Y6",
+        .compile_commands = .{
+            .url = "https://github.com/the-argus/zig-compile-commands/archive/refs/heads/main.zip",
+            .hash = "N-V-__8AAFbOAADWdt__Qs3GpRdZiQ5hGxc2AQyI_k4BEjC8",
         },
-        .vulkan_vma = .{
-            .url = "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.3.0.tar.gz",
-            .hash = "N-V-__8AAIutPgABk6NlXZhlJ5P8qVECvakZIKoO94h7xUOw",
+        .sdl = .{
+            .url = "git+https://github.com/castholm/SDL.git#3ed62e53aecd9ffb28e44b9d35b7c09a8739e823",
+            .hash = "sdl-0.2.4+3.2.16-7uIn9DPhfgH29yAIJqHLc69hNb4IW0q-AngtKCFoT92b",
         },
         .glfw3 = .{
-            .url = "https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz",
-            .hash = "N-V-__8AAL40TADEbrysYHBl-UIZO4KiG4chP8pLDVDINGH4",
+            .url = "git+https://github.com/allyourcodebase/glfw.git#98607df9bce062c7fd837d58fafa06dae22edb04",
+            .hash = "glfw-0.0.0-R5AeUm0HGgA_Rlrr9HR91ejkGd-K_JyCjkXz_U3b-jp9",
+        },
+        .wayland = .{
+            .url = "git+https://github.com/allyourcodebase/wayland.git#9781e2dd79cfce291cbeec65b8fb3d8408506165",
+            .hash = "wayland-1.23.1-4-dxEBa1ZlAAC22FC0nGgyz8MIL8C-zNP2fQ2x4AvfsAJk",
+        },
+        .wayland_protocols = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/archive/1.45/wayland-protocols-1.45.tar.gz",
+            .hash = "N-V-__8AAIKCDgBX6hRMzFmvC-WAwrOH_ewvZgAzPGbBvavk",
+        },
+        .entt = .{
+            .url = "https://github.com/skypjack/entt/archive/refs/tags/v3.15.0.tar.gz",
+            .hash = "N-V-__8AAG6PVwB95XiI_kBMCQw5cBCpwzTcAO07r883Btuc",
         },
         .vulkan_headers = .{
             .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.319.tar.gz",
             .hash = "N-V-__8AAGKQBwIWKQOO6vWM_mykZmlSotugX1DoZ4wmwU2L",
+        },
+        .volk = .{
+            .url = "https://github.com/zeux/volk/archive/refs/tags/1.4.304.tar.gz",
+            .hash = "N-V-__8AAM6ZBgBIXgvAA8c_vDecqpmN19205AyaaSjzENaf",
+        },
+        .vulkan_vma = .{
+            .url = "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.3.0.tar.gz",
+            .hash = "N-V-__8AAIutPgABk6NlXZhlJ5P8qVECvakZIKoO94h7xUOw",
         },
     },
 
