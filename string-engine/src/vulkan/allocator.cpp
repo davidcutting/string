@@ -1,6 +1,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string/vulkan/allocator.hpp>
+#include "vulkan/vulkan_core.h"
 
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
@@ -74,7 +75,7 @@ std::unique_ptr<Buffer> Allocator::create_buffer(const VkDeviceSize& buffer_size
     buffer_data->buffer_size = buffer_size;
 
     if (result != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create vertex buffer with VMA");
+        throw std::runtime_error("Failed to create buffer with VMA");
     }
 
     return buffer_data;
@@ -122,7 +123,7 @@ std::unique_ptr<Image> Allocator::create_image(const uint32_t& width, const uint
     );
 
     if (result != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create vertex buffer with VMA");
+        throw std::runtime_error("Failed to create image with VMA");
     }
 
     return image_data;
@@ -130,13 +131,22 @@ std::unique_ptr<Image> Allocator::create_image(const uint32_t& width, const uint
 
 void Allocator::destroy_buffer(std::unique_ptr<Buffer>& buffer)
 {
-    vmaDestroyBuffer(allocator_, buffer->buffer, buffer->allocation);
+    if (!buffer) return;
+    if (buffer->buffer != VK_NULL_HANDLE)
+    {
+        vmaDestroyBuffer(allocator_, buffer->buffer, buffer->allocation);
+    }
     buffer.reset();
 }
 
 void Allocator::destroy_image(std::unique_ptr<Image>& image)
 {
-    vmaDestroyImage(allocator_, image->image, image->allocation);
+    if (!image) return;
+    if (image->image != VK_NULL_HANDLE)
+    {
+        vmaDestroyImage(allocator_, image->image, image->allocation);
+    }
+    image.reset();
 }
 
 std::unique_ptr<Buffer> Allocator::create_vertex_buffer(const VkDeviceSize& buffer_size)

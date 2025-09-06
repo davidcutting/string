@@ -1,10 +1,13 @@
 #pragma once
 
 #include <memory>
+#include <string/vulkan/frame.hpp>
 #include <string/vulkan/pipelines/pipeline_2d.hpp>
 #include <string/vulkan/pipelines/pipeline_3d.hpp>
 #include <string/vulkan/pipelines/pipeline_grid_2d.hpp>
 #include <string/vulkan/pipelines/hello_slang_pipeline.hpp>
+#include <string/vulkan/command_recorder.hpp>
+#include "string/vulkan/queue.hpp"
 
 #include <volk.h>
 
@@ -98,6 +101,16 @@ private:
     std::shared_ptr<Window> window_;
     std::shared_ptr<Device> device_;
     std::unique_ptr<Swapchain> swap_chain_;
+    Queue graphics_queue_;
+    Queue present_queue_;
+    Queue compute_queue_;
+    // Queue transfer_queue_;
+
+    std::vector<Frame> frames;
+    uint32_t swap_chain_image_count_{2};
+    uint32_t current_frame = 0;
+
+    std::unique_ptr<CommandRecorder> transfer_command_recorder_;
 
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
@@ -132,7 +145,6 @@ private:
     std::unique_ptr<HelloSlangPipeline> hello_slang_pipeline_;
 
     VkDescriptorPool descriptorPool;
-    VkCommandPool commandPool;
 
     std::unique_ptr<Image> depth_image_;
     VkImageView depthImageView;
@@ -141,17 +153,10 @@ private:
     VkImageView textureImageView;
     VkSampler textureSampler;
 
-    std::vector<VkCommandBuffer> commandBuffers;
     std::vector<VkDescriptorSet> descriptor_sets_3d_;
     std::vector<VkDescriptorSet> ui_descriptor_sets_;
     std::vector<VkDescriptorSet> hello_slang_descriptor_sets_;
     std::vector<VkDescriptorSet> grid_2d_descriptor_sets_;
-
-    uint32_t swap_chain_image_count_{2};
-    uint32_t current_frame = 0;
-    std::vector<VkFence> frame_in_flight_fences_;
-    std::vector<VkSemaphore> image_available_semaphores_;
-    std::vector<VkSemaphore> render_complete_semaphores_;
 
     bool framebufferResized = false;
 
@@ -162,8 +167,6 @@ private:
     void recreateSwapChain();
 
     void createDescriptorSetLayout();
-
-    void createCommandPool();
 
     void createDepthResources();
 
@@ -198,13 +201,11 @@ private:
 
     VkCommandBuffer beginSingleTimeCommands();
 
-    void endSingleTimeCommands(VkCommandBuffer commandBuffer);
+    void endSingleTimeCommands();
 
     void copy_buffer(const Buffer* src, const Buffer* dest);
 
-    void createCommandBuffers();
-
-    void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex);
+    void recordCommandBuffer(Frame& frame);
 
     void createSyncObjects();
 

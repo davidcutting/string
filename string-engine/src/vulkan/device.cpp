@@ -3,6 +3,10 @@
 #include <stdexcept>
 #include <string/vulkan/device.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
+#include <string/vulkan/command_recorder.hpp>
+#include <string/core/logger.hpp>
+#include "string/vulkan/queue.hpp"
+#include "vulkan/vulkan_core.h"
 
 #include <volk.h>
 
@@ -42,7 +46,7 @@ void Device::create_instance(const ApplicationInfo& info)
     }
 
     if (ENABLE_VALIDATION_LAYERS && !are_validation_layer_supported()) {
-        throw std::runtime_error("validation layers requested, but not available!");
+        throw std::runtime_error("Validation layers requested, but not available!");
     }
 
     // clang-format off
@@ -226,7 +230,11 @@ void Device::create_logical_device()
     QueueFamilyIndices indices = get_queue_families(physical_device_);
 
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-    std::set<uint32_t> uniqueQueueFamilies = {indices.graphics_family.value(), indices.present_family.value()};
+    std::set<uint32_t> uniqueQueueFamilies = {
+        indices.graphics_family.value(),
+        indices.compute_family.value(),
+        indices.present_family.value()
+    };
 
     float queuePriority = 1.0f;
     for (uint32_t queueFamily : uniqueQueueFamilies) {
@@ -296,9 +304,6 @@ void Device::create_logical_device()
     }
 
     volkLoadDevice(device_);
-
-    vkGetDeviceQueue(device_, indices.graphics_family.value(), 0, &graphics_queue_);
-    vkGetDeviceQueue(device_, indices.present_family.value(), 0, &present_queue_);
 }
 
 SwapChainSupportDetails Device::get_swap_chain_support(const VkPhysicalDevice& physical_device)
@@ -341,24 +346,37 @@ QueueFamilyIndices Device::get_queue_families(const VkPhysicalDevice& physical_d
     std::vector<VkQueueFamilyProperties> queueFamilies(queue_family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, queueFamilies.data());
 
-    int i = 0;
-    for (const auto& queueFamily : queueFamilies) {
-        if (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+    // Track best candidate for transfer queue
+    std::optional<uint32_t> dedicated_transfer;
+
+    for (uint32_t i = 0; i < queue_family_count; i++)
+    {
+        const auto& queueFamily = queueFamilies[i];
+
+        if (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT)
+        {
             indices.graphics_family = i;
         }
+        if ((queueFamily.queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            !(queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT))
+        {
+            indices.compute_family = i;
+        }
 
+        // Check if this is a dedicated transfer queue
+        if ((queueFamily.queueFlags & VK_QUEUE_TRANSFER_BIT) &&
+            !(queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+            !(queueFamily.queueFlags & VK_QUEUE_COMPUTE_BIT))
+        {
+            indices.transfer_family = i;
+        }
+
+        // Present support
         VkBool32 presentSupport = false;
         vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, i, surface_, &presentSupport);
-
         if (presentSupport) {
             indices.present_family = i;
         }
-
-        if (indices.can_render()) {
-            break;
-        }
-
-        i++;
     }
 
     return indices;
@@ -420,29 +438,82 @@ VkFormat Device::get_depth_format() {
     // clang-format on
 }
 
+auto Device::create_command_recorder(const QueueType& queue_type) -> std::unique_ptr<CommandRecorder>
+{
+    // return std::move(std::make_unique<CommandRecorder>(device_, get_queue_families(), queue_type));
+}
+
 VkSurfaceKHR Device::get_surface() const
 {
     return surface_;
 }
 
-VkDevice Device::get_device() const
+VkDevice& Device::get_device()
 {
     return device_;
 }
 
-VkQueue Device::get_graphics_queue() const
+auto Device::get_queue(const QueueType& type) -> Queue
 {
-    return graphics_queue_;
-}
+    QueueFamilyIndices indices = get_queue_families();
 
-VkQueue Device::get_present_queue() const
-{
-    return present_queue_;
-}
+    Queue queue = {
+        .queue_family_index = 0,
+        .type = type,
+        .queue = VK_NULL_HANDLE,
+    };
 
-VkQueue Device::get_compute_queue() const
-{
-    return compute_queue_;
+    switch (type)
+    {
+        case QueueType::GRAPHICS:
+        {
+            if (indices.graphics_family.has_value())
+            {
+                STRING_LOG_DEBUG("Creating graphics queue.");
+                queue.queue_family_index = indices.graphics_family.value();
+                vkGetDeviceQueue(device_, queue.queue_family_index, 0, &queue.queue);
+                return std::move(queue);
+            }
+            break;
+        }
+        case QueueType::COMPUTE:
+        {
+            if (indices.compute_family.has_value())
+            {
+                STRING_LOG_DEBUG("Creating compute queue.");
+                queue.queue_family_index = indices.compute_family.value();
+                vkGetDeviceQueue(device_, queue.queue_family_index, 0, &queue.queue);
+                return std::move(queue);
+            }
+            break;
+        }
+        case QueueType::TRANSFER:
+        {
+            if (indices.transfer_family.has_value())
+            {
+                STRING_LOG_DEBUG("Creating transfer queue.");
+                queue.queue_family_index = indices.transfer_family.value();
+                vkGetDeviceQueue(device_, queue.queue_family_index, 0, &queue.queue);
+                return std::move(queue);
+            }
+            break;
+        }
+        case QueueType::PRESENT:
+        {
+            if (indices.present_family.has_value())
+            {
+                STRING_LOG_DEBUG("Creating present queue.");
+                queue.queue_family_index = indices.present_family.value();
+                vkGetDeviceQueue(device_, queue.queue_family_index, 0, &queue.queue);
+                return std::move(queue);
+            }
+            break;
+        }
+        default:
+            throw std::runtime_error("Attempt to get queue type which is not supported!");   
+    }
+
+    throw std::runtime_error("Failed to get queue!");
 }
 
 Allocator& Device::get_allocator() const

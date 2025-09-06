@@ -1,20 +1,22 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <memory>
 #include <vector>
 #include <string/platform/window.hpp>
 #include <string/vulkan/allocator.hpp>
 #include <string/core/app_info.hpp>
+#include <string/core/platform_detection.hpp>
+#include <string/vulkan/command_recorder.hpp>
+#include <string/vulkan/queue.hpp>
 
 #include <volk.h>
 
-// #ifdef NDEBUG
-// static constexpr bool ENABLE_VALIDATION_LAYERS = false;
-// #else
+#ifdef STRING_RELEASE
+static constexpr bool ENABLE_VALIDATION_LAYERS = false;
+#else
 static constexpr bool ENABLE_VALIDATION_LAYERS = true;
-// #endif
+#endif
 
 namespace String
 {
@@ -22,15 +24,6 @@ struct SwapChainSupportDetails {
     VkSurfaceCapabilitiesKHR capabilities;
     std::vector<VkSurfaceFormatKHR> formats;
     std::vector<VkPresentModeKHR> presentModes;
-};
-
-struct QueueFamilyIndices {
-    std::optional<uint32_t> graphics_family;
-    std::optional<uint32_t> present_family;
-    std::optional<uint32_t> compute_family;
-
-    bool can_render() { return graphics_family.has_value() && present_family.has_value(); }
-    bool has_compute() { return compute_family.has_value(); }
 };
 
 class Device
@@ -47,11 +40,11 @@ public:
     QueueFamilyIndices get_queue_families();
 
     VkSurfaceKHR get_surface() const;
-    VkDevice get_device() const;
-    VkQueue get_graphics_queue() const;
-    VkQueue get_present_queue() const;
-    VkQueue get_compute_queue() const;
-    Allocator& get_allocator() const;
+    VkDevice& get_device();
+    auto get_queue(const QueueType& type) -> Queue;
+    auto get_allocator() const -> Allocator&;
+
+    auto create_command_recorder(const QueueType& queue_type) -> std::unique_ptr<CommandRecorder>;
 
 private:
     std::shared_ptr<Window> window_;
@@ -61,9 +54,6 @@ private:
     VkSurfaceKHR surface_{VK_NULL_HANDLE};
     VkPhysicalDevice physical_device_{VK_NULL_HANDLE};
     VkDevice device_{VK_NULL_HANDLE};
-    VkQueue graphics_queue_{VK_NULL_HANDLE};
-    VkQueue present_queue_{VK_NULL_HANDLE};
-    VkQueue compute_queue_{VK_NULL_HANDLE};
 
     void create_instance(const ApplicationInfo& info);
     void setup_debug_messenger();
@@ -75,7 +65,6 @@ private:
     SwapChainSupportDetails get_swap_chain_support(const VkPhysicalDevice& physical_device);
     bool check_device_extension_support(const VkPhysicalDevice& device);
     bool is_device_suitable(const VkPhysicalDevice& physical_device);
-    std::vector<const char*> get_glfw_extensions();
     bool are_validation_layer_supported();
 
     const std::vector<const char*> validation_layers = {"VK_LAYER_KHRONOS_validation"};

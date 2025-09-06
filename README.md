@@ -19,11 +19,11 @@ My priorities follow:
 A disclaimer; I see this as an experiment and I'm not an expert so implementation may be naive. I am more than happy to review pull requests, but expect I may be picky.
 
 ## Platforms and Versions
-| Operating System  | Library (version) | Supported     |
-| :---------------- | :---------------: | :-----------: |
-| Linux 64-bit      | Vulkan (1.3)      | Yes           |
-| Windows 64-bit    | Vulkan (1.3)      | No            |
-| Mac 64-bit        | Metal/MoltenVK    | No            |
+| Operating System  | Library (version) | Supported | Stability    |
+| :---------------- | :---------------: | :-------: | :----------: |
+| Linux 64-bit      | Vulkan (1.3)      | Yes       | Experimental |
+| Windows 64-bit    | Vulkan (1.3)      | Yes       | Experimental |
+| Mac 64-bit        | Metal/MoltenVK    | No        | Non-existent |
 
 ## Dependencies
 

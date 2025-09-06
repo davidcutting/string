@@ -9,6 +9,10 @@
 #include <string/vulkan/pipelines/pipeline_2d.hpp>
 #include <string/vulkan/render_data.hpp>
 #include "glm/fwd.hpp"
+#include <string/core/platform_detection.hpp>
+#include <string/core/logger.hpp>
+#include <string/vulkan/command_recorder.hpp>
+#include <string/vulkan/queue.hpp>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <string/core/stb_image.h>
@@ -19,16 +23,20 @@
 #define VOLK_IMPLEMENTATION
 #include <volk.h>
 
-namespace String {
+namespace String
+{
 
 Renderer::Renderer(const ApplicationInfo& application_info)
 : application_info_(application_info)
 {
+    STRING_LOG_DEBUG("Constructing renderer...");
     // constructor
 }
 
 void Renderer::initialize(const std::shared_ptr<Window>& window)
 {
+    STRING_LOG_DEBUG("Initializing renderer...");
+
     // Window
     window->register_resize_event_callback(
         std::bind(&Renderer::framebuffer_resize_callback, this, std::placeholders::_1));
@@ -40,6 +48,12 @@ void Renderer::initialize(const std::shared_ptr<Window>& window)
         .width = window->get_properties().extent.width,
         .height = window->get_properties().extent.height
     };
+
+    graphics_queue_ = device_->get_queue(QueueType::GRAPHICS);
+    present_queue_ = device_->get_queue(QueueType::PRESENT);
+    compute_queue_ = device_->get_queue(QueueType::COMPUTE);
+    // transfer_queue_ = device_->get_queue(QueueType::TRANSFER);
+
     swap_chain_ = std::make_unique<Swapchain>(device_, extent);
     swap_chain_image_count_ = swap_chain_->get_swap_chain_image_count();
 
@@ -66,7 +80,21 @@ void Renderer::initialize(const std::shared_ptr<Window>& window)
 
     hello_slang_pipeline_ = std::make_unique<HelloSlangPipeline>(resources_path, device_, hello_slang_descriptor_set_layout_);
 
-    createCommandPool();
+    // Create frame local stuff
+    STRING_LOG_DEBUG("swap_chain_image_count_: {}",  swap_chain_image_count_);
+    for (uint32_t frame_index = 0; frame_index < swap_chain_image_count_; ++frame_index)
+    {
+        Frame frame = {
+            .graphics_command_recorder = std::move(std::make_unique<CommandRecorder>(device_->get_device(), graphics_queue_)),
+            .compute_command_recorder = std::move(std::make_unique<CommandRecorder>(device_->get_device(), compute_queue_)),
+        };
+        frames.emplace_back(std::move(frame));
+        STRING_LOG_DEBUG("Adding frame: {}",  frame_index);
+    }
+    STRING_LOG_DEBUG("frames size: {}", frames.size());
+
+    transfer_command_recorder_ = std::make_unique<CommandRecorder>(device_->get_device(),
+                                                                   graphics_queue_);
     createDepthResources();
 
     createTextureImage();
@@ -79,7 +107,6 @@ void Renderer::initialize(const std::shared_ptr<Window>& window)
 
     createDescriptorPool();
     createDescriptorSets();
-    createCommandBuffers();
     createSyncObjects();
 }
 
@@ -136,14 +163,14 @@ void Renderer::cleanup() {
     device_->get_allocator().destroy_buffer(scene_3d_.index_buffer);
     device_->get_allocator().destroy_buffer(scene_3d_.vertex_buffer);
 
-    for (size_t i = 0; i < swap_chain_image_count_; ++i)
+    for (const auto& frame : frames)
     {
-        vkDestroySemaphore(device_->get_device(), render_complete_semaphores_[i], nullptr);
-        vkDestroySemaphore(device_->get_device(), image_available_semaphores_[i], nullptr);
-        vkDestroyFence(device_->get_device(), frame_in_flight_fences_[i], nullptr);
+        vkDestroySemaphore(device_->get_device(), frame.render_complete_semaphore, nullptr);
+        vkDestroySemaphore(device_->get_device(), frame.image_available_semaphore, nullptr);
+        vkDestroyFence(device_->get_device(), frame.in_flight_fence, nullptr);
     }
 
-    vkDestroyCommandPool(device_->get_device(), commandPool, nullptr);
+    transfer_command_recorder_.reset();
 
     device_.reset();
 }
@@ -153,10 +180,16 @@ void Renderer::update()
     drawFrame();
 }
 
-void Renderer::drawFrame() {
-    vkWaitForFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame], VK_TRUE, UINT64_MAX);
+void Renderer::drawFrame()
+{
+    // STRING_LOG_DEBUG("Drawing frame...");
+    // STRING_LOG_DEBUG("Current frame: {}", current_frame);
+    vkWaitForFences(device_->get_device(), 1, &frames[current_frame].in_flight_fence, VK_TRUE, UINT64_MAX);
 
-    auto[result, image_index] = swap_chain_->acquire_next_frame(image_available_semaphores_[current_frame]);
+    auto[result, image_index] = swap_chain_->acquire_next_frame(frames[current_frame].image_available_semaphore);
+    frames[current_frame].swapchain_image_index = image_index;
+
+    // STRING_LOG_DEBUG("Got swapchain image at: {}", image_index);
 
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         recreateSwapChain();
@@ -165,17 +198,22 @@ void Renderer::drawFrame() {
         throw std::runtime_error("failed to acquire swap chain image!");
     }
 
-    updateUniformBuffer(current_frame);
-    vkResetFences(device_->get_device(), 1, &frame_in_flight_fences_[current_frame]);
+    auto& frame = frames[current_frame];
 
-    vkResetCommandBuffer(commandBuffers[current_frame], 0);
-    recordCommandBuffer(commandBuffers[current_frame], image_index);
+    updateUniformBuffer(current_frame);
+    vkResetFences(device_->get_device(), 1, &frames[current_frame].in_flight_fence);
+
+    frame.graphics_command_recorder->reset();
+    frame.compute_command_recorder->reset();
+    // transfer_command_recorder_->reset();
+
+    recordCommandBuffer(frame);
 
     const VkSemaphoreSubmitInfo wait_semaphore_infos[] = {
         {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .pNext = nullptr,
-            .semaphore = image_available_semaphores_[current_frame],
+            .semaphore = frames[current_frame].image_available_semaphore,
             .value = 0,
             .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             .deviceIndex = 0
@@ -186,7 +224,7 @@ void Renderer::drawFrame() {
         {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .pNext = nullptr,
-            .semaphore = render_complete_semaphores_[current_frame],
+            .semaphore = frames[current_frame].render_complete_semaphore,
             .value = 0,
             .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             .deviceIndex = 0
@@ -196,7 +234,7 @@ void Renderer::drawFrame() {
     VkCommandBufferSubmitInfo command_buffer_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
         .pNext = nullptr,
-        .commandBuffer = commandBuffers[current_frame],
+        .commandBuffer = frames[current_frame].graphics_command_recorder->get_command_buffer(),
         .deviceMask = 0
     };
 
@@ -212,7 +250,7 @@ void Renderer::drawFrame() {
         .pSignalSemaphoreInfos = signal_semaphore_infos
     };
 
-    if (vkQueueSubmit2(device_->get_graphics_queue(), 1, &submit_info, frame_in_flight_fences_[current_frame]) != VK_SUCCESS) {
+    if (vkQueueSubmit2(frame.graphics_command_recorder->get_queue().queue, 1, &submit_info, frames[current_frame].in_flight_fence) != VK_SUCCESS) {
         throw std::runtime_error("failed to submit draw command buffer!");
     }
 
@@ -222,14 +260,14 @@ void Renderer::drawFrame() {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .pNext = nullptr,
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &render_complete_semaphores_[current_frame],
+        .pWaitSemaphores = &frames[current_frame].render_complete_semaphore,
         .swapchainCount = 1,
         .pSwapchains = swap_chains,
         .pImageIndices = &image_index,
         .pResults = nullptr
     };
 
-    result = vkQueuePresentKHR(device_->get_present_queue(), &present_info);
+    result = vkQueuePresentKHR(present_queue_.queue, &present_info);
 
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
         framebufferResized = false;
@@ -302,6 +340,13 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
                 .position = {100, 100},
                 .radius = 50.0f,
                 .stroke_width = 5.0f,
+            },
+            { // Medium ?? circle (black outline/slightly transparent)
+                .fill = {0.0f, 1.0f, 0.0f, 1.0f},
+                .stroke = {0.0f, 0.0f, 0.0f, 1.0f},
+                .position = {300, 100},
+                .radius = 75.0f,
+                .stroke_width = 2.0f,
             }
         };
 
@@ -332,17 +377,13 @@ void Renderer::updateUniformBuffer(uint32_t currentImage) {
     // }
 }
 
-void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
+void Renderer::recordCommandBuffer(Frame& frame)
+{
     // TODO(DCut): Refactor begin and end command buffer function because it is doing
     // an additional allocation we may not always need
     // Also, it isn't used here because those allocations can be reused and its a lot
     // for one frame
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-
-    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
-        throw std::runtime_error("failed to begin recording command buffer!");
-    }
+    frame.graphics_command_recorder->begin();
 
     // TODO(DCut): Clean up image transition function and refactor this to use it
     // Transition swapchain image from UNDEFINED to COLOR_ATTACHMENT_OPTIMAL
@@ -355,7 +396,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
         .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = swap_chain_->get_images()[imageIndex],
+        .image = swap_chain_->get_images()[frame.swapchain_image_index],
         .subresourceRange = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel = 0,
@@ -365,7 +406,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
         }
     };
 
-    vkCmdPipelineBarrier(commandBuffer,
+    vkCmdPipelineBarrier(frame.graphics_command_recorder->get_command_buffer(),
                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &image_barrier);
@@ -373,7 +414,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     VkRenderingAttachmentInfo color_attachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .pNext = nullptr,
-        .imageView = swap_chain_->get_image_views()[imageIndex],
+        .imageView = swap_chain_->get_image_views()[frame.swapchain_image_index],
         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .resolveMode = VK_RESOLVE_MODE_NONE,
         .resolveImageView = VK_NULL_HANDLE,
@@ -415,7 +456,9 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
         .pStencilAttachment = nullptr,
     };
 
-    vkCmdBeginRendering(commandBuffer, &rendering_info);
+    VkCommandBuffer& command_buffer = frame.graphics_command_recorder->get_command_buffer();
+
+    vkCmdBeginRendering(command_buffer, &rendering_info);
 
     /// -----------------------------------------------------------------------------------------
 
@@ -462,7 +505,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
         .layerCount = 1
     };
 
-    vkCmdClearAttachments(commandBuffer, 1, &clear_attachment, 1, &clear_rect);
+    vkCmdClearAttachments(command_buffer, 1, &clear_attachment, 1, &clear_rect);
 
     /// -----------------------------------------------------------------------------------------
 
@@ -509,37 +552,37 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     // Draw 3D
 
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
-    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline());
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 
     VkBuffer vertex_buffers_3d[] = { scene_3d_.vertex_buffer->buffer };
     VkDeviceSize vertex_buffer_3d_offsets[] = { 0 };
-    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
-    vkCmdBindIndexBuffer(commandBuffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdBindVertexBuffers(command_buffer, 0, 1, vertex_buffers_3d, vertex_buffer_3d_offsets);
+    vkCmdBindIndexBuffer(command_buffer, scene_3d_.index_buffer->buffer, 0, VK_INDEX_TYPE_UINT32);
 
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_3d_->get_pipeline_layout(), 0, 1,
                             &descriptor_sets_3d_[current_frame], 0, nullptr);
 
-    vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+    vkCmdDrawIndexed(command_buffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
 
     // Draw UI
 
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline());
-    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline_layout(),
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline());
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_->get_pipeline_layout(),
         0, 1, &ui_descriptor_sets_[current_frame], 0, nullptr);
     
-    vkCmdPushConstants(commandBuffer, ui_pipeline_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    vkCmdPushConstants(command_buffer, ui_pipeline_->get_pipeline_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         0, sizeof(ui_push_constant_), &ui_push_constant_);
-    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    vkCmdDraw(command_buffer, 3, 1, 0, 0);
 
     /// -----------------------------------------------------------------------------------------
 
-    vkCmdEndRendering(commandBuffer);
+    vkCmdEndRendering(command_buffer);
 
     // Transition swapchain image from COLOR_ATTACHMENT_OPTIMAL to PRESENT_SRC_KHR
     image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -547,14 +590,12 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     image_barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     image_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-    vkCmdPipelineBarrier(commandBuffer,
+    vkCmdPipelineBarrier(command_buffer,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &image_barrier);
     
-    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
-        throw std::runtime_error("failed to record command buffer!");
-    }
+    frame.graphics_command_recorder->end();
 }
 
 void Renderer::recreateSwapChain()
@@ -692,23 +733,6 @@ void Renderer::createDescriptorSetLayout()
         if (vkCreateDescriptorSetLayout(device_->get_device(), &layout_info, nullptr, &hello_slang_descriptor_set_layout_) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor set layout!");
         }
-    }
-}
-
-void Renderer::createCommandPool() {
-    QueueFamilyIndices queueFamilyIndices = device_->get_queue_families();
-
-    // clang-format off
-    VkCommandPoolCreateInfo pool_info = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-        .queueFamilyIndex = queueFamilyIndices.graphics_family.value()
-    };
-    // clang-format on
-
-    if (vkCreateCommandPool(device_->get_device(), &pool_info, nullptr, &commandPool) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create graphics command pool!");
     }
 }
 
@@ -903,7 +927,7 @@ void Renderer::transitionImageLayout(VkImage image, VkFormat /*format*/, VkImage
 
     vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    endSingleTimeCommands(commandBuffer);
+    endSingleTimeCommands();
 }
 
 void Renderer::copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) {
@@ -925,7 +949,7 @@ void Renderer::copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width,
 
     vkCmdCopyBufferToImage(commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    endSingleTimeCommands(commandBuffer);
+    endSingleTimeCommands();
 }
 
 void Renderer::create_vertex_buffer()
@@ -1290,49 +1314,16 @@ void Renderer::createDescriptorSets()
     }
 }
 
-VkCommandBuffer Renderer::beginSingleTimeCommands() {
-    VkCommandBufferAllocateInfo alloc_info = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .pNext = nullptr,
-        .commandPool = commandPool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1
-    };
-
-    VkCommandBuffer command_buffer;
-    vkAllocateCommandBuffers(device_->get_device(), &alloc_info, &command_buffer);
-
-    VkCommandBufferBeginInfo beginInfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        .pInheritanceInfo = nullptr
-    };
-
-    vkBeginCommandBuffer(command_buffer, &beginInfo);
-
-    return command_buffer;
+VkCommandBuffer Renderer::beginSingleTimeCommands()
+{
+    transfer_command_recorder_->begin();
+    return transfer_command_recorder_->get_command_buffer();
 }
 
-void Renderer::endSingleTimeCommands(VkCommandBuffer commandBuffer) {
-    vkEndCommandBuffer(commandBuffer);
-
-    VkSubmitInfo submit_info = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .pWaitDstStageMask = nullptr,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &commandBuffer,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr
-    };
-
-    vkQueueSubmit(device_->get_graphics_queue(), 1, &submit_info, VK_NULL_HANDLE);
-    vkQueueWaitIdle(device_->get_graphics_queue());
-
-    vkFreeCommandBuffers(device_->get_device(), commandPool, 1, &commandBuffer);
+void Renderer::endSingleTimeCommands() {
+    transfer_command_recorder_->end();
+    transfer_command_recorder_->immediate_submit();
+    transfer_command_recorder_->reset();
 }
 
 void Renderer::copy_buffer(const Buffer* src, const Buffer* dest) {
@@ -1346,31 +1337,11 @@ void Renderer::copy_buffer(const Buffer* src, const Buffer* dest) {
 
     vkCmdCopyBuffer(commandBuffer, src->buffer, dest->buffer, 1, &copy_region);
 
-    endSingleTimeCommands(commandBuffer);
-}
-
-void Renderer::createCommandBuffers() {
-    commandBuffers.resize(swap_chain_image_count_);
-
-    VkCommandBufferAllocateInfo alloc_info = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .pNext = nullptr,
-        .commandPool = commandPool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = (uint32_t)commandBuffers.size()
-    };
-
-    if (vkAllocateCommandBuffers(device_->get_device(), &alloc_info, commandBuffers.data()) != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate command buffers!");
-    }
+    endSingleTimeCommands();
 }
 
 void Renderer::createSyncObjects()
 {
-    image_available_semaphores_.resize(swap_chain_image_count_);
-    render_complete_semaphores_.resize(swap_chain_image_count_);
-    frame_in_flight_fences_.resize(swap_chain_image_count_);
-
     VkSemaphoreCreateInfo semaphore_info = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         .pNext = nullptr,
@@ -1383,11 +1354,11 @@ void Renderer::createSyncObjects()
         .flags = VK_FENCE_CREATE_SIGNALED_BIT
     };
 
-    for (size_t i = 0; i < swap_chain_image_count_; i++)
+    for (auto& frame : frames)
     {
-        if (vkCreateSemaphore(device_->get_device(), &semaphore_info, nullptr, &image_available_semaphores_[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(device_->get_device(), &semaphore_info, nullptr, &render_complete_semaphores_[i]) != VK_SUCCESS ||
-            vkCreateFence(device_->get_device(), &fence_info, nullptr, &frame_in_flight_fences_[i]) != VK_SUCCESS) 
+        if (vkCreateSemaphore(device_->get_device(), &semaphore_info, nullptr, &frame.image_available_semaphore) != VK_SUCCESS ||
+            vkCreateSemaphore(device_->get_device(), &semaphore_info, nullptr, &frame.render_complete_semaphore) != VK_SUCCESS ||
+            vkCreateFence(device_->get_device(), &fence_info, nullptr, &frame.in_flight_fence) != VK_SUCCESS) 
         {
             throw std::runtime_error("Failed to create synchronization objects for a frame!");
         }

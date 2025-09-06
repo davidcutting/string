@@ -18,8 +18,8 @@
             .hash = "glfw-0.0.0-R5AeUm0HGgA_Rlrr9HR91ejkGd-K_JyCjkXz_U3b-jp9",
         },
         .wayland = .{
-            .url = "git+https://github.com/allyourcodebase/wayland.git#9781e2dd79cfce291cbeec65b8fb3d8408506165",
-            .hash = "wayland-1.23.1-4-dxEBa1ZlAAC22FC0nGgyz8MIL8C-zNP2fQ2x4AvfsAJk",
+            .url = "git+https://github.com/allyourcodebase/wayland.git#381e053169a01ef33f16ceb18f4e7776ea4f72f3",
+            .hash = "wayland-1.24.0-dxEBa1RlAADfFhaFgVOxvHQq8-NMmGS8ASz2vnDj_7Bx",
         },
         .wayland_protocols = .{
             .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/archive/1.45/wayland-protocols-1.45.tar.gz",
@@ -40,6 +40,10 @@
         .vulkan_vma = .{
             .url = "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.3.0.tar.gz",
             .hash = "N-V-__8AAIutPgABk6NlXZhlJ5P8qVECvakZIKoO94h7xUOw",
+        },
+        .tracy = .{
+            .url = "git+https://github.com/davidcutting/tracy.git#1969e9ef02e4dc39578c48e177b77b6a80425ca6",
+            .hash = "tracy-0.12.2-zvQnzaH-BgEHXKxCOv836Fz8NkfF4KGLOGtK5PFMt-aj",
         },
     },
 

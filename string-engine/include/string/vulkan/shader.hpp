@@ -1,6 +1,6 @@
 #pragma once
 
-#include <string/logger.hpp>
+#include <string/core/logger.hpp>
 #include <slang.h>
 #include <slang-com-ptr.h>
 #include <slang-com-helper.h>

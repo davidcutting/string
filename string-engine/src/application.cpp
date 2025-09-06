@@ -15,7 +15,8 @@ void Application::run() {
     // Cap at 60fps
     const auto period = std::chrono::duration<double>(1 / 60);
 
-    while (!window_->should_close()) {
+    while (!window_->should_close())
+    {
         window_->update();
         renderer_->update();
 

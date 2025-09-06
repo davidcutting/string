@@ -12,9 +12,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
             .link_libcpp = true,
+            .pic = true,
+            .strip = true,
         }),
-        .pic = true,
-        .strip = true,
     });
 
     exe.linkLibC();
@@ -48,6 +48,14 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(entt_dep.path("src"));
 
+    const tracy_dep = b.dependency("tracy", .{
+        .target = target,
+        .optimize = optimize,
+        .linkage = .static,
+    });
+    // exe.addIncludePath(tracy_dep.path("include"));
+    exe.linkLibrary(tracy_dep.artifact("tracy"));
+
     exe.linkSystemLibrary2("glm", .{
         .preferred_link_mode = .static,
         .use_pkg_config = .yes,
@@ -64,6 +72,8 @@ pub fn build(b: *std.Build) void {
             "vulkan/allocator.cpp",
             "vulkan/swapchain.cpp",
             "vulkan/vulkan_utils.cpp",
+            "vulkan/command_recorder.cpp",
+            "vulkan/presenter.cpp",
             "vulkan/pipeline_builder.cpp",
             "vulkan/pipelines/pipeline_2d.cpp",
             "vulkan/pipelines/pipeline_3d.cpp",

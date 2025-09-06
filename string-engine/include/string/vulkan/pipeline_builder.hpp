@@ -1,17 +1,13 @@
 #pragma once
 
 #include <memory>
+#include <string/vulkan/pipeline.hpp>
 #include <string/vulkan/device.hpp>
 
 #include <volk.h>
 
 namespace String
 {
-
-enum class PipelineType {
-    GRAPHICS,
-    COMPUTE
-};
 
 class PipelineLayoutBuilder
 {

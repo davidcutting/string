@@ -90,7 +90,8 @@ Swapchain::~Swapchain()
 {
     vkDeviceWaitIdle(device_->get_device());
 
-    for (auto image_view : swap_chain_image_views_) {
+    for (auto image_view : swap_chain_image_views_)
+    {
         vkDestroyImageView(device_->get_device(), image_view, nullptr);
     }
 

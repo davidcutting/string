@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace string
+namespace String
 {
 
 enum class PlatformType : std::uint8_t
@@ -12,10 +12,11 @@ enum class PlatformType : std::uint8_t
 };
 
 #ifdef _WIN32
-    constexpr PlatformType current_platform = PlatformType::WINDOWS;
+    static constexpr PlatformType current_platform = PlatformType::WINDOWS;
     #define STRING_PLATFORM_WINDOWS
 #elif defined(__linux__)
-    constexpr PlatformType current_platform = PlatformType::LINUX;
+    static constexpr PlatformType current_platform = PlatformType::LINUX;
+    #define VK_USE_PLATFORM_WAYLAND_KHR
     #define STRING_PLATFORM_LINUX
 #else
     static_assert(false, "Unsupported platform!");
@@ -28,11 +29,14 @@ enum class ReleaseType : std::uint8_t
 };
 
 #ifdef DEBUG
-    constexpr ReleaseType current_release = ReleaseType::DEBUG;
+    static constexpr ReleaseType current_release = ReleaseType::DEBUG;
     #define STRING_DEBUG
-#else
-constexpr ReleaseType current_release = ReleaseType::RELEASE;
+#elifdef NDEBUG
+    static constexpr ReleaseType current_release = ReleaseType::RELEASE;
     #define STRING_RELEASE
+#else
+    static constexpr ReleaseType current_release = ReleaseType::DEBUG;
+    #define STRING_DEBUG
 #endif
 
 }

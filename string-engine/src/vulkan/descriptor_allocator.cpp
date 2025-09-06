@@ -1,12 +1,15 @@
-#include <string/vulkan/descriptor_set_allocator.hpp>
+#include <string/vulkan/descriptor_allocator.hpp>
 #include <string/vulkan/device.hpp>
 #include <vector>
 #include <stdexcept>
+#include <string/vulkan/resource_allocator.hpp>
 
-namespace String {
+namespace String
+{
 
-DescriptorAllocator::DescriptorAllocator(std::shared_ptr<Device> device)
-: device_(std::move(device))
+DescriptorAllocator::DescriptorAllocator(VkDevice& device, ResourceAllocator& allocator)
+: device_(device)
+, allocator_(allocator)
 {
     // Create descriptor set layout
     std::vector<VkDescriptorSetLayoutBinding> bindings = {
@@ -41,12 +44,13 @@ DescriptorAllocator::DescriptorAllocator(std::shared_ptr<Device> device)
     VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = &binding_flags_info,
-        .flags = 0,
+        .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
         .bindingCount = static_cast<uint32_t>(bindings.size()),
         .pBindings = bindings.data()
     };
 
-    if (vkCreateDescriptorSetLayout(device_->get_device(), &layout_info, nullptr, &descriptor_set_layout_) != VK_SUCCESS) {
+    if (vkCreateDescriptorSetLayout(device_, &layout_info, nullptr, &descriptor_set_layout_) != VK_SUCCESS)
+    {
         throw std::runtime_error("Failed to create bindless descriptor set layout");
     }
 
@@ -65,7 +69,8 @@ DescriptorAllocator::DescriptorAllocator(std::shared_ptr<Device> device)
         .pPoolSizes = pool_sizes.data()
     };
 
-    if (vkCreateDescriptorPool(device_->get_device(), &pool_info, nullptr, &descriptor_pool_) != VK_SUCCESS) {
+    if (vkCreateDescriptorPool(device_, &pool_info, nullptr, &descriptor_pool_) != VK_SUCCESS)
+    {
         throw std::runtime_error("Failed to create bindless descriptor pool");
     }
 
@@ -87,28 +92,36 @@ DescriptorAllocator::DescriptorAllocator(std::shared_ptr<Device> device)
         .pSetLayouts = &descriptor_set_layout_
     };
 
-    if (vkAllocateDescriptorSets(device_->get_device(), &alloc_info, &descriptor_set_) != VK_SUCCESS) {
+    if (vkAllocateDescriptorSets(device_, &alloc_info, &descriptor_set_) != VK_SUCCESS)
+    {
         throw std::runtime_error("Failed to allocate bindless descriptor set");
     }
 }
 
-DescriptorAllocator::~DescriptorAllocator() {
-    if (descriptor_pool_) {
-        vkDestroyDescriptorPool(device_->get_device(), descriptor_pool_, nullptr);
+DescriptorAllocator::~DescriptorAllocator()
+{
+    if (descriptor_pool_)
+    {
+        vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
     }
-    if (descriptor_set_layout_) {
-        vkDestroyDescriptorSetLayout(device_->get_device(), descriptor_set_layout_, nullptr);
+    if (descriptor_set_layout_)
+    {
+        vkDestroyDescriptorSetLayout(device_, descriptor_set_layout_, nullptr);
     }
 }
 
-auto DescriptorAllocator::allocate_texture(VkImageView view, VkSampler sampler) -> uint32_t {
-    if (next_texture_index_ >= MAX_BINDLESS_TEXTURES) {
+void DescriptorAllocator::allocate_image(const ResourceID& handle)
+{
+    if (next_texture_index_ >= MAX_BINDLESS_TEXTURES)
+    {
         throw std::runtime_error("Exceeded maximum bindless textures");
     }
 
+    const auto& image = allocator_.get_image(handle);
+
     VkDescriptorImageInfo image_info = {
-        .sampler = sampler,
-        .imageView = view,
+        .sampler = image.sampler,
+        .imageView = image.view,
         .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
     };
 
@@ -116,7 +129,7 @@ auto DescriptorAllocator::allocate_texture(VkImageView view, VkSampler sampler) 
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .pNext = nullptr,
         .dstSet = descriptor_set_,
-        .dstBinding = 0,
+        .dstBinding = TEXTURE_BINDING_SLOT,
         .dstArrayElement = next_texture_index_,
         .descriptorCount = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -125,38 +138,38 @@ auto DescriptorAllocator::allocate_texture(VkImageView view, VkSampler sampler) 
         .pTexelBufferView = nullptr
     };
 
-    vkUpdateDescriptorSets(device_->get_device(), 1, &image_write, 0, nullptr);
-
-    return next_texture_index_++;
+    vkUpdateDescriptorSets(device_, 1, &image_write, 0, nullptr);
 }
 
-auto DescriptorAllocator::allocate_buffer(VkBuffer buffer, VkDeviceSize size) -> uint32_t {
-    if (next_buffer_index_ >= MAX_BINDLESS_BUFFERS) {
+void DescriptorAllocator::allocate_buffer(const ResourceID& handle)
+{
+    if (next_buffer_index_ >= MAX_BINDLESS_BUFFERS)
+    {
         throw std::runtime_error("Exceeded maximum bindless buffers");
     }
 
+    const auto& buffer = allocator_.get_buffer(handle);
+
     VkDescriptorBufferInfo buffer_info = {
-        .buffer = buffer,
+        .buffer = buffer.buffer,
         .offset = 0,
-        .range = size
+        .range = buffer.size
     };
 
     VkWriteDescriptorSet buffer_write = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .pNext = nullptr,
         .dstSet = descriptor_set_,
-        .dstBinding = 0,
-        .dstArrayElement = next_texture_index_,
+        .dstBinding = BUFFER_BINDING_SLOT,
+        .dstArrayElement = next_buffer_index_,
         .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .pImageInfo = nullptr,
         .pBufferInfo = &buffer_info,
         .pTexelBufferView = nullptr
     };
 
-    vkUpdateDescriptorSets(device_->get_device(), 1, &buffer_write, 0, nullptr);
-
-    return next_buffer_index_++;
+    vkUpdateDescriptorSets(device_, 1, &buffer_write, 0, nullptr);
 }
 
 } // namespace String

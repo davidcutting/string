@@ -1,8 +1,8 @@
 #include <string/platform/window.hpp>
 #include <string/core/logger.hpp>
+#include <string/core/platform_detection.hpp>
 #include <cassert>
 #include <stdexcept>
-
 
 #define VK_NO_PROTOTYPES
 #include <SDL3/SDL.h>
@@ -127,6 +127,9 @@ void Window::update()
         {
             int width, height;
             SDL_GetWindowSize((SDL_Window*)window_handle_, &width, &height);
+
+            if (width <= 0 || height <= 0)
+                continue;
             
             properties_.extent.width = static_cast<uint32_t>(width);
             properties_.extent.height = static_cast<uint32_t>(height);
@@ -166,7 +169,7 @@ VkSurfaceKHR Window::create_surface(const VkInstance& instance)
     VkSurfaceKHR surface;
     if (!SDL_Vulkan_CreateSurface((SDL_Window*)window_handle_, instance, nullptr, &surface))
     {
-        throw std::runtime_error("failed to create window surface!");
+        throw std::runtime_error("Failed to create window surface!");
     }
     return surface;
 }

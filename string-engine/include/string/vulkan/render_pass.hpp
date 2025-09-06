@@ -1,28 +1,24 @@
 #pragma once
 
-#include <cstdint>
+#include <string/vulkan/resource.hpp>
+#include <string/vulkan/pipeline.hpp>
+#include <string/vulkan/command_recorder.hpp>
+
+#include <unordered_set>
+
 
 #include <volk.h>
 
 namespace String
 {
 
-class RenderPass
+struct Pass
 {
-public:
-    virtual ~RenderPass() = default;
+    Pipeline pipeline;
+    std::unordered_set<ResourceID> reads;
+    std::unordered_set<ResourceID> writes;
 
-    virtual void record(const VkCommandBuffer& command_buffer, uint32_t frame_index, VkExtent2D extent) = 0;
-    virtual void resize(VkExtent2D extent) = 0;
-    virtual void destroy() = 0;
-
-    virtual auto get_color_view() const -> VkImageView = 0;
-    virtual auto get_color_image() const -> VkImage = 0;
-    virtual auto get_color_format() const -> VkFormat = 0;
-
-    virtual auto get_depth_view() const -> VkImageView = 0;
-    virtual auto get_depth_image() const -> VkImage = 0;
-    virtual auto get_depth_format() const -> VkFormat = 0;
+    virtual void record(const CommandRecorder& recorder) = 0;
 };
 
-}
+} // namespace String

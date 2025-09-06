@@ -6,6 +6,7 @@
 #include <source_location>
 #include <string_view>
 #include <mutex>
+#include <string/core/platform_detection.hpp>
 
 namespace String
 {
