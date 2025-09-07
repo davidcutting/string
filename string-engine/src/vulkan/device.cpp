@@ -5,8 +5,7 @@
 #include <string/vulkan/vulkan_utils.hpp>
 #include <string/vulkan/command_recorder.hpp>
 #include <string/core/logger.hpp>
-#include "string/vulkan/queue.hpp"
-#include "vulkan/vulkan_core.h"
+#include <string/vulkan/queue.hpp>
 
 #include <volk.h>
 

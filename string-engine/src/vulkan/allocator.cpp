@@ -1,7 +1,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string/vulkan/allocator.hpp>
-#include "vulkan/vulkan_core.h"
 
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>

@@ -5,8 +5,8 @@
 
 #include <volk.h>
 
-#include <Tracy.hpp>
-#include <TracyVulkan.hpp>
+#include <tracy/Tracy.hpp>
+#include <tracy/TracyVulkan.hpp>
 
 namespace String
 {
@@ -224,7 +224,7 @@ void Presenter<MAX_FRAMES_IN_FLIGHT>::present()
         throw std::runtime_error("Failed to present swapchain image!");
     }
 
-    FrameMark;
+    // FrameMark;
 
     // Consume this frame, we need to increment the next frame id and invalidate the current frame
     next_frame_id_= (next_frame_id_ + 1) % MAX_FRAMES_IN_FLIGHT;
