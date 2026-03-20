@@ -1,5 +1,4 @@
 #include <cstdint>
-#include <memory>
 #include <string/vulkan/pipeline_builder.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 
@@ -22,7 +21,7 @@ PipelineLayoutBuilder& PipelineLayoutBuilder::set_push_constant_ranges(const std
     return *this;
 }
 
-VkPipelineLayout PipelineLayoutBuilder::build(const std::shared_ptr<Device>& device)
+VkPipelineLayout PipelineLayoutBuilder::build(Device& device)
 {
     VkPipelineLayout pipeline_layout;
 
@@ -38,7 +37,7 @@ VkPipelineLayout PipelineLayoutBuilder::build(const std::shared_ptr<Device>& dev
     };
     // clang-format on
 
-    if (vkCreatePipelineLayout(device->get_device(), &pipeline_layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
+    if (vkCreatePipelineLayout(device.get_device(), &pipeline_layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create pipeline layout!");
     }
 
@@ -47,7 +46,7 @@ VkPipelineLayout PipelineLayoutBuilder::build(const std::shared_ptr<Device>& dev
 
 // Pipeline Builder --------------------------------------------------------------
 
-PipelineBuilder::PipelineBuilder(const std::shared_ptr<Device>& device, const PipelineType& type)
+PipelineBuilder::PipelineBuilder(Device& device, const PipelineType& type)
 : type_(type)
 , device_(device)
 {
@@ -96,16 +95,16 @@ PipelineBuilder::PipelineBuilder(const std::shared_ptr<Device>& device, const Pi
 PipelineBuilder::~PipelineBuilder()
 {
     if (compute_shader_module_ != VK_NULL_HANDLE)
-        vkDestroyShaderModule(device_->get_device(), compute_shader_module_, nullptr);
+        vkDestroyShaderModule(device_.get_device(), compute_shader_module_, nullptr);
     if (vertex_shader_module_ != VK_NULL_HANDLE)
-        vkDestroyShaderModule(device_->get_device(), vertex_shader_module_, nullptr);
+        vkDestroyShaderModule(device_.get_device(), vertex_shader_module_, nullptr);
     if (fragment_shader_module_ != VK_NULL_HANDLE)
-        vkDestroyShaderModule(device_->get_device(), fragment_shader_module_, nullptr);
+        vkDestroyShaderModule(device_.get_device(), fragment_shader_module_, nullptr);
 }
 
 PipelineBuilder& PipelineBuilder::add_compute_shader(const std::filesystem::path& resource_path)
 {
-    compute_shader_module_ = vku::load_shader_from_disk(device_->get_device(), resource_path);
+    compute_shader_module_ = vku::load_shader_from_disk(device_.get_device(), resource_path);
 
     // clang-format off
     VkPipelineShaderStageCreateInfo compute_shader_stage_info = {
@@ -124,7 +123,7 @@ PipelineBuilder& PipelineBuilder::add_compute_shader(const std::filesystem::path
 
 PipelineBuilder& PipelineBuilder::add_vertex_shader(const std::filesystem::path& resource_path)
 {
-    vertex_shader_module_ = vku::load_shader_from_disk(device_->get_device(), resource_path);
+    vertex_shader_module_ = vku::load_shader_from_disk(device_.get_device(), resource_path);
 
     // clang-format off
     VkPipelineShaderStageCreateInfo vertex_shader_stage_info = {
@@ -143,7 +142,7 @@ PipelineBuilder& PipelineBuilder::add_vertex_shader(const std::filesystem::path&
 
 PipelineBuilder& PipelineBuilder::add_fragment_shader(const std::filesystem::path& resource_path)
 {
-    fragment_shader_module_ = vku::load_shader_from_disk(device_->get_device(), resource_path);
+    fragment_shader_module_ = vku::load_shader_from_disk(device_.get_device(), resource_path);
 
     // clang-format off
     VkPipelineShaderStageCreateInfo fragment_shader_stage_info = {
@@ -361,14 +360,14 @@ VkPipeline PipelineBuilder::build_graphics_pipeline(const VkPipelineLayout& pipe
         .basePipelineIndex = 0
     };
 
-    if (vkCreateGraphicsPipelines(device_->get_device(), VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
+    if (vkCreateGraphicsPipelines(device_.get_device(), VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
         throw std::runtime_error("failed to create graphics pipeline!");
     }
     // clang-format on
 
     // Pipeline baked, now de-allocate shader modules
-    vkDestroyShaderModule(device_->get_device(), vertex_shader_module_, nullptr);
-    vkDestroyShaderModule(device_->get_device(), fragment_shader_module_, nullptr);
+    vkDestroyShaderModule(device_.get_device(), vertex_shader_module_, nullptr);
+    vkDestroyShaderModule(device_.get_device(), fragment_shader_module_, nullptr);
 
     vertex_shader_module_ = VK_NULL_HANDLE;
     fragment_shader_module_ = VK_NULL_HANDLE;
@@ -391,13 +390,13 @@ VkPipeline PipelineBuilder::build_compute_pipeline(const VkPipelineLayout& pipel
         .basePipelineIndex = 0
     };
 
-    if (vkCreateComputePipelines(device_->get_device(), VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(device_.get_device(), VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
         throw std::runtime_error("failed to create graphics pipeline!");
     }
     // clang-format on
 
     // Pipeline baked, now de-allocate shader modules
-    vkDestroyShaderModule(device_->get_device(), compute_shader_module_, nullptr);
+    vkDestroyShaderModule(device_.get_device(), compute_shader_module_, nullptr);
 
     compute_shader_module_ = VK_NULL_HANDLE;
 

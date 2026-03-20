@@ -7,10 +7,11 @@
 namespace String
 {
 
-CommandRecorder::CommandRecorder(VkDevice& device, const Queue& queue)
-: device_(device)
-, queue_(queue)
+void CommandRecorder::init(const VkDevice& device, const Queue& queue)
 {
+    device_ = device;
+    queue_ = queue;
+
     // clang-format off
     VkCommandPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -42,16 +43,19 @@ CommandRecorder::CommandRecorder(VkDevice& device, const Queue& queue)
     }
 }
 
-CommandRecorder::~CommandRecorder()
+void CommandRecorder::destroy()
 {
-    vkDeviceWaitIdle(device_);
+    if (primary_command_buffer_ != VK_NULL_HANDLE)
+    {
+        vkFreeCommandBuffers(device_, command_pool_, 1, &primary_command_buffer_);
+    }
     if (command_pool_ != VK_NULL_HANDLE)
     {
         vkDestroyCommandPool(device_, command_pool_, nullptr);
-    }    
+    }
 }
 
-auto CommandRecorder::begin(const VkCommandBufferUsageFlags& command_buffer_usage) -> CommandRecorder&
+auto CommandRecorder::begin(const VkCommandBufferUsageFlags& command_buffer_usage) -> VkCommandBuffer&
 {
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -61,7 +65,7 @@ auto CommandRecorder::begin(const VkCommandBufferUsageFlags& command_buffer_usag
     };
 
     vkBeginCommandBuffer(primary_command_buffer_, &begin_info);
-    return *this;
+    return primary_command_buffer_;
 }
 
 auto CommandRecorder::end() -> CommandRecorder&
@@ -90,17 +94,6 @@ auto CommandRecorder::get_command_buffer() -> VkCommandBuffer&
 auto CommandRecorder::get_queue() -> Queue&
 {
     return queue_;
-}
-
-auto CommandRecorder::bind_descriptor_table(const DescriptorAllocator& descriptor_allocator, const ResourceAllocator& resource_allocator) -> CommandRecorder&
-{
-    return *this;
-}
-
-auto CommandRecorder::record(const Pass& pass) -> CommandRecorder&
-{
-    // TODO: Implement
-    return *this;
 }
 
 auto CommandRecorder::immediate_submit() -> CommandRecorder&

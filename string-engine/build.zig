@@ -17,6 +17,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    if (optimize != .Debug) {
+        exe.root_module.addCMacro("NDEBUG", "1");
+    }
+
     exe.linkLibC();
     exe.linkLibCpp();
 
@@ -48,17 +52,36 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(entt_dep.path("src"));
 
-    // const tracy_dep = b.dependency("tracy", .{
-    //     .target = target,
-    //     .optimize = optimize,
-    //     .linkage = .static,
-    // });
-    // exe.linkLibrary(tracy_dep.artifact("tracy"));
+    const tracy_dep = b.dependency("tracy", .{
+        .target = target,
+        .optimize = optimize,
+        .linkage = .static,
+    });
+    // for some reason need to add include path here for intellisense
+    // intellisense wants #include <Tracy.hpp>
+    // but it builds with #include <tracy/Tracy.hpp>
+    exe.addIncludePath(tracy_dep.path("public/tracy"));
+    exe.linkLibrary(tracy_dep.artifact("tracy"));
+
+    const assimp_dep = b.dependency("zig_assimp", .{
+        .target = target,
+        .optimize = optimize,
+        .formats = "all",
+    });
+    exe.linkLibrary(assimp_dep.artifact("assimp"));
 
     exe.linkSystemLibrary2("glm", .{
         .preferred_link_mode = .static,
         .use_pkg_config = .yes,
     });
+
+    const sdl_dep = b.dependency("sdl", .{
+        .target = target,
+        .optimize = optimize,
+        .preferred_linkage = .static,
+        .install_build_config_h = true,
+    });
+    exe.linkLibrary(sdl_dep.artifact("SDL3"));
 
     exe.addIncludePath(b.path("include"));
     exe.addCSourceFiles(.{
@@ -66,14 +89,20 @@ pub fn build(b: *std.Build) void {
         .files = &.{
             "test_application.cpp",
             "application.cpp",
+            "platform/sdl_window.cpp",
             "vulkan/renderer.cpp",
+            "vulkan/driver.cpp",
             "vulkan/device.cpp",
-            "vulkan/allocator.cpp",
-            "vulkan/swapchain.cpp",
+            "vulkan/resource_allocator.cpp",
+            "vulkan/descriptor_allocator.cpp",
+            "vulkan/descriptor_allocator_growable.cpp",
             "vulkan/vulkan_utils.cpp",
             "vulkan/command_recorder.cpp",
-            // "vulkan/presenter.cpp",
+            "vulkan/presenter.cpp",
             "vulkan/pipeline_builder.cpp",
+            // "vulkan/passes/geometry_pass.cpp",
+            // "vulkan/passes/ui_pass.cpp",
+            // "vulkan/passes/hello_slang_pass.cpp",
             "vulkan/pipelines/pipeline_2d.cpp",
             "vulkan/pipelines/pipeline_3d.cpp",
             "vulkan/pipelines/pipeline_grid_2d.cpp",
@@ -87,43 +116,19 @@ pub fn build(b: *std.Build) void {
 
     switch (target.result.os.tag) {
         .windows => {
-            exe.addCSourceFiles(.{
-                .files = &.{
-                    "src/platform/sdl_window.cpp",
-                },
-                .flags = &.{
-                    "-std=c++23",
-                },
-            });
-
-            const sdl_dep = b.dependency("sdl", .{
-                .target = target,
-                .optimize = optimize,
-                .preferred_linkage = .static,
-                .install_build_config_h = true,
-            });
-            exe.linkLibrary(sdl_dep.artifact("SDL3"));
+            //
         },
         .linux => {
-            exe.addCSourceFiles(.{
-                .files = &.{
-                    "src/platform/sdl_window.cpp",
-                    // "src/platform/glfw_window.cpp",
-                    // "src/platform/wayland/client.cpp",
-                    // "src/platform/wayland/window.cpp",
-                },
-                .flags = &.{
-                    "-std=c++23",
-                },
-            });
-
-            const sdl_dep = b.dependency("sdl", .{
-                .target = target,
-                .optimize = optimize,
-                .preferred_linkage = .static,
-                .install_build_config_h = true,
-            });
-            exe.linkLibrary(sdl_dep.artifact("SDL3"));
+            // exe.addCSourceFiles(.{
+            //     .files = &.{
+            //         // "src/platform/glfw_window.cpp",
+            //         // "src/platform/wayland/client.cpp",
+            //         // "src/platform/wayland/window.cpp",
+            //     },
+            //     .flags = &.{
+            //         "-std=c++23",
+            //     },
+            // });
 
             // const glfw_dep = b.dependency("glfw3", .{
             //     .target = target,
@@ -182,9 +187,9 @@ pub fn build(b: *std.Build) void {
 
     exe.installHeadersDirectory(b.path("include"), "", .{});
 
-    var targets = std.ArrayList(*std.Build.Step.Compile).init(b.allocator);
-    targets.append(exe) catch @panic("OOM");
-    const zcc_step = zcc.createStep(b, "gen-cc", targets.toOwnedSlice() catch @panic("OOM"));
+    var targets = std.ArrayListUnmanaged(*std.Build.Step.Compile){};
+    targets.append(b.allocator, exe) catch @panic("OOM");
+    const zcc_step = zcc.createStep(b, "gen-cc", targets.toOwnedSlice(b.allocator) catch @panic("OOM"));
     zcc_step.dependOn(&exe.step);
 
     // Run step

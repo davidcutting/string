@@ -6,25 +6,25 @@
 
     .dependencies = .{
         .compile_commands = .{
-            .url = "https://github.com/the-argus/zig-compile-commands/archive/refs/heads/main.zip",
-            .hash = "N-V-__8AAFbOAADWdt__Qs3GpRdZiQ5hGxc2AQyI_k4BEjC8",
+            .url = "https://github.com/the-argus/zig-compile-commands/archive/70fb439897e12cae896c071717d7c9c382918689.tar.gz",
+            .hash = "zig_compile_commands-0.0.1-OZg5-ULBAABTh3NXO3WXoSUX1474ez0EouuoT2yDANhz",
         },
         .sdl = .{
-            .url = "git+https://github.com/castholm/SDL.git#3ed62e53aecd9ffb28e44b9d35b7c09a8739e823",
-            .hash = "sdl-0.2.4+3.2.16-7uIn9DPhfgH29yAIJqHLc69hNb4IW0q-AngtKCFoT92b",
+            .url = "git+https://github.com/castholm/SDL.git#b1913e7c31ad72ecfd3ab04aeac387027754cfaf",
+            .hash = "sdl-0.3.0+3.2.22-7uIn9Pg3fwGG2IyIOPxxOSVe-75nUng9clt7tXGFLzMr",
         },
-        .glfw3 = .{
-            .url = "git+https://github.com/allyourcodebase/glfw.git#98607df9bce062c7fd837d58fafa06dae22edb04",
-            .hash = "glfw-0.0.0-R5AeUm0HGgA_Rlrr9HR91ejkGd-K_JyCjkXz_U3b-jp9",
-        },
-        .wayland = .{
-            .url = "git+https://github.com/allyourcodebase/wayland.git#381e053169a01ef33f16ceb18f4e7776ea4f72f3",
-            .hash = "wayland-1.24.0-dxEBa1RlAADfFhaFgVOxvHQq8-NMmGS8ASz2vnDj_7Bx",
-        },
-        .wayland_protocols = .{
-            .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/archive/1.45/wayland-protocols-1.45.tar.gz",
-            .hash = "N-V-__8AAIKCDgBX6hRMzFmvC-WAwrOH_ewvZgAzPGbBvavk",
-        },
+        // .glfw3 = .{
+        //     .url = "git+https://github.com/allyourcodebase/glfw.git#98607df9bce062c7fd837d58fafa06dae22edb04",
+        //     .hash = "glfw-0.0.0-R5AeUm0HGgA_Rlrr9HR91ejkGd-K_JyCjkXz_U3b-jp9",
+        // },
+        // .wayland = .{
+        //     .url = "git+https://github.com/allyourcodebase/wayland.git#381e053169a01ef33f16ceb18f4e7776ea4f72f3",
+        //     .hash = "wayland-1.24.0-dxEBa1RlAADfFhaFgVOxvHQq8-NMmGS8ASz2vnDj_7Bx",
+        // },
+        // .wayland_protocols = .{
+        //     .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/archive/1.45/wayland-protocols-1.45.tar.gz",
+        //     .hash = "N-V-__8AAIKCDgBX6hRMzFmvC-WAwrOH_ewvZgAzPGbBvavk",
+        // },
         .entt = .{
             .url = "https://github.com/skypjack/entt/archive/refs/tags/v3.15.0.tar.gz",
             .hash = "N-V-__8AAG6PVwB95XiI_kBMCQw5cBCpwzTcAO07r883Btuc",
@@ -42,8 +42,12 @@
             .hash = "N-V-__8AAIutPgABk6NlXZhlJ5P8qVECvakZIKoO94h7xUOw",
         },
         .tracy = .{
-            .url = "git+https://github.com/davidcutting/tracy.git#1969e9ef02e4dc39578c48e177b77b6a80425ca6",
-            .hash = "tracy-0.12.2-zvQnzaH-BgEHXKxCOv836Fz8NkfF4KGLOGtK5PFMt-aj",
+            .url = "git+https://github.com/davidcutting/tracy.git#8bf7b3f5daf387a17b8ac4483042f3097524b1d8",
+            .hash = "tracy-0.12.2-zvQnzQb-BgHcHzqOdncJKpHurnePCmhaIX0X86KTnkI4",
+        },
+        .zig_assimp = .{
+            .url = "git+https://github.com/parodyband/assimp.git#8c92bc97241a2bf9b6dcb0fbb8af80b798e37b38",
+            .hash = "zig_assimp-5.3.1--G7jvn-0AADpJrSYChodW0OwQDhPs2JONVgHZMYudqDc",
         },
     },
 

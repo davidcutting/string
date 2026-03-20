@@ -6,7 +6,6 @@
 
 #include <unordered_set>
 
-
 #include <volk.h>
 
 namespace String
@@ -14,11 +13,18 @@ namespace String
 
 struct Pass
 {
+    VkDescriptorSetLayout descriptor_set_layout;
+    std::vector<VkDescriptorSet> descriptor_sets;
     Pipeline pipeline;
+    VkExtent2D screen_size;
+
     std::unordered_set<ResourceID> reads;
     std::unordered_set<ResourceID> writes;
 
-    virtual void record(const CommandRecorder& recorder) = 0;
+    virtual ~Pass() = 0;
+    virtual void update(const float& delta_time, const uint16_t& current_frame) = 0;
+    virtual void record(CommandRecorder& recorder, const uint16_t& current_frame) = 0;
+    void resize(const VkExtent2D& extent) { screen_size = extent; }
 };
 
 } // namespace String

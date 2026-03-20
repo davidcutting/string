@@ -47,6 +47,7 @@ struct ImageInfo
     VkFormat format;
     VkImageTiling tiling;
     VkImageUsageFlags usage;
+    VkImageAspectFlags aspect_flags;
     VmaMemoryUsage memory_usage;
     VmaAllocationCreateFlags allocation_flags;
 };

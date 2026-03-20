@@ -1,13 +1,14 @@
+#include <cstdint>
+#include <stdexcept>
 #include <string/vulkan/descriptor_allocator.hpp>
 #include <string/vulkan/device.hpp>
 #include <vector>
-#include <stdexcept>
 #include <string/vulkan/resource_allocator.hpp>
 
 namespace String
 {
 
-DescriptorAllocator::DescriptorAllocator(VkDevice& device, ResourceAllocator& allocator)
+DescriptorTable::DescriptorTable(VkDevice& device, ResourceAllocator& allocator)
 : device_(device)
 , allocator_(allocator)
 {
@@ -15,23 +16,47 @@ DescriptorAllocator::DescriptorAllocator(VkDevice& device, ResourceAllocator& al
     std::vector<VkDescriptorSetLayoutBinding> bindings = {
         {
             .binding = 0,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = MAX_BINDLESS_TEXTURES,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = MAX_BINDLESS_BUFFERS,
             .stageFlags = VK_SHADER_STAGE_ALL,
             .pImmutableSamplers = nullptr
         },
         {
             .binding = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = MAX_BINDLESS_BUFFERS,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = MAX_BINDLESS_IMAGES,
             .stageFlags = VK_SHADER_STAGE_ALL,
             .pImmutableSamplers = nullptr
-        }
+        },
+        {
+            .binding = 2,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = MAX_BINDLESS_IMAGES,
+            .stageFlags = VK_SHADER_STAGE_ALL,
+            .pImmutableSamplers = nullptr
+        },
+        // {
+        //     .binding = 3,
+        //     .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+        //     .descriptorCount = MAX_BINDLESS_ACCEL_STRUCT,
+        //     .stageFlags = VK_SHADER_STAGE_ALL,
+        //     .pImmutableSamplers = nullptr
+        // },
+        // {
+        //     .binding = 4,
+        //     .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+        //     .descriptorCount = MAX_BINDLESS_ACCEL_STRUCT,
+        //     .stageFlags = VK_SHADER_STAGE_ALL,
+        //     .pImmutableSamplers = nullptr
+        // },
     };
 
     VkDescriptorBindingFlags binding_flags[] = {
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size ssbos
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size storage images
+        // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size tlas
+        // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size blas
     };
 
     VkDescriptorSetLayoutBindingFlagsCreateInfoEXT binding_flags_info = {
@@ -56,8 +81,11 @@ DescriptorAllocator::DescriptorAllocator(VkDevice& device, ResourceAllocator& al
 
     // Create descriptor pool
     std::vector<VkDescriptorPoolSize> pool_sizes = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_BINDLESS_TEXTURES },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_BINDLESS_BUFFERS }
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_BINDLESS_BUFFERS },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_BINDLESS_IMAGES },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_BINDLESS_IMAGES },
+        // { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, MAX_BINDLESS_ACCEL_STRUCT },
+        // { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, MAX_BINDLESS_ACCEL_STRUCT },
     };
 
     VkDescriptorPoolCreateInfo pool_info = {
@@ -75,13 +103,14 @@ DescriptorAllocator::DescriptorAllocator(VkDevice& device, ResourceAllocator& al
     }
 
     // Allocate descriptor set
-    uint32_t max_descriptors[] = { MAX_BINDLESS_TEXTURES, MAX_BINDLESS_BUFFERS };
+    // Currently we can limit size of everything to the number of images, since UBOs and SSBOs are fixed
+    std::array<uint32_t, 1> max_descriptors = { MAX_BINDLESS_IMAGES };
 
     VkDescriptorSetVariableDescriptorCountAllocateInfo variable_count_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO,
         .pNext = nullptr,
         .descriptorSetCount = 1,
-        .pDescriptorCounts = max_descriptors
+        .pDescriptorCounts = max_descriptors.data()
     };
 
     VkDescriptorSetAllocateInfo alloc_info = {
@@ -98,7 +127,7 @@ DescriptorAllocator::DescriptorAllocator(VkDevice& device, ResourceAllocator& al
     }
 }
 
-DescriptorAllocator::~DescriptorAllocator()
+DescriptorTable::~DescriptorTable()
 {
     if (descriptor_pool_)
     {
@@ -110,66 +139,132 @@ DescriptorAllocator::~DescriptorAllocator()
     }
 }
 
-void DescriptorAllocator::allocate_image(const ResourceID& handle)
+void DescriptorTable::bind(const ResourceID& handle, const DescriptorType& type)
 {
-    if (next_texture_index_ >= MAX_BINDLESS_TEXTURES)
+    uint32_t slot = 0;
+
+    switch(type)
     {
-        throw std::runtime_error("Exceeded maximum bindless textures");
+        case DescriptorType::STORAGE_BUFFER:
+            slot = ssbo_descriptor_allocator_.allocate(handle);
+            bind_buffer(handle, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, slot);
+            break;
+
+        case DescriptorType::TEXTURE:
+            slot = texture_descriptor_allocator_.allocate(handle);
+            bind_image(handle, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, slot);
+            break;
+
+        case DescriptorType::STORAGE_IMAGE:
+            slot = st_image_descriptor_allocator_.allocate(handle);
+            bind_image(handle, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, slot);
+            break;
+        
+        case DescriptorType::TLAS:
+            slot = tlas_descriptor_allocator_.allocate(handle);
+            // bind_image(handle, VK_DESCRIPTOR_TYPE_SAMPLER, slot);
+            break;
+        
+        case DescriptorType::BLAS:
+            slot = blas_descriptor_allocator_.allocate(handle);
+            // bind_image(handle, VK_DESCRIPTOR_TYPE_SAMPLER, slot);
+            break;
     }
-
-    const auto& image = allocator_.get_image(handle);
-
-    VkDescriptorImageInfo image_info = {
-        .sampler = image.sampler,
-        .imageView = image.view,
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-    };
-
-    VkWriteDescriptorSet image_write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .pNext = nullptr,
-        .dstSet = descriptor_set_,
-        .dstBinding = TEXTURE_BINDING_SLOT,
-        .dstArrayElement = next_texture_index_,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .pImageInfo = &image_info,
-        .pBufferInfo = nullptr,
-        .pTexelBufferView = nullptr
-    };
-
-    vkUpdateDescriptorSets(device_, 1, &image_write, 0, nullptr);
 }
 
-void DescriptorAllocator::allocate_buffer(const ResourceID& handle)
+void DescriptorTable::unbind(const ResourceID& handle, const DescriptorType& type)
 {
-    if (next_buffer_index_ >= MAX_BINDLESS_BUFFERS)
+    // TODO(DCut): Handle timeline value and flushing
+    switch(type)
     {
-        throw std::runtime_error("Exceeded maximum bindless buffers");
+        case DescriptorType::STORAGE_BUFFER:
+            ssbo_descriptor_allocator_.release(handle);
+            break;
+        case DescriptorType::TEXTURE:
+            texture_descriptor_allocator_.release(handle);
+            break;
+        case DescriptorType::STORAGE_IMAGE:
+            st_image_descriptor_allocator_.release(handle);
+            break;
+        case DescriptorType::TLAS:
+            tlas_descriptor_allocator_.release(handle);
+            break;
+        case DescriptorType::BLAS:
+            tlas_descriptor_allocator_.release(handle);
+            break;
     }
+}
 
+auto DescriptorTable::get_binding_slot(const ResourceID& handle, const DescriptorType& type) -> std::uint32_t
+{
+    switch(type)
+    {
+        case DescriptorType::STORAGE_BUFFER:    return ssbo_descriptor_allocator_.get_slot(handle);
+        case DescriptorType::TEXTURE:           return texture_descriptor_allocator_.get_slot(handle);
+        case DescriptorType::STORAGE_IMAGE:     return st_image_descriptor_allocator_.get_slot(handle);
+        case DescriptorType::TLAS:              return tlas_descriptor_allocator_.get_slot(handle);
+        case DescriptorType::BLAS:              return blas_descriptor_allocator_.get_slot(handle);
+    }
+    throw std::runtime_error("Failed to get binding slot, somehow hit unreachable code.");
+}
+
+void DescriptorTable::bind_buffer(const ResourceID& handle, const VkDescriptorType& type, const uint32_t& slot)
+{
     const auto& buffer = allocator_.get_buffer(handle);
 
     VkDescriptorBufferInfo buffer_info = {
         .buffer = buffer.buffer,
         .offset = 0,
-        .range = buffer.size
+        .range  = buffer.size
     };
 
-    VkWriteDescriptorSet buffer_write = {
+    const uint32_t dst_binding = (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) ? 0 : 1;
+
+    VkWriteDescriptorSet write = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .pNext = nullptr,
         .dstSet = descriptor_set_,
-        .dstBinding = BUFFER_BINDING_SLOT,
-        .dstArrayElement = next_buffer_index_,
+        .dstBinding = dst_binding,
+        .dstArrayElement = slot,
         .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorType = type,
         .pImageInfo = nullptr,
         .pBufferInfo = &buffer_info,
         .pTexelBufferView = nullptr
     };
 
-    vkUpdateDescriptorSets(device_, 1, &buffer_write, 0, nullptr);
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+}
+
+void DescriptorTable::bind_image(const ResourceID& handle, const VkDescriptorType& type, const uint32_t& slot)
+{
+    const auto& image = allocator_.get_image(handle);
+
+    const auto image_layout = (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) ?
+                                VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkDescriptorImageInfo image_info = {
+        .sampler = image.sampler,
+        .imageView = image.view,
+        .imageLayout = image_layout, 
+    };
+
+    const uint32_t dst_binding = (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ? 2 : 3;
+
+    VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .pNext = nullptr,
+        .dstSet = descriptor_set_,
+        .dstBinding = dst_binding,
+        .dstArrayElement = slot,
+        .descriptorCount = 1,
+        .descriptorType = type,
+        .pImageInfo = &image_info,
+        .pBufferInfo = nullptr,
+        .pTexelBufferView = nullptr
+    };
+
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 }
 
 } // namespace String

@@ -2,7 +2,6 @@
 
 #include <volk.h>
 
-#include <memory>
 #include <string/vulkan/device.hpp>
 
 namespace String
@@ -11,7 +10,7 @@ class PipelineGrid3D
 {
 public:
     explicit PipelineGrid3D(
-        std::shared_ptr<Device>& device,
+        Device& device,
         const VkDescriptorSetLayout& descriptor_set_layout,
         const VkPushConstantRange& push_constant_range);
     ~PipelineGrid3D();
@@ -26,6 +25,6 @@ private:
 
     VkPipelineLayout pipeline_layout_;
     VkPipeline pipeline_;
-    std::shared_ptr<Device> device_;
+    Device& device_;
 }; // class PipelineGrid3D
 }  // namespace String

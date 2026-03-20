@@ -2,7 +2,6 @@
 
 #include <volk.h>
 
-#include <memory>
 #include <string/vulkan/device.hpp>
 
 namespace String
@@ -12,7 +11,7 @@ class HelloSlangPipeline
 public:
     explicit HelloSlangPipeline(
         const std::filesystem::path& resources_path,
-        std::shared_ptr<Device>& device,
+        Device& device,
         const VkDescriptorSetLayout& descriptor_set_layout);
     ~HelloSlangPipeline();
 
@@ -23,6 +22,6 @@ private:
 
     VkPipelineLayout pipeline_layout_;
     VkPipeline pipeline_;
-    std::shared_ptr<Device> device_;
+    Device& device_;
 }; // class PipelineGrid2D
 }  // namespace String

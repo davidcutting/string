@@ -10,7 +10,7 @@ namespace String
 
 PipelineGrid2D::PipelineGrid2D(
     const std::filesystem::path& resources_path,
-    std::shared_ptr<Device>& device,
+    Device& device,
     const VkPushConstantRange& push_constant_range)
 : device_(device)
 {
@@ -38,8 +38,8 @@ PipelineGrid2D::PipelineGrid2D(
 
 PipelineGrid2D::~PipelineGrid2D()
 {
-    vkDestroyPipeline(device_->get_device(), pipeline_, nullptr);
-    vkDestroyPipelineLayout(device_->get_device(), pipeline_layout_, nullptr);
+    vkDestroyPipeline(device_.get_device(), pipeline_, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), pipeline_layout_, nullptr);
 }
 
 VkPipeline PipelineGrid2D::get_pipeline() const

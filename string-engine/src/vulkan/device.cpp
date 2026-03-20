@@ -12,100 +12,21 @@
 namespace String
 {
 
-Device::Device(const ApplicationInfo& info, const std::shared_ptr<Window>& window)
+Device::Device(Driver& driver, const std::shared_ptr<Window>& window)
 : window_(window)
+, driver_(driver)
+, surface_(window_->create_surface(driver_.get_instance()))
 {
-    create_instance(info);
-    setup_debug_messenger();
-    create_surface();
     select_physical_device();
     create_logical_device();
-    allocator_ = std::make_unique<Allocator>(physical_device_, device_, instance_);
 }
 
 Device::~Device()
 {
-    vkDeviceWaitIdle(device_);
-    allocator_.reset();
     if (device_ != VK_NULL_HANDLE)
         vkDestroyDevice(device_, nullptr);
     if (surface_ != VK_NULL_HANDLE)
-        vkDestroySurfaceKHR(instance_, surface_, nullptr);
-    if (debug_messenger_ != VK_NULL_HANDLE)
-        vku::DestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
-    if (instance_ != VK_NULL_HANDLE)
-        vkDestroyInstance(instance_, nullptr);
-}
-
-void Device::create_instance(const ApplicationInfo& info)
-{
-    if (volkInitialize() != VK_SUCCESS)
-    {
-        throw std::runtime_error("Failed to initialize Volk!");
-    }
-
-    if (ENABLE_VALIDATION_LAYERS && !are_validation_layer_supported()) {
-        throw std::runtime_error("Validation layers requested, but not available!");
-    }
-
-    // clang-format off
-    VkApplicationInfo application_info = {
-        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pNext = nullptr,
-        .pApplicationName = info.application_name.c_str(),
-        .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
-        .pEngineName = "String Engine",
-        .engineVersion = VK_MAKE_VERSION(0, 1, 0),
-        .apiVersion = VK_API_VERSION_1_3,
-    };
-    // clang-format on
-
-    auto extensions = window_->get_platform_extensions(ENABLE_VALIDATION_LAYERS);
-    extensions.emplace_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-
-    // clang-format off
-    VkInstanceCreateInfo create_info = {
-        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
-        .pApplicationInfo = &application_info,
-        .enabledLayerCount = 0,
-        .ppEnabledLayerNames = nullptr,
-        .enabledExtensionCount = static_cast<uint32_t>(extensions.size()),
-        .ppEnabledExtensionNames = extensions.data()
-    };
-    // clang-format on
-
-    VkDebugUtilsMessengerCreateInfoEXT debug_create_info{};
-    if (ENABLE_VALIDATION_LAYERS) {
-        create_info.enabledLayerCount = static_cast<uint32_t>(validation_layers.size());
-        create_info.ppEnabledLayerNames = validation_layers.data();
-
-        vku::default_debug_messenger_create_info(debug_create_info);
-        create_info.pNext = (VkDebugUtilsMessengerCreateInfoEXT*)&debug_create_info;
-    }
-
-    if (vkCreateInstance(&create_info, nullptr, &instance_) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create Vulkan instance!");
-    }
-
-    volkLoadInstance(instance_);
-}
-
-void Device::setup_debug_messenger() {
-    if (!ENABLE_VALIDATION_LAYERS) return;
-
-    VkDebugUtilsMessengerCreateInfoEXT create_info;
-    vku::default_debug_messenger_create_info(create_info);
-
-    if (vku::CreateDebugUtilsMessengerEXT(instance_, &create_info, nullptr, &debug_messenger_) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to set up Vulkan debug messenger!");
-    }
-}
-
-void Device::create_surface()
-{
-    surface_ = window_->create_surface(instance_);
+        vkDestroySurfaceKHR(driver_.get_instance(), surface_, nullptr);
 }
 
 bool Device::check_device_extension_support(const VkPhysicalDevice& device) {
@@ -136,12 +57,9 @@ bool Device::is_device_suitable(const VkPhysicalDevice& device) {
     }
 
     // Set up feature query
-    VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features{};
-    buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-
     VkPhysicalDeviceDynamicRenderingFeatures dynamic_rendering_features{};
     dynamic_rendering_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
-    dynamic_rendering_features.pNext = &buffer_device_address_features;
+    dynamic_rendering_features.pNext = nullptr;
 
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT extended_dynamic_state2_features{};
     extended_dynamic_state2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
@@ -151,14 +69,13 @@ bool Device::is_device_suitable(const VkPhysicalDevice& device) {
     extended_dynamic_state3_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT;
     extended_dynamic_state3_features.pNext = &extended_dynamic_state2_features;
 
-    VkPhysicalDeviceDescriptorIndexingFeatures descriptor_indexing_features{};
-    descriptor_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
-    descriptor_indexing_features.pNext = &extended_dynamic_state3_features;
-
-
     VkPhysicalDeviceVulkan12Features vulkan12_features{};
     vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     vulkan12_features.pNext = &extended_dynamic_state2_features;
+    vulkan12_features.bufferDeviceAddress = true;
+    vulkan12_features.descriptorBindingPartiallyBound = true;
+    vulkan12_features.descriptorBindingSampledImageUpdateAfterBind = true;
+
     VkPhysicalDeviceVulkan13Features vulkan13_features{};
     vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     vulkan13_features.pNext = &vulkan12_features;
@@ -170,6 +87,7 @@ bool Device::is_device_suitable(const VkPhysicalDevice& device) {
     // Query what features are supported
     vkGetPhysicalDeviceFeatures2(device, &supported_features);
 
+    // TODO(DCut): Fix this so that we properly query for bindless support
     // Check if desired features are supported
     bool has_desired_features = supported_features.features.samplerAnisotropy
         && vulkan13_features.dynamicRendering == VK_TRUE
@@ -177,7 +95,6 @@ bool Device::is_device_suitable(const VkPhysicalDevice& device) {
         && vulkan12_features.timelineSemaphore == VK_TRUE
         && vulkan12_features.bufferDeviceAddress == VK_TRUE
         && extended_dynamic_state2_features.extendedDynamicState2 == VK_TRUE;
-        //&& extended_dynamic_state3_features.extendedDynamicState3 == VK_TRUE;
 
     return indices.can_render() && extensions_supported && swap_chain_adequate && has_desired_features;
 }
@@ -185,13 +102,13 @@ bool Device::is_device_suitable(const VkPhysicalDevice& device) {
 void Device::select_physical_device()
 {
     uint32_t device_count = 0;
-    vkEnumeratePhysicalDevices(instance_, &device_count, nullptr);
+    vkEnumeratePhysicalDevices(driver_.get_instance(), &device_count, nullptr);
     if (device_count == 0) {
         throw std::runtime_error("Failed to find GPUs with Vulkan support!");
     }
 
     std::vector<VkPhysicalDevice> devices(device_count);
-    vkEnumeratePhysicalDevices(instance_, &device_count, devices.data());
+    vkEnumeratePhysicalDevices(driver_.get_instance(), &device_count, devices.data());
 
     for (const auto& device : devices) {
         if (is_device_suitable(device)) {
@@ -260,6 +177,12 @@ void Device::create_logical_device()
     vulkan12_features.pNext = &extended_dynamic_state2_features;
     vulkan12_features.timelineSemaphore = VK_TRUE;
     vulkan12_features.bufferDeviceAddress = VK_TRUE;
+    vulkan12_features.descriptorBindingPartiallyBound = VK_TRUE;
+    vulkan12_features.descriptorBindingVariableDescriptorCount = VK_TRUE;
+    vulkan12_features.descriptorBindingUniformBufferUpdateAfterBind = VK_TRUE;
+    vulkan12_features.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+    vulkan12_features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    vulkan12_features.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
 
     VkPhysicalDeviceVulkan13Features vulkan13_features{};
     vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -279,7 +202,7 @@ void Device::create_logical_device()
     // clang-format on
 
     // clang-format off
-    VkDeviceCreateInfo createInfo = {
+    VkDeviceCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &enabled_device_features2,
         .flags = 0,
@@ -293,12 +216,12 @@ void Device::create_logical_device()
     };
     // clang-format on
 
-    if (ENABLE_VALIDATION_LAYERS) {
-        createInfo.enabledLayerCount = static_cast<uint32_t>(validation_layers.size());
-        createInfo.ppEnabledLayerNames = validation_layers.data();
-    }
+#ifdef STRING_DEBUG
+    create_info.enabledLayerCount = static_cast<uint32_t>(validation_layers.size());
+    create_info.ppEnabledLayerNames = validation_layers.data();
+#endif
 
-    if (vkCreateDevice(physical_device_, &createInfo, nullptr, &device_) != VK_SUCCESS) {
+    if (vkCreateDevice(physical_device_, &create_info, nullptr, &device_) != VK_SUCCESS) {
         throw std::runtime_error("failed to create logical device!");
     }
 
@@ -437,11 +360,6 @@ VkFormat Device::get_depth_format() {
     // clang-format on
 }
 
-auto Device::create_command_recorder(const QueueType& queue_type) -> std::unique_ptr<CommandRecorder>
-{
-    // return std::move(std::make_unique<CommandRecorder>(device_, get_queue_families(), queue_type));
-}
-
 VkSurfaceKHR Device::get_surface() const
 {
     return surface_;
@@ -450,6 +368,11 @@ VkSurfaceKHR Device::get_surface() const
 VkDevice& Device::get_device()
 {
     return device_;
+}
+
+auto Device::get_physical_device() -> VkPhysicalDevice&
+{
+    return physical_device_;
 }
 
 auto Device::get_queue(const QueueType& type) -> Queue
@@ -513,11 +436,6 @@ auto Device::get_queue(const QueueType& type) -> Queue
     }
 
     throw std::runtime_error("Failed to get queue!");
-}
-
-Allocator& Device::get_allocator() const
-{
-    return *allocator_.get();
 }
 
 #include <string.h>

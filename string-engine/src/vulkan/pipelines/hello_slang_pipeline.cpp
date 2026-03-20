@@ -11,7 +11,7 @@ namespace String
 
 HelloSlangPipeline::HelloSlangPipeline(
     const std::filesystem::path& resources_path,
-    std::shared_ptr<Device>& device,
+    Device& device,
     const VkDescriptorSetLayout& descriptor_set_layout)
 : device_(device)
 {
@@ -32,8 +32,8 @@ HelloSlangPipeline::HelloSlangPipeline(
 
 HelloSlangPipeline::~HelloSlangPipeline()
 {
-    vkDestroyPipeline(device_->get_device(), pipeline_, nullptr);
-    vkDestroyPipelineLayout(device_->get_device(), pipeline_layout_, nullptr);
+    vkDestroyPipeline(device_.get_device(), pipeline_, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), pipeline_layout_, nullptr);
 }
 
 VkPipeline HelloSlangPipeline::get_pipeline() const

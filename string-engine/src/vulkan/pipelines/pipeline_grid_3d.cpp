@@ -10,7 +10,7 @@ namespace String
 {
 
 PipelineGrid3D::PipelineGrid3D(
-    std::shared_ptr<Device>& device,
+    Device& device,
     const VkDescriptorSetLayout& descriptor_set_layout,
     const VkPushConstantRange& push_constant_range)
 : device_(device)
@@ -41,8 +41,8 @@ PipelineGrid3D::PipelineGrid3D(
 
 PipelineGrid3D::~PipelineGrid3D()
 {
-    vkDestroyPipeline(device_->get_device(), pipeline_, nullptr);
-    vkDestroyPipelineLayout(device_->get_device(), pipeline_layout_, nullptr);
+    vkDestroyPipeline(device_.get_device(), pipeline_, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), pipeline_layout_, nullptr);
 }
 
 VkPipeline PipelineGrid3D::get_pipeline() const

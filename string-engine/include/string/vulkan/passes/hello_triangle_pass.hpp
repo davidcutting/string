@@ -1,5 +1,7 @@
 #pragma once
 
+#include <filesystem>
+
 #include <string/vulkan/render_pass.hpp>
 
 #include <volk.h>
@@ -7,20 +9,16 @@
 namespace String
 {
 
-struct Attachment
+class HelloTrianglePass final : public Pass
 {
-    VkImage image = VK_NULL_HANDLE;
-    VkImageView image_view = VK_NULL_HANDLE;
-    VmaAllocation allocation = VK_NULL_HANDLE;
-};
+    Device& device_;
 
-class MeshTrianglePass : public Pass
-{
 public:
-    MeshTrianglePass(const VkDevice& device);
-    ~MeshTrianglePass();
+    HelloTrianglePass(Device& device, const std::filesystem::path& resources_path, const uint16_t& frames_in_flight);
+    virtual ~HelloTrianglePass() override;
 
-    virtual void record(const CommandRecorder& recorder) override;
+    virtual void update(const float& delta_time, const uint16_t& current_frame) override;
+    virtual void record(CommandRecorder& recorder, const uint16_t& current_frame) override;
 };
 
 }

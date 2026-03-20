@@ -27,6 +27,7 @@
               llvm
               lcov
               gdb
+              dbus
               gtest
               gcc
               gcovr
@@ -50,7 +51,7 @@
               vulkan-memory-allocator
               liburing
               wayland
-              linuxPackages_latest.perf
+              perf
             ];
             shellHook = ''
             export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib:${pkgs.wayland}/lib:$LD_LIBRARY_PATH"

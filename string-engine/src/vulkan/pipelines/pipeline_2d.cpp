@@ -10,7 +10,7 @@ namespace String
 
 Pipeline2D::Pipeline2D(
     const std::filesystem::path& resources_path,
-    std::shared_ptr<Device>& device,
+    Device& device,
     const VkDescriptorSetLayout& descriptor_set_layout,
     const VkPushConstantRange& push_constant_range)
 : device_(device)
@@ -39,8 +39,8 @@ Pipeline2D::Pipeline2D(
 
 Pipeline2D::~Pipeline2D()
 {
-    vkDestroyPipeline(device_->get_device(), pipeline_, nullptr);
-    vkDestroyPipelineLayout(device_->get_device(), pipeline_layout_, nullptr);
+    vkDestroyPipeline(device_.get_device(), pipeline_, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), pipeline_layout_, nullptr);
 }
 
 VkPipeline Pipeline2D::get_pipeline() const

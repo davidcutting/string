@@ -3,6 +3,7 @@
 #include <string/core/platform_detection.hpp>
 #include <cassert>
 #include <stdexcept>
+#include <entt/entt.hpp>
 
 #define VK_NO_PROTOTYPES
 #include <SDL3/SDL.h>
@@ -114,25 +115,47 @@ Window::~Window()
     SDL_DestroyWindow((SDL_Window*)window_handle_);
 }
 
-void Window::update()
+void Window::update(entt::dispatcher& dispatcher)
 {
     SDL_Event event;
     while (SDL_PollEvent(&event))
     {
-        if (event.type == SDL_EVENT_QUIT)
+        switch (event.type)
         {
-            closing = true;
-        }
-        if (event.type == SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED)
-        {
-            int width, height;
-            SDL_GetWindowSize((SDL_Window*)window_handle_, &width, &height);
+            case SDL_EVENT_QUIT:
+            {
+                dispatcher.trigger(WindowEvent{
+                    .close = true,
+                });
+                closing = true;
+                break;
+            }
+            case SDL_EVENT_WINDOW_RESIZED:
+            {
+                int width, height;
+                SDL_GetWindowSize((SDL_Window*)window_handle_, &width, &height);
 
-            if (width <= 0 || height <= 0)
-                continue;
-            
-            properties_.extent.width = static_cast<uint32_t>(width);
-            properties_.extent.height = static_cast<uint32_t>(height);
+                if (width <= 0 || height <= 0)
+                    continue;
+                
+                properties_.extent.width = static_cast<uint32_t>(width);
+                properties_.extent.height = static_cast<uint32_t>(height);
+                break;
+            }
+            case SDL_EVENT_WINDOW_MINIMIZED:
+            {
+                dispatcher.trigger(WindowEvent{
+                    .minimize = true,
+                });
+                break;
+            }
+            case SDL_EVENT_WINDOW_RESTORED:
+            {
+                dispatcher.trigger(WindowEvent{
+                    .maximize = true,
+                });
+                break;
+            }
         }
     }
 }

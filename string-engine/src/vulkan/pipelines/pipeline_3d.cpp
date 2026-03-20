@@ -10,7 +10,7 @@ namespace String
 
 Pipeline3D::Pipeline3D(
     const std::filesystem::path& resources_path,
-    std::shared_ptr<Device>& device,
+    Device& device,
     const VkDescriptorSetLayout& descriptor_set_layout)
 : device_(device)
 {
@@ -40,8 +40,8 @@ Pipeline3D::Pipeline3D(
 
 Pipeline3D::~Pipeline3D()
 {
-    vkDestroyPipeline(device_->get_device(), pipeline_, nullptr);
-    vkDestroyPipelineLayout(device_->get_device(), pipeline_layout_, nullptr);
+    vkDestroyPipeline(device_.get_device(), pipeline_, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), pipeline_layout_, nullptr);
 }
 
 VkPipeline Pipeline3D::get_pipeline() const

@@ -1,9 +1,7 @@
 #pragma once
 
-#include <cstdint>
-#include <queue>
+#include <functional>
 #include <unordered_map>
-#include <span>
 
 #include <string/vulkan/resource.hpp>
 
@@ -13,52 +11,61 @@
 namespace String
 {
 
-struct PendingRelease
-{
-    ResourceID id;
-    uint64_t release_value;
-};
-
 struct ResourceAllocatorCreateInfo
 {
+    VkInstance& instance;
+    VkPhysicalDevice& physical_device;
     VkDevice& device;
-    VmaAllocator& allocator;
 };
 
 class ResourceAllocator
 {
-    VmaAllocator& allocator_;
+    VmaAllocator allocator_;
+    VkPhysicalDevice& physical_device_;
     VkDevice& device_;
     IDRegistry registry_;
 
     std::unordered_map<ResourceID, AllocatedBuffer> buffers_;
     std::unordered_map<ResourceID, AllocatedImage> images_;
 
-    std::queue<PendingRelease> pending_buffers_;
-    std::queue<PendingRelease> pending_images_;
-
-    VkSemaphore timeline_semaphore_ = VK_NULL_HANDLE;
-    uint64_t timeline_value_ = 1;
-
 public:
     explicit ResourceAllocator(const ResourceAllocatorCreateInfo& info);
     ~ResourceAllocator();
 
-    auto create_buffer(const BufferInfo& info) -> ResourceID;
-    void destroy_buffer(const ResourceID& id);
-    auto get_buffer(const ResourceID& id) const -> const AllocatedBuffer&;
+    auto create_resource(const BufferInfo& info) -> ResourceID;
+    auto create_resource(const ImageInfo& info) -> ResourceID;
+    auto create_staging(const VkDeviceSize& size) -> ResourceID;
+    void destroy_resource(const ResourceID& id);
 
-    auto create_image(const ImageInfo& info) -> ResourceID;
-    void destroy_image(const ResourceID& id);
+    auto get_buffer(const ResourceID& id) const -> const AllocatedBuffer&;
     auto get_image(const ResourceID& id) const -> const AllocatedImage&;
 
-    auto create_transient_buffer(const BufferInfo& info) -> ResourceID;
-    void destroy_transient_buffer(const ResourceID& id);
-    template<typename T>
-    auto get_transient_buffer(const ResourceID& id) -> std::span<T>;
+    void copy_data_to_buffer(void* data, const ResourceID& resource) const;
 
-    void flush();
-    auto advance_timeline() -> VkTimelineSemaphoreSubmitInfo;
+private:
+    void create_image_sampler(AllocatedImage& allocated_image);
+    void create_image_view(AllocatedImage& allocated_image, const VkImageAspectFlags& aspect_flags);
+};
+
+struct DeletionQueue
+{
+    std::deque<std::function<void()>> deletors;
+
+    void push_function(std::function<void()>&& function)
+    {
+        deletors.push_back(function);
+    }
+
+    void flush()
+    {
+        // reverse iterate the deletion queue to execute all the functions
+        for (auto it = deletors.rbegin(); it != deletors.rend(); it++)
+        {
+            (*it)(); // call functors
+        }
+
+        deletors.clear();
+    }
 };
 
 } // namespace String

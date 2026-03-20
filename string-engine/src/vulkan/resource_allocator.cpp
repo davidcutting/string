@@ -3,6 +3,7 @@
 #include <string/vulkan/resource_allocator.hpp>
 #include <string/core/logger.hpp>
 #include <string/vulkan/resource.hpp>
+#include "vulkan/vulkan_core.h"
 
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
@@ -11,48 +12,30 @@ namespace String
 {
 
 ResourceAllocator::ResourceAllocator(const ResourceAllocatorCreateInfo& info)
-: device_(info.device)
-, allocator_(info.allocator)
+: physical_device_(info.physical_device)
+, device_(info.device)
 {
-    // VmaAllocatorCreateInfo allocator_info = {
-    //     .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
-    //     .physicalDevice = info.physical_device,
-    //     .device = info.device,
-    //     .preferredLargeHeapBlockSize = 0,
-    //     .pAllocationCallbacks = nullptr,
-    //     .pDeviceMemoryCallbacks = nullptr,
-    //     .pHeapSizeLimit = nullptr,
-    //     .pVulkanFunctions = nullptr,
-    //     .instance = info.instance,
-    //     .vulkanApiVersion = VK_API_VERSION_1_3,
-    //     .pTypeExternalMemoryHandleTypes = nullptr
-    // };
-
-    // VmaVulkanFunctions function_table;
-    // vmaImportVulkanFunctionsFromVolk(&allocator_info, &function_table);
-    // allocator_info.pVulkanFunctions = &function_table;
-
-    // if (vmaCreateAllocator(&allocator_info, &allocator_) != VK_SUCCESS)
-    // {
-    //     throw std::runtime_error("Failed to create VMA allocator");
-    // }
-
-    VkSemaphoreTypeCreateInfo timeline_create_info = {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-        .pNext = nullptr,
-        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-        .initialValue = timeline_value_,
+    VmaAllocatorCreateInfo allocator_info = {
+        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        .physicalDevice = info.physical_device,
+        .device = info.device,
+        .preferredLargeHeapBlockSize = 0,
+        .pAllocationCallbacks = nullptr,
+        .pDeviceMemoryCallbacks = nullptr,
+        .pHeapSizeLimit = nullptr,
+        .pVulkanFunctions = nullptr,
+        .instance = info.instance,
+        .vulkanApiVersion = VK_API_VERSION_1_3,
+        .pTypeExternalMemoryHandleTypes = nullptr
     };
 
-    VkSemaphoreCreateInfo semaphore_info{
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        .pNext = &timeline_create_info,
-        .flags = 0,
-    };
+    VmaVulkanFunctions function_table;
+    vmaImportVulkanFunctionsFromVolk(&allocator_info, &function_table);
+    allocator_info.pVulkanFunctions = &function_table;
 
-    if (vkCreateSemaphore(device_, &semaphore_info, nullptr, &timeline_semaphore_) != VK_SUCCESS)
+    if (vmaCreateAllocator(&allocator_info, &allocator_) != VK_SUCCESS)
     {
-        throw std::runtime_error("Failed to create timeline semaphore for resource allocator!");
+        throw std::runtime_error("Failed to create VMA allocator");
     }
 }
 
@@ -65,19 +48,17 @@ ResourceAllocator::~ResourceAllocator()
     }
     for (auto&[id, image] : images_)
     {
+        vkDestroyImageView(device_, image.view, nullptr);
+        vkDestroySampler(device_, image.sampler, nullptr);
         vmaDestroyImage(allocator_, image.image, image.allocation);
     }
-    if (timeline_semaphore_ != VK_NULL_HANDLE)
+    if (allocator_ != VK_NULL_HANDLE)
     {
-        vkDestroySemaphore(device_, timeline_semaphore_, nullptr);
+        vmaDestroyAllocator(allocator_);
     }
-    // if (allocator_ != VK_NULL_HANDLE)
-    // {
-    //     vmaDestroyAllocator(allocator_);
-    // }
 }
 
-auto ResourceAllocator::create_buffer(const BufferInfo& info) -> ResourceID
+auto ResourceAllocator::create_resource(const BufferInfo& info) -> ResourceID
 {
     AllocatedBuffer new_buffer = {
         .buffer = VK_NULL_HANDLE,
@@ -120,22 +101,7 @@ auto ResourceAllocator::create_buffer(const BufferInfo& info) -> ResourceID
     return id;
 }
 
-void ResourceAllocator::destroy_buffer(const ResourceID& id)
-{
-    PendingRelease release = {
-        .id = id,
-        .release_value = timeline_value_,
-    };
-
-    pending_buffers_.emplace(std::move(release));
-}
-
-auto ResourceAllocator::get_buffer(const ResourceID& id) const -> const AllocatedBuffer&
-{
-    return buffers_.at(id);
-}
-
-auto ResourceAllocator::create_image(const ImageInfo& info) -> ResourceID
+auto ResourceAllocator::create_resource(const ImageInfo& info) -> ResourceID
 {
     AllocatedImage new_image = {
         .image = VK_NULL_HANDLE,
@@ -186,19 +152,46 @@ auto ResourceAllocator::create_image(const ImageInfo& info) -> ResourceID
         throw std::runtime_error("Failed to create an image with VMA");
     }
 
+    create_image_sampler(new_image);
+    create_image_view(new_image, info.aspect_flags);
+
     const auto& id = registry_.get_id();
     images_[id] = std::move(new_image);
     return id;
 }
 
-void ResourceAllocator::destroy_image(const ResourceID& id)
+auto ResourceAllocator::create_staging(const VkDeviceSize& size) -> ResourceID
 {
-    PendingRelease release = {
-        .id = id,
-        .release_value = timeline_value_,
-    };
+    return create_resource(BufferInfo{
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_CPU_ONLY,
+        .allocation_flags = {},
+    });
+}
 
-    pending_images_.emplace(std::move(release));
+void ResourceAllocator::destroy_resource(const ResourceID& id)
+{
+    if (buffers_.contains(id))
+    {
+        AllocatedBuffer& garbage = buffers_.at(id);
+        vmaDestroyBuffer(allocator_, garbage.buffer, garbage.allocation);
+        buffers_.erase(id);
+    }
+    if (images_.contains(id))
+    {
+        AllocatedImage& garbage = images_.at(id);
+        vkDestroyImageView(device_, garbage.view, nullptr);
+        vkDestroySampler(device_, garbage.sampler, nullptr);
+        vmaDestroyImage(allocator_, garbage.image, garbage.allocation);
+        images_.erase(id);
+    }
+    registry_.release_id(id);
+}
+
+auto ResourceAllocator::get_buffer(const ResourceID& id) const -> const AllocatedBuffer&
+{
+    return buffers_.at(id);
 }
 
 auto ResourceAllocator::get_image(const ResourceID& id) const -> const AllocatedImage&
@@ -206,80 +199,73 @@ auto ResourceAllocator::get_image(const ResourceID& id) const -> const Allocated
     return images_.at(id);
 }
 
-auto ResourceAllocator::create_transient_buffer(const BufferInfo& info) -> ResourceID
+void ResourceAllocator::copy_data_to_buffer(void* data, const ResourceID& resource) const
 {
-    // TODO: implement
+    // TODO(DCut): In general, one can configure allocations and pools with VMA to automatically contain
+    // a void* to the mapping for us, which would shift the cost of mapping to the allocation time,
+    // potentially saving some/tons(?) of time during this copy. Def need to profile this
+    void* mapped_memory;
+    auto& buffer = get_buffer(resource);
+    vmaMapMemory(allocator_, buffer.allocation, &mapped_memory);
+    memcpy(mapped_memory, data, buffer.size);
+    vmaUnmapMemory(allocator_, buffer.allocation);
 }
 
-void ResourceAllocator::destroy_transient_buffer(const ResourceID& id)
+void ResourceAllocator::create_image_sampler(AllocatedImage& allocated_image)
 {
-    // TODO: implement
-}
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(physical_device_, &properties);
 
-template<typename T>
-auto get_transient_buffer(const ResourceID& id) -> std::span<T>
-{
-    // TODO: implement
-}
-
-void ResourceAllocator::flush()
-{
-    uint64_t completed_value = 0;
-    if (vkGetSemaphoreCounterValue(device_, timeline_semaphore_, &completed_value) != VK_SUCCESS)
-    {
-        STRING_LOG_ERROR("Failed to get timeline semaphore value during ResourceAllocator::flush(). Skipping flush...");
-        return;
-    }
-
-    while (!pending_buffers_.empty())
-    {
-        const auto& release = pending_buffers_.front();
-        if (release.release_value > completed_value)
-        {
-            break;
-        }
-
-        AllocatedBuffer& garbage = buffers_.at(release.id);
-        vmaDestroyBuffer(allocator_, garbage.buffer, garbage.allocation);
-
-        buffers_.erase(release.id);
-        registry_.release_id(release.id);
-
-        pending_buffers_.pop();
-    }
-
-    while (!pending_images_.empty())
-    {
-        const auto& release = pending_images_.front();
-        if (release.release_value > completed_value)
-        {
-            break;
-        }
-
-        AllocatedImage& garbage = images_.at(release.id);
-        vmaDestroyImage(allocator_, garbage.image, garbage.allocation);
-
-        images_.erase(release.id);
-        registry_.release_id(release.id);
-
-        pending_images_.pop();
-    }
-}
-
-auto ResourceAllocator::advance_timeline() -> VkTimelineSemaphoreSubmitInfo
-{
-    timeline_value_++;
-
-    VkTimelineSemaphoreSubmitInfo timeline_info = {
-        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+    VkSamplerCreateInfo sampler_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
-        .waitSemaphoreValueCount = 0,
-        .pWaitSemaphoreValues = nullptr,
-        .signalSemaphoreValueCount = 1,
-        .pSignalSemaphoreValues = &timeline_value_,
+        .flags = 0,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .mipLodBias = 0.f,
+        .anisotropyEnable = VK_TRUE,
+        .maxAnisotropy = properties.limits.maxSamplerAnisotropy,
+        .compareEnable = VK_FALSE,
+        .compareOp = VK_COMPARE_OP_ALWAYS,
+        .minLod = 0.f,
+        .maxLod = 0.f,
+        .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .unnormalizedCoordinates = VK_FALSE
     };
 
-    return timeline_info;
+    if (vkCreateSampler(device_, &sampler_info, nullptr, &allocated_image.sampler) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create image sampler!");
+    }
+}
+
+void ResourceAllocator::create_image_view(AllocatedImage& allocated_image, const VkImageAspectFlags& aspect_flags)
+{
+    VkImageViewCreateInfo view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .image = allocated_image.image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = allocated_image.format,
+        .components = {},
+        .subresourceRange = {
+            .aspectMask = aspect_flags,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+
+    if (vkCreateImageView(device_, &view_info, nullptr, &allocated_image.view) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create image view!");
+    }
 }
 
 }

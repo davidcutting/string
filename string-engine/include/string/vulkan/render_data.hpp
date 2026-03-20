@@ -8,16 +8,6 @@
 namespace String
 {
 
-struct UIShape {
-    alignas(16) glm::vec2 center;
-    alignas(16) glm::vec2 size;
-    alignas(16) glm::vec4 color;
-    float cornerRadius;
-    float strokeWidth;
-    uint32_t shapeType;
-    uint32_t flags;
-};
-
 struct Vertex {
     glm::vec3 pos;
     glm::vec3 color;

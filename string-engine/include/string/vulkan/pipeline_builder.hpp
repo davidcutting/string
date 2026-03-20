@@ -1,6 +1,5 @@
 #pragma once
 
-#include <memory>
 #include <string/vulkan/pipeline.hpp>
 #include <string/vulkan/device.hpp>
 
@@ -14,7 +13,7 @@ class PipelineLayoutBuilder
 public:
     PipelineLayoutBuilder& set_descriptor_set_layout(const std::vector<VkDescriptorSetLayout>& descriptor_set_layouts);
     PipelineLayoutBuilder& set_push_constant_ranges(const std::vector<VkPushConstantRange>& push_constant_ranges);
-    VkPipelineLayout build(const std::shared_ptr<Device>& device);
+    VkPipelineLayout build(Device& device);
 private:
     std::vector<VkDescriptorSetLayout> descriptor_set_layouts_;
     std::vector<VkPushConstantRange> push_constant_ranges_;
@@ -23,14 +22,12 @@ private:
 class PipelineBuilder
 {
 public:
-    explicit PipelineBuilder(const std::shared_ptr<Device>& device, const PipelineType& type = PipelineType::GRAPHICS);
+    explicit PipelineBuilder(Device& device, const PipelineType& type = PipelineType::GRAPHICS);
     ~PipelineBuilder();
 
-    // Non-copyable, movable
+    // Non-copyable
     PipelineBuilder(const PipelineBuilder&) = delete;
     PipelineBuilder& operator=(const PipelineBuilder&) = delete;
-    PipelineBuilder(PipelineBuilder&&) = default;
-    PipelineBuilder& operator=(PipelineBuilder&&) = default;
 
     // Shader stages
     PipelineBuilder& add_compute_shader(const std::filesystem::path& resource_path);
@@ -55,7 +52,7 @@ public:
 
 private:
     PipelineType type_;
-    std::shared_ptr<Device> device_;
+    Device& device_;
     VkShaderModule compute_shader_module_{VK_NULL_HANDLE};
     VkShaderModule vertex_shader_module_{VK_NULL_HANDLE};
     VkShaderModule fragment_shader_module_{VK_NULL_HANDLE};

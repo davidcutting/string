@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include <entt/entt.hpp>
 #include <volk.h>
 
 namespace String
@@ -24,6 +25,13 @@ enum class VSync { OFF, ON };
 
 }  // namespace View
 
+struct WindowEvent
+{
+    bool close = false;
+    bool minimize = false;
+    bool maximize = false;
+};
+
 class Window {
 public:
     using ResizeEventCallbackFn = std::function<void(View::Extent const&)>;
@@ -39,7 +47,7 @@ public:
     Window(const Properties& properties);
     ~Window();
 
-    void update();
+    void update(entt::dispatcher& dispatcher);
 
     void register_resize_event_callback(const ResizeEventCallbackFn& fn);
 

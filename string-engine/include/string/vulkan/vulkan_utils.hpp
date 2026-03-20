@@ -3,15 +3,35 @@
 #include <string_view>
 #include <string/core/logger.hpp>
 #include <string/vulkan/render_data.hpp>
+#include <string/vulkan/resource.hpp>
 #include <vector>
 #include <fstream>
 #include <filesystem>
+#include "string/vulkan/command_recorder.hpp"
 
 #include <volk.h>
 
-namespace String {
+namespace String
+{
 
-namespace vku {
+namespace vku
+{
+
+void transition_image_layout(
+    CommandRecorder& transfer_command_recorder,
+    VkImage image,
+    VkFormat format,
+    VkImageLayout old_layout,
+    VkImageLayout new_layout);
+void copy_buffer_to_image(
+    CommandRecorder& transfer_command_recorder,
+    const AllocatedBuffer& buffer,
+    const AllocatedImage& image,
+    const VkExtent2D& extent);
+void copy_buffer(
+    CommandRecorder& transfer_command_recorder,
+    const AllocatedBuffer& source_buffer,
+    const AllocatedBuffer& dest_buffer);
 
 inline std::vector<char> read_file(const std::filesystem::path& filepath)
 {
@@ -113,6 +133,11 @@ inline void default_debug_messenger_create_info(VkDebugUtilsMessengerCreateInfoE
         .pUserData = nullptr
     };
     // clang-format on
+}
+
+inline bool hasStencilComponent(const VkFormat& format)
+{
+    return format == VK_FORMAT_D32_SFLOAT_S8_UINT || format == VK_FORMAT_D24_UNORM_S8_UINT;
 }
 
 }  // namespace vku
