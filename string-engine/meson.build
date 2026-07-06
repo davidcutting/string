@@ -130,6 +130,9 @@ core_src = [
     'src/vulkan/pipelines/pipeline_grid_3d.cpp',
     'src/vulkan/pipelines/hello_slang_pipeline.cpp',
     'src/vulkan/passes/hello_triangle_pass.cpp',
+    'src/vulkan/passes/composite_pass.cpp',
+    'src/vulkan/passes/grid_2d_pass.cpp',
+    'src/vulkan/passes/geometry_pass.cpp',
     # The remaining passes are still stale against the Device/ResourceAllocator API.
     # Revive one at a time (Phase 3):
     #   'src/vulkan/passes/hello_slang_pass.cpp',     # stale: get_allocator, descriptor_pool
@@ -150,7 +153,9 @@ static_target = static_library(
 )
 
 install_subdir('include/string', install_dir : 'include')
-install_subdir('assets', install_dir : 'assets')
+# NOTE: assets are intentionally NOT copied here. The Nix build symlinks them under
+# include/string/assets (see flake.nix postInstall) so large models aren't duplicated into
+# every build output. Non-Nix builds point STRING_RESOURCES_DIR at a tree that has them.
 
 # --------------------------------------------------
 

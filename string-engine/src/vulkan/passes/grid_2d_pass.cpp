@@ -6,6 +6,7 @@ namespace String
 Grid2DPass::Grid2DPass(Device& device, const std::filesystem::path& resources_path, const uint16_t& frames_in_flight)
 : device_(device)
 {
+    (void)frames_in_flight;
     grid_2d_push_constant_range_ = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
@@ -21,11 +22,13 @@ Grid2DPass::~Grid2DPass()
 
 void Grid2DPass::update(const float& delta_time, const uint16_t& current_frame)
 {
-
+    (void)delta_time;
+    (void)current_frame;
 }
 
 void Grid2DPass::record(CommandRecorder& recorder, const uint16_t& current_frame)
 {
+    (void)current_frame;
     VkCommandBuffer& command_buffer = recorder.get_command_buffer();
 
     Grid2DParams params = {

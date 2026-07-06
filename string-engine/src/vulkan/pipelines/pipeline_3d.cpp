@@ -11,12 +11,14 @@ namespace String
 Pipeline3D::Pipeline3D(
     const std::filesystem::path& resources_path,
     Device& device,
-    const VkDescriptorSetLayout& descriptor_set_layout)
+    const VkDescriptorSetLayout& descriptor_set_layout,
+    const VkPushConstantRange& push_constant_range)
 : device_(device)
 {
     std::vector<VkDescriptorSetLayout> descriptor_set_layouts = { descriptor_set_layout };
     pipeline_layout_ = PipelineLayoutBuilder()
         .set_descriptor_set_layout(descriptor_set_layouts)
+        .set_push_constant_ranges({ push_constant_range })
         .build(device_);
 
     auto binding_description = Vertex::getBindingDescription();

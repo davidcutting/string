@@ -245,14 +245,14 @@ PipelineBuilder& PipelineBuilder::set_multisampling()
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::enable_depth_stencil()
+PipelineBuilder& PipelineBuilder::enable_depth_stencil(bool depth_test, bool depth_write)
 {
     VkPipelineDepthStencilStateCreateInfo depth_stencil_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .depthTestEnable = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
+        .depthTestEnable = depth_test ? VK_TRUE : VK_FALSE,
+        .depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE,
         .depthCompareOp = VK_COMPARE_OP_LESS,
         .depthBoundsTestEnable = VK_FALSE,
         .stencilTestEnable = VK_FALSE,
@@ -262,6 +262,42 @@ PipelineBuilder& PipelineBuilder::enable_depth_stencil()
         .maxDepthBounds = 0
     };
     depth_stencil_info_ = depth_stencil_info;
+    depth_format_ = VK_FORMAT_D32_SFLOAT;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::set_color_format(VkFormat format)
+{
+    color_format_ = format;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::disable_color_blending()
+{
+    color_blend_attachment_info_ = {
+        .blendEnable = VK_FALSE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                          VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT |
+                          VK_COLOR_COMPONENT_A_BIT
+    };
+
+    color_blending_info_ = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .logicOpEnable = VK_FALSE,
+        .logicOp = VK_LOGIC_OP_COPY,
+        .attachmentCount = 1,
+        .pAttachments = &color_blend_attachment_info_,
+        .blendConstants = { 0.0f, 0.0f, 0.0f, 0.0f }
+    };
     return *this;
 }
 
@@ -324,9 +360,9 @@ VkPipeline PipelineBuilder::build_graphics_pipeline(const VkPipelineLayout& pipe
     // Create the pipeline
 
     VkPipeline pipeline;
-    // Must match the offscreen render target (Renderer's color_attachment_), which every
-    // pass renders into before it is blitted to the swapchain. NOT the swapchain format.
-    VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    // Defaults to the offscreen HDR target (color_format_); composite/present passes
+    // override via set_color_format(). Depth is UNDEFINED unless enable_depth_stencil().
+    VkFormat color_format = color_format_;
     VkPipelineShaderStageCreateInfo shader_stages[] = { vertex_shader_stage_info_, fragment_shader_stage_info_ };
 
     VkPipelineRenderingCreateInfo pipeline_render_info
@@ -336,7 +372,7 @@ VkPipeline PipelineBuilder::build_graphics_pipeline(const VkPipelineLayout& pipe
         .viewMask = 0,
         .colorAttachmentCount = 1,
         .pColorAttachmentFormats = &color_format,
-        .depthAttachmentFormat = VK_FORMAT_D32_SFLOAT,
+        .depthAttachmentFormat = depth_format_,
         .stencilAttachmentFormat = {}
     };
 
@@ -352,7 +388,8 @@ VkPipeline PipelineBuilder::build_graphics_pipeline(const VkPipelineLayout& pipe
         .pViewportState = &viewport_state,
         .pRasterizationState = &rasterizer_state_info_,
         .pMultisampleState = &multisampling_state_info_,
-        .pDepthStencilState = &depth_stencil_info_,
+        // No depth attachment (composite pass) => no depth-stencil state.
+        .pDepthStencilState = (depth_format_ == VK_FORMAT_UNDEFINED) ? nullptr : &depth_stencil_info_,
         .pColorBlendState = &color_blending_info_,
         .pDynamicState = &dynamic_state,
         .layout = pipeline_layout,

@@ -220,7 +220,8 @@ void DescriptorTable::bind_buffer(const ResourceID& handle, const VkDescriptorTy
         .range  = buffer.size
     };
 
-    const uint32_t dst_binding = (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) ? 0 : 1;
+    // Layout binding 0 is the storage-buffer array (the only buffer binding in the table).
+    const uint32_t dst_binding = 0;
 
     VkWriteDescriptorSet write = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -251,7 +252,8 @@ void DescriptorTable::bind_image(const ResourceID& handle, const VkDescriptorTyp
         .imageLayout = image_layout, 
     };
 
-    const uint32_t dst_binding = (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ? 2 : 3;
+    // Layout binding 1 is combined image samplers (textures), binding 2 is storage images.
+    const uint32_t dst_binding = (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ? 1 : 2;
 
     VkWriteDescriptorSet write = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,

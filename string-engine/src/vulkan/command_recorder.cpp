@@ -43,15 +43,22 @@ void CommandRecorder::init(const VkDevice& device, const Queue& queue)
     }
 }
 
+CommandRecorder::~CommandRecorder()
+{
+    destroy();
+}
+
 void CommandRecorder::destroy()
 {
     if (primary_command_buffer_ != VK_NULL_HANDLE)
     {
         vkFreeCommandBuffers(device_, command_pool_, 1, &primary_command_buffer_);
+        primary_command_buffer_ = VK_NULL_HANDLE;
     }
     if (command_pool_ != VK_NULL_HANDLE)
     {
         vkDestroyCommandPool(device_, command_pool_, nullptr);
+        command_pool_ = VK_NULL_HANDLE;
     }
 }
 

@@ -4,9 +4,7 @@
 #include <memory>
 #include <vector>
 
-#include <string/vulkan/allocator.hpp>
 #include <string/vulkan/render_pass.hpp>
-#include <string/vulkan/pipelines/pipeline_2d.hpp>
 #include <string/vulkan/device.hpp>
 #include "string/vulkan/pipelines/pipeline_grid_2d.hpp"
 
@@ -41,10 +39,6 @@ class Grid2DPass final : public Pass
     Device& device_;
     VkPushConstantRange grid_2d_push_constant_range_;
     std::unique_ptr<PipelineGrid2D> pipeline_grid_2d_;
-
-    Grid2DParams grid_params_;
-    // std::vector<std::unique_ptr<Buffer>> ui_shapes_ssbo_;
-    // std::vector<std::span<UIElement>> ui_elements_mapped_;
 
 public:
     Grid2DPass(Device& device, const std::filesystem::path& resources_path, const uint16_t& frames_in_flight);

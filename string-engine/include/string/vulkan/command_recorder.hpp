@@ -20,7 +20,12 @@ class CommandRecorder
     VkCommandBuffer primary_command_buffer_ = VK_NULL_HANDLE;
 public:
     CommandRecorder() = default;
-    // No copy
+    // RAII: frees the pool/buffer if still owned. Makes the recorder safe to leave to
+    // stack unwinding (e.g. if a later member's constructor throws) — destroy() is also
+    // callable explicitly and is idempotent.
+    ~CommandRecorder();
+    // No copy (and, with a user-declared destructor, no implicit move) — recorders are
+    // owned in place as members and never relocated.
     CommandRecorder(const CommandRecorder&) = delete;
     CommandRecorder& operator=(const CommandRecorder&) = delete;
 

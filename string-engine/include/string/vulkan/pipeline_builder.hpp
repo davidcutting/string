@@ -44,8 +44,17 @@ public:
         VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL,
         VkCullModeFlags cull_mode = VK_CULL_MODE_BACK_BIT);
     PipelineBuilder& set_multisampling();
-    PipelineBuilder& enable_depth_stencil();
+    // Declares a D32 depth attachment (matching the offscreen pass). test/write default on
+    // for 3D passes; a 2D background pass (e.g. the grid) passes false to declare the format
+    // without depth-testing so it doesn't occlude geometry drawn after it.
+    PipelineBuilder& enable_depth_stencil(bool depth_test = true, bool depth_write = true);
     PipelineBuilder& enable_color_blending();
+    // Opaque single-attachment color state (blendEnable = false, RGBA writes). For passes
+    // that fully cover their target and want a straight write, e.g. the composite copy.
+    PipelineBuilder& disable_color_blending();
+    // Override the dynamic-rendering color target format (default: the offscreen HDR
+    // R16G16B16A16_SFLOAT). Composite/present passes set this to the swapchain format.
+    PipelineBuilder& set_color_format(VkFormat format);
 
     VkPipeline build_graphics_pipeline(const VkPipelineLayout& pipeline_layout);
     VkPipeline build_compute_pipeline(const VkPipelineLayout& pipeline_layout);
@@ -69,6 +78,12 @@ private:
     VkPipelineDepthStencilStateCreateInfo depth_stencil_info_{};
     VkPipelineColorBlendAttachmentState color_blend_attachment_info_{};
     VkPipelineColorBlendStateCreateInfo color_blending_info_{};
+
+    // Dynamic-rendering attachment formats. Depth stays UNDEFINED unless
+    // enable_depth_stencil() is called, so passes without a depth attachment (e.g. the
+    // composite pass) don't declare one.
+    VkFormat color_format_ = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
 };
 
 }

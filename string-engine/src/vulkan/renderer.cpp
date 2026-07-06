@@ -35,6 +35,8 @@ Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_pt
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
 , global_descriptor_table_(device_.get_device(), allocator_)
 , triangle_pass_(device_, std::filesystem::path(application_info.resources_directory), static_cast<uint16_t>(frames_in_flight_))
+, grid_2d_pass_(device_, std::filesystem::path(application_info.resources_directory), static_cast<uint16_t>(frames_in_flight_))
+, composite_pass_(device_, std::filesystem::path(application_info.resources_directory), global_descriptor_table_.get_layout(), presenter_.get_format())
 {
     STRING_LOG_DEBUG("Initializing renderer...");
     const auto resources_path = std::filesystem::path(application_info_.resources_directory);
@@ -63,7 +65,24 @@ Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_pt
         .allocation_flags = {},
     });
 
-    transfer_command_recorder_.init(device_.get_device(), compute_queue_);
+    // Make the offscreen HDR target samplable by the composite pass via the bindless table.
+    bind_composite_source();
+
+    // The grid sizes itself from the pass screen_size; seed it with the current extent.
+    grid_2d_pass_.resize(extent);
+
+    // Upload on the graphics queue: the texture's TRANSFER_DST -> SHADER_READ_ONLY barrier
+    // uses a FRAGMENT_SHADER dst stage (only valid on a graphics-capable queue), and keeping
+    // upload + sampling on one queue family avoids a queue-ownership transfer. (A dedicated
+    // async-transfer queue would need explicit ownership transfers instead.)
+    transfer_command_recorder_.init(device_.get_device(), graphics_queue_);
+
+    // Geometry uploads its mesh/texture via the transfer recorder (now initialized) and
+    // binds its texture into the bindless table.
+    geometry_pass_ = std::make_unique<GeometryPass>(
+        device_, allocator_, global_descriptor_table_, transfer_command_recorder_,
+        resources_path, static_cast<uint16_t>(frames_in_flight_));
+    geometry_pass_->resize(extent);
 
     for (auto& frame : frames_)
     {
@@ -98,6 +117,9 @@ Renderer::~Renderer()
     STRING_LOG_DEBUG("Waiting for device to be idle...");
     vkDeviceWaitIdle(device_.get_device());
 
+    // Destroy the geometry pass while the allocator, table, and device are still alive.
+    geometry_pass_.reset();
+
     vkDestroySemaphore(device_.get_device(), frame_semaphore_, nullptr);
 
     for (auto& frame : frames_)
@@ -117,17 +139,9 @@ void Renderer::update()
     static auto startTime = std::chrono::high_resolution_clock::now();
 
     auto currentTime = std::chrono::high_resolution_clock::now();
-    [[maybe_unused]] float delta_time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+    float delta_time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
 
-    [[maybe_unused]] const auto swap_chain_extent = presenter_.get_extent();
-
-    // // Resize passes
-    // geometry_pass_.resize(swap_chain_extent);
-    // ui_pass_.resize(swap_chain_extent);
-
-    // // Update passes
-    // geometry_pass_.update(delta_time, current_frame_);
-    // ui_pass_.update(delta_time, current_frame_);
+    geometry_pass_->update(delta_time, static_cast<uint16_t>(current_frame_));
 }
 
 void Renderer::begin_frame()
@@ -153,6 +167,7 @@ void Renderer::begin_frame()
     // handles out of AcquiredImage (which holds references into vectors resize() reallocates).
     AcquiredImage acquired = presenter_.acquire_next_frame();
     acquired_image_ = acquired.image;
+    acquired_image_view_ = acquired.image_view;
     acquired_wait_semaphore_ = acquired.wait_for_image_available;
     acquired_signal_semaphore_ = acquired.signal_when_ready_to_present;
 }
@@ -285,36 +300,36 @@ void Renderer::end_rendering()
     auto& command_buffer = frame.recorder.get_command_buffer();
     auto& color_attachment = allocator_.get_image(color_attachment_);
 
+    // Offscreen scene rendering (into color_attachment_) is done.
     vkCmdEndRendering(command_buffer);
 
     const auto extent = presenter_.get_extent();
 
-    // Blit the offscreen HDR target into the acquired swapchain image. This is the step
-    // that decouples the render target's format/resolution from the swapchain; blitting
-    // into the SRGB swapchain applies the linear->sRGB encode on store. The transitions
-    // bracket the blit:
-    //   color_attachment_ : COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL
-    //   swapchain image   : UNDEFINED -> TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR
-    VkImageMemoryBarrier pre_blit_barriers[2] = {
-        {   // Offscreen color target becomes the blit source.
+    // Composite the offscreen HDR target into the acquired swapchain image via the bindless
+    // table: the composite pass samples color_attachment_ and writes a fullscreen triangle
+    // into the swapchain (SRGB), which applies the linear->sRGB encode on store. Transitions:
+    //   color_attachment_ : COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL
+    //   swapchain image   : UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
+    VkImageMemoryBarrier pre_composite_barriers[2] = {
+        {   // Offscreen color target becomes a shader-read source.
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = color_attachment.image,
             .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
         },
-        {   // Swapchain image becomes the blit destination.
+        {   // Swapchain image becomes the composite color target.
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = 0,
-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = acquired_image_,
@@ -323,26 +338,59 @@ void Renderer::end_rendering()
     };
     vkCmdPipelineBarrier(command_buffer,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 2, pre_blit_barriers);
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0, 0, nullptr, 0, nullptr, 2, pre_composite_barriers);
 
-    VkImageBlit blit_region = {
-        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .srcOffsets = { { 0, 0, 0 }, { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 } },
-        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .dstOffsets = { { 0, 0, 0 }, { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 } },
+    VkRenderingAttachmentInfo swapchain_attachment = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = acquired_image_view_,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .resolveMode = VK_RESOLVE_MODE_NONE,
+        .resolveImageView = VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,   // fullscreen triangle covers every pixel
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = {},
     };
-    vkCmdBlitImage(command_buffer,
-        color_attachment.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        acquired_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1, &blit_region, VK_FILTER_NEAREST);
+
+    VkRenderingInfo composite_rendering_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .renderArea = {{0, 0}, extent},
+        .layerCount = 1,
+        .viewMask = 0,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &swapchain_attachment,
+        .pDepthAttachment = nullptr,
+        .pStencilAttachment = nullptr,
+    };
+
+    vkCmdBeginRendering(command_buffer, &composite_rendering_info);
+
+    const VkViewport viewport = {
+        .x = 0.0f,
+        .y = 0.0f,
+        .width = static_cast<float>(extent.width),
+        .height = static_cast<float>(extent.height),
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f,
+    };
+    const VkRect2D scissor = { .offset = { 0, 0 }, .extent = extent };
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+    composite_pass_.record(frame.recorder, static_cast<uint16_t>(current_frame_));
+
+    vkCmdEndRendering(command_buffer);
 
     VkImageMemoryBarrier present_barrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
         .dstAccessMask = 0,
-        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -350,7 +398,7 @@ void Renderer::end_rendering()
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
     };
     vkCmdPipelineBarrier(command_buffer,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
         0, 0, nullptr, 0, nullptr, 1, &present_barrier);
 
@@ -363,14 +411,14 @@ void Renderer::end_frame()
     auto& frame = frames_[current_frame_];
 
     // The swapchain image was acquired in begin_frame; wait on image-availability at the
-    // TRANSFER stage since the first thing we do to the swapchain image is the blit.
+    // COLOR_ATTACHMENT_OUTPUT stage since the first thing we do to it is the composite draw.
     const VkSemaphoreSubmitInfo wait_semaphore_infos[] = {
         {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .pNext = nullptr,
             .semaphore = acquired_wait_semaphore_,
             .value = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             .deviceIndex = 0
         }
     };
@@ -433,17 +481,28 @@ void Renderer::draw(Scene& scene)
     (void)scene;
     begin_frame();
     begin_rendering();
-    triangle_pass_.record(frames_[current_frame_].recorder, static_cast<uint16_t>(current_frame_));
+    grid_2d_pass_.record(frames_[current_frame_].recorder, static_cast<uint16_t>(current_frame_));
+    geometry_pass_->record(frames_[current_frame_].recorder, static_cast<uint16_t>(current_frame_));
     end_rendering();
     end_frame();
+}
+
+void Renderer::bind_composite_source()
+{
+    global_descriptor_table_.bind(color_attachment_, DescriptorType::TEXTURE);
+    const uint32_t slot = global_descriptor_table_.get_binding_slot(color_attachment_, DescriptorType::TEXTURE);
+    composite_pass_.set_source(global_descriptor_table_.get_set(), slot);
 }
 
 void Renderer::handle_resize(const String::View::Extent& extent)
 {
     VkExtent2D vk_extent = {extent.width, extent.height};
     presenter_.resize(vk_extent);
+    grid_2d_pass_.resize(vk_extent);
+    geometry_pass_->resize(vk_extent);
 
-    // Clean up depth resources and re-allocate
+    // Release the old HDR target's bindless slot before it is destroyed, then re-allocate.
+    global_descriptor_table_.unbind(color_attachment_, DescriptorType::TEXTURE);
     allocator_.destroy_resource(color_attachment_);
     color_attachment_ = allocator_.create_resource(ImageInfo{
         .extent = {extent.width, extent.height, 1},
@@ -454,6 +513,9 @@ void Renderer::handle_resize(const String::View::Extent& extent)
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
     });
+    // Re-bind the new HDR target into the table and refresh the composite pass's slot.
+    bind_composite_source();
+
     allocator_.destroy_resource(depth_attachment_);
     depth_attachment_ = allocator_.create_resource(ImageInfo{
         .extent = {extent.width, extent.height, 1},

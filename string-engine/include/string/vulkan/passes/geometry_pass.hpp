@@ -26,10 +26,11 @@ namespace String
 const std::string MODEL_PATH = "assets/viking_room.obj";
 const std::string TEXTURE_PATH = "assets/viking_room.png";
 
-struct Camera3D {
-    alignas(16) glm::mat4 model;
-    alignas(16) glm::mat4 view;
-    alignas(16) glm::mat4 proj;
+// Push constant for the 3D pipeline: precomputed model-view-projection plus the bindless
+// slot of the model's texture. Layout must match shaders/3d_shader.{vert,frag}.
+struct GeometryPush {
+    glm::mat4 mvp;
+    uint32_t texture_slot;
 };
 
 struct Scene3D
@@ -37,7 +38,6 @@ struct Scene3D
     ResourceID vertex_buffer;
     ResourceID index_buffer;
     uint32_t index_count;
-    Camera3D camera;
 };
 
 class GeometryPass final : public Pass
@@ -48,8 +48,9 @@ class GeometryPass final : public Pass
     Scene3D scene_3d_;
     std::unique_ptr<Pipeline3D> pipeline_3d_;
 
-    ResourceID upload_staging_;
     ResourceID texture_image_;
+    uint32_t texture_slot_ = 0;
+    GeometryPush push_{};
 
 public:
     GeometryPass(

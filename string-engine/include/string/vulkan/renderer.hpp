@@ -14,6 +14,9 @@
 #include <string/vulkan/resource_allocator.hpp>
 #include <string/vulkan/descriptor_allocator.hpp>
 #include <string/vulkan/passes/hello_triangle_pass.hpp>
+#include <string/vulkan/passes/grid_2d_pass.hpp>
+#include <string/vulkan/passes/geometry_pass.hpp>
+#include <string/vulkan/passes/composite_pass.hpp>
 
 #include <volk.h>
 
@@ -47,12 +50,18 @@ class Renderer
     ResourceAllocator allocator_;
     DescriptorTable global_descriptor_table_;
     HelloTrianglePass triangle_pass_;
+    Grid2DPass grid_2d_pass_;
+    CompositePass composite_pass_;
     CommandRecorder transfer_command_recorder_;
+    // Constructed in the ctor body: it does GPU uploads through transfer_command_recorder_,
+    // which must be init()'d first, so it can't be a plain init-list member.
+    std::unique_ptr<GeometryPass> geometry_pass_;
     VkSemaphore frame_semaphore_;
 
     // Swapchain image acquired at the start of the frame (in begin_frame), so that
     // end_rendering has a valid blit target and end_frame can submit/present against it.
     VkImage acquired_image_ = VK_NULL_HANDLE;
+    VkImageView acquired_image_view_ = VK_NULL_HANDLE;
     VkSemaphore acquired_wait_semaphore_ = VK_NULL_HANDLE;
     VkSemaphore acquired_signal_semaphore_ = VK_NULL_HANDLE;
     uint64_t frame_count_ = 1;
@@ -77,6 +86,10 @@ private:
     ResourceID depth_attachment_;
 
     void handle_resize(const String::View::Extent& extent);
+
+    // Binds color_attachment_ into the bindless table as a texture and hands the composite
+    // pass the global set + the slot it landed in. Called at init and after each resize.
+    void bind_composite_source();
 };
 
 }  // namespace String

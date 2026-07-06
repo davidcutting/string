@@ -32,6 +32,9 @@ PipelineGrid2D::PipelineGrid2D(
         .set_tessellation()
         .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
         .set_multisampling()
+        // Declare the offscreen pass's D32 depth attachment, but don't test/write: the grid
+        // is a 2D background and must not occlude the geometry drawn after it.
+        .enable_depth_stencil(false, false)
         .enable_color_blending()
         .build_graphics_pipeline(pipeline_layout_);
 }

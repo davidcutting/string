@@ -12,7 +12,9 @@ shaders = [
     'ui_shader.frag',
     'ui_shader.vert',
     'hello_triangle.vert',
-    'hello_triangle.frag'
+    'hello_triangle.frag',
+    'composite.vert',
+    'composite.frag'
 ]
 
 shader_targets = []

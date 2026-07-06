@@ -55,6 +55,7 @@ public:
     void resize(const VkExtent2D& extent);
     auto get_max_frames_in_flight() const -> uint32_t;
     auto get_extent() const -> VkExtent2D;
+    auto get_format() const -> VkFormat { return image_format_; }
 
 private:
     [[nodiscard]]

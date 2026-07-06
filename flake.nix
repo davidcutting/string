@@ -63,10 +63,20 @@
             "-Ddemo=true"
           ];
 
+          # Build with debug info (nixpkgs' meson hook defaults to --buildtype=plain, which
+          # drops -g) and keep it in the binary, so gdb has line numbers + locals.
+          mesonBuildType = "debug";
+          dontStrip = true;
+
           # Point the demo at the shaders installed under $out/include/string/shaders, and
           # make the Khronos validation layer discoverable (debug builds require it). This
           # lets `nix run` / ./result/bin/string_demo work without the devShell env.
           postInstall = ''
+            # Symlink assets under STRING_RESOURCES_DIR rather than copying them into the
+            # output. They live once in the store (content-addressed) and are shared across
+            # builds, so large models don't get duplicated into every build result.
+            ln -s ${./string-engine/assets} $out/include/string/assets
+
             wrapProgram $out/bin/string_demo \
               --set STRING_RESOURCES_DIR $out/include/string \
               --prefix VK_LAYER_PATH : ${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d \

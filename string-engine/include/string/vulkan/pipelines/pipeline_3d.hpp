@@ -12,7 +12,8 @@ public:
     explicit Pipeline3D(
         const std::filesystem::path& resources_path,
         Device& device,
-        const VkDescriptorSetLayout& descriptor_set_layouts);
+        const VkDescriptorSetLayout& descriptor_set_layouts,
+        const VkPushConstantRange& push_constant_range);
     ~Pipeline3D();
 
     VkPipeline get_pipeline() const;
