@@ -127,18 +127,10 @@ core_src = [
     'src/vulkan/pipelines/pipeline_2d.cpp',
     'src/vulkan/pipelines/pipeline_3d.cpp',
     'src/vulkan/pipelines/pipeline_grid_2d.cpp',
-    'src/vulkan/pipelines/pipeline_grid_3d.cpp',
-    'src/vulkan/pipelines/hello_slang_pipeline.cpp',
-    'src/vulkan/passes/hello_triangle_pass.cpp',
     'src/vulkan/passes/composite_pass.cpp',
     'src/vulkan/passes/grid_2d_pass.cpp',
     'src/vulkan/passes/geometry_pass.cpp',
-    # The remaining passes are still stale against the Device/ResourceAllocator API.
-    # Revive one at a time (Phase 3):
-    #   'src/vulkan/passes/hello_slang_pass.cpp',     # stale: get_allocator, descriptor_pool
-    #   'src/vulkan/passes/geometry_pass.cpp',        # stale: create_*_resource, DescriptorType::UNIFORM
-    #   'src/vulkan/passes/grid_2d_pass.cpp',
-    #   'src/vulkan/passes/ui_pass.cpp',              # stale: get_allocator, descriptor_pool
+    'src/vulkan/passes/ui_pass.cpp',
 ]
 
 src = core_src + platform_src

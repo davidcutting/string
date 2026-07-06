@@ -7,12 +7,8 @@ shaders = [
     '3d_shader.vert',
     'grid_2d_shader.vert',
     'grid_2d_shader.frag',
-    # 'grid_3d_shader.vert',
-    # 'grid_3d_shader.frag',
     'ui_shader.frag',
     'ui_shader.vert',
-    'hello_triangle.vert',
-    'hello_triangle.frag',
     'composite.vert',
     'composite.frag'
 ]
@@ -28,7 +24,3 @@ foreach s : shaders
         install_dir : 'include/string/shaders'
     )
 endforeach
-
-if not meson.is_subproject()
-    subdir('slang')
-endif

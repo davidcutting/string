@@ -112,9 +112,9 @@ enum class direction : uint8_t
 
 enum class shape : uint8_t
 {
-    CIRCLE,
-    RECTANGLE,
-    ROUNDED_RECTANGLE,
+    RECTANGLE,          // default: sharp corners (radius ignored)
+    ROUNDED_RECTANGLE,  // corners rounded by `radius`
+    CIRCLE,             // filled circle/pill: corner radius = half the smaller side
 };
 
 // How an element resolves its size on a single axis.
@@ -153,10 +153,13 @@ struct sizing
 struct element
 {
     id id;
-    color color;
-    uint16_t radius;
-    shape shape;
-    sizing sizing;   // how this element sizes itself on each axis
+    color color;            // fill
+    // Elaborated 'struct color': the member 'color' above hides the type name in this scope.
+    struct color stroke_color;   // border colour (used when stroke_width > 0)
+    uint16_t radius;        // corner radius (px), honored for ROUNDED_RECTANGLE
+    uint16_t stroke_width;  // border width (px); 0 = no border
+    shape shape;            // RECTANGLE by default
+    sizing sizing;          // how this element sizes itself on each axis
 };
 
 struct format

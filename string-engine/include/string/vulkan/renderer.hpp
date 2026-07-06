@@ -1,11 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 #include <string/vulkan/frame.hpp>
-#include <string/vulkan/pipelines/pipeline_2d.hpp>
-#include <string/vulkan/pipelines/pipeline_3d.hpp>
-#include <string/vulkan/pipelines/pipeline_grid_2d.hpp>
-#include <string/vulkan/pipelines/hello_slang_pipeline.hpp>
 #include <string/vulkan/command_recorder.hpp>
 #include <string/vulkan/driver.hpp>
 #include <string/vulkan/presenter.hpp>
@@ -13,9 +10,10 @@
 #include <string/vulkan/resource.hpp>
 #include <string/vulkan/resource_allocator.hpp>
 #include <string/vulkan/descriptor_allocator.hpp>
-#include <string/vulkan/passes/hello_triangle_pass.hpp>
+#include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/passes/grid_2d_pass.hpp>
 #include <string/vulkan/passes/geometry_pass.hpp>
+#include <string/vulkan/passes/ui_pass.hpp>
 #include <string/vulkan/passes/composite_pass.hpp>
 
 #include <volk.h>
@@ -49,13 +47,13 @@ class Renderer
     Presenter presenter_;
     ResourceAllocator allocator_;
     DescriptorTable global_descriptor_table_;
-    HelloTrianglePass triangle_pass_;
-    Grid2DPass grid_2d_pass_;
     CompositePass composite_pass_;
     CommandRecorder transfer_command_recorder_;
-    // Constructed in the ctor body: it does GPU uploads through transfer_command_recorder_,
-    // which must be init()'d first, so it can't be a plain init-list member.
-    std::unique_ptr<GeometryPass> geometry_pass_;
+    // Ordered passes that draw into the offscreen HDR target (color_attachment_), recorded
+    // between begin_rendering() and end_rendering(). composite_pass_ is the fixed resolve
+    // (offscreen -> swapchain) and is intentionally NOT in this list. Built in the ctor body
+    // since passes need the allocator/table/transfer recorder to be ready first.
+    std::vector<std::unique_ptr<Pass>> scene_passes_;
     VkSemaphore frame_semaphore_;
 
     // Swapchain image acquired at the start of the frame (in begin_frame), so that

@@ -34,8 +34,6 @@ Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_pt
 , presenter_(device_, window_, frames_in_flight_)
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
 , global_descriptor_table_(device_.get_device(), allocator_)
-, triangle_pass_(device_, std::filesystem::path(application_info.resources_directory), static_cast<uint16_t>(frames_in_flight_))
-, grid_2d_pass_(device_, std::filesystem::path(application_info.resources_directory), static_cast<uint16_t>(frames_in_flight_))
 , composite_pass_(device_, std::filesystem::path(application_info.resources_directory), global_descriptor_table_.get_layout(), presenter_.get_format())
 {
     STRING_LOG_DEBUG("Initializing renderer...");
@@ -68,21 +66,29 @@ Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_pt
     // Make the offscreen HDR target samplable by the composite pass via the bindless table.
     bind_composite_source();
 
-    // The grid sizes itself from the pass screen_size; seed it with the current extent.
-    grid_2d_pass_.resize(extent);
-
     // Upload on the graphics queue: the texture's TRANSFER_DST -> SHADER_READ_ONLY barrier
     // uses a FRAGMENT_SHADER dst stage (only valid on a graphics-capable queue), and keeping
     // upload + sampling on one queue family avoids a queue-ownership transfer. (A dedicated
     // async-transfer queue would need explicit ownership transfers instead.)
     transfer_command_recorder_.init(device_.get_device(), graphics_queue_);
 
-    // Geometry uploads its mesh/texture via the transfer recorder (now initialized) and
+    // Ordered offscreen passes: grid (background) then geometry (viking room, on top).
+    // GeometryPass uploads its mesh/texture via the now-initialized transfer recorder and
     // binds its texture into the bindless table.
-    geometry_pass_ = std::make_unique<GeometryPass>(
+    scene_passes_.push_back(std::make_unique<Grid2DPass>(
+        device_, resources_path, static_cast<uint16_t>(frames_in_flight_)));
+    scene_passes_.push_back(std::make_unique<GeometryPass>(
         device_, allocator_, global_descriptor_table_, transfer_command_recorder_,
-        resources_path, static_cast<uint16_t>(frames_in_flight_));
-    geometry_pass_->resize(extent);
+        resources_path, static_cast<uint16_t>(frames_in_flight_)));
+    // UI overlay: drawn last so it composites on top of the scene.
+    scene_passes_.push_back(std::make_unique<UIPass>(
+        device_, allocator_, global_descriptor_table_,
+        resources_path, static_cast<uint16_t>(frames_in_flight_)));
+
+    for (auto& pass : scene_passes_)
+    {
+        pass->resize(extent);
+    }
 
     for (auto& frame : frames_)
     {
@@ -117,8 +123,8 @@ Renderer::~Renderer()
     STRING_LOG_DEBUG("Waiting for device to be idle...");
     vkDeviceWaitIdle(device_.get_device());
 
-    // Destroy the geometry pass while the allocator, table, and device are still alive.
-    geometry_pass_.reset();
+    // Destroy the passes while the allocator, table, and device are still alive.
+    scene_passes_.clear();
 
     vkDestroySemaphore(device_.get_device(), frame_semaphore_, nullptr);
 
@@ -141,7 +147,10 @@ void Renderer::update()
     auto currentTime = std::chrono::high_resolution_clock::now();
     float delta_time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
 
-    geometry_pass_->update(delta_time, static_cast<uint16_t>(current_frame_));
+    for (auto& pass : scene_passes_)
+    {
+        pass->update(delta_time, static_cast<uint16_t>(current_frame_));
+    }
 }
 
 void Renderer::begin_frame()
@@ -481,8 +490,11 @@ void Renderer::draw(Scene& scene)
     (void)scene;
     begin_frame();
     begin_rendering();
-    grid_2d_pass_.record(frames_[current_frame_].recorder, static_cast<uint16_t>(current_frame_));
-    geometry_pass_->record(frames_[current_frame_].recorder, static_cast<uint16_t>(current_frame_));
+    auto& recorder = frames_[current_frame_].recorder;
+    for (auto& pass : scene_passes_)
+    {
+        pass->record(recorder, static_cast<uint16_t>(current_frame_));
+    }
     end_rendering();
     end_frame();
 }
@@ -498,8 +510,10 @@ void Renderer::handle_resize(const String::View::Extent& extent)
 {
     VkExtent2D vk_extent = {extent.width, extent.height};
     presenter_.resize(vk_extent);
-    grid_2d_pass_.resize(vk_extent);
-    geometry_pass_->resize(vk_extent);
+    for (auto& pass : scene_passes_)
+    {
+        pass->resize(vk_extent);
+    }
 
     // Release the old HDR target's bindless slot before it is destroyed, then re-allocate.
     global_descriptor_table_.unbind(color_attachment_, DescriptorType::TEXTURE);

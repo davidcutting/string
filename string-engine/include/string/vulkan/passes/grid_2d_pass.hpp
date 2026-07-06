@@ -44,7 +44,7 @@ public:
     Grid2DPass(Device& device, const std::filesystem::path& resources_path, const uint16_t& frames_in_flight);
     virtual ~Grid2DPass() override;
 
-    virtual void update(const float& delta_time, const uint16_t& current_frame) override;
+    // No update() override — the grid is static, so it uses Pass's default no-op.
     virtual void record(CommandRecorder& recorder, const uint16_t& current_frame) override;
 };
 

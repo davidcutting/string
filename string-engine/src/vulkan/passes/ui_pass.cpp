@@ -1,252 +1,210 @@
+#include <algorithm>
+#include <array>
 #include <cstdint>
-#include <filesystem>
-#include <cstring>
+#include <cmath>
+#include <vector>
 
-#include <span>
 #include <string/vulkan/passes/ui_pass.hpp>
+#include <string/vulkan/pipeline_builder.hpp>
+#include <string/core/layout.hpp>
 
 namespace String
 {
-
-UIPass::UIPass(Device& device, const std::filesystem::path& resources_path, const uint16_t& frames_in_flight)
-: device_(device)
+namespace
 {
-    // Descriptor set layouts
-    // clang-format off
-    VkDescriptorSetLayoutBinding ubo_layout_binding = {
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .pImmutableSamplers = nullptr
-    };
 
-    VkDescriptorSetLayoutBinding ssbo_layout_binding = {
-        .binding = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .pImmutableSamplers = nullptr
-    };
-    // clang-format on
+// GPU shape, std430-compatible: matches `struct Shape` in shaders/ui_shader.vert. All-vec4
+// so the layout is unambiguous (16-byte aligned, 64-byte stride).
+//   rect   = { pos.x, pos.y, size.x, size.y }  (pixels)
+//   fill   = { r, g, b, a }                    (LINEAR — see srgb_to_linear)
+//   stroke = { r, g, b, a }                    (LINEAR border colour)
+//   params = { corner_radius, stroke_width, _, _ }  (pixels)
+struct GpuShape
+{
+    float rect[4];
+    float fill[4];
+    float stroke[4];
+    float params[4];
+};
 
-    std::vector<VkDescriptorSetLayoutBinding> bindings = {ubo_layout_binding, ssbo_layout_binding};
+// Authored UI colors are sRGB, but they're written into the linear HDR offscreen (which the
+// composite then re-encodes to sRGB) — so decode to linear on the way in, or they brighten.
+// Alpha is already linear and left alone.
+float srgb_to_linear(float c)
+{
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
 
-    // clang-format off
-    VkDescriptorSetLayoutCreateInfo layout_info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .bindingCount = static_cast<uint32_t>(bindings.size()),
-        .pBindings = bindings.data()
-    };
-    // clang-format on
-
-    if (vkCreateDescriptorSetLayout(device_.get_device(), &layout_info, nullptr, &descriptor_set_layout) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create descriptor set layout!");
-    }
-
-    // Note: In tutorial code the construction of descriptor set layouts and the actual descriptor sets were seperated
-
-    // Descriptor Sets
-    std::vector<VkDescriptorSetLayout> ui_layouts(frames_in_flight, descriptor_set_layout);
-    VkDescriptorSetAllocateInfo ui_descriptor_set_alloc_info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .pNext = nullptr,
-        .descriptorPool = descriptor_pool,
-        .descriptorSetCount = static_cast<uint32_t>(frames_in_flight),
-        .pSetLayouts = ui_layouts.data()
-    };
-    descriptor_sets.resize(frames_in_flight);
-
-    if (vkAllocateDescriptorSets(device_.get_device(), &ui_descriptor_set_alloc_info, descriptor_sets.data()) != VK_SUCCESS)
+// Honor the shape enum by resolving it to a corner radius the SDF can render directly:
+// RECTANGLE is sharp, ROUNDED_RECTANGLE uses `radius`, CIRCLE fills to half the smaller side
+// (a perfect circle for a square element, a pill otherwise). The shader stays shape-agnostic.
+float effective_radius(const string::element& e, float w, float h)
+{
+    switch (e.shape)
     {
-        throw std::runtime_error("Failed to allocate UI descriptor sets!");
+        case string::shape::RECTANGLE:         return 0.0f;
+        case string::shape::ROUNDED_RECTANGLE: return static_cast<float>(e.radius);
+        case string::shape::CIRCLE:            return std::min(w, h) * 0.5f;
     }
+    return 0.0f;
+}
 
-    for (size_t i = 0; i < frames_in_flight; i++) {
-        VkDescriptorBufferInfo ui_shapes_ssbo_info = {
-            .buffer = ui_shapes_ssbo_[i]->buffer,
-            .offset = 0,
-            .range = ui_shapes_ssbo_[i]->buffer_size
-        };
+struct UIPush
+{
+    float screen_size[2];
+    uint32_t shape_slot;
+};
 
-        std::vector<VkWriteDescriptorSet> descriptor_writes = {
-            // {
-            //     .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            //     .pNext = nullptr,
-            //     .dstSet = ui_descriptor_sets_[i],
-            //     .dstBinding = 0,
-            //     .dstArrayElement = 0,
-            //     .descriptorCount = 1,
-            //     .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            //     .pImageInfo = nullptr,
-            //     .pBufferInfo = &camera_2d_ubo_info,
-            //     .pTexelBufferView = nullptr,
-            // },
-            {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .pNext = nullptr,
-                .dstSet = descriptor_sets[i],
-                .dstBinding = 1,
-                .dstArrayElement = 0,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pImageInfo = nullptr,
-                .pBufferInfo = &ui_shapes_ssbo_info,
-                .pTexelBufferView = nullptr,
-            }
-        };
+// Build a simple static demo UI (a padded panel with three colored boxes) and pack the
+// laid-out nodes into GPU shapes. This is where core/layout.hpp (namespace `string`) meets
+// the renderer (namespace `String`).
+std::vector<GpuShape> build_ui_shapes()
+{
+    using namespace string;
 
-        vkUpdateDescriptorSets(
-            device_.get_device(),
-            static_cast<uint32_t>(descriptor_writes.size()),
-            descriptor_writes.data(), 0,
-            nullptr);
+    element panel{};
+    panel.color = { 30, 30, 46, 220 };
+    panel.stroke_color = { 88, 91, 112, 255 };   // subtle surface border
+    panel.stroke_width = 2;
+    panel.radius = 16;
+    panel.shape = shape::ROUNDED_RECTANGLE;
+    panel.sizing = size_fit();   // shrink-wrap the children + padding
+
+    // a) sharp rectangle, no border
+    element rect_box{};
+    rect_box.color = { 243, 139, 168, 255 };
+    rect_box.shape = shape::RECTANGLE;
+    rect_box.sizing = size_fixed(180, 60);
+
+    // b) rounded rectangle with a border
+    element rounded_box{};
+    rounded_box.color = { 166, 227, 161, 255 };
+    rounded_box.stroke_color = { 64, 120, 80, 255 };
+    rounded_box.stroke_width = 3;
+    rounded_box.radius = 12;
+    rounded_box.shape = shape::ROUNDED_RECTANGLE;
+    rounded_box.sizing = size_fixed(180, 60);
+
+    // c) circle with a border
+    element circle{};
+    circle.color = { 137, 180, 250, 255 };
+    circle.stroke_color = { 40, 60, 110, 255 };
+    circle.stroke_width = 2;
+    circle.shape = shape::CIRCLE;
+    circle.sizing = size_fixed(60, 60);
+
+    layout_builder b;
+    b.begin(panel, format{ .padding = { 8, 8, 8, 8 }, .gap = 8, .direction = direction::VERTICAL })
+         .add_element(rect_box)
+         .add_element(rounded_box)
+         .add_element(circle)
+     .end();
+
+    const auto to_linear = [](color c) {
+        return std::array<float, 4>{ srgb_to_linear(c.r / 255.0f), srgb_to_linear(c.g / 255.0f),
+                                     srgb_to_linear(c.b / 255.0f), c.a / 255.0f };
+    };
+
+    std::vector<GpuShape> shapes;
+    shapes.reserve(b.nodes().size());
+    for (const auto& n : b.nodes())
+    {
+        const float w = static_cast<float>(n.box.dimension.width);
+        const float h = static_cast<float>(n.box.dimension.height);
+        const auto fill = to_linear(n.element.color);
+        const auto stroke = to_linear(n.element.stroke_color);
+        shapes.push_back(GpuShape{
+            { static_cast<float>(n.box.x), static_cast<float>(n.box.y), w, h },
+            { fill[0], fill[1], fill[2], fill[3] },
+            { stroke[0], stroke[1], stroke[2], stroke[3] },
+            { effective_radius(n.element, w, h), static_cast<float>(n.element.stroke_width), 0.0f, 0.0f },
+        });
     }
+    return shapes;
+}
 
-    // Pipelines
-    pipeline.push_constants = {
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+}  // namespace
+
+UIPass::UIPass(Device& device, ResourceAllocator& allocator, DescriptorTable& descriptor_table,
+               const std::filesystem::path& resources_path, const uint16_t& frames_in_flight)
+: device_(device)
+, allocator_(allocator)
+, descriptor_table_(descriptor_table)
+{
+    (void)frames_in_flight;
+
+    // Build the layout once and upload its shapes to a persistent, host-visible storage
+    // buffer (static UI: no per-frame ring needed yet).
+    const std::vector<GpuShape> shapes = build_ui_shapes();
+    shape_count_ = static_cast<uint32_t>(shapes.size());
+
+    shape_buffer_ = allocator_.create_resource(BufferInfo{
+        .size = shape_count_ * sizeof(GpuShape),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+        .allocation_flags = {},
+    });
+    allocator_.copy_data_to_buffer(shapes.data(), shape_buffer_);
+
+    descriptor_table_.bind(shape_buffer_, DescriptorType::STORAGE_BUFFER);
+    descriptor_set_ = descriptor_table_.get_set();
+    shape_slot_ = descriptor_table_.get_binding_slot(shape_buffer_, DescriptorType::STORAGE_BUFFER);
+
+    const VkPushConstantRange push_constant_range = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
         .offset = 0,
-        .size = sizeof(UIShaderConfig)
+        .size = sizeof(UIPush),
     };
+    pipeline_layout_ = PipelineLayoutBuilder()
+        .set_descriptor_set_layout({ descriptor_table.get_layout() })
+        .set_push_constant_ranges({ push_constant_range })
+        .build(device_);
 
-    pipeline_2d_ = std::make_unique<Pipeline2D>(
-        resources_path,
-        device,
-        descriptor_set_layout,
-        pipeline.push_constants
-    );
-
-    // Resources
-    ui_shapes_ssbo_.resize(frames_in_flight);
-    ui_elements_mapped_.resize(frames_in_flight);
-
-    uint32_t num_elements = 10;
-    VkDeviceSize shapes_buffer_size = sizeof(UIElement) * num_elements;
-    void* shapes_buffer_mapping;
-
-    for (size_t i = 0; i < frames_in_flight; i++)
-    {
-        ui_shapes_ssbo_[i] = device_.get_allocator().create_buffer(shapes_buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
-
-        vmaMapMemory(
-            device_.get_allocator().get_allocator(),
-            ui_shapes_ssbo_[i]->allocation,
-            &shapes_buffer_mapping
-        );
-
-        ui_elements_mapped_[i] = std::span<UIElement>(
-            reinterpret_cast<UIElement*>(shapes_buffer_mapping),
-            num_elements
-        );
-    }
+    // Overlay: procedural quads (no vertex input), alpha-blended, no depth test (but declares
+    // the offscreen D32 format so the pipeline matches the pass), offscreen R16F target.
+    pipeline_ = PipelineBuilder(device_)
+        .add_vertex_shader(resources_path / "shaders/ui_shader.vert.spv")
+        .add_fragment_shader(resources_path / "shaders/ui_shader.frag.spv")
+        .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+        .set_tessellation()
+        .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
+        .set_multisampling()
+        .enable_depth_stencil(false, false)
+        .enable_color_blending()
+        .build_graphics_pipeline(pipeline_layout_);
 }
 
 UIPass::~UIPass()
 {
-    pipeline_2d_.reset();
-
-    for (auto& ssbo : ui_shapes_ssbo_)
-    {
-        vmaUnmapMemory(device_.get_allocator().get_allocator(), ssbo->allocation);
-        device_.get_allocator().destroy_buffer(ssbo);
-    }
-
-    vkDestroyDescriptorSetLayout(device_.get_device(), descriptor_set_layout, nullptr);
-}
-
-void UIPass::update(const float& delta_time, const uint16_t& current_frame)
-{
-    // UIElement dot = { // black dot, 5px size
-    //     .fill = {0.0f, 0.0f, 0.0f, 1.0f},
-    //     .stroke = {0.1f, 0.1f, 0.1f, 1.0f},
-    //     .position = { swap_chain_extent.width / 2, swap_chain_extent.height / 2 },
-    //     .radius = 5.0f,
-    //     .stroke_width = 1.0f,
-    // };
-
-    // const uint32_t samples = 100;
-    // const float resolution = 0.1;
-    // const auto pi2 = 2 * 3.1415;
-    // std::vector<UIElement> elements;
-    // elements.reserve(samples);
-
-    // const uint32_t scale_factor_x = 50;
-    // const uint32_t scale_factor_y = 10;
-
-    // for (uint32_t s = 0; s < samples; ++s)
-    // {
-    //     auto temp_shape = dot;
-    //     auto step = s / resolution;
-    //     temp_shape.position.x += pi2 * step * scale_factor_x;
-    //     temp_shape.position.y += std::sin(temp_shape.position.x) * scale_factor_y;
-    //     elements.push_back(temp_shape);
-    // }
-
-    std::vector<UIElement> elements = {
-        { // Giant blue circle
-            .fill = {0.0f, 0.0f, 1.0f, 1.0f},
-            .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
-            .position = {400, 400},
-            .radius = 100.0f,
-            .stroke_width = 10.0f,
-        },
-        { // Little red circle
-            .fill = {1.0f, 0.0f, 0.0f, 1.0f},
-            .stroke = {0.0f, 1.0f, 0.0f, 1.0f},
-            .position = {100, 100},
-            .radius = 50.0f,
-            .stroke_width = 5.0f,
-        },
-        { // Medium ?? circle (black outline/slightly transparent)
-            .fill = {0.0f, 1.0f, 0.0f, 1.0f},
-            .stroke = {0.0f, 0.0f, 0.0f, 1.0f},
-            .position = {300, 100},
-            .radius = 75.0f,
-            .stroke_width = 2.0f,
-        }
-    };
-
-    // Logic here to make rounded boxes
-
-    ui_push_constant_ = {
-        .screen_size = { screen_size.width, screen_size.height },
-        .num_shapes = static_cast<uint32_t>(elements.size()),
-        .delta_time = delta_time,
-    };
-
-    std::memcpy(ui_elements_mapped_[current_frame].data(), elements.data(), sizeof(UIElement) * elements.size());
+    vkDestroyPipeline(device_.get_device(), pipeline_, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), pipeline_layout_, nullptr);
+    descriptor_table_.unbind(shape_buffer_, DescriptorType::STORAGE_BUFFER);
+    allocator_.destroy_resource(shape_buffer_);
 }
 
 void UIPass::record(CommandRecorder& recorder, const uint16_t& current_frame)
 {
-    VkCommandBuffer& command_buffer = recorder.get_command_buffer();
+    (void)current_frame;
+    if (shape_count_ == 0)
+    {
+        return;
+    }
 
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
+    VkCommandBuffer command_buffer = recorder.get_command_buffer();
 
-    vkCmdBindDescriptorSets(
-        command_buffer,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        pipeline.pipeline_layout,
-        0,
-        1,
-        &descriptor_sets[current_frame],
-        0,
-        nullptr
-    );
-    
-    vkCmdPushConstants(
-        command_buffer,
-        pipeline.pipeline_layout,
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        0,
-        sizeof(ui_push_constant_),
-        &ui_push_constant_
-    );
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        pipeline_layout_, 0, 1, &descriptor_set_, 0, nullptr);
 
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    const UIPush push{
+        { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
+        shape_slot_,
+    };
+    vkCmdPushConstants(command_buffer, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT,
+        0, sizeof(UIPush), &push);
+
+    // 6 verts (two triangles) per shape, one instance per shape.
+    vkCmdDraw(command_buffer, 6, shape_count_, 0, 0);
 }
 
 }

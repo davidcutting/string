@@ -22,7 +22,9 @@ struct Pass
     std::unordered_set<ResourceID> writes;
 
     virtual ~Pass() = 0;
-    virtual void update(const float& delta_time, const uint16_t& current_frame) = 0;
+    // Per-frame CPU update. Defaults to a no-op so passes that don't need one (grid, most
+    // static passes) can skip it; record() is the only method a pass must implement.
+    virtual void update(const float& /*delta_time*/, const uint16_t& /*current_frame*/) {}
     virtual void record(CommandRecorder& recorder, const uint16_t& current_frame) = 0;
     void resize(const VkExtent2D& extent) { screen_size = extent; }
 };

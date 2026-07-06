@@ -67,6 +67,9 @@
           # drops -g) and keep it in the binary, so gdb has line numbers + locals.
           mesonBuildType = "debug";
           dontStrip = true;
+          # _FORTIFY_SOURCE (a default hardening flag) requires -O; the debug build is -O0,
+          # so drop just that flag to avoid a warning on every TU.
+          hardeningDisable = [ "fortify" ];
 
           # Point the demo at the shaders installed under $out/include/string/shaders, and
           # make the Khronos validation layer discoverable (debug builds require it). This

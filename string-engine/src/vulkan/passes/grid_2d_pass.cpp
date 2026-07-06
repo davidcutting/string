@@ -20,12 +20,6 @@ Grid2DPass::~Grid2DPass()
     pipeline_grid_2d_.reset();
 }
 
-void Grid2DPass::update(const float& delta_time, const uint16_t& current_frame)
-{
-    (void)delta_time;
-    (void)current_frame;
-}
-
 void Grid2DPass::record(CommandRecorder& recorder, const uint16_t& current_frame)
 {
     (void)current_frame;

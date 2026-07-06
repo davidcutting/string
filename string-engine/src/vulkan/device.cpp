@@ -182,6 +182,7 @@ void Device::create_logical_device()
     // Bindless: unbounded descriptor arrays in shaders + (non-)uniform indexing into them.
     vulkan12_features.runtimeDescriptorArray = VK_TRUE;
     vulkan12_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    vulkan12_features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
     vulkan12_features.descriptorBindingUniformBufferUpdateAfterBind = VK_TRUE;
     vulkan12_features.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
     vulkan12_features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
