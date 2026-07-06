@@ -14,10 +14,10 @@ namespace String
 {
 
 Presenter::Presenter(Device& device, std::shared_ptr<Window> window, uint32_t frames_in_flight)
-: device_(device)
-, present_queue_(device_.get_queue(QueueType::PRESENT))
-, wait_for_image_available_semaphores_{VK_NULL_HANDLE}
+: wait_for_image_available_semaphores_{VK_NULL_HANDLE}
 , signal_when_ready_to_present_semaphores_{VK_NULL_HANDLE}
+, device_(device)
+, present_queue_(device_.get_queue(QueueType::PRESENT))
 , frames_in_flight_(frames_in_flight)
 {
     STRING_PROFILE_SCOPE("Presenter Constructor")
@@ -201,9 +201,6 @@ void Presenter::present()
     {
         throw std::runtime_error("Usage error: present() called without a prior acquire()");
     }
-
-    // Use the current frame
-    const auto& frame_id = current_frame_id_;
 
     VkSwapchainKHR swap_chains[] = { swapchain_ };
     VkPresentInfoKHR present_info = {

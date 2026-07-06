@@ -51,7 +51,7 @@ public:
     VkPipeline build_compute_pipeline(const VkPipelineLayout& pipeline_layout);
 
 private:
-    PipelineType type_;
+    [[maybe_unused]] PipelineType type_;
     Device& device_;
     VkShaderModule compute_shader_module_{VK_NULL_HANDLE};
     VkShaderModule vertex_shader_module_{VK_NULL_HANDLE};

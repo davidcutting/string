@@ -51,8 +51,8 @@ public:
 private:
     template<typename... Args>
     void log_impl(LogLevel level, 
-                  std::format_string<Args...> fmt, 
-                  const std::source_location& loc,
+                  std::format_string<Args...> fmt,
+                  [[maybe_unused]] const std::source_location& loc,
                   Args&&... args) const
     {
         std::lock_guard lock(mutex_);

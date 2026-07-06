@@ -56,7 +56,7 @@ struct SlotRelease
 
 class DescriptorTable
 {
-    VkDevice& device_;
+    VkDevice device_;
     ResourceAllocator& allocator_;
 
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
@@ -74,7 +74,7 @@ class DescriptorTable
     static constexpr uint32_t MAX_BINDLESS_ACCEL_STRUCT = 1024;
 
 public:
-    explicit DescriptorTable(VkDevice& device, ResourceAllocator& allocator);
+    explicit DescriptorTable(VkDevice device, ResourceAllocator& allocator);
     ~DescriptorTable();
 
     void bind(const ResourceID& handle, const DescriptorType& type);

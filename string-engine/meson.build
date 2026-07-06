@@ -110,23 +110,17 @@ endif
 include_dir = include_directories('include')
 
 # rewrite-6 engine sources.
-# Deliberately EXCLUDED:
-#   src/vulkan/allocator.cpp     - legacy allocator; duplicate VMA_IMPLEMENTATION
-#                                  with resource_allocator.cpp (multiple-definition).
-#   src/vulkan/render_graph.cpp  - standalone demo, has its own main() (line ~160);
-#                                  not library code. Graph types live in headers.
-#   src/platform/linux_*.cpp     - unclear role; add here if Phase-1 linking needs them.
+# NOTE: the standalone render-graph prototype (its own main()) now lives under
+# examples/render_graph.cpp; graph types still live in headers for the future tier.
 core_src = [
     'src/application.cpp',
     'src/scene.cpp',
-    'src/core/layout.cpp',
     'src/vulkan/renderer.cpp',
     'src/vulkan/driver.cpp',
     'src/vulkan/device.cpp',
     'src/vulkan/presenter.cpp',
     'src/vulkan/resource_allocator.cpp',
     'src/vulkan/descriptor_allocator.cpp',
-    'src/vulkan/descriptor_allocator_growable.cpp',
     'src/vulkan/command_recorder.cpp',
     'src/vulkan/vulkan_utils.cpp',
     'src/vulkan/pipeline_builder.cpp',

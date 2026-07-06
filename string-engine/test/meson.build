@@ -1,5 +1,6 @@
 test_files = [
-    'test/graph_test.cpp'
+    'test/graph_test.cpp',
+    'test/layout_test.cpp'
 ]
 
 test_dep = [

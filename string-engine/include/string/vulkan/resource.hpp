@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include <queue>
+#include <stack>
 
 #define VK_NO_PROTOTYPES
 #include <vk_mem_alloc.h>
@@ -84,7 +84,7 @@ struct AllocatedBuffer
 class IDRegistry
 {
     ResourceID capacity_ = 0;
-    std::queue<ResourceID> free_list_;
+    std::stack<ResourceID> free_list_;
 public:
     auto get_id() -> ResourceID
     {
@@ -95,7 +95,7 @@ public:
             capacity_++;
             return new_id;
         }
-        new_id = free_list_.front();
+        new_id = free_list_.top();
         free_list_.pop();
         return new_id;
     }

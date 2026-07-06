@@ -14,6 +14,17 @@
       ];
       perSystem = { config, self', inputs', pkgs, system, ... }: {
 
+        # `nix flake check` builds the engine with the gtest suite enabled and runs it. This is
+        # what keeps the header-only bits (e.g. core/layout.hpp) actually compiled + verified —
+        # the default package build never includes them.
+        checks.default = self'.packages.default.overrideAttrs (old: {
+          pname = "string-engine-tests";
+          doCheck = true;
+          buildInputs = old.buildInputs ++ [ pkgs.gtest ];
+          mesonFlags = [ "-Dwsi=sdl" "-Dtests=true" "-Ddemo=false" ];
+          postInstall = "";   # no demo binary to wrap when -Ddemo=false
+        });
+
         # packages.default builds the engine (static lib + `string_demo`)
         # directly with Meson, using the pinned nixpkgs toolchain and deps.
         # Build with `nix build`, run with `nix run` (or ./result/bin/string_demo).
@@ -89,6 +100,7 @@
               spdlog
               glm
               glfw
+              sdl3
               glslang
               shader-slang
               vulkan-headers

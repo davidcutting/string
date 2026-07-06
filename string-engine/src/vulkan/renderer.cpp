@@ -7,11 +7,9 @@
 #include <string/vulkan/driver.hpp>
 #include <string/vulkan/renderer.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
-#include <string/vulkan/allocator.hpp>
 #include <string/vulkan/device.hpp>
 #include <string/vulkan/pipelines/pipeline_2d.hpp>
 #include <string/vulkan/render_data.hpp>
-#include <string/vulkan/descriptor_allocator_growable.hpp>
 #include <string/vulkan/resource.hpp>
 #include <string/vulkan/resource_allocator.hpp>
 #include <string/vulkan/presenter.hpp>
@@ -70,12 +68,6 @@ Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_pt
     for (auto& frame : frames_)
     {
         frame.frame_id = 0;
-        frame.descriptor_table.init(device_.get_device(), 1000, {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
-                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
-                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 },
-                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 },
-            });
         frame.recorder.init(device_.get_device(), graphics_queue_);
     }
 
@@ -111,7 +103,6 @@ Renderer::~Renderer()
     for (auto& frame : frames_)
     {
         frame.garbage_collector.flush();
-        frame.descriptor_table.destroy_pools();
         frame.recorder.destroy();
     }
 
@@ -126,9 +117,9 @@ void Renderer::update()
     static auto startTime = std::chrono::high_resolution_clock::now();
 
     auto currentTime = std::chrono::high_resolution_clock::now();
-    float delta_time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+    [[maybe_unused]] float delta_time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
 
-    const auto swap_chain_extent = presenter_.get_extent();
+    [[maybe_unused]] const auto swap_chain_extent = presenter_.get_extent();
 
     // // Resize passes
     // geometry_pass_.resize(swap_chain_extent);
@@ -217,6 +208,7 @@ void Renderer::begin_rendering()
 
     VkImageMemoryBarrier depth_barrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = nullptr,
         .srcAccessMask = 0,
         .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -306,6 +298,7 @@ void Renderer::end_rendering()
     VkImageMemoryBarrier pre_blit_barriers[2] = {
         {   // Offscreen color target becomes the blit source.
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -317,6 +310,7 @@ void Renderer::end_rendering()
         },
         {   // Swapchain image becomes the blit destination.
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
             .srcAccessMask = 0,
             .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -345,6 +339,7 @@ void Renderer::end_rendering()
 
     VkImageMemoryBarrier present_barrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = nullptr,
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = 0,
         .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,

@@ -8,7 +8,7 @@
 namespace String
 {
 
-DescriptorTable::DescriptorTable(VkDevice& device, ResourceAllocator& allocator)
+DescriptorTable::DescriptorTable(VkDevice device, ResourceAllocator& allocator)
 : device_(device)
 , allocator_(allocator)
 {

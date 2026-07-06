@@ -10,7 +10,7 @@
 namespace String
 {
 
-class Pass;
+struct Pass;
 
 class CommandRecorder
 {

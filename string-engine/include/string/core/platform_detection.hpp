@@ -30,10 +30,14 @@ enum class ReleaseType : std::uint8_t
 
 #ifdef NDEBUG
     static constexpr ReleaseType current_release = ReleaseType::RELEASE;
+    #ifndef STRING_RELEASE
     #define STRING_RELEASE
+    #endif
 #else
     static constexpr ReleaseType current_release = ReleaseType::DEBUG;
+    #ifndef STRING_DEBUG
     #define STRING_DEBUG
+    #endif
 #endif
 
 }

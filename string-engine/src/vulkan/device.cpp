@@ -268,9 +268,6 @@ QueueFamilyIndices Device::get_queue_families(const VkPhysicalDevice& physical_d
     std::vector<VkQueueFamilyProperties> queueFamilies(queue_family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, queueFamilies.data());
 
-    // Track best candidate for transfer queue
-    std::optional<uint32_t> dedicated_transfer;
-
     for (uint32_t i = 0; i < queue_family_count; i++)
     {
         const auto& queueFamily = queueFamilies[i];
@@ -394,7 +391,7 @@ auto Device::get_queue(const QueueType& type) -> Queue
                 STRING_LOG_DEBUG("Creating graphics queue.");
                 queue.queue_family_index = indices.graphics_family.value();
                 vkGetDeviceQueue(device_, queue.queue_family_index, 0, &queue.queue);
-                return std::move(queue);
+                return queue;
             }
             break;
         }
@@ -405,7 +402,7 @@ auto Device::get_queue(const QueueType& type) -> Queue
                 STRING_LOG_DEBUG("Creating compute queue.");
                 queue.queue_family_index = indices.compute_family.value();
                 vkGetDeviceQueue(device_, queue.queue_family_index, 0, &queue.queue);
-                return std::move(queue);
+                return queue;
             }
             break;
         }
@@ -416,7 +413,7 @@ auto Device::get_queue(const QueueType& type) -> Queue
                 STRING_LOG_DEBUG("Creating transfer queue.");
                 queue.queue_family_index = indices.transfer_family.value();
                 vkGetDeviceQueue(device_, queue.queue_family_index, 0, &queue.queue);
-                return std::move(queue);
+                return queue;
             }
             break;
         }
@@ -427,7 +424,7 @@ auto Device::get_queue(const QueueType& type) -> Queue
                 STRING_LOG_DEBUG("Creating present queue.");
                 queue.queue_family_index = indices.present_family.value();
                 vkGetDeviceQueue(device_, queue.queue_family_index, 0, &queue.queue);
-                return std::move(queue);
+                return queue;
             }
             break;
         }

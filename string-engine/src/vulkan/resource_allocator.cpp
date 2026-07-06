@@ -61,6 +61,7 @@ ResourceAllocator::~ResourceAllocator()
 auto ResourceAllocator::create_resource(const BufferInfo& info) -> ResourceID
 {
     AllocatedBuffer new_buffer = {
+        .id = 0,
         .buffer = VK_NULL_HANDLE,
         .size = info.size,
         .allocation = VK_NULL_HANDLE,
@@ -104,6 +105,7 @@ auto ResourceAllocator::create_resource(const BufferInfo& info) -> ResourceID
 auto ResourceAllocator::create_resource(const ImageInfo& info) -> ResourceID
 {
     AllocatedImage new_image = {
+        .id = 0,
         .image = VK_NULL_HANDLE,
         .view = VK_NULL_HANDLE,
         .sampler = VK_NULL_HANDLE,
@@ -199,7 +201,7 @@ auto ResourceAllocator::get_image(const ResourceID& id) const -> const Allocated
     return images_.at(id);
 }
 
-void ResourceAllocator::copy_data_to_buffer(void* data, const ResourceID& resource) const
+void ResourceAllocator::copy_data_to_buffer(const void* data, const ResourceID& resource) const
 {
     // TODO(DCut): In general, one can configure allocations and pools with VMA to automatically contain
     // a void* to the mapping for us, which would shift the cost of mapping to the allocation time,
