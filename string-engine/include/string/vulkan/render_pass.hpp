@@ -27,4 +27,7 @@ struct Pass
     void resize(const VkExtent2D& extent) { screen_size = extent; }
 };
 
+// A pure-virtual destructor still needs a definition so derived passes can link.
+inline Pass::~Pass() = default;
+
 } // namespace String

@@ -13,6 +13,7 @@
 #include <string/vulkan/resource.hpp>
 #include <string/vulkan/resource_allocator.hpp>
 #include <string/vulkan/descriptor_allocator.hpp>
+#include <string/vulkan/passes/hello_triangle_pass.hpp>
 
 #include <volk.h>
 
@@ -45,8 +46,15 @@ class Renderer
     Presenter presenter_;
     ResourceAllocator allocator_;
     DescriptorTable global_descriptor_table_;
+    HelloTrianglePass triangle_pass_;
     CommandRecorder transfer_command_recorder_;
     VkSemaphore frame_semaphore_;
+
+    // Swapchain image acquired at the start of the frame (in begin_frame), so that
+    // end_rendering has a valid blit target and end_frame can submit/present against it.
+    VkImage acquired_image_ = VK_NULL_HANDLE;
+    VkSemaphore acquired_wait_semaphore_ = VK_NULL_HANDLE;
+    VkSemaphore acquired_signal_semaphore_ = VK_NULL_HANDLE;
     uint64_t frame_count_ = 1;
     uint64_t current_frame_ = 0;
     std::array<Frame, frames_in_flight_> frames_;

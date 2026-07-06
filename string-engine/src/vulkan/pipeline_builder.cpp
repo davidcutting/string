@@ -324,7 +324,9 @@ VkPipeline PipelineBuilder::build_graphics_pipeline(const VkPipelineLayout& pipe
     // Create the pipeline
 
     VkPipeline pipeline;
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
+    // Must match the offscreen render target (Renderer's color_attachment_), which every
+    // pass renders into before it is blitted to the swapchain. NOT the swapchain format.
+    VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkPipelineShaderStageCreateInfo shader_stages[] = { vertex_shader_stage_info_, fragment_shader_stage_info_ };
 
     VkPipelineRenderingCreateInfo pipeline_render_info

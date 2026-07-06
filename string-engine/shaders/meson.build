@@ -10,7 +10,9 @@ shaders = [
     # 'grid_3d_shader.vert',
     # 'grid_3d_shader.frag',
     'ui_shader.frag',
-    'ui_shader.vert'
+    'ui_shader.vert',
+    'hello_triangle.vert',
+    'hello_triangle.frag'
 ]
 
 shader_targets = []

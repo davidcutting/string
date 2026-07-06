@@ -51,10 +51,12 @@ DescriptorTable::DescriptorTable(VkDevice& device, ResourceAllocator& allocator)
         // },
     };
 
+    // VARIABLE_DESCRIPTOR_COUNT_BIT must be on the highest-numbered binding, so it lives on
+    // the last binding (storage images), whose descriptorCount matches the variable count max.
     VkDescriptorBindingFlags binding_flags[] = {
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size ssbos
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size storage images
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // binding 0: fixed size ssbos
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // binding 1: combined image samplers
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT, // binding 2: storage images (last)
         // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size tlas
         // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size blas
     };

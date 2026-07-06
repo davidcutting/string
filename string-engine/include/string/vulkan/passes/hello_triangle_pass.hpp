@@ -3,6 +3,7 @@
 #include <filesystem>
 
 #include <string/vulkan/render_pass.hpp>
+#include <string/vulkan/device.hpp>
 
 #include <volk.h>
 

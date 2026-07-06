@@ -2,9 +2,9 @@ project(
     'string',
     'cpp',
     version : '0.0.1',
-    license: 'MIT',
+    license : 'MIT',
     default_options : [
-        'cpp_std=c++20',
+        'cpp_std=c++23',
         'buildtype=debug',
         'warning_level=3',
         'default_library=static'
@@ -23,17 +23,11 @@ message('Compiler: ' + compiler.get_id())
 
 if get_option('buildtype') == 'release'
     message('Building in Release mode')
-    release = ['-DSTRING_RELEASE']
-    build_args += ['-O3']
-elif get_option('buildtype') == 'debug'
+    build_args += ['-DSTRING_RELEASE', '-O3']
+else
     message('Building in Debug mode')
-    release = ['-DSTRING_DEBUG']
-elif get_option('buildtype') == 'debugoptimized'
-    message('Building in RelWithDebInfo')
-    release = ['-DSTRING_DEBUG']
+    build_args += ['-DSTRING_DEBUG']
 endif
-
-add_project_arguments(release, language : 'cpp')
 
 # --------------------------------------------------
 
@@ -41,30 +35,99 @@ add_project_arguments(release, language : 'cpp')
 # Dependencies
 # ======
 
+# Core deps. On NixOS these are provided (pinned) by the flake; wrapfiles under
+# subprojects/ act as the portable fallback for off-Nix targets.
 deps = [
     dependency('threads'),
-    dependency('spdlog', static: true),
+    dependency('spdlog', static : true),
     dependency('glm'),
-    dependency('glfw3', static: true),
     dependency('entt'),
-    dependency('vulkan')
+    dependency('vulkan'),
 ]
+
+# --- Vulkan Memory Allocator (header-only) -----------------------------------
+# resource_allocator.cpp / allocator.hpp #include <vk_mem_alloc.h>. Try a
+# pkg-config/wrap dep first, then fall back to the header on the system include
+# path (the Nix `vulkan-memory-allocator` package puts it there).
+vma_dep = dependency('VulkanMemoryAllocator', required : false)
+if not vma_dep.found()
+    assert(compiler.has_header('vk_mem_alloc.h'),
+           'vk_mem_alloc.h not found — add VulkanMemoryAllocator (flake pkg or wrap)')
+    vma_dep = declare_dependency()
+endif
+deps += vma_dep
+
+# --- volk (Vulkan meta-loader; header-only, impl compiled in driver.cpp) ------
+# No pkg-config is shipped; just ensure the header is reachable.
+volk_dep = dependency('volk', required : false)
+if not volk_dep.found()
+    assert(compiler.has_header('volk.h'),
+           'volk.h not found — add vulkan-volk (flake pkg or wrap)')
+    volk_dep = declare_dependency()
+endif
+deps += volk_dep
+
+# --- Slang (shader compiler runtime; shader.hpp uses <slang.h>) --------------
+slang_dep = dependency('slang', required : false)
+if not slang_dep.found()
+    slang_lib = compiler.find_library('slang', required : true,
+        has_headers : ['slang.h', 'slang-com-ptr.h'])
+    slang_dep = declare_dependency(dependencies : slang_lib)
+endif
+deps += slang_dep
+
+# --- WSI backend (selectable via -Dwsi=) -------------------------------------
+wsi = get_option('wsi')
+message('WSI backend: ' + wsi)
+
+if wsi == 'glfw'
+    deps += dependency('glfw3', static : true)
+    platform_src = [ 'src/platform/glfw_window.cpp' ]
+    build_args += '-DSTRING_WSI_GLFW'
+elif wsi == 'sdl'
+    deps += dependency('sdl3')
+    platform_src = [ 'src/platform/sdl_window.cpp' ]
+    build_args += '-DSTRING_WSI_SDL'
+elif wsi == 'wayland'
+    # EXPERIMENTAL: the from-scratch client also needs wayland-protocols
+    # scanning (wl_scanner) wired up before it will link. Left minimal on
+    # purpose; revisit when reviving the raw-Wayland path.
+    deps += dependency('wayland-client')
+    platform_src = [
+        'src/platform/wayland/client.cpp',
+        'src/platform/wayland/window.cpp',
+        'src/platform/wayland/presenter.cpp',
+    ]
+    build_args += '-DSTRING_WSI_WAYLAND'
+endif
 
 # --------------------------------------------------
 
 # ======
-# Target
+# Library
 # ======
 
 include_dir = include_directories('include')
 
-src = [
+# rewrite-6 engine sources.
+# Deliberately EXCLUDED:
+#   src/vulkan/allocator.cpp     - legacy allocator; duplicate VMA_IMPLEMENTATION
+#                                  with resource_allocator.cpp (multiple-definition).
+#   src/vulkan/render_graph.cpp  - standalone demo, has its own main() (line ~160);
+#                                  not library code. Graph types live in headers.
+#   src/platform/linux_*.cpp     - unclear role; add here if Phase-1 linking needs them.
+core_src = [
     'src/application.cpp',
-    'src/window.cpp',
+    'src/scene.cpp',
+    'src/core/layout.cpp',
     'src/vulkan/renderer.cpp',
+    'src/vulkan/driver.cpp',
     'src/vulkan/device.cpp',
-    'src/vulkan/allocator.cpp',
-    'src/vulkan/swapchain.cpp',
+    'src/vulkan/presenter.cpp',
+    'src/vulkan/resource_allocator.cpp',
+    'src/vulkan/descriptor_allocator.cpp',
+    'src/vulkan/descriptor_allocator_growable.cpp',
+    'src/vulkan/command_recorder.cpp',
     'src/vulkan/vulkan_utils.cpp',
     'src/vulkan/pipeline_builder.cpp',
     'src/vulkan/pipelines/pipeline_2d.cpp',
@@ -72,15 +135,24 @@ src = [
     'src/vulkan/pipelines/pipeline_grid_2d.cpp',
     'src/vulkan/pipelines/pipeline_grid_3d.cpp',
     'src/vulkan/pipelines/hello_slang_pipeline.cpp',
+    'src/vulkan/passes/hello_triangle_pass.cpp',
+    # The remaining passes are still stale against the Device/ResourceAllocator API.
+    # Revive one at a time (Phase 3):
+    #   'src/vulkan/passes/hello_slang_pass.cpp',     # stale: get_allocator, descriptor_pool
+    #   'src/vulkan/passes/geometry_pass.cpp',        # stale: create_*_resource, DescriptorType::UNIFORM
+    #   'src/vulkan/passes/grid_2d_pass.cpp',
+    #   'src/vulkan/passes/ui_pass.cpp',              # stale: get_allocator, descriptor_pool
 ]
+
+src = core_src + platform_src
 
 static_target = static_library(
     meson.project_name(),
-    dependencies: deps,
-    include_directories: include_dir,
-    sources: src,
-    install: true,
-    cpp_args: build_args
+    dependencies : deps,
+    include_directories : include_dir,
+    sources : src,
+    install : true,
+    cpp_args : build_args
 )
 
 install_subdir('include/string', install_dir : 'include')
@@ -97,7 +169,7 @@ subdir('shaders')
 # --------------------------------------------------
 
 # ======
-# Project
+# Package / exported dependency
 # ======
 
 pkg_mod = import('pkgconfig')
@@ -111,7 +183,8 @@ pkg_mod.generate(
 
 project_deps = declare_dependency(
     include_directories : include_dir,
-    link_with : [ static_target ]
+    link_with : [ static_target ],
+    dependencies : deps
 )
 
 set_variable(meson.project_name() + '_dep', project_deps)
@@ -119,19 +192,35 @@ set_variable(meson.project_name() + '_dep', project_deps)
 # --------------------------------------------------
 
 # ======
+# Demo executable
+# ======
+
+# The runnable engine driver. test_application.cpp holds main() (line 6).
+if get_option('demo') and not meson.is_subproject()
+    executable(
+        'string_demo',
+        'src/test_application.cpp',
+        dependencies : project_deps,
+        cpp_args : build_args,
+        install : true
+    )
+endif
+
+# --------------------------------------------------
+
+# ======
 # Tests
 # ======
 
-if not meson.is_subproject()
-  add_languages('cpp')
-  subdir('test')
+if get_option('tests') and not meson.is_subproject()
+    subdir('test')
 
-  test('all_tests',
-    executable(
-      'run_tests',
-      test_files,
-      dependencies : [project_deps, test_dep],
-      install : false
+    test('all_tests',
+        executable(
+            'run_tests',
+            test_files,
+            dependencies : [ project_deps, test_dep ],
+            install : false
+        )
     )
-  )
 endif

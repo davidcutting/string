@@ -36,6 +36,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_pt
 , presenter_(device_, window_, frames_in_flight_)
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
 , global_descriptor_table_(device_.get_device(), allocator_)
+, triangle_pass_(device_, std::filesystem::path(application_info.resources_directory), static_cast<uint16_t>(frames_in_flight_))
 {
     STRING_LOG_DEBUG("Initializing renderer...");
     const auto resources_path = std::filesystem::path(application_info_.resources_directory);
@@ -49,7 +50,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_pt
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
@@ -82,7 +83,10 @@ Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_pt
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
         .pNext = nullptr,
         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-        .initialValue = frame_count_, // frame_count_ starts at 1
+        // Start at 0: the first submit signals frame_count_ (== 1), which must be strictly
+        // greater than the timeline's current value. Starting at frame_count_ (1) made the
+        // first signal illegal, which broke per-frame gating (stale command-buffer reuse).
+        .initialValue = 0,
     };
 
     VkSemaphoreCreateInfo semaphore_info = {
@@ -153,6 +157,13 @@ void Renderer::begin_frame()
     frame.recorder.reset();
 
     update();
+
+    // Acquire now, before recording, so end_rendering has a valid blit target. Copy the
+    // handles out of AcquiredImage (which holds references into vectors resize() reallocates).
+    AcquiredImage acquired = presenter_.acquire_next_frame();
+    acquired_image_ = acquired.image;
+    acquired_wait_semaphore_ = acquired.wait_for_image_available;
+    acquired_signal_semaphore_ = acquired.signal_when_ready_to_present;
 }
 
 void Renderer::begin_rendering()
@@ -259,59 +270,112 @@ void Renderer::begin_rendering()
     };
 
     vkCmdBeginRendering(command_buffer, &rendering_info);
+
+    VkViewport viewport = {
+        .x = 0.0f,
+        .y = 0.0f,
+        .width = static_cast<float>(swap_chain_extent.width),
+        .height = static_cast<float>(swap_chain_extent.height),
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f
+    };
+    VkRect2D scissor = {
+        .offset = { 0, 0 },
+        .extent = swap_chain_extent
+    };
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 }
 
 void Renderer::end_rendering()
 {
     auto& frame = frames_[current_frame_];
-    auto& command_buffer = frame.recorder.begin();
+    auto& command_buffer = frame.recorder.get_command_buffer();
     auto& color_attachment = allocator_.get_image(color_attachment_);
-
-    frame.recorder.end();
 
     vkCmdEndRendering(command_buffer);
 
-    // Transition swapchain image from COLOR_ATTACHMENT_OPTIMAL to PRESENT_SRC_KHR
-    VkImageMemoryBarrier image_barrier = {
+    const auto extent = presenter_.get_extent();
+
+    // Blit the offscreen HDR target into the acquired swapchain image. This is the step
+    // that decouples the render target's format/resolution from the swapchain; blitting
+    // into the SRGB swapchain applies the linear->sRGB encode on store. The transitions
+    // bracket the blit:
+    //   color_attachment_ : COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL
+    //   swapchain image   : UNDEFINED -> TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR
+    VkImageMemoryBarrier pre_blit_barriers[2] = {
+        {   // Offscreen color target becomes the blit source.
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = color_attachment.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+        {   // Swapchain image becomes the blit destination.
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = acquired_image_,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+    };
+    vkCmdPipelineBarrier(command_buffer,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 2, pre_blit_barriers);
+
+    VkImageBlit blit_region = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { { 0, 0, 0 }, { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 } },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = { { 0, 0, 0 }, { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 } },
+    };
+    vkCmdBlitImage(command_buffer,
+        color_attachment.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        acquired_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blit_region, VK_FILTER_NEAREST);
+
+    VkImageMemoryBarrier present_barrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = 0,
-        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = color_attachment.image,
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        }
+        .image = acquired_image_,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
     };
-
-    vkCmdPipelineBarrier(
-        command_buffer,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+    vkCmdPipelineBarrier(command_buffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-        // VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        0, 0, nullptr, 0, nullptr, 1,
-        &image_barrier);
+        0, 0, nullptr, 0, nullptr, 1, &present_barrier);
+
+    // End recording only after every vkCmd* for this frame has been issued.
+    frame.recorder.end();
 }
 
 void Renderer::end_frame()
 {
     auto& frame = frames_[current_frame_];
-    AcquiredImage acquired = presenter_.acquire_next_frame();
 
+    // The swapchain image was acquired in begin_frame; wait on image-availability at the
+    // TRANSFER stage since the first thing we do to the swapchain image is the blit.
     const VkSemaphoreSubmitInfo wait_semaphore_infos[] = {
         {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .pNext = nullptr,
-            .semaphore = acquired.wait_for_image_available,
+            .semaphore = acquired_wait_semaphore_,
             .value = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             .deviceIndex = 0
         }
     };
@@ -320,9 +384,9 @@ void Renderer::end_frame()
         {   // Render semaphore for present synchronization
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .pNext = nullptr,
-            .semaphore = acquired.signal_when_ready_to_present,
+            .semaphore = acquired_signal_semaphore_,
             .value = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             .deviceIndex = 0
         },
         {   // Timeline semaphore for each frame
@@ -368,27 +432,15 @@ void Renderer::end_frame()
     current_frame_ = frame_count_ % frames_in_flight_;
 }
 
+// The whole-frame entry point, called once per frame from Application::run.
 void Renderer::draw(Scene& scene)
 {
-    auto& frame = frames_[current_frame_];
-    auto& command_buffer = frame.recorder.begin();
-    const auto swap_chain_extent = presenter_.get_extent();
-
-    VkViewport viewport = {
-        .x = 0.0f,
-        .y = 0.0f,
-        .width = static_cast<float>(swap_chain_extent.width),
-        .height = static_cast<float>(swap_chain_extent.height),
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f
-    };
-    VkRect2D scissor = {
-        .offset = { 0, 0 },
-        .extent = swap_chain_extent
-    };
-
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+    (void)scene;
+    begin_frame();
+    begin_rendering();
+    triangle_pass_.record(frames_[current_frame_].recorder, static_cast<uint16_t>(current_frame_));
+    end_rendering();
+    end_frame();
 }
 
 void Renderer::handle_resize(const String::View::Extent& extent)
@@ -402,7 +454,7 @@ void Renderer::handle_resize(const String::View::Extent& extent)
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},

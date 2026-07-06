@@ -10,7 +10,6 @@ void init_signal_handling();
 
 #if defined(STRING_PLATFORM_LINUX)
 #include <csignal>
-#include <SDL3/SDL.h>
 
 inline void handle_sigint(int /*signum*/)
 {
@@ -26,7 +25,6 @@ inline void init_signal_handling()
 #elif defined(STRING_PLATFORM_WINDOWS)
 
 #include <windows.h>
-#include <SDL3/SDL.h>
 
 inline BOOL WINAPI ConsoleHandler(DWORD signal)
 {

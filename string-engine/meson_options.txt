@@ -1,0 +1,14 @@
+# Window System Integration backend.
+#   glfw    - default; light, few deps, easiest hermetic/static build
+#   sdl     - SDL3 backend
+#   wayland - from-scratch Wayland client (EXPERIMENTAL, needs protocol codegen)
+option('wsi', type: 'combo', choices: ['glfw', 'sdl', 'wayland'], value: 'glfw',
+       description: 'Windowing / input backend')
+
+# Build the unit/integration tests (requires gtest).
+option('tests', type: 'boolean', value: false,
+       description: 'Build the test suite')
+
+# Build the runnable engine demo executable (test_application).
+option('demo', type: 'boolean', value: true,
+       description: 'Build the runnable demo executable')
