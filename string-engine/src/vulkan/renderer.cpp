@@ -84,6 +84,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         allocator_,
         global_descriptor_table_,
         transfer_batch,
+        window_->get_input(),
         COLOR_TARGET,
         DEPTH_TARGET,
         resources_path,
@@ -169,10 +170,13 @@ Renderer::~Renderer()
 
 void Renderer::update()
 {
-    static auto startTime = std::chrono::high_resolution_clock::now();
-
-    auto currentTime = std::chrono::high_resolution_clock::now();
-    float delta_time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+    // Real per-frame delta (seconds since the previous update), for framerate-independent
+    // motion like the camera. First frame clamps to ~0.
+    static auto last_time = std::chrono::high_resolution_clock::now();
+    const auto current_time = std::chrono::high_resolution_clock::now();
+    const float delta_time =
+        std::chrono::duration<float, std::chrono::seconds::period>(current_time - last_time).count();
+    last_time = current_time;
 
     for (auto& pass : scene_passes_)
     {

@@ -42,7 +42,8 @@ public:
     PipelineBuilder& set_tessellation(uint32_t patch_control_points = 0);
     PipelineBuilder& set_rasterization(
         VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL,
-        VkCullModeFlags cull_mode = VK_CULL_MODE_BACK_BIT);
+        VkCullModeFlags cull_mode = VK_CULL_MODE_BACK_BIT,
+        VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE);
     PipelineBuilder& set_multisampling();
     // Declares a D32 depth attachment (matching the offscreen pass). test/write default on
     // for 3D passes; a 2D background pass (e.g. the grid) passes false to declare the format

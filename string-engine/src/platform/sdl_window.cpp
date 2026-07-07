@@ -14,6 +14,40 @@
 namespace String
 {
 
+namespace
+{
+
+// Map the SDL scancodes we care about to our backend-neutral KeyCode (others are ignored).
+KeyCode translate_scancode(SDL_Scancode scancode)
+{
+    switch (scancode)
+    {
+        case SDL_SCANCODE_W:      return KeyCode::W;
+        case SDL_SCANCODE_A:      return KeyCode::A;
+        case SDL_SCANCODE_S:      return KeyCode::S;
+        case SDL_SCANCODE_D:      return KeyCode::D;
+        case SDL_SCANCODE_Q:      return KeyCode::Q;
+        case SDL_SCANCODE_E:      return KeyCode::E;
+        case SDL_SCANCODE_SPACE:  return KeyCode::SPACE;
+        case SDL_SCANCODE_LSHIFT: return KeyCode::LEFT_SHIFT;
+        case SDL_SCANCODE_LCTRL:  return KeyCode::LEFT_CONTROL;
+        case SDL_SCANCODE_ESCAPE: return KeyCode::ESCAPE;
+        default:                  return KeyCode::UNKNOWN;
+    }
+}
+
+MouseButton translate_button(Uint8 button)
+{
+    switch (button)
+    {
+        case SDL_BUTTON_RIGHT:  return MouseButton::RIGHT;
+        case SDL_BUTTON_MIDDLE: return MouseButton::MIDDLE;
+        default:                return MouseButton::LEFT;
+    }
+}
+
+}  // namespace
+
 inline auto get_all_wsi_lib() -> std::vector<std::string>
 {
     std::vector<std::string> wsi_libs;
@@ -108,6 +142,11 @@ Window::Window(const Properties& properties)
     properties_.extent.height = static_cast<uint32_t>(height);
 
     window_handle_ = (void*) window_handle;
+
+    // Start in mouse-look (relative) mode: cursor hidden + locked, motion reported as deltas.
+    // Esc releases it (see update()), a click re-captures.
+    SDL_SetWindowRelativeMouseMode(window_handle, true);
+    input_.set_mouse_captured(true);
 };
 
 Window::~Window()
@@ -117,6 +156,9 @@ Window::~Window()
 
 void Window::update(entt::dispatcher& dispatcher)
 {
+    // Reset per-frame accumulators (the mouse delta); persistent key/button state carries over.
+    input_.new_frame();
+
     SDL_Event event;
     while (SDL_PollEvent(&event))
     {
@@ -137,7 +179,7 @@ void Window::update(entt::dispatcher& dispatcher)
 
                 if (width <= 0 || height <= 0)
                     continue;
-                
+
                 properties_.extent.width = static_cast<uint32_t>(width);
                 properties_.extent.height = static_cast<uint32_t>(height);
                 break;
@@ -154,6 +196,43 @@ void Window::update(entt::dispatcher& dispatcher)
                 dispatcher.trigger(WindowEvent{
                     .maximize = true,
                 });
+                break;
+            }
+            case SDL_EVENT_KEY_DOWN:
+            case SDL_EVENT_KEY_UP:
+            {
+                const bool down = event.type == SDL_EVENT_KEY_DOWN;
+                const KeyCode key = translate_scancode(event.key.scancode);
+                if (key != KeyCode::UNKNOWN)
+                    input_.set_key(key, down);
+
+                // Esc releases the captured cursor (frees it to interact with the desktop/UI).
+                if (down && event.key.scancode == SDL_SCANCODE_ESCAPE)
+                {
+                    SDL_SetWindowRelativeMouseMode((SDL_Window*)window_handle_, false);
+                    input_.set_mouse_captured(false);
+                }
+                break;
+            }
+            case SDL_EVENT_MOUSE_MOTION:
+            {
+                // Only feed look-deltas while captured, so a released cursor doesn't turn.
+                if (input_.mouse_captured())
+                    input_.add_mouse_delta({ event.motion.xrel, event.motion.yrel });
+                break;
+            }
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+            {
+                const bool down = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+                input_.set_mouse_button(translate_button(event.button.button), down);
+
+                // A click while released re-captures the cursor back into mouse-look.
+                if (down && !input_.mouse_captured())
+                {
+                    SDL_SetWindowRelativeMouseMode((SDL_Window*)window_handle_, true);
+                    input_.set_mouse_captured(true);
+                }
                 break;
             }
         }

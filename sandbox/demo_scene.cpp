@@ -68,10 +68,10 @@ std::vector<string::layout_node> build_demo_ui()
 String::RenderPlan build_demo_plan()
 {
     String::RenderPlan plan;
-    // Grid (background) then the viking room on top, then the UI overlay last.
+    // Grid (background) then the Sponza scene on top, then the UI overlay last.
     plan.add<Grid2DPass>();
-    plan.add<GeometryPass>(std::filesystem::path{ "assets/viking_room.obj" },
-                           std::filesystem::path{ "assets/viking_room.png" });
+    plan.add<GeometryPass>(
+        std::filesystem::path{ "assets/sponza/main/NewSponza_Main_glTF_003.gltf" });
     plan.add<UIPass>(build_demo_ui());
     return plan;
 }

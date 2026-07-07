@@ -7,6 +7,7 @@
 #include <string/vulkan/resource_allocator.hpp>
 #include <string/vulkan/descriptor_allocator.hpp>
 #include <string/vulkan/transfer_batch.hpp>
+#include <string/platform/input.hpp>
 
 namespace String
 {
@@ -24,6 +25,9 @@ struct PassContext
     // Batches a pass's one-time uploads (mesh/texture staging copies); flushed once by the
     // renderer after all passes are built, so uploads cost a single submit, not one per copy.
     TransferBatch& transfer;
+    // Polled per-frame input (keyboard/mouse), for passes that respond to it (e.g. a camera).
+    // Stable for the app's lifetime; a pass may store the reference and read it in update().
+    const Input& input;
     // The offscreen render targets a scene pass draws into, so it can declare its ColorWrite /
     // DepthWrite usages (the render graph orders + barriers passes from these).
     ResourceID color_target;

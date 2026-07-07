@@ -1,0 +1,14 @@
+[wrap-git]
+# fastgltf — SIMD-accelerated glTF 2.0 importer (spnda/fastgltf). Used by the sandbox's glTF
+# loader (Sponza + future assets). fastgltf ships CMake-only, so patch_directory overlays a
+# small meson.build (see subprojects/packagefiles/fastgltf/) that builds its three .cpp files
+# over simdjson (pulled via simdjson.wrap). This is the OFF-NIX fallback only: the Nix build
+# provides fastgltf via buildInputs (see flake.nix), so this wrap is never cloned in the
+# sandbox.
+url = https://github.com/spnda/fastgltf.git
+revision = v0.8.0
+depth = 1
+patch_directory = fastgltf
+
+[provide]
+fastgltf = fastgltf_dep

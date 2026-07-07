@@ -37,6 +37,15 @@ if not volk_dep.found()
 endif
 deps += volk_dep
 
+# --- fastgltf (glTF 2.0 importer; SIMD-accelerated, used for Sponza et al.) ---
+# Nix provides it via buildInputs (resolved here by pkg-config/cmake); off-Nix falls back to
+# the git wrap under subprojects/, which builds it over simdjson (WrapDB wrap).
+deps += dependency('fastgltf', fallback : ['fastgltf', 'fastgltf_dep'])
+# fastgltf is a static lib that links simdjson, so the final consumer must link simdjson too
+# (static libs don't embed their deps, and neither build path propagates it reliably). List it
+# explicitly: Nix resolves it from buildInputs (cmake), off-Nix from the WrapDB wrap.
+deps += dependency('simdjson', fallback : ['simdjson', 'simdjson_dep'])
+
 # --- Slang (shader compiler runtime; shader.hpp uses <slang.h>) --------------
 slang_dep = dependency('slang', required : false)
 if not slang_dep.found()

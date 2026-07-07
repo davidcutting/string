@@ -7,6 +7,8 @@
 #include <entt/entt.hpp>
 #include <volk.h>
 
+#include <string/platform/input.hpp>
+
 namespace String
 {
 
@@ -53,6 +55,9 @@ public:
 
     const Properties& get_properties() const;
     const View::Extent& get_extent() const;
+    // Polled input state, refreshed by update() each frame (see Input). Stable for the window's
+    // lifetime, so consumers can hold the reference.
+    const Input& get_input() const { return input_; }
     bool should_close() const;
     void resize(const View::Extent& extent);
     void key_action(int key, int scancode, int action, int mods);
@@ -67,6 +72,7 @@ private:
     void* window_handle_;
     std::vector<ResizeEventCallbackFn> resize_callbacks_;
     bool closing = false;
+    Input input_;
 };
 
 }  // namespace String

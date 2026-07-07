@@ -12,7 +12,30 @@
       systems = [
         "x86_64-linux" "aarch64-linux"
       ];
-      perSystem = { config, self', inputs', pkgs, system, ... }: {
+      perSystem = { config, self', inputs', pkgs, system, ... }:
+      let
+        # fastgltf isn't in nixpkgs yet, so build it from a hash-pinned source. Upstream is
+        # CMake-only; find_package(simdjson CONFIG) picks up nixpkgs' simdjson (deps download
+        # is thus skipped), and the CMake install exports fastgltfConfig.cmake, which Meson's
+        # dependency('fastgltf') resolves via its cmake method. Off-Nix builds use the meson
+        # wrap under string-engine/subprojects/ instead.
+        fastgltf = pkgs.stdenv.mkDerivation {
+          pname = "fastgltf";
+          version = "0.8.0";
+          src = pkgs.fetchFromGitHub {
+            owner = "spnda";
+            repo = "fastgltf";
+            rev = "v0.8.0";
+            hash = "sha256-nPkVMrve1+04XRpSswBqjlSurliCFBRxR8Zxy4xZ5pE=";
+          };
+          nativeBuildInputs = [ pkgs.cmake ];
+          buildInputs = [ pkgs.simdjson ];
+          cmakeFlags = [
+            "-DFASTGLTF_ENABLE_TESTS=OFF"
+            "-DFASTGLTF_ENABLE_EXAMPLES=OFF"
+          ];
+        };
+      in {
 
         # `nix flake check` builds the engine with the gtest suite enabled and runs it. This is
         # what keeps the header-only bits (e.g. core/layout.hpp) actually compiled + verified —
@@ -39,6 +62,7 @@
             meson
             ninja
             pkg-config
+            cmake         # lets Meson's cmake dependency method find fastgltf (no .pc, cmake-only)
             makeWrapper   # wrap string_demo to point at its installed resources
             glslang       # glslangValidator, for GLSL -> SPIR-V
             shader-slang  # slangc, for Slang -> SPIR-V
@@ -55,6 +79,8 @@
             vulkan-memory-allocator    # vk_mem_alloc.h
             vulkan-volk                # volk.h (Vulkan meta-loader)
             shader-slang               # libslang runtime (shader.hpp)
+            fastgltf                   # glTF 2.0 importer (Sponza et al.)
+            simdjson                   # fastgltf's (public) dependency; needed on the prefix path
           ];
 
           # Default WSI is glfw; flip to sdl/wayland here if desired.
@@ -67,6 +93,9 @@
           # Build with debug info (nixpkgs' meson hook defaults to --buildtype=plain, which
           # drops -g) and keep it in the binary, so gdb has line numbers + locals.
           mesonBuildType = "debug";
+          # cmake is present only so Meson can read fastgltf's cmake config; don't let its
+          # setup hook take over the configure phase from Meson.
+          dontUseCmakeConfigure = true;
           dontStrip = true;
           # _FORTIFY_SOURCE (a default hardening flag) requires -O; the debug build is -O0,
           # so drop just that flag to avoid a warning on every TU.
@@ -83,7 +112,7 @@
             ln -s ${./sandbox/assets} $out/include/string/assets
 
             wrapProgram $out/bin/string_demo \
-              --set STRING_RESOURCES_DIR $out/include/string \
+              --set-default STRING_RESOURCES_DIR $out/include/string \
               --prefix VK_LAYER_PATH : ${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d \
               --prefix LD_LIBRARY_PATH : ${pkgs.vulkan-validation-layers}/lib
           '';
@@ -125,6 +154,8 @@
               vulkan-tools-lunarg
               vulkan-volk
               vulkan-memory-allocator
+              fastgltf
+              simdjson
               liburing
               wayland
               perf

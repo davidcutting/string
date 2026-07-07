@@ -17,6 +17,7 @@ executable(
     [
         'main.cpp',
         'demo_scene.cpp',
+        'gltf_loader.cpp',
         'passes/grid_2d_pass.cpp',
         'passes/geometry_pass.cpp',
         'passes/ui_pass.cpp',

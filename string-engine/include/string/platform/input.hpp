@@ -1,6 +1,10 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+
+#include <glm/glm.hpp>
 
 namespace String
 {
@@ -130,5 +134,40 @@ constexpr bool has_modifier(KeyModifier modifiers, KeyModifier flag)
 {
     return (modifiers & flag) != KeyModifier::NONE;
 }
+
+// Per-frame input state, polled by consumers (e.g. a camera in a pass's update()). The WSI
+// backend fills it each frame from platform events: key/button state persists across frames
+// (set on press, cleared on release); the mouse delta accumulates within a frame and is reset
+// by new_frame() at the top of each window update. `mouse_captured` reflects relative-mouse
+// (look) mode — deltas are only accumulated while captured, so a released cursor stops the look.
+class Input
+{
+public:
+    bool key_down(KeyCode key) const { return keys_[static_cast<std::size_t>(key)]; }
+    bool mouse_button_down(MouseButton button) const
+    {
+        return buttons_[static_cast<std::size_t>(button)];
+    }
+    glm::vec2 mouse_delta() const { return mouse_delta_; }
+    bool mouse_captured() const { return mouse_captured_; }
+
+    // --- Filled by the WSI backend ---
+    void set_key(KeyCode key, bool down) { keys_[static_cast<std::size_t>(key)] = down; }
+    void set_mouse_button(MouseButton button, bool down)
+    {
+        buttons_[static_cast<std::size_t>(button)] = down;
+    }
+    void add_mouse_delta(glm::vec2 delta) { mouse_delta_ += delta; }
+    void set_mouse_captured(bool captured) { mouse_captured_ = captured; }
+    void new_frame() { mouse_delta_ = glm::vec2(0.0f); }
+
+private:
+    // KeyCode values are sparse GLFW codes topping out at 347; a flat array covers them.
+    static constexpr std::size_t MAX_KEYS = 512;
+    std::array<bool, MAX_KEYS> keys_{};
+    std::array<bool, 8> buttons_{};
+    glm::vec2 mouse_delta_{ 0.0f };
+    bool mouse_captured_ = false;
+};
 
 }

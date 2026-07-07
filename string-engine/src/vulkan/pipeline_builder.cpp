@@ -207,7 +207,8 @@ PipelineBuilder& PipelineBuilder::set_tessellation(uint32_t patch_control_points
 
 PipelineBuilder& PipelineBuilder::set_rasterization(
     VkPolygonMode polygon_mode,
-    VkCullModeFlags cull_mode)
+    VkCullModeFlags cull_mode,
+    VkFrontFace front_face)
 {
     VkPipelineRasterizationStateCreateInfo rasterizer_state_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
@@ -217,7 +218,7 @@ PipelineBuilder& PipelineBuilder::set_rasterization(
         .rasterizerDiscardEnable = VK_FALSE,
         .polygonMode = polygon_mode,
         .cullMode = cull_mode,
-        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .frontFace = front_face,
         .depthBiasEnable = VK_FALSE,
         .depthBiasConstantFactor = 0,
         .depthBiasClamp = 0,
