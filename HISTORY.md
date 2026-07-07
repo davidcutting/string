@@ -135,8 +135,14 @@ coalescing target — and **not in a working build state**.
 ## Notes for the coalescing phase
 
 - **ECS lives only on `master`** — if you want it back, that branch is the sole source.
-- **`asset` / `filesystem`** abstractions trace to `string_new`; check whether `rewrite-6`
-  has equivalents or should adopt them.
+- **`string_old`, `string_new`, and `ogl-string` have nothing worth resurrecting** (verified
+  2026-07-06): `string_old` is 2022 tutorial-era Vulkan superseded by rewrite-6; its Camera and
+  FPS-movement math are worth a *reference glance* when building a 3D camera, nothing more.
+  `string_new`'s much-hyped `asset`/`filesystem` turned out to be an empty stub plus a one-function
+  file reader that `rewrite-6` already has (`read_file` in `vulkan_utils`). `ogl-string` is
+  **misnamed — it is Vulkan, not OpenGL** (zero `gl*` calls); a 2024 parallel rewrite sharing the
+  `string` ancestry, superseded by rewrite-6. Its only value is as a known-good *reference* for
+  the `tinyobjloader` + `stb_image` model/texture path when reviving `geometry_pass`.
 - **Raw Wayland WSI, Slang, VMA, render-graph/passes** are all `rewrite-6` strengths —
   keep as the spine.
 - The `rewrite-N` numbering is informal/aspirational; only `rewrite-5`/`-6` (and the

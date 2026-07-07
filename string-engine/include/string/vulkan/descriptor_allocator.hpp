@@ -28,20 +28,20 @@ class DescriptorAllocator
     std::unordered_map<ResourceID, Slot> slot_map_;
 
 public:
-    auto allocate(const ResourceID& resource) -> Slot
+    auto allocate(ResourceID resource) -> Slot
     {
         const Slot slot = registry_.get_id();
         slot_map_[resource] = slot;
         return slot;
     }
 
-    void release(const ResourceID& resource)
+    void release(ResourceID resource)
     {
         registry_.release_id(get_slot(resource));
         slot_map_.erase(resource);
     }
 
-    auto get_slot(const ResourceID& resource) const -> Slot
+    auto get_slot(ResourceID resource) const -> Slot
     {
         return slot_map_.at(resource);
     }
@@ -77,16 +77,16 @@ public:
     explicit DescriptorTable(VkDevice device, ResourceAllocator& allocator);
     ~DescriptorTable();
 
-    void bind(const ResourceID& handle, const DescriptorType& type);
-    void unbind(const ResourceID& handle, const DescriptorType& type);
+    void bind(ResourceID handle, DescriptorType type);
+    void unbind(ResourceID handle, DescriptorType type);
 
-    auto get_binding_slot(const ResourceID& handle, const DescriptorType& type) -> std::uint32_t;
+    auto get_binding_slot(ResourceID handle, DescriptorType type) -> std::uint32_t;
     auto get_layout() const -> VkDescriptorSetLayout { return descriptor_set_layout_; }
     auto get_set() const -> VkDescriptorSet { return descriptor_set_; }
 
 private:
-    void bind_buffer(const ResourceID& handle, const VkDescriptorType& type, const uint32_t& slot);
-    void bind_image(const ResourceID& handle, const VkDescriptorType& type, const uint32_t& slot);
+    void bind_buffer(ResourceID handle, VkDescriptorType type, uint32_t slot);
+    void bind_image(ResourceID handle, VkDescriptorType type, uint32_t slot);
 };
 
 } // namespace String

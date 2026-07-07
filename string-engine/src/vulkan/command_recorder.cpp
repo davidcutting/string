@@ -7,7 +7,7 @@
 namespace String
 {
 
-void CommandRecorder::init(const VkDevice& device, const Queue& queue)
+void CommandRecorder::init(VkDevice device, Queue queue)
 {
     device_ = device;
     queue_ = queue;
@@ -62,7 +62,7 @@ void CommandRecorder::destroy()
     }
 }
 
-auto CommandRecorder::begin(const VkCommandBufferUsageFlags& command_buffer_usage) -> VkCommandBuffer&
+auto CommandRecorder::begin(VkCommandBufferUsageFlags command_buffer_usage) -> VkCommandBuffer&
 {
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,

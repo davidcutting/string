@@ -5,8 +5,9 @@
 #include <vector>
 
 #include <string/vulkan/render_pass.hpp>
+#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/pipeline.hpp>
 #include <string/vulkan/device.hpp>
-#include "string/vulkan/pipelines/pipeline_grid_2d.hpp"
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -14,7 +15,7 @@
 
 #include <volk.h>
 
-namespace String
+namespace sandbox
 {
 
 struct Grid2DParams {
@@ -34,18 +35,18 @@ struct Grid2DParams {
     float show_axes;
 };
 
-class Grid2DPass final : public Pass
+class Grid2DPass final : public String::Pass
 {
-    Device& device_;
+    String::Device& device_;
     VkPushConstantRange grid_2d_push_constant_range_;
-    std::unique_ptr<PipelineGrid2D> pipeline_grid_2d_;
+    String::Pipeline pipeline_;
 
 public:
-    Grid2DPass(Device& device, const std::filesystem::path& resources_path, const uint16_t& frames_in_flight);
+    explicit Grid2DPass(String::PassContext& context);
     virtual ~Grid2DPass() override;
 
     // No update() override — the grid is static, so it uses Pass's default no-op.
-    virtual void record(CommandRecorder& recorder, const uint16_t& current_frame) override;
+    virtual void record(String::CommandRecorder& recorder, uint16_t current_frame) override;
 };
 
-}
+}  // namespace sandbox

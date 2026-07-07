@@ -9,6 +9,6 @@ option('wsi', type: 'combo', choices: ['glfw', 'sdl', 'wayland'], value: 'glfw',
 option('tests', type: 'boolean', value: false,
        description: 'Build the test suite')
 
-# Build the runnable engine demo executable (test_application).
+# Build the runnable demo application (sandbox/).
 option('demo', type: 'boolean', value: true,
        description: 'Build the runnable demo executable')

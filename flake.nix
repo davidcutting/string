@@ -31,9 +31,10 @@
         packages.default = pkgs.clangStdenv.mkDerivation {
           pname = "string-engine";
           version = "0.0.1";
-          src = ./string-engine;
+          # Whole repo: the meson project root is now the top-level meson.build, which builds
+          # the string-engine/ library and the sandbox/ demo application.
+          src = ./.;
 
-          # meson project root is string-engine/ (where meson.build lives).
           nativeBuildInputs = with pkgs; [
             meson
             ninja
@@ -77,8 +78,9 @@
           postInstall = ''
             # Symlink assets under STRING_RESOURCES_DIR rather than copying them into the
             # output. They live once in the store (content-addressed) and are shared across
-            # builds, so large models don't get duplicated into every build result.
-            ln -s ${./string-engine/assets} $out/include/string/assets
+            # builds, so large models don't get duplicated into every build result. Assets are
+            # app content, so they live under sandbox/.
+            ln -s ${./sandbox/assets} $out/include/string/assets
 
             wrapProgram $out/bin/string_demo \
               --set STRING_RESOURCES_DIR $out/include/string \

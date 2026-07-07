@@ -3,10 +3,10 @@
 #include <memory>
 #include <string/core/logger.hpp>
 #include <string/vulkan/renderer.hpp>
+#include <string/vulkan/render_plan.hpp>
 #include <string/platform/window.hpp>
 #include <string/core/app_info.hpp>
 #include <entt/entt.hpp>
-#include <string/scene.hpp>
 
 namespace String {
 
@@ -16,8 +16,9 @@ namespace String {
 class Application {
 public:
     ~Application();
-    /// Lazy initialization of the application's major systems.
-    void initialize(const ApplicationInfo& info);
+    /// Lazy initialization of the application's major systems. The RenderPlan declares what
+    /// the renderer will draw (supplied by the application, e.g. sandbox/).
+    void initialize(const ApplicationInfo& info, const RenderPlan& plan);
     /// Contains the application's main loop.
     void run();
     /// Closes the application
@@ -34,8 +35,6 @@ private:
     bool freeze_rendering_ = false;
     /// Event handler
     entt::dispatcher event_handler_;
-    /// The scene
-    Scene scene_;
 
     void on_window_event(const WindowEvent& event);
 };

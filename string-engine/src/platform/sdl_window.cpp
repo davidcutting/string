@@ -197,7 +197,7 @@ VkSurfaceKHR Window::create_surface(const VkInstance& instance)
     return surface;
 }
 
-std::vector<const char*> Window::get_platform_extensions(const bool& enable_validation_layers)
+std::vector<const char*> Window::get_platform_extensions(bool enable_validation_layers)
 {
     uint32_t extension_count = 0;
     const auto sdl_extensions = SDL_Vulkan_GetInstanceExtensions(&extension_count);

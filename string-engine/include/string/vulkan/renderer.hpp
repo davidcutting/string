@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <vector>
+#include <unordered_set>
 #include <string/vulkan/frame.hpp>
 #include <string/vulkan/command_recorder.hpp>
 #include <string/vulkan/driver.hpp>
@@ -10,10 +11,10 @@
 #include <string/vulkan/resource.hpp>
 #include <string/vulkan/resource_allocator.hpp>
 #include <string/vulkan/descriptor_allocator.hpp>
+#include <string/vulkan/resource_state.hpp>
 #include <string/vulkan/render_pass.hpp>
-#include <string/vulkan/passes/grid_2d_pass.hpp>
-#include <string/vulkan/passes/geometry_pass.hpp>
-#include <string/vulkan/passes/ui_pass.hpp>
+#include <string/vulkan/render_plan.hpp>
+#include <string/vulkan/pass_context.hpp>
 #include <string/vulkan/passes/composite_pass.hpp>
 
 #include <volk.h>
@@ -28,9 +29,7 @@
 #include <string/vulkan/vulkan_utils.hpp>
 #include <string/platform/window.hpp>
 #include <string/vulkan/device.hpp>
-#include <string/vulkan/render_data.hpp>
 #include <string/core/app_info.hpp>
-#include <string/scene.hpp>
 
 namespace String
 {
@@ -47,13 +46,21 @@ class Renderer
     Presenter presenter_;
     ResourceAllocator allocator_;
     DescriptorTable global_descriptor_table_;
+    // Derives the frame's image-layout barriers from tracked state (see begin/end_rendering).
+    ResourceStateTracker resource_states_;
     CompositePass composite_pass_;
     CommandRecorder transfer_command_recorder_;
     // Ordered passes that draw into the offscreen HDR target (color_attachment_), recorded
     // between begin_rendering() and end_rendering(). composite_pass_ is the fixed resolve
     // (offscreen -> swapchain) and is intentionally NOT in this list. Built in the ctor body
-    // since passes need the allocator/table/transfer recorder to be ready first.
+    // from the application's RenderPlan, once the allocator/table/transfer recorder are ready.
     std::vector<std::unique_ptr<Pass>> scene_passes_;
+    // The frame graph's execution list: scene_passes_ then composite_pass_, recorded as
+    // render-pass groups by record_frame(). written_resources_ = the resources the graph itself
+    // writes (color/depth/swapchain) — static uploaded inputs (textures/buffers) are never
+    // re-transitioned.
+    std::vector<Pass*> frame_passes_;
+    std::unordered_set<ResourceID> written_resources_;
     VkSemaphore frame_semaphore_;
 
     // Swapchain image acquired at the start of the frame (in begin_frame), so that
@@ -66,22 +73,29 @@ class Renderer
     uint64_t current_frame_ = 0;
     std::array<Frame, frames_in_flight_> frames_;
 public:
-    Renderer(const ApplicationInfo& application_info, const std::shared_ptr<Window>& window);
+    Renderer(const ApplicationInfo& application_info, std::shared_ptr<Window> window,
+             const RenderPlan& plan);
     ~Renderer();
 
     void update();
 
     void begin_frame();
-    void begin_rendering();
-
-    void draw(Scene& scene);
-
-    void end_rendering();
+    void draw();
     void end_frame();
 
 private:
     ResourceID color_attachment_;
     ResourceID depth_attachment_;
+
+    // Records the whole frame's render work: groups frame_passes_ into render-pass instances by
+    // their color target, derives every image barrier from the passes' declared usages (via
+    // resource_states_), and transitions the swapchain to present. Replaces the old
+    // begin_rendering/end_rendering scaffold.
+    void record_frame();
+    // The VkImage / VkImageView backing a target ResourceID; SWAPCHAIN_TARGET resolves to the
+    // frame's acquired swapchain image.
+    VkImage image_of(ResourceID target) const;
+    VkImageView image_view_of(ResourceID target) const;
 
     void handle_resize(const String::View::Extent& extent);
 

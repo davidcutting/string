@@ -237,7 +237,7 @@ VkSurfaceKHR Window::create_surface(const VkInstance& instance)
     return surface;
 }
 
-std::vector<const char*> Window::get_platform_extensions(const bool& enable_validation_layers)
+std::vector<const char*> Window::get_platform_extensions(bool enable_validation_layers)
 {
     uint32_t glfwExtensionCount = 0;
     const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);

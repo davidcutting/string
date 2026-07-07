@@ -1,14 +1,8 @@
 
 glsl_compiler = find_program('glslangValidator')
+# Only the composite resolve is a built-in engine shader; the scene passes' shaders
+# (2d/3d/grid/ui) live with those passes in the application (sandbox/shaders).
 shaders = [
-    '2d_shader.frag',
-    '2d_shader.vert',
-    '3d_shader.frag',
-    '3d_shader.vert',
-    'grid_2d_shader.vert',
-    'grid_2d_shader.frag',
-    'ui_shader.frag',
-    'ui_shader.vert',
     'composite.vert',
     'composite.frag'
 ]

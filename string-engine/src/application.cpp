@@ -4,12 +4,12 @@
 
 namespace String {
 
-void Application::initialize(const ApplicationInfo& info)
+void Application::initialize(const ApplicationInfo& info, const RenderPlan& plan)
 {
     event_handler_.sink<WindowEvent>().connect<&Application::on_window_event>(*this);
     window_ = std::make_shared<Window>(Window::Properties{.title = info.application_name, .extent = {800, 800}});
     init_signal_handling();
-    renderer_ = std::make_unique<Renderer>(info, window_);
+    renderer_ = std::make_unique<Renderer>(info, window_, plan);
 }
 
 Application::~Application()
@@ -31,7 +31,7 @@ void Application::run() {
         event_handler_.update();
 
         if (!freeze_rendering_)
-            renderer_->draw(scene_);
+            renderer_->draw();
 
         const auto now = std::chrono::steady_clock::now();
         const auto iterations = (now - start) / period;

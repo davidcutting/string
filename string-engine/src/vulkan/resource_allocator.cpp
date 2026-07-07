@@ -162,7 +162,7 @@ auto ResourceAllocator::create_resource(const ImageInfo& info) -> ResourceID
     return id;
 }
 
-auto ResourceAllocator::create_staging(const VkDeviceSize& size) -> ResourceID
+auto ResourceAllocator::create_staging(VkDeviceSize size) -> ResourceID
 {
     return create_resource(BufferInfo{
         .size = size,
@@ -172,7 +172,7 @@ auto ResourceAllocator::create_staging(const VkDeviceSize& size) -> ResourceID
     });
 }
 
-void ResourceAllocator::destroy_resource(const ResourceID& id)
+void ResourceAllocator::destroy_resource(ResourceID id)
 {
     if (buffers_.contains(id))
     {
@@ -191,17 +191,17 @@ void ResourceAllocator::destroy_resource(const ResourceID& id)
     registry_.release_id(id);
 }
 
-auto ResourceAllocator::get_buffer(const ResourceID& id) const -> const AllocatedBuffer&
+auto ResourceAllocator::get_buffer(ResourceID id) const -> const AllocatedBuffer&
 {
     return buffers_.at(id);
 }
 
-auto ResourceAllocator::get_image(const ResourceID& id) const -> const AllocatedImage&
+auto ResourceAllocator::get_image(ResourceID id) const -> const AllocatedImage&
 {
     return images_.at(id);
 }
 
-void ResourceAllocator::copy_data_to_buffer(const void* data, const ResourceID& resource) const
+void ResourceAllocator::copy_data_to_buffer(const void* data, ResourceID resource) const
 {
     // TODO(DCut): In general, one can configure allocations and pools with VMA to automatically contain
     // a void* to the mapping for us, which would shift the cost of mapping to the allocation time,
@@ -245,7 +245,7 @@ void ResourceAllocator::create_image_sampler(AllocatedImage& allocated_image)
     }
 }
 
-void ResourceAllocator::create_image_view(AllocatedImage& allocated_image, const VkImageAspectFlags& aspect_flags)
+void ResourceAllocator::create_image_view(AllocatedImage& allocated_image, VkImageAspectFlags aspect_flags)
 {
     VkImageViewCreateInfo view_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,

@@ -15,15 +15,9 @@ PassBuilder::PassBuilder(GraphBuilder& graph_builder, const std::string& name)
 
 }
 
-auto PassBuilder::reads(const ResourceID& resource, const Access& access) -> PassBuilder&
+auto PassBuilder::use(ResourceID resource, Access access, VkPipelineStageFlags2 stage) -> PassBuilder&
 {
-    building_.reads.emplace_back(resource, access);
-    return *this;
-}
-
-auto PassBuilder::writes(const ResourceID& resource, const Access& access) -> PassBuilder&
-{
-    building_.writes.emplace_back(resource, access);
+    building_.usages.push_back({ resource, access, stage });
     return *this;
 }
 
@@ -40,7 +34,7 @@ auto GraphBuilder::add_pass(const std::string& name) -> PassBuilder
     return PassBuilder(*this, std::move(name));
 }
 
-void GraphBuilder::finish_pass(Pass&& pass)
+void GraphBuilder::finish_pass(PassNode&& pass)
 {
     passes_.push_back(std::move(pass));
 }
@@ -62,17 +56,19 @@ auto GraphBuilder::build() -> RenderGraph
     const int num_passes = graph.passes.size();
     graph.adjacency.assign(num_passes, {});
 
-    // 1) Collect writers/readers lists per resource (declaration order)
+    // 1) Collect writers/readers lists per resource (read vs write derived from the Access)
     std::unordered_map<ResourceID, std::vector<uint32_t>> resource_writers;
     std::unordered_map<ResourceID, std::vector<uint32_t>> resource_readers;
 
     for (int i = 0; i < num_passes; ++i)
     {
-        for (auto& dep : graph.passes[i].writes)
-            resource_writers[dep.resource].push_back(i);
-
-        for (auto& dep : graph.passes[i].reads)
-            resource_readers[dep.resource].push_back(i);
+        for (const auto& usage : graph.passes[i].usages)
+        {
+            if (is_write(usage.access))
+                resource_writers[usage.resource].push_back(i);
+            else
+                resource_readers[usage.resource].push_back(i);
+        }
     }
 
     // 2) Build adjacency using writer chain + writer->reader links (single pass)
@@ -120,27 +116,16 @@ auto GraphBuilder::build() -> RenderGraph
     for (uint32_t pos = 0; pos < graph.toposorted.size(); ++pos)
     {
         uint32_t pass_index = graph.toposorted[pos];
-        const Pass& pass = graph.passes[pass_index];
+        const PassNode& pass = graph.passes[pass_index];
 
-        // reads
-        for (auto& dep : pass.reads)
+        for (const auto& usage : pass.usages)
         {
-            auto& lifetime = graph.resource_lifetimes[dep.resource];
-
-            lifetime.first = std::min(lifetime.first.value_or(pos), pos);
-            lifetime.last = std::max(lifetime.last.value_or(pos), pos);
-            // readers do not set first_writer
-        }
-
-        // writes
-        for (auto& dep : pass.writes)
-        {
-            auto& lifetime = graph.resource_lifetimes[dep.resource];
+            auto& lifetime = graph.resource_lifetimes[usage.resource];
 
             lifetime.first = std::min(lifetime.first.value_or(pos), pos);
             lifetime.last = std::max(lifetime.last.value_or(pos), pos);
 
-            if (!lifetime.first_writer.has_value())
+            if (is_write(usage.access) && !lifetime.first_writer.has_value())
             {
                 // earliest writer seen in topo-order
                 lifetime.first_writer = pos;
@@ -158,8 +143,6 @@ auto GraphBuilder::build() -> RenderGraph
 using namespace String;
 
 int main() {
-    GraphBuilder builder;
-
     // Fake resource IDs for now
     ResourceID depth_id   = 1;
     ResourceID color_id   = 2;
@@ -167,26 +150,25 @@ int main() {
 
     RenderGraph graph = GraphBuilder()
         .add_pass("depth_prepass")
-            .writes(depth_id, Access::DepthStencilWrite)
+            .use(depth_id, Access::DepthWrite, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT)
             .end_pass()
         .add_pass("light_cull")
-            .reads(depth_id, Access::DepthStencilRead)
-            .writes(lightgrid_id, Access::StorageWrite)
+            .use(depth_id, Access::DepthRead, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+            .use(lightgrid_id, Access::StorageWrite, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
             .end_pass()
         .add_pass("forward_shading")
-            .reads(depth_id, Access::DepthStencilRead)
-            .reads(lightgrid_id, Access::StorageRead)
-            .writes(color_id, Access::ColorWrite)
+            .use(depth_id, Access::DepthRead, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT)
+            .use(lightgrid_id, Access::StorageRead, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT)
+            .use(color_id, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT)
             .end_pass()
         .build();
 
     for (auto& pass : graph.passes)
     {
-        std::println("Pass: {}", pass.name);
-        for (auto& dep : pass.reads)
-            std::println("  Reads: {} ({})", dep.resource, (int) dep.access);
-        for (auto& dep : pass.writes)
-            std::println("  Writes: {} ({})", dep.resource, (int) dep.access);
+        std::println("PassNode: {}", pass.name);
+        for (auto& usage : pass.usages)
+            std::println("  {} {} ({})", is_write(usage.access) ? "Writes" : "Reads",
+                usage.resource, (int) usage.access);
     }
 
     std::println("Execution order:");

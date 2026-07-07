@@ -60,7 +60,7 @@ public:
 
     void* get_native_handle() const;
     VkSurfaceKHR create_surface(const VkInstance& instance);
-    std::vector<const char*> get_platform_extensions(const bool& enable_validation_layers);
+    std::vector<const char*> get_platform_extensions(bool enable_validation_layers);
 
 private:
     Properties properties_;

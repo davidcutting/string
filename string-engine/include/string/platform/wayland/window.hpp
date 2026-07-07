@@ -14,7 +14,7 @@ static void xdg_toplevel_close(void* data, xdg_toplevel* toplevel);
 namespace wl
 {
 
-using on_resize = std::function<void(const std::uint32_t&, const uint32_t&)>;
+using on_resize = std::function<void(std::uint32_t, uint32_t)>;
 using on_close = std::function<void()>;
 
 class window

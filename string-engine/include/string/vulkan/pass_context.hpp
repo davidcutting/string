@@ -1,0 +1,36 @@
+#pragma once
+
+#include <cstdint>
+#include <filesystem>
+
+#include <string/vulkan/device.hpp>
+#include <string/vulkan/resource_allocator.hpp>
+#include <string/vulkan/descriptor_allocator.hpp>
+#include <string/vulkan/transfer_batch.hpp>
+
+namespace String
+{
+
+// The GPU-side context a pass needs at construction. It bundles the renderer-owned systems
+// (device, allocator, bindless table, upload recorder) plus where resources live and how many
+// frames are in flight. Passes receive this as their first constructor argument so the
+// application can declare *what* to draw (content) without touching *how* it's built (the GPU
+// context, which only exists inside the Renderer). See render_plan.hpp for how it's injected.
+struct PassContext
+{
+    Device& device;
+    ResourceAllocator& allocator;
+    DescriptorTable& descriptor_table;
+    // Batches a pass's one-time uploads (mesh/texture staging copies); flushed once by the
+    // renderer after all passes are built, so uploads cost a single submit, not one per copy.
+    TransferBatch& transfer;
+    // The offscreen render targets a scene pass draws into, so it can declare its ColorWrite /
+    // DepthWrite usages (the render graph orders + barriers passes from these).
+    ResourceID color_target;
+    ResourceID depth_target;
+    // Root that contains shaders/ (and, at runtime, assets/); passes resolve their files here.
+    std::filesystem::path resources_path;
+    uint16_t frames_in_flight;
+};
+
+}  // namespace String

@@ -3,6 +3,7 @@
 #include <filesystem>
 
 #include <string/vulkan/render_pass.hpp>
+#include <string/vulkan/pipeline.hpp>
 #include <string/vulkan/device.hpp>
 
 #include <volk.h>
@@ -16,6 +17,7 @@ namespace String
 class CompositePass final : public Pass
 {
     Device& device_;
+    Pipeline pipeline_;
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
     uint32_t source_slot_ = 0;
 
@@ -28,8 +30,8 @@ public:
     // (re-supplied on resize, when the target is re-created and re-bound).
     void set_source(VkDescriptorSet descriptor_set, uint32_t source_slot);
 
-    virtual void update(const float& delta_time, const uint16_t& current_frame) override;
-    virtual void record(CommandRecorder& recorder, const uint16_t& current_frame) override;
+    virtual void update(float delta_time, uint16_t current_frame) override;
+    virtual void record(CommandRecorder& recorder, uint16_t current_frame) override;
 };
 
 }

@@ -12,8 +12,8 @@
 namespace String
 {
 
-Device::Device(Driver& driver, const std::shared_ptr<Window>& window)
-: window_(window)
+Device::Device(Driver& driver, std::shared_ptr<Window> window)
+: window_(std::move(window))
 , driver_(driver)
 , surface_(window_->create_surface(driver_.get_instance()))
 {
@@ -92,6 +92,7 @@ bool Device::is_device_suitable(const VkPhysicalDevice& device) {
     bool has_desired_features = supported_features.features.samplerAnisotropy
         && vulkan13_features.dynamicRendering == VK_TRUE
         && vulkan13_features.synchronization2 == VK_TRUE
+        && vulkan13_features.shaderDemoteToHelperInvocation == VK_TRUE
         && vulkan12_features.timelineSemaphore == VK_TRUE
         && vulkan12_features.bufferDeviceAddress == VK_TRUE
         && extended_dynamic_state2_features.extendedDynamicState2 == VK_TRUE;
@@ -136,14 +137,15 @@ void Device::select_physical_device()
         throw std::runtime_error("Failed to find a suitable GPU!");
     }
 
-    VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(physical_device_, &props);
-    STRING_LOG_INFO("Device name: {}", props.deviceName);
+    // Cache the selected device's immutable data once; every later query reuses these.
+    vkGetPhysicalDeviceProperties(physical_device_, &properties_);
+    queue_family_indices_ = get_queue_families(physical_device_);
+    STRING_LOG_INFO("Device name: {}", properties_.deviceName);
 }
 
 void Device::create_logical_device()
 {
-    QueueFamilyIndices indices = get_queue_families(physical_device_);
+    const QueueFamilyIndices& indices = queue_family_indices_;
 
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
     std::set<uint32_t> uniqueQueueFamilies = {
@@ -193,6 +195,9 @@ void Device::create_logical_device()
     vulkan13_features.pNext = &vulkan12_features;
     vulkan13_features.synchronization2 = VK_TRUE;
     vulkan13_features.dynamicRendering = VK_TRUE;
+    // GLSL `discard` compiles to OpDemoteToHelperInvocation under the vulkan1.3 target env
+    // (used by the UI fragment shader), which requires this feature.
+    vulkan13_features.shaderDemoteToHelperInvocation = VK_TRUE;
 
     VkPhysicalDeviceFeatures enabled_device_features{};
     enabled_device_features.samplerAnisotropy = VK_TRUE;
@@ -307,7 +312,7 @@ QueueFamilyIndices Device::get_queue_families(const VkPhysicalDevice& physical_d
 
 QueueFamilyIndices Device::get_queue_families()
 {
-    return get_queue_families(physical_device_);
+    return queue_family_indices_;
 }
 
 VkFormat Device::get_format_support(const std::vector<VkFormat>& candidates, const VkImageTiling& tiling, const VkFormatFeatureFlags& features)
@@ -326,7 +331,7 @@ VkFormat Device::get_format_support(const std::vector<VkFormat>& candidates, con
     throw std::runtime_error("Failed to find supported format!");
 }
 
-uint32_t Device::get_memory_type(const uint32_t& type_filter, const VkMemoryPropertyFlags& properties)
+uint32_t Device::get_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties)
 {
     VkPhysicalDeviceMemoryProperties memory_properties;
     vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties);
@@ -342,10 +347,7 @@ uint32_t Device::get_memory_type(const uint32_t& type_filter, const VkMemoryProp
 
 VkPhysicalDeviceLimits Device::get_physical_device_limits()
 {
-    VkPhysicalDeviceProperties properties{};
-    vkGetPhysicalDeviceProperties(physical_device_, &properties);
-
-    return properties.limits;
+    return properties_.limits;
 }
 
 VkFormat Device::get_depth_format() {
@@ -376,9 +378,9 @@ auto Device::get_physical_device() -> VkPhysicalDevice&
     return physical_device_;
 }
 
-auto Device::get_queue(const QueueType& type) -> Queue
+auto Device::get_queue(QueueType type) -> Queue
 {
-    QueueFamilyIndices indices = get_queue_families();
+    const QueueFamilyIndices& indices = queue_family_indices_;
 
     Queue queue = {
         .queue_family_index = 0,

@@ -52,3 +52,90 @@ This project is MIT licensed. Third party libraries may/do have their own licens
 - Austin Morlan: A simple Entity Component System (ECS) [C++]
 - Yan Chernikov: Hazel Game Engine
 - Godot Team: The Godot Game Engine
+
+## Handy Resources
+
+https://github.com/vinjn/awesome-vulkan
+
+https://www.khronos.org/registry/vulkan/specs/1.3/html/vkspec.html#introduction
+
+### Design
+
+http://gameprogrammingpatterns.com/contents.html
+
+https://alextardif.com/Bindless.html
+
+https://alextardif.com/RenderingAbstractionLayers.html
+
+https://alain.xyz/blog/comparison-of-modern-graphics-apis
+
+http://www.gijskaerts.com/wordpress/?p=98
+
+https://www.gamedeveloper.com/programming/designing-a-modern-cross-platform-low-level-graphics-library
+
+### Other Engines
+
+https://github.com/godotengine/godot
+
+https://github.com/OGRECave/ogre-next
+
+https://github.com/DiligentGraphics/DiligentCore
+
+https://github.com/Themaister/Granite
+
+https://github.com/kcloudy0717/Kaguya
+
+https://github.com/TheCherno/Hazel
+
+### OpenGL
+
+https://learnopengl.com/
+
+### Vulkan
+
+https://vulkan-tutorial.com/Introduction
+
+https://github.com/KhronosGroup/Vulkan-Samples
+
+https://zeux.io/2020/02/27/writing-an-efficient-vulkan-renderer/
+
+https://github.com/blurrypiano/littleVulkanEngine
+
+https://alain.xyz/blog/raw-vulkan
+
+https://gpuopen.com/learn/understanding-vulkan-objects
+
+### Render Graphs
+
+https://www.gdcvault.com/play/1024612/FrameGraph-Extensible-Rendering-Architecture-in
+
+https://developer.download.nvidia.com/assets/gameworks/downloads/regular/GDC17/DX12CaseStudies_GDC2017_FINAL.pdf
+
+https://www.khronos.org/assets/uploads/developers/library/2019-reboot-develop-blue/SEED-EA_Rapid-Innovation-Using-Modern-Graphics_Apr19.pdf
+
+https://github.com/azhirnov/FrameGraph
+
+https://themaister.net/blog/2017/08/15/render-graphs-and-vulkan-a-deep-dive/
+
+### D3D
+
+https://docs.microsoft.com/en-us/windows/win32/direct3d12/directx-12-programming-guide
+
+https://alain.xyz/blog/raw-directx12
+
+### PBR and RayTracing
+
+https://www.realtimerendering.com/raytracinggems/
+
+https://www.pbr-book.org/3ed-2018/contents
+
+https://github.com/RayTracing/raytracing.github.io
+
+### Memory
+
+https://floooh.github.io/2018/06/17/handles-vs-pointers.html
+
+### ECS
+
+https://github.com/skypjack/entt
+

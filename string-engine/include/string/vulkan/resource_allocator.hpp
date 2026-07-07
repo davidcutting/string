@@ -35,17 +35,17 @@ public:
 
     auto create_resource(const BufferInfo& info) -> ResourceID;
     auto create_resource(const ImageInfo& info) -> ResourceID;
-    auto create_staging(const VkDeviceSize& size) -> ResourceID;
-    void destroy_resource(const ResourceID& id);
+    auto create_staging(VkDeviceSize size) -> ResourceID;
+    void destroy_resource(ResourceID id);
 
-    auto get_buffer(const ResourceID& id) const -> const AllocatedBuffer&;
-    auto get_image(const ResourceID& id) const -> const AllocatedImage&;
+    auto get_buffer(ResourceID id) const -> const AllocatedBuffer&;
+    auto get_image(ResourceID id) const -> const AllocatedImage&;
 
-    void copy_data_to_buffer(const void* data, const ResourceID& resource) const;
+    void copy_data_to_buffer(const void* data, ResourceID resource) const;
 
 private:
     void create_image_sampler(AllocatedImage& allocated_image);
-    void create_image_view(AllocatedImage& allocated_image, const VkImageAspectFlags& aspect_flags);
+    void create_image_view(AllocatedImage& allocated_image, VkImageAspectFlags aspect_flags);
 };
 
 struct DeletionQueue

@@ -13,7 +13,7 @@
 namespace String
 {
 
-Presenter::Presenter(Device& device, std::shared_ptr<Window> window, uint32_t frames_in_flight)
+Presenter::Presenter(Device& device, const std::shared_ptr<Window>& window, uint32_t frames_in_flight)
 : wait_for_image_available_semaphores_{VK_NULL_HANDLE}
 , signal_when_ready_to_present_semaphores_{VK_NULL_HANDLE}
 , device_(device)
@@ -232,7 +232,7 @@ void Presenter::present()
     current_frame_id_ = std::numeric_limits<uint32_t>::max();
 }
 
-void Presenter::resize(const VkExtent2D& extent)
+void Presenter::resize(VkExtent2D extent)
 {
     STRING_PROFILE_SCOPE("Resize Presenter")
     vkDeviceWaitIdle(device_.get_device());
@@ -371,7 +371,7 @@ auto Presenter::choose_swap_present_mode(const std::vector<VkPresentModeKHR>& av
     return VK_PRESENT_MODE_FIFO_KHR;  // FIFO mode is required to be supported
 }
 
-auto Presenter::choose_swap_extent(const VkExtent2D& extent, const VkSurfaceCapabilitiesKHR& capabilities) -> VkExtent2D
+auto Presenter::choose_swap_extent(VkExtent2D extent, const VkSurfaceCapabilitiesKHR& capabilities) -> VkExtent2D
 {
     if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max())
     {

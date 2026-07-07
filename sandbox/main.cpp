@@ -1,12 +1,16 @@
 #include <cstdlib>
 #include <filesystem>
-#include <string/application.hpp>
 #include <iostream>
+
+#include <string/application.hpp>
 #include <string/core/logger.hpp>
+
+#include "demo_scene.hpp"
 
 namespace
 {
-// Resolve the resources root (which contains a `shaders/` directory):
+// Resolve the resources root (which contains a `shaders/` directory, and at runtime an
+// `assets/` one):
 //   1. $STRING_RESOURCES_DIR if set (the Nix package wraps the binary to point here),
 //   2. else $XDG_CONFIG_HOME/string, else $HOME/.config/string.
 std::filesystem::path resolve_resources_directory()
@@ -19,7 +23,7 @@ std::filesystem::path resolve_resources_directory()
         return std::filesystem::path(home) / ".config" / "string";
     return std::filesystem::current_path();
 }
-}
+}  // namespace
 
 int main()
 {
@@ -36,13 +40,13 @@ int main()
     try
     {
         STRING_LOG_DEBUG("Initializing application...");
-        app.initialize(app_info);
+        app.initialize(app_info, sandbox::build_demo_plan());
         STRING_LOG_DEBUG("Running application...");
         app.run();
     }
     catch (const std::exception& e)
     {
-        std::cerr << e.what() << std::endl;
+        std::cerr << e.what() << '\n';
         return EXIT_FAILURE;
     }
 

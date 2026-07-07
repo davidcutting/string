@@ -22,20 +22,20 @@ struct SwapChainSupportDetails {
 class Device
 {
 public:
-    explicit Device(Driver& driver, const std::shared_ptr<Window>& window);
+    explicit Device(Driver& driver, std::shared_ptr<Window> window);
     ~Device();
 
     SwapChainSupportDetails get_swap_chain_support();
     VkFormat get_format_support(const std::vector<VkFormat>& candidates, const VkImageTiling& tiling, const VkFormatFeatureFlags& features);
     VkFormat get_depth_format();
-    uint32_t get_memory_type(const uint32_t& type_filter, const VkMemoryPropertyFlags& properties);
+    uint32_t get_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties);
     VkPhysicalDeviceLimits get_physical_device_limits();
     QueueFamilyIndices get_queue_families();
 
     auto get_surface() const -> VkSurfaceKHR;
     auto get_physical_device() -> VkPhysicalDevice&;
     auto get_device() -> VkDevice&;
-    auto get_queue(const QueueType& type) -> Queue;
+    auto get_queue(QueueType type) -> Queue;
 
 private:
     std::shared_ptr<Window> window_;
@@ -43,6 +43,12 @@ private:
     VkSurfaceKHR surface_;
     VkPhysicalDevice physical_device_{VK_NULL_HANDLE};
     VkDevice device_{VK_NULL_HANDLE};
+
+    // Immutable per-physical-device data, queried once at selection and reused — avoids
+    // re-probing queue families (2 property queries + a per-family surface-support query) on
+    // every get_queue()/create_logical_device(), and re-querying properties for limits.
+    QueueFamilyIndices queue_family_indices_{};
+    VkPhysicalDeviceProperties properties_{};
 
     void select_physical_device();
     void create_logical_device();

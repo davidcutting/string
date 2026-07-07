@@ -45,14 +45,14 @@ class Presenter
     uint32_t swapchain_image_count_ = 2;
 
 public:
-    explicit Presenter(Device& device, std::shared_ptr<Window> window, uint32_t frames_in_flight = 3);
+    explicit Presenter(Device& device, const std::shared_ptr<Window>& window, uint32_t frames_in_flight = 3);
     ~Presenter();
 
     [[nodiscard]]
     auto acquire_next_frame() -> AcquiredImage;
     void present();
 
-    void resize(const VkExtent2D& extent);
+    void resize(VkExtent2D extent);
     auto get_max_frames_in_flight() const -> uint32_t;
     auto get_extent() const -> VkExtent2D;
     auto get_format() const -> VkFormat { return image_format_; }
@@ -62,7 +62,7 @@ private:
     auto create_image_view(VkImage image, VkFormat format, VkImageAspectFlags aspect_flags) -> VkImageView;
     auto choose_swap_surface_format(const std::vector<VkSurfaceFormatKHR>& available_formats) -> VkSurfaceFormatKHR;
     auto choose_swap_present_mode(const std::vector<VkPresentModeKHR>& available_present_modes) -> VkPresentModeKHR;
-    auto choose_swap_extent(const VkExtent2D& extent, const VkSurfaceCapabilitiesKHR& capabilities) -> VkExtent2D;
+    auto choose_swap_extent(VkExtent2D extent, const VkSurfaceCapabilitiesKHR& capabilities) -> VkExtent2D;
 };
 
 }

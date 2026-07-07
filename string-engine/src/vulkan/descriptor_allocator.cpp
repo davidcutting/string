@@ -141,7 +141,7 @@ DescriptorTable::~DescriptorTable()
     }
 }
 
-void DescriptorTable::bind(const ResourceID& handle, const DescriptorType& type)
+void DescriptorTable::bind(ResourceID handle, DescriptorType type)
 {
     uint32_t slot = 0;
 
@@ -174,7 +174,7 @@ void DescriptorTable::bind(const ResourceID& handle, const DescriptorType& type)
     }
 }
 
-void DescriptorTable::unbind(const ResourceID& handle, const DescriptorType& type)
+void DescriptorTable::unbind(ResourceID handle, DescriptorType type)
 {
     // TODO(DCut): Handle timeline value and flushing
     switch(type)
@@ -197,7 +197,7 @@ void DescriptorTable::unbind(const ResourceID& handle, const DescriptorType& typ
     }
 }
 
-auto DescriptorTable::get_binding_slot(const ResourceID& handle, const DescriptorType& type) -> std::uint32_t
+auto DescriptorTable::get_binding_slot(ResourceID handle, DescriptorType type) -> std::uint32_t
 {
     switch(type)
     {
@@ -210,7 +210,7 @@ auto DescriptorTable::get_binding_slot(const ResourceID& handle, const Descripto
     throw std::runtime_error("Failed to get binding slot, somehow hit unreachable code.");
 }
 
-void DescriptorTable::bind_buffer(const ResourceID& handle, const VkDescriptorType& type, const uint32_t& slot)
+void DescriptorTable::bind_buffer(ResourceID handle, VkDescriptorType type, uint32_t slot)
 {
     const auto& buffer = allocator_.get_buffer(handle);
 
@@ -239,7 +239,7 @@ void DescriptorTable::bind_buffer(const ResourceID& handle, const VkDescriptorTy
     vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 }
 
-void DescriptorTable::bind_image(const ResourceID& handle, const VkDescriptorType& type, const uint32_t& slot)
+void DescriptorTable::bind_image(ResourceID handle, VkDescriptorType type, uint32_t slot)
 {
     const auto& image = allocator_.get_image(handle);
 

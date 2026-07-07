@@ -2,14 +2,14 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <unordered_map>
 
 #include <string/vulkan/driver.hpp>
 #include <string/vulkan/renderer.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 #include <string/vulkan/device.hpp>
-#include <string/vulkan/pipelines/pipeline_2d.hpp>
-#include <string/vulkan/render_data.hpp>
 #include <string/vulkan/resource.hpp>
 #include <string/vulkan/resource_allocator.hpp>
 #include <string/vulkan/presenter.hpp>
@@ -24,7 +24,8 @@
 namespace String
 {
 
-Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_ptr<Window>& window)
+Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Window> window,
+                   const RenderPlan& plan)
 : application_info_(application_info)
 , window_(std::move(window))
 , driver_(application_info, window_)
@@ -72,18 +73,44 @@ Renderer::Renderer(const ApplicationInfo& application_info, const std::shared_pt
     // async-transfer queue would need explicit ownership transfers instead.)
     transfer_command_recorder_.init(device_.get_device(), graphics_queue_);
 
-    // Ordered offscreen passes: grid (background) then geometry (viking room, on top).
-    // GeometryPass uploads its mesh/texture via the now-initialized transfer recorder and
-    // binds its texture into the bindless table.
-    scene_passes_.push_back(std::make_unique<Grid2DPass>(
-        device_, resources_path, static_cast<uint16_t>(frames_in_flight_)));
-    scene_passes_.push_back(std::make_unique<GeometryPass>(
-        device_, allocator_, global_descriptor_table_, transfer_command_recorder_,
-        resources_path, static_cast<uint16_t>(frames_in_flight_)));
-    // UI overlay: drawn last so it composites on top of the scene.
-    scene_passes_.push_back(std::make_unique<UIPass>(
-        device_, allocator_, global_descriptor_table_,
-        resources_path, static_cast<uint16_t>(frames_in_flight_)));
+    // Build the application's declared passes now that the GPU context is ready. The plan
+    // authors the content (which passes, in what order); the renderer just supplies the
+    // context and executes. Passes that upload (e.g. geometry) record into the transfer batch
+    // and bind into the bindless table during construction.
+    TransferBatch transfer_batch{ transfer_command_recorder_, allocator_ };
+
+    PassContext pass_context{
+        device_,
+        allocator_,
+        global_descriptor_table_,
+        transfer_batch,
+        COLOR_TARGET,
+        DEPTH_TARGET,
+        resources_path,
+        static_cast<uint16_t>(frames_in_flight_),
+    };
+    scene_passes_ = plan.build(pass_context);
+
+    // Composite resolves the offscreen HDR target to the swapchain: reads color_attachment_,
+    // writes the screen. Declared here (composite_pass_ is renderer-built, not in the plan).
+    composite_pass_.usages = {
+        { COLOR_TARGET,     Access::SampledRead, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT },
+        { SWAPCHAIN_TARGET, Access::ColorWrite,  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
+    };
+
+    // The frame graph's execution list: scene passes, then the composite resolve. written_
+    // resources_ = everything the graph writes, so record_frame only transitions those (never
+    // the static uploaded textures/buffers the transfer batch already left in SHADER_READ).
+    for (auto& pass : scene_passes_)
+        frame_passes_.push_back(pass.get());
+    frame_passes_.push_back(&composite_pass_);
+    for (const Pass* pass : frame_passes_)
+        for (const ResourceUsage& usage : pass->usages)
+            if (is_write(usage.access))
+                written_resources_.insert(usage.resource);
+
+    // Submit every pass's recorded uploads in one batch and wait before the first frame.
+    transfer_batch.flush();
 
     for (auto& pass : scene_passes_)
     {
@@ -181,238 +208,144 @@ void Renderer::begin_frame()
     acquired_signal_semaphore_ = acquired.signal_when_ready_to_present;
 }
 
-void Renderer::begin_rendering()
+void Renderer::record_frame()
 {
     auto& frame = frames_[current_frame_];
-    auto& command_buffer = frame.recorder.begin();
-    auto& color_attachment = allocator_.get_image(color_attachment_);
-    auto& depth_attachment = allocator_.get_image(depth_attachment_);
-
-    // Transition swapchain image from UNDEFINED to COLOR_ATTACHMENT_OPTIMAL
-    VkImageMemoryBarrier image_barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = 0,
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, // whatever layout its in who cares, gimme that color attach
-        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = color_attachment.image,
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        }
-    };
-
-    vkCmdPipelineBarrier(
-        command_buffer,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        0, 0, nullptr, 0, nullptr, 1,
-        &image_barrier);
-
-    VkRenderingAttachmentInfo color_attachment_info = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .pNext = nullptr,
-        .imageView = color_attachment.view,
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .resolveMode = VK_RESOLVE_MODE_NONE,
-        .resolveImageView = VK_NULL_HANDLE,
-        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = {
-            .color = {{ 0.0f, 0.0f, 0.0f, 0.0f }}
-        }
-    };
-
-    VkImageMemoryBarrier depth_barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = 0,
-        .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = depth_attachment.image,
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        }
-    };
-
-    vkCmdPipelineBarrier(command_buffer,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-        0, 0, nullptr, 0, nullptr, 1,
-        &depth_barrier);
-
-    VkRenderingAttachmentInfo depth_attachment_info = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .pNext = nullptr,
-        .imageView = depth_attachment.view,
-        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        .resolveMode = VK_RESOLVE_MODE_NONE,
-        .resolveImageView = VK_NULL_HANDLE,
-        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .clearValue = {
-            .depthStencil = {1.0f, 0}
-        }
-    };
-
-    const auto swap_chain_extent = presenter_.get_extent();
-
-    VkRenderingInfo rendering_info = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .renderArea = {{0 , 0}, swap_chain_extent},
-        .layerCount = 1,
-        .viewMask = 0,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &color_attachment_info,
-        .pDepthAttachment = &depth_attachment_info,
-        .pStencilAttachment = nullptr,
-    };
-
-    vkCmdBeginRendering(command_buffer, &rendering_info);
-
-    VkViewport viewport = {
-        .x = 0.0f,
-        .y = 0.0f,
-        .width = static_cast<float>(swap_chain_extent.width),
-        .height = static_cast<float>(swap_chain_extent.height),
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f
-    };
-    VkRect2D scissor = {
-        .offset = { 0, 0 },
-        .extent = swap_chain_extent
-    };
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-}
-
-void Renderer::end_rendering()
-{
-    auto& frame = frames_[current_frame_];
-    auto& command_buffer = frame.recorder.get_command_buffer();
-    auto& color_attachment = allocator_.get_image(color_attachment_);
-
-    // Offscreen scene rendering (into color_attachment_) is done.
-    vkCmdEndRendering(command_buffer);
-
-    const auto extent = presenter_.get_extent();
-
-    // Composite the offscreen HDR target into the acquired swapchain image via the bindless
-    // table: the composite pass samples color_attachment_ and writes a fullscreen triangle
-    // into the swapchain (SRGB), which applies the linear->sRGB encode on store. Transitions:
-    //   color_attachment_ : COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL
-    //   swapchain image   : UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
-    VkImageMemoryBarrier pre_composite_barriers[2] = {
-        {   // Offscreen color target becomes a shader-read source.
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = color_attachment.image,
-            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-        },
-        {   // Swapchain image becomes the composite color target.
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = 0,
-            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = acquired_image_,
-            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-        },
-    };
-    vkCmdPipelineBarrier(command_buffer,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        0, 0, nullptr, 0, nullptr, 2, pre_composite_barriers);
-
-    VkRenderingAttachmentInfo swapchain_attachment = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .pNext = nullptr,
-        .imageView = acquired_image_view_,
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .resolveMode = VK_RESOLVE_MODE_NONE,
-        .resolveImageView = VK_NULL_HANDLE,
-        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,   // fullscreen triangle covers every pixel
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = {},
-    };
-
-    VkRenderingInfo composite_rendering_info = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .renderArea = {{0, 0}, extent},
-        .layerCount = 1,
-        .viewMask = 0,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &swapchain_attachment,
-        .pDepthAttachment = nullptr,
-        .pStencilAttachment = nullptr,
-    };
-
-    vkCmdBeginRendering(command_buffer, &composite_rendering_info);
+    VkCommandBuffer command_buffer = frame.recorder.begin();
+    const VkExtent2D extent = presenter_.get_extent();
 
     const VkViewport viewport = {
-        .x = 0.0f,
-        .y = 0.0f,
+        .x = 0.0f, .y = 0.0f,
         .width = static_cast<float>(extent.width),
         .height = static_cast<float>(extent.height),
-        .minDepth = 0.0f,
-        .maxDepth = 1.0f,
+        .minDepth = 0.0f, .maxDepth = 1.0f,
     };
     const VkRect2D scissor = { .offset = { 0, 0 }, .extent = extent };
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 
-    composite_pass_.record(frame.recorder, static_cast<uint16_t>(current_frame_));
-
-    vkCmdEndRendering(command_buffer);
-
-    VkImageMemoryBarrier present_barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        .dstAccessMask = 0,
-        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = acquired_image_,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    // The color / depth target a pass renders into (every frame pass writes exactly one color
+    // target; SWAPCHAIN_TARGET means the screen).
+    const auto color_target_of = [](const Pass* pass) -> ResourceID {
+        for (const ResourceUsage& usage : pass->usages)
+            if (usage.access == Access::ColorWrite) return usage.resource;
+        return SWAPCHAIN_TARGET;
     };
-    vkCmdPipelineBarrier(command_buffer,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &present_barrier);
+    const auto depth_target_of = [](const Pass* pass) -> std::optional<ResourceID> {
+        for (const ResourceUsage& usage : pass->usages)
+            if (usage.access == Access::DepthWrite) return usage.resource;
+        return std::nullopt;
+    };
 
-    // End recording only after every vkCmd* for this frame has been issued.
+    // Group consecutive passes that share a color target and run each group as one render-pass
+    // instance. All barriers are derived from the passes' declared usages via resource_states_.
+    size_t start = 0;
+    while (start < frame_passes_.size())
+    {
+        const ResourceID group_color = color_target_of(frame_passes_[start]);
+        std::optional<ResourceID> group_depth;
+        size_t end = start;
+        while (end < frame_passes_.size() && color_target_of(frame_passes_[end]) == group_color)
+        {
+            if (auto depth = depth_target_of(frame_passes_[end])) group_depth = depth;
+            ++end;
+        }
+
+        // Barriers: transition each graph-written image the group touches to the state its usage
+        // needs (deduped per resource). Static uploaded inputs are skipped — they aren't in
+        // written_resources_, and buffer usages map to VK_IMAGE_LAYOUT_UNDEFINED. Reads of a
+        // graph-written resource (the composite sampling color) get the correct source layout
+        // from the tracker; writes discard the previous contents.
+        std::unordered_map<ResourceID, ResourceUsage> group_transitions;
+        for (size_t i = start; i < end; ++i)
+            for (const ResourceUsage& usage : frame_passes_[i]->usages)
+            {
+                if (!written_resources_.contains(usage.resource)) continue;
+                if (access_scope(usage.access).layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
+                group_transitions[usage.resource] = usage;
+            }
+        for (const auto& [resource, usage] : group_transitions)
+        {
+            const VkImageAspectFlags aspect =
+                (usage.access == Access::DepthWrite || usage.access == Access::DepthRead)
+                    ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            resource_states_.transition(command_buffer, image_of(resource), aspect,
+                usage.access, usage.stage, /*discard=*/is_write(usage.access));
+        }
+
+        const VkRenderingAttachmentInfo color_attachment_info = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = image_view_of(group_color),
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = { .color = {{ 0.0f, 0.0f, 0.0f, 0.0f }} },
+        };
+        const VkRenderingAttachmentInfo depth_attachment_info = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = group_depth ? image_view_of(*group_depth) : VK_NULL_HANDLE,
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .clearValue = { .depthStencil = { 1.0f, 0 } },
+        };
+        const VkRenderingInfo rendering_info = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea = {{ 0, 0 }, extent},
+            .layerCount = 1,
+            .viewMask = 0,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &color_attachment_info,
+            .pDepthAttachment = group_depth ? &depth_attachment_info : nullptr,
+            .pStencilAttachment = nullptr,
+        };
+
+        vkCmdBeginRendering(command_buffer, &rendering_info);
+        vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+        vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+        for (size_t i = start; i < end; ++i)
+            frame_passes_[i]->record(frame.recorder, static_cast<uint16_t>(current_frame_));
+
+        vkCmdEndRendering(command_buffer);
+        start = end;
+    }
+
+    // The swapchain was rendered by the final group; ready it for presentation.
+    resource_states_.transition(command_buffer, acquired_image_, VK_IMAGE_ASPECT_COLOR_BIT,
+        Access::Present, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+
     frame.recorder.end();
+}
+
+VkImage Renderer::image_of(ResourceID target) const
+{
+    switch (target)
+    {
+        case SWAPCHAIN_TARGET: return acquired_image_;
+        case COLOR_TARGET:     return allocator_.get_image(color_attachment_).image;
+        case DEPTH_TARGET:     return allocator_.get_image(depth_attachment_).image;
+        default:               return allocator_.get_image(target).image;
+    }
+}
+
+VkImageView Renderer::image_view_of(ResourceID target) const
+{
+    switch (target)
+    {
+        case SWAPCHAIN_TARGET: return acquired_image_view_;
+        case COLOR_TARGET:     return allocator_.get_image(color_attachment_).view;
+        case DEPTH_TARGET:     return allocator_.get_image(depth_attachment_).view;
+        default:               return allocator_.get_image(target).view;
+    }
 }
 
 void Renderer::end_frame()
@@ -485,17 +418,10 @@ void Renderer::end_frame()
 }
 
 // The whole-frame entry point, called once per frame from Application::run.
-void Renderer::draw(Scene& scene)
+void Renderer::draw()
 {
-    (void)scene;
     begin_frame();
-    begin_rendering();
-    auto& recorder = frames_[current_frame_].recorder;
-    for (auto& pass : scene_passes_)
-    {
-        pass->record(recorder, static_cast<uint16_t>(current_frame_));
-    }
-    end_rendering();
+    record_frame();
     end_frame();
 }
 
@@ -540,6 +466,10 @@ void Renderer::handle_resize(const String::View::Extent& extent)
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
     });
+
+    // The swapchain images and both attachments were just recreated — their old VkImage handles
+    // (and tracked layouts) are stale.
+    resource_states_.clear();
 }
 
 }  // namespace String

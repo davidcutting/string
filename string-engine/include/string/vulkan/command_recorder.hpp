@@ -29,10 +29,10 @@ public:
     CommandRecorder(const CommandRecorder&) = delete;
     CommandRecorder& operator=(const CommandRecorder&) = delete;
 
-    void init(const VkDevice& device, const Queue& queue);
+    void init(VkDevice device, Queue queue);
     void destroy();
 
-    auto begin(const VkCommandBufferUsageFlags& command_buffer_usage = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) -> VkCommandBuffer&;
+    auto begin(VkCommandBufferUsageFlags command_buffer_usage = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) -> VkCommandBuffer&;
     auto end() -> CommandRecorder&;
     auto reset() -> CommandRecorder&;
 

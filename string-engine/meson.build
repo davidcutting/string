@@ -1,35 +1,5 @@
-project(
-    'string',
-    'cpp',
-    version : '0.0.1',
-    license : 'MIT',
-    default_options : [
-        'cpp_std=c++23',
-        'buildtype=debug',
-        'warning_level=3',
-        'default_library=static'
-    ]
-)
-
-project_description = 'Simple Tiny RenderING engine, my hobby engine.'
-
-build_args = [
-    '-DPROJECT_NAME=' + meson.project_name(),
-    '-DPROJECT_VERSION=' + meson.project_version()
-]
-
-compiler = meson.get_compiler('cpp')
-message('Compiler: ' + compiler.get_id())
-
-if get_option('buildtype') == 'release'
-    message('Building in Release mode')
-    build_args += ['-DSTRING_RELEASE', '-O3']
-else
-    message('Building in Debug mode')
-    build_args += ['-DSTRING_DEBUG']
-endif
-
-# --------------------------------------------------
+# The engine library. project(), build_args, and the demo/sandbox live at the repo root
+# (../meson.build); this file builds only the library, shaders, tests, and exports string_dep.
 
 # ======
 # Dependencies
@@ -122,15 +92,13 @@ core_src = [
     'src/vulkan/resource_allocator.cpp',
     'src/vulkan/descriptor_allocator.cpp',
     'src/vulkan/command_recorder.cpp',
+    'src/vulkan/transfer_batch.cpp',
+    'src/vulkan/resource_state.cpp',
     'src/vulkan/vulkan_utils.cpp',
     'src/vulkan/pipeline_builder.cpp',
-    'src/vulkan/pipelines/pipeline_2d.cpp',
-    'src/vulkan/pipelines/pipeline_3d.cpp',
-    'src/vulkan/pipelines/pipeline_grid_2d.cpp',
+    # The offscreen->swapchain resolve is the only built-in pass; concrete scene passes
+    # (grid/geometry/ui) and their pipelines live in the application (sandbox/).
     'src/vulkan/passes/composite_pass.cpp',
-    'src/vulkan/passes/grid_2d_pass.cpp',
-    'src/vulkan/passes/geometry_pass.cpp',
-    'src/vulkan/passes/ui_pass.cpp',
 ]
 
 src = core_src + platform_src
@@ -179,23 +147,6 @@ project_deps = declare_dependency(
 )
 
 set_variable(meson.project_name() + '_dep', project_deps)
-
-# --------------------------------------------------
-
-# ======
-# Demo executable
-# ======
-
-# The runnable engine driver. test_application.cpp holds main() (line 6).
-if get_option('demo') and not meson.is_subproject()
-    executable(
-        'string_demo',
-        'src/test_application.cpp',
-        dependencies : project_deps,
-        cpp_args : build_args,
-        install : true
-    )
-endif
 
 # --------------------------------------------------
 
