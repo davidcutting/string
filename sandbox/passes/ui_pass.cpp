@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "ui_pass.hpp"
-#include <string/vulkan/pipeline_builder.hpp>
+#include <string/gpu/pipeline_builder.hpp>
 #include <string/core/layout.hpp>
 
 namespace sandbox
@@ -102,7 +102,7 @@ UIPass::UIPass(PassContext& context, std::vector<string::layout_node> nodes)
     const std::vector<GpuShape> shapes = pack_shapes(nodes);
     shape_count_ = static_cast<uint32_t>(shapes.size());
 
-    shape_buffer_ = allocator_.create_resource(BufferInfo{
+    shape_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
         .size = shape_count_ * sizeof(GpuShape),
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
@@ -110,9 +110,9 @@ UIPass::UIPass(PassContext& context, std::vector<string::layout_node> nodes)
     });
     allocator_.copy_data_to_buffer(shapes.data(), shape_buffer_);
 
-    descriptor_table_.bind(shape_buffer_, DescriptorType::STORAGE_BUFFER);
+    descriptor_table_.bind(shape_buffer_, string::gpu::descriptor_type::STORAGE_BUFFER);
     descriptor_set_ = descriptor_table_.get_set();
-    shape_slot_ = descriptor_table_.get_binding_slot(shape_buffer_, DescriptorType::STORAGE_BUFFER);
+    shape_slot_ = descriptor_table_.get_binding_slot(shape_buffer_, string::gpu::descriptor_type::STORAGE_BUFFER);
 
     // Declare the storage buffer this pass reads (vertex shader) + the color target it draws
     // into (overlay; no depth), for the render graph.
@@ -126,14 +126,14 @@ UIPass::UIPass(PassContext& context, std::vector<string::layout_node> nodes)
         .offset = 0,
         .size = sizeof(UIPush),
     };
-    pipeline_.pipeline_layout = PipelineLayoutBuilder()
+    pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
         .set_descriptor_set_layout({ descriptor_table_.get_layout() })
         .set_push_constant_ranges({ push_constant_range })
         .build(device_);
 
     // Overlay: procedural quads (no vertex input), alpha-blended, no depth test (but declares
     // the offscreen D32 format so the pipeline matches the pass), offscreen R16F target.
-    pipeline_.pipeline = PipelineBuilder(device_)
+    pipeline_.pipeline = string::gpu::pipeline_builder(device_)
         .add_vertex_shader(resources_path / "shaders/ui_shader.vert.spv")
         .add_fragment_shader(resources_path / "shaders/ui_shader.frag.spv")
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -143,18 +143,18 @@ UIPass::UIPass(PassContext& context, std::vector<string::layout_node> nodes)
         .enable_depth_stencil(false, false)
         .enable_color_blending()
         .build_graphics_pipeline(pipeline_.pipeline_layout);
-    pipeline_.pipeline_type = PipelineType::GRAPHICS;
+    pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
 }
 
 UIPass::~UIPass()
 {
     vkDestroyPipeline(device_.get_device(), pipeline_.pipeline, nullptr);
     vkDestroyPipelineLayout(device_.get_device(), pipeline_.pipeline_layout, nullptr);
-    descriptor_table_.unbind(shape_buffer_, DescriptorType::STORAGE_BUFFER);
+    descriptor_table_.unbind(shape_buffer_, string::gpu::descriptor_type::STORAGE_BUFFER);
     allocator_.destroy_resource(shape_buffer_);
 }
 
-void UIPass::record(CommandRecorder& recorder, uint16_t current_frame)
+void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     (void)current_frame;
     if (shape_count_ == 0)

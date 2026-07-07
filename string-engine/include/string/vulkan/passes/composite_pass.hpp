@@ -3,8 +3,8 @@
 #include <filesystem>
 
 #include <string/vulkan/render_pass.hpp>
-#include <string/vulkan/pipeline.hpp>
-#include <string/vulkan/device.hpp>
+#include <string/gpu/pipeline.hpp>
+#include <string/gpu/device.hpp>
 
 #include <volk.h>
 
@@ -16,13 +16,13 @@ namespace String
 // image's slot; the fragment shader indexes the sampler array by that slot.
 class CompositePass final : public Pass
 {
-    Device& device_;
-    Pipeline pipeline_;
+    string::gpu::device& device_;
+    string::gpu::pipeline pipeline_;
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
     uint32_t source_slot_ = 0;
 
 public:
-    CompositePass(Device& device, const std::filesystem::path& resources_path,
+    CompositePass(string::gpu::device& device, const std::filesystem::path& resources_path,
                   VkDescriptorSetLayout global_layout, VkFormat color_format);
     virtual ~CompositePass() override;
 
@@ -31,7 +31,7 @@ public:
     void set_source(VkDescriptorSet descriptor_set, uint32_t source_slot);
 
     virtual void update(float delta_time, uint16_t current_frame) override;
-    virtual void record(CommandRecorder& recorder, uint16_t current_frame) override;
+    virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 };
 
 }

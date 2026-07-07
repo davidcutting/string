@@ -5,10 +5,10 @@
 
 #include <volk.h>
 
-namespace String
+namespace string::gpu
 {
 
-enum class QueueType : std::uint8_t
+enum class queue_type : std::uint8_t
 {
     GRAPHICS,
     COMPUTE,
@@ -16,7 +16,7 @@ enum class QueueType : std::uint8_t
     PRESENT,
 };
 
-struct QueueFamilyIndices {
+struct queue_family_indices {
     std::optional<uint32_t> graphics_family;
     std::optional<uint32_t> present_family;
     std::optional<uint32_t> compute_family;
@@ -26,10 +26,10 @@ struct QueueFamilyIndices {
     bool has_compute() { return compute_family.has_value(); }
 };
 
-struct Queue
+struct queue
 {
     uint32_t queue_family_index;
-    QueueType type;
+    queue_type type;
     VkQueue queue;
 };
 

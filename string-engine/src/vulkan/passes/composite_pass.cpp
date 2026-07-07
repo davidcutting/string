@@ -1,10 +1,10 @@
 #include <string/vulkan/passes/composite_pass.hpp>
-#include <string/vulkan/pipeline_builder.hpp>
+#include <string/gpu/pipeline_builder.hpp>
 
 namespace String
 {
 
-CompositePass::CompositePass(Device& device, const std::filesystem::path& resources_path,
+CompositePass::CompositePass(string::gpu::device& device, const std::filesystem::path& resources_path,
                              VkDescriptorSetLayout global_layout, VkFormat color_format)
 : device_(device)
 {
@@ -14,14 +14,14 @@ CompositePass::CompositePass(Device& device, const std::filesystem::path& resour
         .size = sizeof(uint32_t),   // source_slot
     };
 
-    pipeline_.pipeline_layout = PipelineLayoutBuilder()
+    pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
         .set_descriptor_set_layout({ global_layout })
         .set_push_constant_ranges({ push_constant_range })
         .build(device_);
 
     // Fullscreen triangle sampling the bindless HDR target into the swapchain: no depth,
     // no blending, target format is the swapchain's (set via set_color_format).
-    pipeline_.pipeline = PipelineBuilder(device_)
+    pipeline_.pipeline = string::gpu::pipeline_builder(device_)
         .add_vertex_shader(resources_path / "shaders/composite.vert.spv")
         .add_fragment_shader(resources_path / "shaders/composite.frag.spv")
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -32,7 +32,7 @@ CompositePass::CompositePass(Device& device, const std::filesystem::path& resour
         .set_color_format(color_format)
         .build_graphics_pipeline(pipeline_.pipeline_layout);
 
-    pipeline_.pipeline_type = PipelineType::GRAPHICS;
+    pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
 }
 
 CompositePass::~CompositePass()
@@ -53,7 +53,7 @@ void CompositePass::update(float delta_time, uint16_t current_frame)
     (void)current_frame;
 }
 
-void CompositePass::record(CommandRecorder& recorder, uint16_t current_frame)
+void CompositePass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     (void)current_frame;
     VkCommandBuffer command_buffer = recorder.get_command_buffer();

@@ -1,6 +1,6 @@
 #include "grid_2d_pass.hpp"
 
-#include <string/vulkan/pipeline_builder.hpp>
+#include <string/gpu/pipeline_builder.hpp>
 
 namespace sandbox
 {
@@ -15,14 +15,14 @@ Grid2DPass::Grid2DPass(PassContext& context)
         .size = sizeof(Grid2DParams)
     };
 
-    pipeline_.pipeline_layout = PipelineLayoutBuilder()
+    pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
         .set_descriptor_set_layout({})
         .set_push_constant_ranges({ grid_2d_push_constant_range_ })
         .build(device_);
 
     // 2D background grid: procedural (no vertex input), no depth test/write (but declares the
     // offscreen D32 format so the pipeline matches the pass) so it never occludes the geometry.
-    pipeline_.pipeline = PipelineBuilder(device_)
+    pipeline_.pipeline = string::gpu::pipeline_builder(device_)
         .add_vertex_shader(context.resources_path / "shaders/grid_2d_shader.vert.spv")
         .add_fragment_shader(context.resources_path / "shaders/grid_2d_shader.frag.spv")
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -32,7 +32,7 @@ Grid2DPass::Grid2DPass(PassContext& context)
         .enable_depth_stencil(false, false)
         .enable_color_blending()
         .build_graphics_pipeline(pipeline_.pipeline_layout);
-    pipeline_.pipeline_type = PipelineType::GRAPHICS;
+    pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
 
     // Draws into the offscreen color target (background; no depth).
     usages = {
@@ -46,7 +46,7 @@ Grid2DPass::~Grid2DPass()
     vkDestroyPipelineLayout(device_.get_device(), pipeline_.pipeline_layout, nullptr);
 }
 
-void Grid2DPass::record(CommandRecorder& recorder, uint16_t current_frame)
+void Grid2DPass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     (void)current_frame;
     VkCommandBuffer& command_buffer = recorder.get_command_buffer();

@@ -4,13 +4,13 @@
 #include <vector>
 #include <unordered_set>
 #include <string/vulkan/frame.hpp>
-#include <string/vulkan/command_recorder.hpp>
-#include <string/vulkan/driver.hpp>
-#include <string/vulkan/presenter.hpp>
-#include <string/vulkan/queue.hpp>
-#include <string/vulkan/resource.hpp>
-#include <string/vulkan/resource_allocator.hpp>
-#include <string/vulkan/descriptor_allocator.hpp>
+#include <string/gpu/command_recorder.hpp>
+#include <string/gpu/driver.hpp>
+#include <string/gpu/presenter.hpp>
+#include <string/gpu/queue.hpp>
+#include <string/gpu/resource.hpp>
+#include <string/gpu/resource_allocator.hpp>
+#include <string/gpu/descriptor_allocator.hpp>
 #include <string/vulkan/resource_state.hpp>
 #include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/render_plan.hpp>
@@ -28,7 +28,7 @@
 #include <string/core/logger.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 #include <string/platform/window.hpp>
-#include <string/vulkan/device.hpp>
+#include <string/gpu/device.hpp>
 #include <string/core/app_info.hpp>
 
 namespace String
@@ -39,17 +39,17 @@ class Renderer
     static constexpr uint32_t frames_in_flight_ = 3;
     ApplicationInfo application_info_;
     std::shared_ptr<Window> window_;
-    Driver driver_;
-    Device device_;
-    Queue graphics_queue_;
-    Queue compute_queue_;
-    Presenter presenter_;
-    ResourceAllocator allocator_;
-    DescriptorTable global_descriptor_table_;
+    string::gpu::driver driver_;
+    string::gpu::device device_;
+    string::gpu::queue graphics_queue_;
+    string::gpu::queue compute_queue_;
+    string::gpu::presenter presenter_;
+    string::gpu::resource_allocator allocator_;
+    string::gpu::descriptor_table global_descriptor_table_;
     // Derives the frame's image-layout barriers from tracked state (see begin/end_rendering).
     ResourceStateTracker resource_states_;
     CompositePass composite_pass_;
-    CommandRecorder transfer_command_recorder_;
+    string::gpu::command_recorder transfer_command_recorder_;
     // Ordered passes that draw into the offscreen HDR target (color_attachment_), recorded
     // between begin_rendering() and end_rendering(). composite_pass_ is the fixed resolve
     // (offscreen -> swapchain) and is intentionally NOT in this list. Built in the ctor body
@@ -60,7 +60,7 @@ class Renderer
     // writes (color/depth/swapchain) — static uploaded inputs (textures/buffers) are never
     // re-transitioned.
     std::vector<Pass*> frame_passes_;
-    std::unordered_set<ResourceID> written_resources_;
+    std::unordered_set<string::gpu::resource_id> written_resources_;
     VkSemaphore frame_semaphore_;
 
     // Swapchain image acquired at the start of the frame (in begin_frame), so that
@@ -84,18 +84,18 @@ public:
     void end_frame();
 
 private:
-    ResourceID color_attachment_;
-    ResourceID depth_attachment_;
+    string::gpu::resource_id color_attachment_;
+    string::gpu::resource_id depth_attachment_;
 
     // Records the whole frame's render work: groups frame_passes_ into render-pass instances by
     // their color target, derives every image barrier from the passes' declared usages (via
     // resource_states_), and transitions the swapchain to present. Replaces the old
     // begin_rendering/end_rendering scaffold.
     void record_frame();
-    // The VkImage / VkImageView backing a target ResourceID; SWAPCHAIN_TARGET resolves to the
+    // The VkImage / VkImageView backing a target string::gpu::resource_id; string::gpu::SWAPCHAIN_TARGET resolves to the
     // frame's acquired swapchain image.
-    VkImage image_of(ResourceID target) const;
-    VkImageView image_view_of(ResourceID target) const;
+    VkImage image_of(string::gpu::resource_id target) const;
+    VkImageView image_view_of(string::gpu::resource_id target) const;
 
     void handle_resize(const String::View::Extent& extent);
 

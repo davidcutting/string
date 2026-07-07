@@ -1,6 +1,6 @@
 #pragma once
 
-#include <string/vulkan/command_recorder.hpp>
+#include <string/gpu/command_recorder.hpp>
 #include <string/vulkan/resource_usage.hpp>
 
 #include <vector>
@@ -11,7 +11,7 @@ namespace String
 {
 
 // Abstract base for a recordable render pass. It owns no GPU objects — each pass manages its
-// own pipeline/descriptors as members (a `Pipeline` member, by convention). The base is just
+// own pipeline/descriptors as members (a `string::gpu::pipeline` member, by convention). The base is just
 // the interface plus the current screen size and the typed resource usages a future render
 // graph will use to order passes and derive barriers.
 struct Pass
@@ -27,7 +27,7 @@ struct Pass
     // Per-frame CPU update. Defaults to a no-op so passes that don't need one (grid, most
     // static passes) can skip it; record() is the only method a pass must implement.
     virtual void update(float /*delta_time*/, uint16_t /*current_frame*/) {}
-    virtual void record(CommandRecorder& recorder, uint16_t current_frame) = 0;
+    virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) = 0;
     void resize(VkExtent2D extent) { screen_size = extent; }
 };
 

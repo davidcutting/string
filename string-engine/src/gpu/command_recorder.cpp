@@ -1,13 +1,13 @@
 #include <stdexcept>
-#include <string/vulkan/command_recorder.hpp>
-#include <string/vulkan/device.hpp>
+#include <string/gpu/command_recorder.hpp>
+#include <string/gpu/device.hpp>
 #include <string/core/logger.hpp>
-#include <string/vulkan/queue.hpp>
+#include <string/gpu/queue.hpp>
 
-namespace String
+namespace string::gpu
 {
 
-void CommandRecorder::init(VkDevice device, Queue queue)
+void command_recorder::init(VkDevice device, queue queue)
 {
     device_ = device;
     queue_ = queue;
@@ -43,12 +43,12 @@ void CommandRecorder::init(VkDevice device, Queue queue)
     }
 }
 
-CommandRecorder::~CommandRecorder()
+command_recorder::~command_recorder()
 {
     destroy();
 }
 
-void CommandRecorder::destroy()
+void command_recorder::destroy()
 {
     if (primary_command_buffer_ != VK_NULL_HANDLE)
     {
@@ -62,7 +62,7 @@ void CommandRecorder::destroy()
     }
 }
 
-auto CommandRecorder::begin(VkCommandBufferUsageFlags command_buffer_usage) -> VkCommandBuffer&
+auto command_recorder::begin(VkCommandBufferUsageFlags command_buffer_usage) -> VkCommandBuffer&
 {
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -75,7 +75,7 @@ auto CommandRecorder::begin(VkCommandBufferUsageFlags command_buffer_usage) -> V
     return primary_command_buffer_;
 }
 
-auto CommandRecorder::end() -> CommandRecorder&
+auto command_recorder::end() -> command_recorder&
 {
     if (vkEndCommandBuffer(primary_command_buffer_) != VK_SUCCESS)
     {
@@ -84,7 +84,7 @@ auto CommandRecorder::end() -> CommandRecorder&
     return *this;
 }
 
-auto CommandRecorder::reset() -> CommandRecorder&
+auto command_recorder::reset() -> command_recorder&
 {
     if (vkResetCommandPool(device_, command_pool_, 0) != VK_SUCCESS)
     {
@@ -93,17 +93,17 @@ auto CommandRecorder::reset() -> CommandRecorder&
     return *this;
 }
 
-auto CommandRecorder::get_command_buffer() -> VkCommandBuffer&
+auto command_recorder::get_command_buffer() -> VkCommandBuffer&
 {
     return primary_command_buffer_;
 }
 
-auto CommandRecorder::get_queue() -> Queue&
+auto command_recorder::get_queue() -> queue&
 {
     return queue_;
 }
 
-auto CommandRecorder::immediate_submit() -> CommandRecorder&
+auto command_recorder::immediate_submit() -> command_recorder&
 {
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,

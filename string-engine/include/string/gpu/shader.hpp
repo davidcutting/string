@@ -61,7 +61,7 @@ inline bool compile_shader()
         slang_module = session->loadModuleFromSourceString(
             "shortest",                  // Module name
             "shortest.slang",            // Module path
-            src,              // Shader source code
+            src,              // shader source code
             diagnostics_blob.writeRef()); // Optional diagnostic container
 
         if (diagnostics_blob != nullptr)

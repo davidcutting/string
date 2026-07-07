@@ -2,7 +2,7 @@
 
 #include <entt/entt.hpp>
 #include <filesystem>
-#include <string/vulkan/resource_allocator.hpp>
+#include <string/gpu/resource_allocator.hpp>
 
 namespace String
 {
@@ -14,7 +14,7 @@ public:
     Scene() = default;
     ~Scene() = default;
 
-    void load_from_disk(ResourceAllocator& resource_allocator, const std::filesystem::path& path);
+    void load_from_disk(string::gpu::resource_allocator& resource_allocator, const std::filesystem::path& path);
 };
 
 }

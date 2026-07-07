@@ -4,15 +4,15 @@
 #include <filesystem>
 #include <vector>
 
-#include <string/vulkan/command_recorder.hpp>
-#include <string/vulkan/device.hpp>
+#include <string/gpu/command_recorder.hpp>
+#include <string/gpu/device.hpp>
 #include <string/vulkan/render_data.hpp>
 #include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/pass_context.hpp>
-#include <string/vulkan/pipeline.hpp>
-#include "string/vulkan/descriptor_allocator.hpp"
-#include "string/vulkan/resource.hpp"
-#include "string/vulkan/resource_allocator.hpp"
+#include <string/gpu/pipeline.hpp>
+#include "string/gpu/descriptor_allocator.hpp"
+#include "string/gpu/resource.hpp"
+#include "string/gpu/resource_allocator.hpp"
 
 #include "gltf_loader.hpp"
 
@@ -41,22 +41,22 @@ struct GeometryPush
 // the application, resolved under context.resources_path.
 class GeometryPass final : public String::Pass
 {
-    String::Device& device_;
-    String::ResourceAllocator& allocator_;
-    String::DescriptorTable& descriptor_table_;
+    string::gpu::device& device_;
+    string::gpu::resource_allocator& allocator_;
+    string::gpu::descriptor_table& descriptor_table_;
     const String::Input& input_;
-    String::Pipeline pipeline_;
+    string::gpu::pipeline pipeline_;
 
-    String::ResourceID vertex_buffer_;
-    String::ResourceID index_buffer_;
+    string::gpu::resource_id vertex_buffer_;
+    string::gpu::resource_id index_buffer_;
 
     // Per glTF-image backing resource + its bindless slot (index-aligned with the loaded
     // model's textures, so a material's texture index maps straight to a slot).
-    std::vector<String::ResourceID> texture_images_;
+    std::vector<string::gpu::resource_id> texture_images_;
     std::vector<uint32_t> texture_slots_;
     // 1x1 white fallback, used for draws whose material has no base-color texture (the
     // base-color factor still tints it).
-    String::ResourceID white_image_;
+    string::gpu::resource_id white_image_;
     uint32_t white_slot_ = 0;
 
     std::vector<GltfMaterial> materials_;
@@ -78,13 +78,13 @@ public:
     virtual ~GeometryPass() override;
 
     virtual void update(float delta_time, uint16_t current_frame) override;
-    virtual void record(String::CommandRecorder& recorder, uint16_t current_frame) override;
+    virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 
 private:
     // Uploads one decoded texture into a device-local image, binds it into the bindless table,
     // and returns {image resource, slot}. Format is chosen from the texture's sRGB flag.
     void upload_texture(String::PassContext& context, const GltfTexture& texture,
-                        String::ResourceID& out_image, uint32_t& out_slot);
+                        string::gpu::resource_id& out_image, uint32_t& out_slot);
 };
 
 }  // namespace sandbox

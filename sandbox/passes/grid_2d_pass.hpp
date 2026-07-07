@@ -6,8 +6,8 @@
 
 #include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/pass_context.hpp>
-#include <string/vulkan/pipeline.hpp>
-#include <string/vulkan/device.hpp>
+#include <string/gpu/pipeline.hpp>
+#include <string/gpu/device.hpp>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -37,16 +37,16 @@ struct Grid2DParams {
 
 class Grid2DPass final : public String::Pass
 {
-    String::Device& device_;
+    string::gpu::device& device_;
     VkPushConstantRange grid_2d_push_constant_range_;
-    String::Pipeline pipeline_;
+    string::gpu::pipeline pipeline_;
 
 public:
     explicit Grid2DPass(String::PassContext& context);
     virtual ~Grid2DPass() override;
 
     // No update() override — the grid is static, so it uses Pass's default no-op.
-    virtual void record(String::CommandRecorder& recorder, uint16_t current_frame) override;
+    virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 };
 
 }  // namespace sandbox

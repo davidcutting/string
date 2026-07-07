@@ -6,12 +6,12 @@
 #include <string>
 
 #include <string/core/logger.hpp>
-#include <string/vulkan/command_recorder.hpp>
+#include <string/gpu/command_recorder.hpp>
 #include "geometry_pass.hpp"
-#include <string/vulkan/pipeline_builder.hpp>
+#include <string/gpu/pipeline_builder.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
-#include "string/vulkan/descriptor_allocator.hpp"
-#include "string/vulkan/resource.hpp"
+#include "string/gpu/descriptor_allocator.hpp"
+#include "string/gpu/resource.hpp"
 #include "vulkan/vulkan_core.h"
 
 // The single stb_image implementation for the sandbox lives here (this pass decodes textures).
@@ -24,7 +24,7 @@ using namespace String;
 
 void GeometryPass::upload_texture(
         PassContext& context, const GltfTexture& source,
-        ResourceID& out_image, uint32_t& out_slot)
+        string::gpu::resource_id& out_image, uint32_t& out_slot)
 {
     // Decode now (from disk or the embedded bytes) so only one texture is resident at a time.
     int width = 0;
@@ -44,7 +44,7 @@ void GeometryPass::upload_texture(
         ? VK_FORMAT_R8G8B8A8_SRGB
         : VK_FORMAT_R8G8B8A8_UNORM;
 
-    out_image = allocator_.create_resource(ImageInfo{
+    out_image = allocator_.create_resource(string::gpu::image_info{
         .extent = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 },
         .format = format,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -58,8 +58,8 @@ void GeometryPass::upload_texture(
     context.transfer.upload_image(pixels, size, out_image);
     stbi_image_free(pixels);
 
-    descriptor_table_.bind(out_image, DescriptorType::TEXTURE);
-    out_slot = descriptor_table_.get_binding_slot(out_image, DescriptorType::TEXTURE);
+    descriptor_table_.bind(out_image, string::gpu::descriptor_type::TEXTURE);
+    out_slot = descriptor_table_.get_binding_slot(out_image, string::gpu::descriptor_type::TEXTURE);
 
     // Submit + free this texture's staging now, so the batch never holds all of Sponza's
     // textures at once (that peak — decoded + staging + GPU images — exhausts memory).
@@ -85,7 +85,7 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     const uint32_t vertex_size = sizeof(model.vertices[0]) * model.vertices.size();
     const uint32_t index_size = sizeof(model.indices[0]) * model.indices.size();
 
-    vertex_buffer_ = allocator_.create_resource(BufferInfo{
+    vertex_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
         .size = vertex_size,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
@@ -93,7 +93,7 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     });
     context.transfer.upload_buffer(model.vertices.data(), vertex_size, vertex_buffer_);
 
-    index_buffer_ = allocator_.create_resource(BufferInfo{
+    index_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
         .size = index_size,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
@@ -113,7 +113,7 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
 
     // 1x1 white fallback for draws without a base-color texture (factor still tints it).
     const std::array<uint8_t, 4> white_pixel = { 255, 255, 255, 255 };
-    white_image_ = allocator_.create_resource(ImageInfo{
+    white_image_ = allocator_.create_resource(string::gpu::image_info{
         .extent = { 1, 1, 1 },
         .format = VK_FORMAT_R8G8B8A8_UNORM,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -123,8 +123,8 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         .allocation_flags = {},
     });
     context.transfer.upload_image(white_pixel.data(), white_pixel.size(), white_image_);
-    descriptor_table_.bind(white_image_, DescriptorType::TEXTURE);
-    white_slot_ = descriptor_table_.get_binding_slot(white_image_, DescriptorType::TEXTURE);
+    descriptor_table_.bind(white_image_, string::gpu::descriptor_type::TEXTURE);
+    white_slot_ = descriptor_table_.get_binding_slot(white_image_, string::gpu::descriptor_type::TEXTURE);
     context.transfer.flush();
 
     // Frame the whole model: AABB -> look at its centre from far enough out to fit it.
@@ -167,14 +167,14 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         .size = sizeof(GeometryPush),
     };
 
-    pipeline_.pipeline_layout = PipelineLayoutBuilder()
+    pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
         .set_descriptor_set_layout({ descriptor_table_.get_layout() })
         .set_push_constant_ranges({ push_constant_range })
         .build(device_);
 
     const auto binding_description = Vertex::getBindingDescription();
     const auto attribute_descriptions = Vertex::getAttributeDescriptions();
-    pipeline_.pipeline = PipelineBuilder(device_)
+    pipeline_.pipeline = string::gpu::pipeline_builder(device_)
         .add_vertex_shader(context.resources_path / "shaders/3d_shader.vert.spv")
         .add_fragment_shader(context.resources_path / "shaders/3d_shader.frag.spv")
         .set_vertex_binding(binding_description, attribute_descriptions)
@@ -188,7 +188,7 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         .enable_depth_stencil()
         .enable_color_blending()
         .build_graphics_pipeline(pipeline_.pipeline_layout);
-    pipeline_.pipeline_type = PipelineType::GRAPHICS;
+    pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
 }
 
 GeometryPass::~GeometryPass()
@@ -196,11 +196,11 @@ GeometryPass::~GeometryPass()
     vkDestroyPipeline(device_.get_device(), pipeline_.pipeline, nullptr);
     vkDestroyPipelineLayout(device_.get_device(), pipeline_.pipeline_layout, nullptr);
 
-    descriptor_table_.unbind(white_image_, DescriptorType::TEXTURE);
+    descriptor_table_.unbind(white_image_, string::gpu::descriptor_type::TEXTURE);
     allocator_.destroy_resource(white_image_);
-    for (const ResourceID image : texture_images_)
+    for (const string::gpu::resource_id image : texture_images_)
     {
-        descriptor_table_.unbind(image, DescriptorType::TEXTURE);
+        descriptor_table_.unbind(image, string::gpu::descriptor_type::TEXTURE);
         allocator_.destroy_resource(image);
     }
 
@@ -254,7 +254,7 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
     view_proj_ = proj * view;
 }
 
-void GeometryPass::record(CommandRecorder& recorder, uint16_t current_frame)
+void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     (void)current_frame;
     VkCommandBuffer& command_buffer = recorder.get_command_buffer();

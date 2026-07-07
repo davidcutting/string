@@ -5,24 +5,24 @@
 
 #include <string/core/profiler.hpp>
 #include <string/core/logger.hpp>
-#include <string/vulkan/presenter.hpp>
-#include <string/vulkan/queue.hpp>
+#include <string/gpu/presenter.hpp>
+#include <string/gpu/queue.hpp>
 
 #include <volk.h>
 
-namespace String
+namespace string::gpu
 {
 
-Presenter::Presenter(Device& device, const std::shared_ptr<Window>& window, uint32_t frames_in_flight)
+presenter::presenter(device& device, const std::shared_ptr<String::Window>& window, uint32_t frames_in_flight)
 : wait_for_image_available_semaphores_{VK_NULL_HANDLE}
 , signal_when_ready_to_present_semaphores_{VK_NULL_HANDLE}
 , device_(device)
-, present_queue_(device_.get_queue(QueueType::PRESENT))
+, present_queue_(device_.get_queue(queue_type::PRESENT))
 , frames_in_flight_(frames_in_flight)
 {
-    STRING_PROFILE_SCOPE("Presenter Constructor")
+    STRING_PROFILE_SCOPE("presenter Constructor")
 
-    SwapChainSupportDetails swap_chain_support = device_.get_swap_chain_support();
+    swap_chain_support_details swap_chain_support = device_.get_swap_chain_support();
     VkExtent2D desired_extent = {
         .width = window->get_extent().width,
         .height = window->get_extent().height,
@@ -71,7 +71,7 @@ Presenter::Presenter(Device& device, const std::shared_ptr<Window>& window, uint
     // clang-format on
 
     // Make sure that graphics and present queues are not different queues
-    QueueFamilyIndices indices = device_.get_queue_families();
+    queue_family_indices indices = device_.get_queue_families();
     uint32_t queue_family_indices[] = {indices.graphics_family.value(), indices.present_family.value()};
 
     if (indices.graphics_family != indices.present_family)
@@ -129,9 +129,9 @@ Presenter::Presenter(Device& device, const std::shared_ptr<Window>& window, uint
     }
 }
 
-Presenter::~Presenter()
+presenter::~presenter()
 {
-    STRING_PROFILE_SCOPE("Presenter Destructor")
+    STRING_PROFILE_SCOPE("presenter Destructor")
 
     for (auto& semaphore : signal_when_ready_to_present_semaphores_)
     {
@@ -149,7 +149,7 @@ Presenter::~Presenter()
     if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_.get_device(), swapchain_, nullptr);
 }
 
-auto Presenter::acquire_next_frame() -> AcquiredImage
+auto presenter::acquire_next_frame() -> acquired_image
 {
     STRING_PROFILE_SCOPE("Acquire Next Frame")
 
@@ -176,7 +176,7 @@ auto Presenter::acquire_next_frame() -> AcquiredImage
         {
             current_frame_id_ = frame_id;
 
-            return AcquiredImage {
+            return acquired_image {
                 .image = swapchain_images_.at(current_image_index_),
                 .image_view = swapchain_image_views_.at(current_image_index_),
                 .wait_for_image_available = wait_for_image_available_semaphores_[frame_id],
@@ -193,7 +193,7 @@ auto Presenter::acquire_next_frame() -> AcquiredImage
     throw std::runtime_error("Failed image acquisition after retries: " + std::to_string(max_acquisition_attempts));
 }
 
-void Presenter::present()
+void presenter::present()
 {
     STRING_PROFILE_SCOPE("Present")
 
@@ -232,9 +232,9 @@ void Presenter::present()
     current_frame_id_ = std::numeric_limits<uint32_t>::max();
 }
 
-void Presenter::resize(VkExtent2D extent)
+void presenter::resize(VkExtent2D extent)
 {
-    STRING_PROFILE_SCOPE("Resize Presenter")
+    STRING_PROFILE_SCOPE("Resize presenter")
     vkDeviceWaitIdle(device_.get_device());
 
     // Destroy all the resources...
@@ -289,17 +289,17 @@ void Presenter::resize(VkExtent2D extent)
     current_image_index_ = std::numeric_limits<uint32_t>::max();
 }
 
-auto Presenter::get_max_frames_in_flight() const -> uint32_t
+auto presenter::get_max_frames_in_flight() const -> uint32_t
 {
     return frames_in_flight_;
 }
 
-auto Presenter::get_extent() const -> VkExtent2D
+auto presenter::get_extent() const -> VkExtent2D
 {
     return extent_;
 }
 
-auto Presenter::create_image_view(VkImage image, VkFormat format, VkImageAspectFlags aspect_flags) -> VkImageView
+auto presenter::create_image_view(VkImage image, VkFormat format, VkImageAspectFlags aspect_flags) -> VkImageView
 {
     // clang-format off
     VkImageViewCreateInfo view_info = {
@@ -329,7 +329,7 @@ auto Presenter::create_image_view(VkImage image, VkFormat format, VkImageAspectF
     return image_view;
 }
 
-auto Presenter::choose_swap_surface_format(const std::vector<VkSurfaceFormatKHR>& available_formats) -> VkSurfaceFormatKHR
+auto presenter::choose_swap_surface_format(const std::vector<VkSurfaceFormatKHR>& available_formats) -> VkSurfaceFormatKHR
 {
     for (const auto& available_format : available_formats)
     {
@@ -343,7 +343,7 @@ auto Presenter::choose_swap_surface_format(const std::vector<VkSurfaceFormatKHR>
     return available_formats[0];
 }
 
-auto Presenter::choose_swap_present_mode(const std::vector<VkPresentModeKHR>& available_present_modes) -> VkPresentModeKHR
+auto presenter::choose_swap_present_mode(const std::vector<VkPresentModeKHR>& available_present_modes) -> VkPresentModeKHR
 {
     assert(available_present_modes.size() > 0 && "Must have available present modes.");
 
@@ -371,7 +371,7 @@ auto Presenter::choose_swap_present_mode(const std::vector<VkPresentModeKHR>& av
     return VK_PRESENT_MODE_FIFO_KHR;  // FIFO mode is required to be supported
 }
 
-auto Presenter::choose_swap_extent(VkExtent2D extent, const VkSurfaceCapabilitiesKHR& capabilities) -> VkExtent2D
+auto presenter::choose_swap_extent(VkExtent2D extent, const VkSurfaceCapabilitiesKHR& capabilities) -> VkExtent2D
 {
     if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max())
     {

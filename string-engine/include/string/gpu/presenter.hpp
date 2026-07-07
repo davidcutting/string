@@ -5,15 +5,15 @@
 #include <vector>
 
 #include <string/platform/window.hpp>
-#include <string/vulkan/device.hpp>
-#include <string/vulkan/queue.hpp>
+#include <string/gpu/device.hpp>
+#include <string/gpu/queue.hpp>
 
 #include <volk.h>
 
-namespace String
+namespace string::gpu
 {
 
-struct AcquiredImage
+struct acquired_image
 {
     VkImage& image;
     VkImageView& image_view;
@@ -21,7 +21,7 @@ struct AcquiredImage
     VkSemaphore& signal_when_ready_to_present;
 };
 
-class Presenter
+class presenter
 {
     std::vector<VkImage> swapchain_images_;
     std::vector<VkImageView> swapchain_image_views_;
@@ -29,8 +29,8 @@ class Presenter
     std::vector<VkSemaphore> wait_for_image_available_semaphores_;
     std::vector<VkSemaphore> signal_when_ready_to_present_semaphores_;
 
-    Device& device_;
-    Queue present_queue_;
+    device& device_;
+    queue present_queue_;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat image_format_;
     VkExtent2D extent_;
@@ -45,11 +45,11 @@ class Presenter
     uint32_t swapchain_image_count_ = 2;
 
 public:
-    explicit Presenter(Device& device, const std::shared_ptr<Window>& window, uint32_t frames_in_flight = 3);
-    ~Presenter();
+    explicit presenter(device& device, const std::shared_ptr<String::Window>& window, uint32_t frames_in_flight = 3);
+    ~presenter();
 
     [[nodiscard]]
-    auto acquire_next_frame() -> AcquiredImage;
+    auto acquire_next_frame() -> acquired_image;
     void present();
 
     void resize(VkExtent2D extent);

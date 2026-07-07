@@ -3,11 +3,11 @@
 #include <string_view>
 #include <string/core/logger.hpp>
 #include <string/vulkan/render_data.hpp>
-#include <string/vulkan/resource.hpp>
+#include <string/gpu/resource.hpp>
 #include <vector>
 #include <fstream>
 #include <filesystem>
-#include "string/vulkan/command_recorder.hpp"
+#include "string/gpu/command_recorder.hpp"
 
 #include <volk.h>
 

@@ -1,18 +1,18 @@
 #include <memory>
 #include <set>
 #include <stdexcept>
-#include <string/vulkan/device.hpp>
+#include <string/gpu/device.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
-#include <string/vulkan/command_recorder.hpp>
+#include <string/gpu/command_recorder.hpp>
 #include <string/core/logger.hpp>
-#include <string/vulkan/queue.hpp>
+#include <string/gpu/queue.hpp>
 
 #include <volk.h>
 
-namespace String
+namespace string::gpu
 {
 
-Device::Device(Driver& driver, std::shared_ptr<Window> window)
+device::device(driver& driver, std::shared_ptr<String::Window> window)
 : window_(std::move(window))
 , driver_(driver)
 , surface_(window_->create_surface(driver_.get_instance()))
@@ -21,7 +21,7 @@ Device::Device(Driver& driver, std::shared_ptr<Window> window)
     create_logical_device();
 }
 
-Device::~Device()
+device::~device()
 {
     if (device_ != VK_NULL_HANDLE)
         vkDestroyDevice(device_, nullptr);
@@ -29,7 +29,7 @@ Device::~Device()
         vkDestroySurfaceKHR(driver_.get_instance(), surface_, nullptr);
 }
 
-bool Device::check_device_extension_support(const VkPhysicalDevice& device) {
+bool device::check_device_extension_support(const VkPhysicalDevice& device) {
     uint32_t extension_count;
     vkEnumerateDeviceExtensionProperties(device, nullptr, &extension_count, nullptr);
 
@@ -45,14 +45,14 @@ bool Device::check_device_extension_support(const VkPhysicalDevice& device) {
     return required_extensions.empty();
 }
 
-bool Device::is_device_suitable(const VkPhysicalDevice& device) {
-    QueueFamilyIndices indices = get_queue_families(device);
+bool device::is_device_suitable(const VkPhysicalDevice& device) {
+    queue_family_indices indices = get_queue_families(device);
 
     bool extensions_supported = check_device_extension_support(device);
 
     bool swap_chain_adequate = false;
     if (extensions_supported) {
-        SwapChainSupportDetails swapChainSupport = get_swap_chain_support(device);
+        swap_chain_support_details swapChainSupport = get_swap_chain_support(device);
         swap_chain_adequate = !swapChainSupport.formats.empty() && !swapChainSupport.presentModes.empty();
     }
 
@@ -100,7 +100,7 @@ bool Device::is_device_suitable(const VkPhysicalDevice& device) {
     return indices.can_render() && extensions_supported && swap_chain_adequate && has_desired_features;
 }
 
-void Device::select_physical_device()
+void device::select_physical_device()
 {
     uint32_t device_count = 0;
     vkEnumeratePhysicalDevices(driver_.get_instance(), &device_count, nullptr);
@@ -140,12 +140,12 @@ void Device::select_physical_device()
     // Cache the selected device's immutable data once; every later query reuses these.
     vkGetPhysicalDeviceProperties(physical_device_, &properties_);
     queue_family_indices_ = get_queue_families(physical_device_);
-    STRING_LOG_INFO("Device name: {}", properties_.deviceName);
+    STRING_LOG_INFO("device name: {}", properties_.deviceName);
 }
 
-void Device::create_logical_device()
+void device::create_logical_device()
 {
-    const QueueFamilyIndices& indices = queue_family_indices_;
+    const queue_family_indices& indices = queue_family_indices_;
 
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
     std::set<uint32_t> uniqueQueueFamilies = {
@@ -237,9 +237,9 @@ void Device::create_logical_device()
     volkLoadDevice(device_);
 }
 
-SwapChainSupportDetails Device::get_swap_chain_support(const VkPhysicalDevice& physical_device)
+swap_chain_support_details device::get_swap_chain_support(const VkPhysicalDevice& physical_device)
 {
-    SwapChainSupportDetails details;
+    swap_chain_support_details details;
 
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface_, &details.capabilities);
 
@@ -262,14 +262,14 @@ SwapChainSupportDetails Device::get_swap_chain_support(const VkPhysicalDevice& p
     return details;
 }
 
-SwapChainSupportDetails Device::get_swap_chain_support()
+swap_chain_support_details device::get_swap_chain_support()
 {
     return get_swap_chain_support(physical_device_);
 }
 
-QueueFamilyIndices Device::get_queue_families(const VkPhysicalDevice& physical_device)
+queue_family_indices device::get_queue_families(const VkPhysicalDevice& physical_device)
 {
-    QueueFamilyIndices indices;
+    queue_family_indices indices;
 
     uint32_t queue_family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nullptr);
@@ -310,12 +310,12 @@ QueueFamilyIndices Device::get_queue_families(const VkPhysicalDevice& physical_d
     return indices;
 }
 
-QueueFamilyIndices Device::get_queue_families()
+queue_family_indices device::get_queue_families()
 {
     return queue_family_indices_;
 }
 
-VkFormat Device::get_format_support(const std::vector<VkFormat>& candidates, const VkImageTiling& tiling, const VkFormatFeatureFlags& features)
+VkFormat device::get_format_support(const std::vector<VkFormat>& candidates, const VkImageTiling& tiling, const VkFormatFeatureFlags& features)
 {
     for (VkFormat format : candidates)
     {
@@ -331,7 +331,7 @@ VkFormat Device::get_format_support(const std::vector<VkFormat>& candidates, con
     throw std::runtime_error("Failed to find supported format!");
 }
 
-uint32_t Device::get_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties)
+uint32_t device::get_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties)
 {
     VkPhysicalDeviceMemoryProperties memory_properties;
     vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties);
@@ -345,12 +345,12 @@ uint32_t Device::get_memory_type(uint32_t type_filter, VkMemoryPropertyFlags pro
     throw std::runtime_error("failed to find suitable memory type!");
 }
 
-VkPhysicalDeviceLimits Device::get_physical_device_limits()
+VkPhysicalDeviceLimits device::get_physical_device_limits()
 {
     return properties_.limits;
 }
 
-VkFormat Device::get_depth_format() {
+VkFormat device::get_depth_format() {
     // clang-format off
     return get_format_support(
         {
@@ -363,26 +363,26 @@ VkFormat Device::get_depth_format() {
     // clang-format on
 }
 
-VkSurfaceKHR Device::get_surface() const
+VkSurfaceKHR device::get_surface() const
 {
     return surface_;
 }
 
-VkDevice& Device::get_device()
+VkDevice& device::get_device()
 {
     return device_;
 }
 
-auto Device::get_physical_device() -> VkPhysicalDevice&
+auto device::get_physical_device() -> VkPhysicalDevice&
 {
     return physical_device_;
 }
 
-auto Device::get_queue(QueueType type) -> Queue
+auto device::get_queue(queue_type type) -> queue
 {
-    const QueueFamilyIndices& indices = queue_family_indices_;
+    const queue_family_indices& indices = queue_family_indices_;
 
-    Queue queue = {
+    queue queue = {
         .queue_family_index = 0,
         .type = type,
         .queue = VK_NULL_HANDLE,
@@ -390,7 +390,7 @@ auto Device::get_queue(QueueType type) -> Queue
 
     switch (type)
     {
-        case QueueType::GRAPHICS:
+        case queue_type::GRAPHICS:
         {
             if (indices.graphics_family.has_value())
             {
@@ -401,7 +401,7 @@ auto Device::get_queue(QueueType type) -> Queue
             }
             break;
         }
-        case QueueType::COMPUTE:
+        case queue_type::COMPUTE:
         {
             if (indices.compute_family.has_value())
             {
@@ -412,7 +412,7 @@ auto Device::get_queue(QueueType type) -> Queue
             }
             break;
         }
-        case QueueType::TRANSFER:
+        case queue_type::TRANSFER:
         {
             if (indices.transfer_family.has_value())
             {
@@ -423,7 +423,7 @@ auto Device::get_queue(QueueType type) -> Queue
             }
             break;
         }
-        case QueueType::PRESENT:
+        case queue_type::PRESENT:
         {
             if (indices.present_family.has_value())
             {
@@ -443,7 +443,7 @@ auto Device::get_queue(QueueType type) -> Queue
 
 #include <string.h>
 
-bool Device::are_validation_layer_supported()
+bool device::are_validation_layer_supported()
 {
     uint32_t layer_count;
     vkEnumerateInstanceLayerProperties(&layer_count, nullptr);

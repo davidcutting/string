@@ -55,7 +55,7 @@ public:
     Platform& operator=(Platform&&) = delete;
     
     auto create_window(const WindowInfo& window_info) -> std::unique_ptr<Window>;
-    auto create_device(const DeviceInfo& device_info) -> std::unique_ptr<Device>;
+    auto create_device(const DeviceInfo& device_info) -> std::unique_ptr<string::gpu::device>;
 
     auto read_file(const std::filesystem::path& path) -> std::span<const std::byte>;
     void write_file(const std::filesystem::path& path, const std::span<const std::byte>& data);

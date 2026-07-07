@@ -1,14 +1,14 @@
 #include <cstdint>
 #include <stdexcept>
-#include <string/vulkan/descriptor_allocator.hpp>
-#include <string/vulkan/device.hpp>
+#include <string/gpu/descriptor_allocator.hpp>
+#include <string/gpu/device.hpp>
 #include <vector>
-#include <string/vulkan/resource_allocator.hpp>
+#include <string/gpu/resource_allocator.hpp>
 
-namespace String
+namespace string::gpu
 {
 
-DescriptorTable::DescriptorTable(VkDevice device, ResourceAllocator& allocator)
+descriptor_table::descriptor_table(VkDevice device, resource_allocator& allocator)
 : device_(device)
 , allocator_(allocator)
 {
@@ -129,7 +129,7 @@ DescriptorTable::DescriptorTable(VkDevice device, ResourceAllocator& allocator)
     }
 }
 
-DescriptorTable::~DescriptorTable()
+descriptor_table::~descriptor_table()
 {
     if (descriptor_pool_)
     {
@@ -141,76 +141,76 @@ DescriptorTable::~DescriptorTable()
     }
 }
 
-void DescriptorTable::bind(ResourceID handle, DescriptorType type)
+void descriptor_table::bind(resource_id handle, descriptor_type type)
 {
     uint32_t slot = 0;
 
     switch(type)
     {
-        case DescriptorType::STORAGE_BUFFER:
+        case descriptor_type::STORAGE_BUFFER:
             slot = ssbo_descriptor_allocator_.allocate(handle);
             bind_buffer(handle, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, slot);
             break;
 
-        case DescriptorType::TEXTURE:
+        case descriptor_type::TEXTURE:
             slot = texture_descriptor_allocator_.allocate(handle);
             bind_image(handle, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, slot);
             break;
 
-        case DescriptorType::STORAGE_IMAGE:
+        case descriptor_type::STORAGE_IMAGE:
             slot = st_image_descriptor_allocator_.allocate(handle);
             bind_image(handle, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, slot);
             break;
         
-        case DescriptorType::TLAS:
+        case descriptor_type::TLAS:
             slot = tlas_descriptor_allocator_.allocate(handle);
             // bind_image(handle, VK_DESCRIPTOR_TYPE_SAMPLER, slot);
             break;
         
-        case DescriptorType::BLAS:
+        case descriptor_type::BLAS:
             slot = blas_descriptor_allocator_.allocate(handle);
             // bind_image(handle, VK_DESCRIPTOR_TYPE_SAMPLER, slot);
             break;
     }
 }
 
-void DescriptorTable::unbind(ResourceID handle, DescriptorType type)
+void descriptor_table::unbind(resource_id handle, descriptor_type type)
 {
     // TODO(DCut): Handle timeline value and flushing
     switch(type)
     {
-        case DescriptorType::STORAGE_BUFFER:
+        case descriptor_type::STORAGE_BUFFER:
             ssbo_descriptor_allocator_.release(handle);
             break;
-        case DescriptorType::TEXTURE:
+        case descriptor_type::TEXTURE:
             texture_descriptor_allocator_.release(handle);
             break;
-        case DescriptorType::STORAGE_IMAGE:
+        case descriptor_type::STORAGE_IMAGE:
             st_image_descriptor_allocator_.release(handle);
             break;
-        case DescriptorType::TLAS:
+        case descriptor_type::TLAS:
             tlas_descriptor_allocator_.release(handle);
             break;
-        case DescriptorType::BLAS:
+        case descriptor_type::BLAS:
             tlas_descriptor_allocator_.release(handle);
             break;
     }
 }
 
-auto DescriptorTable::get_binding_slot(ResourceID handle, DescriptorType type) -> std::uint32_t
+auto descriptor_table::get_binding_slot(resource_id handle, descriptor_type type) -> std::uint32_t
 {
     switch(type)
     {
-        case DescriptorType::STORAGE_BUFFER:    return ssbo_descriptor_allocator_.get_slot(handle);
-        case DescriptorType::TEXTURE:           return texture_descriptor_allocator_.get_slot(handle);
-        case DescriptorType::STORAGE_IMAGE:     return st_image_descriptor_allocator_.get_slot(handle);
-        case DescriptorType::TLAS:              return tlas_descriptor_allocator_.get_slot(handle);
-        case DescriptorType::BLAS:              return blas_descriptor_allocator_.get_slot(handle);
+        case descriptor_type::STORAGE_BUFFER:    return ssbo_descriptor_allocator_.get_slot(handle);
+        case descriptor_type::TEXTURE:           return texture_descriptor_allocator_.get_slot(handle);
+        case descriptor_type::STORAGE_IMAGE:     return st_image_descriptor_allocator_.get_slot(handle);
+        case descriptor_type::TLAS:              return tlas_descriptor_allocator_.get_slot(handle);
+        case descriptor_type::BLAS:              return blas_descriptor_allocator_.get_slot(handle);
     }
     throw std::runtime_error("Failed to get binding slot, somehow hit unreachable code.");
 }
 
-void DescriptorTable::bind_buffer(ResourceID handle, VkDescriptorType type, uint32_t slot)
+void descriptor_table::bind_buffer(resource_id handle, VkDescriptorType type, uint32_t slot)
 {
     const auto& buffer = allocator_.get_buffer(handle);
 
@@ -239,7 +239,7 @@ void DescriptorTable::bind_buffer(ResourceID handle, VkDescriptorType type, uint
     vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 }
 
-void DescriptorTable::bind_image(ResourceID handle, VkDescriptorType type, uint32_t slot)
+void descriptor_table::bind_image(resource_id handle, VkDescriptorType type, uint32_t slot)
 {
     const auto& image = allocator_.get_image(handle);
 
@@ -271,4 +271,4 @@ void DescriptorTable::bind_image(ResourceID handle, VkDescriptorType type, uint3
     vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 }
 
-} // namespace String
+} // namespace string::gpu

@@ -2,21 +2,21 @@
 
 #include <volk.h>
 
-namespace String
+namespace string::gpu
 {
 
-enum class PipelineType
+enum class pipeline_type
 {
     GRAPHICS,
     COMPUTE
 };
 
-struct Pipeline
+struct pipeline
 {
     VkPushConstantRange push_constants;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    PipelineType pipeline_type;
+    pipeline_type pipeline_type;
 };
 
 }

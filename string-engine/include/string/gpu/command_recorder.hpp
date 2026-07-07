@@ -1,45 +1,44 @@
 #pragma once
 
-#include <string/vulkan/queue.hpp>
-#include <string/vulkan/descriptor_allocator.hpp>
-#include <string/vulkan/resource_allocator.hpp>
+#include <string/gpu/queue.hpp>
+#include <string/gpu/descriptor_allocator.hpp>
+#include <string/gpu/resource_allocator.hpp>
 #include "vulkan/vulkan_core.h"
 
 #include <volk.h>
 
-namespace String
+namespace string::gpu
 {
 
-struct Pass;
 
-class CommandRecorder
+class command_recorder
 {
     VkDevice device_;
-    Queue queue_;
+    queue queue_;
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkCommandBuffer primary_command_buffer_ = VK_NULL_HANDLE;
 public:
-    CommandRecorder() = default;
+    command_recorder() = default;
     // RAII: frees the pool/buffer if still owned. Makes the recorder safe to leave to
     // stack unwinding (e.g. if a later member's constructor throws) — destroy() is also
     // callable explicitly and is idempotent.
-    ~CommandRecorder();
+    ~command_recorder();
     // No copy (and, with a user-declared destructor, no implicit move) — recorders are
     // owned in place as members and never relocated.
-    CommandRecorder(const CommandRecorder&) = delete;
-    CommandRecorder& operator=(const CommandRecorder&) = delete;
+    command_recorder(const command_recorder&) = delete;
+    command_recorder& operator=(const command_recorder&) = delete;
 
-    void init(VkDevice device, Queue queue);
+    void init(VkDevice device, queue queue);
     void destroy();
 
     auto begin(VkCommandBufferUsageFlags command_buffer_usage = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) -> VkCommandBuffer&;
-    auto end() -> CommandRecorder&;
-    auto reset() -> CommandRecorder&;
+    auto end() -> command_recorder&;
+    auto reset() -> command_recorder&;
 
     auto get_command_buffer() -> VkCommandBuffer&;
-    auto get_queue() -> Queue&;
+    auto get_queue() -> queue&;
 
-    auto immediate_submit() -> CommandRecorder&;
+    auto immediate_submit() -> command_recorder&;
 };
 
-} // namespace String
+} // namespace string::gpu

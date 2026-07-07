@@ -2,8 +2,8 @@
 
 #include <vector>
 
-#include <string/vulkan/command_recorder.hpp>
-#include <string/vulkan/resource_allocator.hpp>
+#include <string/gpu/command_recorder.hpp>
+#include <string/gpu/resource_allocator.hpp>
 
 #include <volk.h>
 
@@ -16,21 +16,21 @@ namespace String
 // GPU stall per copy/transition. Staging buffers are held alive until the flush completes.
 class TransferBatch
 {
-    CommandRecorder& recorder_;
-    ResourceAllocator& allocator_;
-    std::vector<ResourceID> pending_staging_;
+    string::gpu::command_recorder& recorder_;
+    string::gpu::resource_allocator& allocator_;
+    std::vector<string::gpu::resource_id> pending_staging_;
     bool recording_ = false;
 
     VkCommandBuffer begin_if_needed();
 
 public:
-    TransferBatch(CommandRecorder& recorder, ResourceAllocator& allocator);
+    TransferBatch(string::gpu::command_recorder& recorder, string::gpu::resource_allocator& allocator);
 
     // Records a staging copy of `data` into a device-local buffer. Nothing is submitted yet.
-    void upload_buffer(const void* data, VkDeviceSize size, ResourceID dst_buffer);
+    void upload_buffer(const void* data, VkDeviceSize size, string::gpu::resource_id dst_buffer);
     // Records UNDEFINED -> TRANSFER_DST, a staging copy, then TRANSFER_DST -> SHADER_READ for
     // the destination image (extent taken from the allocated image). Nothing is submitted yet.
-    void upload_image(const void* pixels, VkDeviceSize size, ResourceID dst_image);
+    void upload_image(const void* pixels, VkDeviceSize size, string::gpu::resource_id dst_image);
 
     // Submits everything recorded so far, waits for completion, and frees staging buffers.
     // No-op if nothing was recorded (e.g. passes that don't upload).

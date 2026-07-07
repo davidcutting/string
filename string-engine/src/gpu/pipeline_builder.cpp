@@ -1,27 +1,27 @@
 #include <cstdint>
-#include <string/vulkan/pipeline_builder.hpp>
+#include <string/gpu/pipeline_builder.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 
 #include <volk.h>
 
-namespace String
+namespace string::gpu
 {
 
-// Pipeline Layout Builder --------------------------------------------------------------
+// pipeline Layout Builder --------------------------------------------------------------
 
-PipelineLayoutBuilder& PipelineLayoutBuilder::set_descriptor_set_layout(const std::vector<VkDescriptorSetLayout>& descriptor_set_layouts)
+pipeline_layout_builder& pipeline_layout_builder::set_descriptor_set_layout(const std::vector<VkDescriptorSetLayout>& descriptor_set_layouts)
 {
     descriptor_set_layouts_ = descriptor_set_layouts;
     return *this;
 }
 
-PipelineLayoutBuilder& PipelineLayoutBuilder::set_push_constant_ranges(const std::vector<VkPushConstantRange>& push_constant_ranges)
+pipeline_layout_builder& pipeline_layout_builder::set_push_constant_ranges(const std::vector<VkPushConstantRange>& push_constant_ranges)
 {
     push_constant_ranges_ = push_constant_ranges;
     return *this;
 }
 
-VkPipelineLayout PipelineLayoutBuilder::build(Device& device)
+VkPipelineLayout pipeline_layout_builder::build(device& device)
 {
     VkPipelineLayout pipeline_layout;
 
@@ -44,9 +44,9 @@ VkPipelineLayout PipelineLayoutBuilder::build(Device& device)
     return pipeline_layout;
 }
 
-// Pipeline Builder --------------------------------------------------------------
+// pipeline Builder --------------------------------------------------------------
 
-PipelineBuilder::PipelineBuilder(Device& device, const PipelineType& type)
+pipeline_builder::pipeline_builder(device& device, const pipeline_type& type)
 : type_(type)
 , device_(device)
 {
@@ -92,7 +92,7 @@ PipelineBuilder::PipelineBuilder(Device& device, const PipelineType& type)
     // clang-format on
 }
 
-PipelineBuilder::~PipelineBuilder()
+pipeline_builder::~pipeline_builder()
 {
     if (compute_shader_module_ != VK_NULL_HANDLE)
         vkDestroyShaderModule(device_.get_device(), compute_shader_module_, nullptr);
@@ -102,9 +102,9 @@ PipelineBuilder::~PipelineBuilder()
         vkDestroyShaderModule(device_.get_device(), fragment_shader_module_, nullptr);
 }
 
-PipelineBuilder& PipelineBuilder::add_compute_shader(const std::filesystem::path& resource_path)
+pipeline_builder& pipeline_builder::add_compute_shader(const std::filesystem::path& resource_path)
 {
-    compute_shader_module_ = vku::load_shader_from_disk(device_.get_device(), resource_path);
+    compute_shader_module_ = String::vku::load_shader_from_disk(device_.get_device(), resource_path);
 
     // clang-format off
     VkPipelineShaderStageCreateInfo compute_shader_stage_info = {
@@ -121,9 +121,9 @@ PipelineBuilder& PipelineBuilder::add_compute_shader(const std::filesystem::path
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::add_vertex_shader(const std::filesystem::path& resource_path)
+pipeline_builder& pipeline_builder::add_vertex_shader(const std::filesystem::path& resource_path)
 {
-    vertex_shader_module_ = vku::load_shader_from_disk(device_.get_device(), resource_path);
+    vertex_shader_module_ = String::vku::load_shader_from_disk(device_.get_device(), resource_path);
 
     // clang-format off
     VkPipelineShaderStageCreateInfo vertex_shader_stage_info = {
@@ -140,9 +140,9 @@ PipelineBuilder& PipelineBuilder::add_vertex_shader(const std::filesystem::path&
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::add_fragment_shader(const std::filesystem::path& resource_path)
+pipeline_builder& pipeline_builder::add_fragment_shader(const std::filesystem::path& resource_path)
 {
-    fragment_shader_module_ = vku::load_shader_from_disk(device_.get_device(), resource_path);
+    fragment_shader_module_ = String::vku::load_shader_from_disk(device_.get_device(), resource_path);
 
     // clang-format off
     VkPipelineShaderStageCreateInfo fragment_shader_stage_info = {
@@ -159,7 +159,7 @@ PipelineBuilder& PipelineBuilder::add_fragment_shader(const std::filesystem::pat
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::set_vertex_binding(const VkVertexInputBindingDescription& binding_description, const std::vector<VkVertexInputAttributeDescription>& attribute_descriptions)
+pipeline_builder& pipeline_builder::set_vertex_binding(const VkVertexInputBindingDescription& binding_description, const std::vector<VkVertexInputAttributeDescription>& attribute_descriptions)
 {
     // clang-format off
     VkPipelineVertexInputStateCreateInfo vertex_input_info = {
@@ -176,7 +176,7 @@ PipelineBuilder& PipelineBuilder::set_vertex_binding(const VkVertexInputBindingD
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::set_input_assembly(VkPrimitiveTopology topology, VkBool32 primitive_restart_enable)
+pipeline_builder& pipeline_builder::set_input_assembly(VkPrimitiveTopology topology, VkBool32 primitive_restart_enable)
 {
     // clang-format off
     VkPipelineInputAssemblyStateCreateInfo input_assembly = {
@@ -191,7 +191,7 @@ PipelineBuilder& PipelineBuilder::set_input_assembly(VkPrimitiveTopology topolog
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::set_tessellation(uint32_t patch_control_points)
+pipeline_builder& pipeline_builder::set_tessellation(uint32_t patch_control_points)
 {
     // clang-format off
     VkPipelineTessellationStateCreateInfo tessellation_state_info = {
@@ -205,7 +205,7 @@ PipelineBuilder& PipelineBuilder::set_tessellation(uint32_t patch_control_points
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::set_rasterization(
+pipeline_builder& pipeline_builder::set_rasterization(
     VkPolygonMode polygon_mode,
     VkCullModeFlags cull_mode,
     VkFrontFace front_face)
@@ -229,7 +229,7 @@ PipelineBuilder& PipelineBuilder::set_rasterization(
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::set_multisampling()
+pipeline_builder& pipeline_builder::set_multisampling()
 {
     VkPipelineMultisampleStateCreateInfo multisampling_state_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
@@ -246,7 +246,7 @@ PipelineBuilder& PipelineBuilder::set_multisampling()
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::enable_depth_stencil(bool depth_test, bool depth_write)
+pipeline_builder& pipeline_builder::enable_depth_stencil(bool depth_test, bool depth_write)
 {
     VkPipelineDepthStencilStateCreateInfo depth_stencil_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
@@ -267,13 +267,13 @@ PipelineBuilder& PipelineBuilder::enable_depth_stencil(bool depth_test, bool dep
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::set_color_format(VkFormat format)
+pipeline_builder& pipeline_builder::set_color_format(VkFormat format)
 {
     color_format_ = format;
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::disable_color_blending()
+pipeline_builder& pipeline_builder::disable_color_blending()
 {
     color_blend_attachment_info_ = {
         .blendEnable = VK_FALSE,
@@ -302,7 +302,7 @@ PipelineBuilder& PipelineBuilder::disable_color_blending()
     return *this;
 }
 
-PipelineBuilder& PipelineBuilder::enable_color_blending()
+pipeline_builder& pipeline_builder::enable_color_blending()
 {
     VkPipelineColorBlendAttachmentState color_blend_attachment_info = {
         .blendEnable = VK_TRUE,
@@ -333,7 +333,7 @@ PipelineBuilder& PipelineBuilder::enable_color_blending()
     return *this;
 }
 
-VkPipeline PipelineBuilder::build_graphics_pipeline(const VkPipelineLayout& pipeline_layout)
+VkPipeline pipeline_builder::build_graphics_pipeline(const VkPipelineLayout& pipeline_layout)
 {
     // Dynamic State
 
@@ -405,7 +405,7 @@ VkPipeline PipelineBuilder::build_graphics_pipeline(const VkPipelineLayout& pipe
     }
     // clang-format on
 
-    // Pipeline baked, now de-allocate shader modules
+    // pipeline baked, now de-allocate shader modules
     vkDestroyShaderModule(device_.get_device(), vertex_shader_module_, nullptr);
     vkDestroyShaderModule(device_.get_device(), fragment_shader_module_, nullptr);
 
@@ -415,7 +415,7 @@ VkPipeline PipelineBuilder::build_graphics_pipeline(const VkPipelineLayout& pipe
     return pipeline;
 }
 
-VkPipeline PipelineBuilder::build_compute_pipeline(const VkPipelineLayout& pipeline_layout)
+VkPipeline pipeline_builder::build_compute_pipeline(const VkPipelineLayout& pipeline_layout)
 {
     // Create the pipeline
     VkPipeline pipeline;
@@ -435,7 +435,7 @@ VkPipeline PipelineBuilder::build_compute_pipeline(const VkPipelineLayout& pipel
     }
     // clang-format on
 
-    // Pipeline baked, now de-allocate shader modules
+    // pipeline baked, now de-allocate shader modules
     vkDestroyShaderModule(device_.get_device(), compute_shader_module_, nullptr);
 
     compute_shader_module_ = VK_NULL_HANDLE;

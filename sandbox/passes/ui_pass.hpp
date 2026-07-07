@@ -5,11 +5,11 @@
 
 #include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/pass_context.hpp>
-#include <string/vulkan/pipeline.hpp>
-#include <string/vulkan/device.hpp>
-#include <string/vulkan/resource.hpp>
-#include <string/vulkan/resource_allocator.hpp>
-#include <string/vulkan/descriptor_allocator.hpp>
+#include <string/gpu/pipeline.hpp>
+#include <string/gpu/device.hpp>
+#include <string/gpu/resource.hpp>
+#include <string/gpu/resource_allocator.hpp>
+#include <string/gpu/descriptor_allocator.hpp>
 #include <string/core/layout.hpp>
 
 #include <volk.h>
@@ -24,13 +24,13 @@ namespace sandbox
 // only the GPU packing and drawing. Dynamic (per-frame rebuilt) UI is a later, additive step.
 class UIPass final : public String::Pass
 {
-    String::Device& device_;
-    String::ResourceAllocator& allocator_;
-    String::DescriptorTable& descriptor_table_;
+    string::gpu::device& device_;
+    string::gpu::resource_allocator& allocator_;
+    string::gpu::descriptor_table& descriptor_table_;
 
-    String::Pipeline pipeline_;
+    string::gpu::pipeline pipeline_;
 
-    String::ResourceID shape_buffer_;
+    string::gpu::resource_id shape_buffer_;
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
     uint32_t shape_slot_ = 0;
     uint32_t shape_count_ = 0;
@@ -41,7 +41,7 @@ public:
     UIPass(String::PassContext& context, std::vector<string::layout_node> nodes);
     virtual ~UIPass() override;
 
-    virtual void record(String::CommandRecorder& recorder, uint16_t current_frame) override;
+    virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 };
 
 }  // namespace sandbox

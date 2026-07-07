@@ -1,4 +1,4 @@
-#include <string/vulkan/driver.hpp>
+#include <string/gpu/driver.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 
 #include <string.h>
@@ -38,10 +38,10 @@ bool are_validation_layer_supported(const std::vector<const char*>& validation_l
 
 }
 
-namespace String
+namespace string::gpu
 {
 
-Driver::Driver(const ApplicationInfo& info, const std::shared_ptr<Window>& window)
+driver::driver(const String::ApplicationInfo& info, const std::shared_ptr<String::Window>& window)
 {
     if (volkInitialize() != VK_SUCCESS)
     {
@@ -91,7 +91,7 @@ Driver::Driver(const ApplicationInfo& info, const std::shared_ptr<Window>& windo
     create_info.enabledLayerCount = static_cast<uint32_t>(validation_layers.size());
     create_info.ppEnabledLayerNames = validation_layers.data();
 
-    vku::default_debug_messenger_create_info(instance_debug_create_info);
+    String::vku::default_debug_messenger_create_info(instance_debug_create_info);
     create_info.pNext = (VkDebugUtilsMessengerCreateInfoEXT*)&instance_debug_create_info;
 #endif
 
@@ -103,23 +103,23 @@ Driver::Driver(const ApplicationInfo& info, const std::shared_ptr<Window>& windo
 
 #ifdef STRING_DEBUG
     VkDebugUtilsMessengerCreateInfoEXT debug_create_info;
-    vku::default_debug_messenger_create_info(debug_create_info);
+    String::vku::default_debug_messenger_create_info(debug_create_info);
 
-    if (vku::CreateDebugUtilsMessengerEXT(instance_, &debug_create_info, nullptr, &debug_messenger_) != VK_SUCCESS) {
+    if (String::vku::CreateDebugUtilsMessengerEXT(instance_, &debug_create_info, nullptr, &debug_messenger_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to set up Vulkan debug messenger!");
     }
 #endif
 }
 
-Driver::~Driver()
+driver::~driver()
 {
     if (debug_messenger_ != VK_NULL_HANDLE)
-        vku::DestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
+        String::vku::DestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
     if (instance_ != VK_NULL_HANDLE)
         vkDestroyInstance(instance_, nullptr);
 }
 
-auto Driver::get_instance() -> VkInstance&
+auto driver::get_instance() -> VkInstance&
 {
     return instance_;
 }

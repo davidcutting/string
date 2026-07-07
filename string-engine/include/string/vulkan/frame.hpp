@@ -1,7 +1,7 @@
 #pragma once
 
-#include <string/vulkan/resource_allocator.hpp>
-#include <string/vulkan/command_recorder.hpp>
+#include <string/gpu/resource_allocator.hpp>
+#include <string/gpu/command_recorder.hpp>
 
 #include <volk.h>
 
@@ -12,9 +12,9 @@ struct Frame
 {
     uint64_t frame_id;
 
-    DeletionQueue garbage_collector;
+    string::gpu::deletion_queue garbage_collector;
 
-    CommandRecorder recorder;
+    string::gpu::command_recorder recorder;
 };
 
 }

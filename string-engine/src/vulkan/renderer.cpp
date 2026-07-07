@@ -6,18 +6,18 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include <string/vulkan/driver.hpp>
+#include <string/gpu/driver.hpp>
 #include <string/vulkan/renderer.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
-#include <string/vulkan/device.hpp>
-#include <string/vulkan/resource.hpp>
-#include <string/vulkan/resource_allocator.hpp>
-#include <string/vulkan/presenter.hpp>
+#include <string/gpu/device.hpp>
+#include <string/gpu/resource.hpp>
+#include <string/gpu/resource_allocator.hpp>
+#include <string/gpu/presenter.hpp>
 #include <string/core/platform_detection.hpp>
 #include <string/core/logger.hpp>
-#include <string/vulkan/command_recorder.hpp>
-#include <string/vulkan/queue.hpp>
-#include <string/vulkan/descriptor_allocator.hpp>
+#include <string/gpu/command_recorder.hpp>
+#include <string/gpu/queue.hpp>
+#include <string/gpu/descriptor_allocator.hpp>
 
 #include <volk.h>
 
@@ -30,8 +30,8 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 , window_(std::move(window))
 , driver_(application_info, window_)
 , device_(driver_, window_)
-, graphics_queue_(device_.get_queue(QueueType::GRAPHICS))
-, compute_queue_(device_.get_queue(QueueType::COMPUTE))
+, graphics_queue_(device_.get_queue(string::gpu::queue_type::GRAPHICS))
+, compute_queue_(device_.get_queue(string::gpu::queue_type::COMPUTE))
 , presenter_(device_, window_, frames_in_flight_)
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
 , global_descriptor_table_(device_.get_device(), allocator_)
@@ -45,7 +45,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     VkExtent2D extent = presenter_.get_extent();
 
     // Allocate render target
-    color_attachment_ = allocator_.create_resource(ImageInfo{
+    color_attachment_ = allocator_.create_resource(string::gpu::image_info{
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -54,7 +54,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
     });
-    depth_attachment_ = allocator_.create_resource(ImageInfo{
+    depth_attachment_ = allocator_.create_resource(string::gpu::image_info{
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_D32_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -85,8 +85,8 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         global_descriptor_table_,
         transfer_batch,
         window_->get_input(),
-        COLOR_TARGET,
-        DEPTH_TARGET,
+        string::gpu::COLOR_TARGET,
+        string::gpu::DEPTH_TARGET,
         resources_path,
         static_cast<uint16_t>(frames_in_flight_),
     };
@@ -95,8 +95,8 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     // Composite resolves the offscreen HDR target to the swapchain: reads color_attachment_,
     // writes the screen. Declared here (composite_pass_ is renderer-built, not in the plan).
     composite_pass_.usages = {
-        { COLOR_TARGET,     Access::SampledRead, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT },
-        { SWAPCHAIN_TARGET, Access::ColorWrite,  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
+        { string::gpu::COLOR_TARGET,     Access::SampledRead, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT },
+        { string::gpu::SWAPCHAIN_TARGET, Access::ColorWrite,  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
     };
 
     // The frame graph's execution list: scene passes, then the composite resolve. written_
@@ -204,8 +204,8 @@ void Renderer::begin_frame()
     update();
 
     // Acquire now, before recording, so end_rendering has a valid blit target. Copy the
-    // handles out of AcquiredImage (which holds references into vectors resize() reallocates).
-    AcquiredImage acquired = presenter_.acquire_next_frame();
+    // handles out of string::gpu::acquired_image (which holds references into vectors resize() reallocates).
+    string::gpu::acquired_image acquired = presenter_.acquire_next_frame();
     acquired_image_ = acquired.image;
     acquired_image_view_ = acquired.image_view;
     acquired_wait_semaphore_ = acquired.wait_for_image_available;
@@ -227,13 +227,13 @@ void Renderer::record_frame()
     const VkRect2D scissor = { .offset = { 0, 0 }, .extent = extent };
 
     // The color / depth target a pass renders into (every frame pass writes exactly one color
-    // target; SWAPCHAIN_TARGET means the screen).
-    const auto color_target_of = [](const Pass* pass) -> ResourceID {
+    // target; string::gpu::SWAPCHAIN_TARGET means the screen).
+    const auto color_target_of = [](const Pass* pass) -> string::gpu::resource_id {
         for (const ResourceUsage& usage : pass->usages)
             if (usage.access == Access::ColorWrite) return usage.resource;
-        return SWAPCHAIN_TARGET;
+        return string::gpu::SWAPCHAIN_TARGET;
     };
-    const auto depth_target_of = [](const Pass* pass) -> std::optional<ResourceID> {
+    const auto depth_target_of = [](const Pass* pass) -> std::optional<string::gpu::resource_id> {
         for (const ResourceUsage& usage : pass->usages)
             if (usage.access == Access::DepthWrite) return usage.resource;
         return std::nullopt;
@@ -244,8 +244,8 @@ void Renderer::record_frame()
     size_t start = 0;
     while (start < frame_passes_.size())
     {
-        const ResourceID group_color = color_target_of(frame_passes_[start]);
-        std::optional<ResourceID> group_depth;
+        const string::gpu::resource_id group_color = color_target_of(frame_passes_[start]);
+        std::optional<string::gpu::resource_id> group_depth;
         size_t end = start;
         while (end < frame_passes_.size() && color_target_of(frame_passes_[end]) == group_color)
         {
@@ -258,7 +258,7 @@ void Renderer::record_frame()
         // written_resources_, and buffer usages map to VK_IMAGE_LAYOUT_UNDEFINED. Reads of a
         // graph-written resource (the composite sampling color) get the correct source layout
         // from the tracker; writes discard the previous contents.
-        std::unordered_map<ResourceID, ResourceUsage> group_transitions;
+        std::unordered_map<string::gpu::resource_id, ResourceUsage> group_transitions;
         for (size_t i = start; i < end; ++i)
             for (const ResourceUsage& usage : frame_passes_[i]->usages)
             {
@@ -330,24 +330,24 @@ void Renderer::record_frame()
     frame.recorder.end();
 }
 
-VkImage Renderer::image_of(ResourceID target) const
+VkImage Renderer::image_of(string::gpu::resource_id target) const
 {
     switch (target)
     {
-        case SWAPCHAIN_TARGET: return acquired_image_;
-        case COLOR_TARGET:     return allocator_.get_image(color_attachment_).image;
-        case DEPTH_TARGET:     return allocator_.get_image(depth_attachment_).image;
+        case string::gpu::SWAPCHAIN_TARGET: return acquired_image_;
+        case string::gpu::COLOR_TARGET:     return allocator_.get_image(color_attachment_).image;
+        case string::gpu::DEPTH_TARGET:     return allocator_.get_image(depth_attachment_).image;
         default:               return allocator_.get_image(target).image;
     }
 }
 
-VkImageView Renderer::image_view_of(ResourceID target) const
+VkImageView Renderer::image_view_of(string::gpu::resource_id target) const
 {
     switch (target)
     {
-        case SWAPCHAIN_TARGET: return acquired_image_view_;
-        case COLOR_TARGET:     return allocator_.get_image(color_attachment_).view;
-        case DEPTH_TARGET:     return allocator_.get_image(depth_attachment_).view;
+        case string::gpu::SWAPCHAIN_TARGET: return acquired_image_view_;
+        case string::gpu::COLOR_TARGET:     return allocator_.get_image(color_attachment_).view;
+        case string::gpu::DEPTH_TARGET:     return allocator_.get_image(depth_attachment_).view;
         default:               return allocator_.get_image(target).view;
     }
 }
@@ -431,8 +431,8 @@ void Renderer::draw()
 
 void Renderer::bind_composite_source()
 {
-    global_descriptor_table_.bind(color_attachment_, DescriptorType::TEXTURE);
-    const uint32_t slot = global_descriptor_table_.get_binding_slot(color_attachment_, DescriptorType::TEXTURE);
+    global_descriptor_table_.bind(color_attachment_, string::gpu::descriptor_type::TEXTURE);
+    const uint32_t slot = global_descriptor_table_.get_binding_slot(color_attachment_, string::gpu::descriptor_type::TEXTURE);
     composite_pass_.set_source(global_descriptor_table_.get_set(), slot);
 }
 
@@ -446,9 +446,9 @@ void Renderer::handle_resize(const String::View::Extent& extent)
     }
 
     // Release the old HDR target's bindless slot before it is destroyed, then re-allocate.
-    global_descriptor_table_.unbind(color_attachment_, DescriptorType::TEXTURE);
+    global_descriptor_table_.unbind(color_attachment_, string::gpu::descriptor_type::TEXTURE);
     allocator_.destroy_resource(color_attachment_);
-    color_attachment_ = allocator_.create_resource(ImageInfo{
+    color_attachment_ = allocator_.create_resource(string::gpu::image_info{
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -461,7 +461,7 @@ void Renderer::handle_resize(const String::View::Extent& extent)
     bind_composite_source();
 
     allocator_.destroy_resource(depth_attachment_);
-    depth_attachment_ = allocator_.create_resource(ImageInfo{
+    depth_attachment_ = allocator_.create_resource(string::gpu::image_info{
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_D32_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,

@@ -6,7 +6,7 @@
 #include <vector>
 #include <unordered_map>
 
-#include <string/vulkan/resource.hpp>
+#include <string/gpu/resource.hpp>
 #include <string/vulkan/resource_usage.hpp>
 
 namespace String
@@ -35,7 +35,7 @@ struct RenderGraph
     std::vector<PassNode> passes;
     std::vector<std::vector<uint32_t>> adjacency;
     std::vector<uint32_t> toposorted;
-    std::unordered_map<ResourceID, ResourceLifetime> resource_lifetimes;
+    std::unordered_map<string::gpu::resource_id, ResourceLifetime> resource_lifetimes;
 };
 
 class PassBuilder
@@ -46,7 +46,7 @@ public:
     explicit PassBuilder(GraphBuilder& graph_builder, const std::string& name);
 
     // Declare a resource use. Read vs write is derived from the Access (is_write).
-    auto use(ResourceID resource, Access access, VkPipelineStageFlags2 stage) -> PassBuilder&;
+    auto use(string::gpu::resource_id resource, Access access, VkPipelineStageFlags2 stage) -> PassBuilder&;
 
     auto end_pass() -> GraphBuilder&;
 };

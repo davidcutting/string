@@ -1,17 +1,17 @@
 #include <stdexcept>
 
-#include <string/vulkan/resource_allocator.hpp>
+#include <string/gpu/resource_allocator.hpp>
 #include <string/core/logger.hpp>
-#include <string/vulkan/resource.hpp>
+#include <string/gpu/resource.hpp>
 #include "vulkan/vulkan_core.h"
 
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
 
-namespace String
+namespace string::gpu
 {
 
-ResourceAllocator::ResourceAllocator(const ResourceAllocatorCreateInfo& info)
+resource_allocator::resource_allocator(const ResourceAllocatorCreateInfo& info)
 : physical_device_(info.physical_device)
 , device_(info.device)
 {
@@ -39,7 +39,7 @@ ResourceAllocator::ResourceAllocator(const ResourceAllocatorCreateInfo& info)
     }
 }
 
-ResourceAllocator::~ResourceAllocator()
+resource_allocator::~resource_allocator()
 {
     vkDeviceWaitIdle(device_);
     for (auto&[id, buffer] : buffers_)
@@ -58,9 +58,9 @@ ResourceAllocator::~ResourceAllocator()
     }
 }
 
-auto ResourceAllocator::create_resource(const BufferInfo& info) -> ResourceID
+auto resource_allocator::create_resource(const buffer_info& info) -> resource_id
 {
-    AllocatedBuffer new_buffer = {
+    allocated_buffer new_buffer = {
         .id = 0,
         .buffer = VK_NULL_HANDLE,
         .size = info.size,
@@ -102,9 +102,9 @@ auto ResourceAllocator::create_resource(const BufferInfo& info) -> ResourceID
     return id;
 }
 
-auto ResourceAllocator::create_resource(const ImageInfo& info) -> ResourceID
+auto resource_allocator::create_resource(const image_info& info) -> resource_id
 {
-    AllocatedImage new_image = {
+    allocated_image new_image = {
         .id = 0,
         .image = VK_NULL_HANDLE,
         .view = VK_NULL_HANDLE,
@@ -162,9 +162,9 @@ auto ResourceAllocator::create_resource(const ImageInfo& info) -> ResourceID
     return id;
 }
 
-auto ResourceAllocator::create_staging(VkDeviceSize size) -> ResourceID
+auto resource_allocator::create_staging(VkDeviceSize size) -> resource_id
 {
-    return create_resource(BufferInfo{
+    return create_resource(buffer_info{
         .size = size,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         .memory_usage = VMA_MEMORY_USAGE_CPU_ONLY,
@@ -172,17 +172,17 @@ auto ResourceAllocator::create_staging(VkDeviceSize size) -> ResourceID
     });
 }
 
-void ResourceAllocator::destroy_resource(ResourceID id)
+void resource_allocator::destroy_resource(resource_id id)
 {
     if (buffers_.contains(id))
     {
-        AllocatedBuffer& garbage = buffers_.at(id);
+        allocated_buffer& garbage = buffers_.at(id);
         vmaDestroyBuffer(allocator_, garbage.buffer, garbage.allocation);
         buffers_.erase(id);
     }
     if (images_.contains(id))
     {
-        AllocatedImage& garbage = images_.at(id);
+        allocated_image& garbage = images_.at(id);
         vkDestroyImageView(device_, garbage.view, nullptr);
         vkDestroySampler(device_, garbage.sampler, nullptr);
         vmaDestroyImage(allocator_, garbage.image, garbage.allocation);
@@ -191,17 +191,17 @@ void ResourceAllocator::destroy_resource(ResourceID id)
     registry_.release_id(id);
 }
 
-auto ResourceAllocator::get_buffer(ResourceID id) const -> const AllocatedBuffer&
+auto resource_allocator::get_buffer(resource_id id) const -> const allocated_buffer&
 {
     return buffers_.at(id);
 }
 
-auto ResourceAllocator::get_image(ResourceID id) const -> const AllocatedImage&
+auto resource_allocator::get_image(resource_id id) const -> const allocated_image&
 {
     return images_.at(id);
 }
 
-void ResourceAllocator::copy_data_to_buffer(const void* data, ResourceID resource) const
+void resource_allocator::copy_data_to_buffer(const void* data, resource_id resource) const
 {
     // TODO(DCut): In general, one can configure allocations and pools with VMA to automatically contain
     // a void* to the mapping for us, which would shift the cost of mapping to the allocation time,
@@ -213,7 +213,7 @@ void ResourceAllocator::copy_data_to_buffer(const void* data, ResourceID resourc
     vmaUnmapMemory(allocator_, buffer.allocation);
 }
 
-void ResourceAllocator::create_image_sampler(AllocatedImage& allocated_image)
+void resource_allocator::create_image_sampler(allocated_image& allocated_image)
 {
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(physical_device_, &properties);
@@ -245,7 +245,7 @@ void ResourceAllocator::create_image_sampler(AllocatedImage& allocated_image)
     }
 }
 
-void ResourceAllocator::create_image_view(AllocatedImage& allocated_image, VkImageAspectFlags aspect_flags)
+void resource_allocator::create_image_view(allocated_image& allocated_image, VkImageAspectFlags aspect_flags)
 {
     VkImageViewCreateInfo view_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,

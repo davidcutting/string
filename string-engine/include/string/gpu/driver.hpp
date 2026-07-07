@@ -7,16 +7,16 @@
 
 #include <volk.h>
 
-namespace String
+namespace string::gpu
 {
 
-class Driver
+class driver
 {
     VkInstance instance_;
     VkDebugUtilsMessengerEXT debug_messenger_;
 public:
-    explicit Driver(const ApplicationInfo& info, const std::shared_ptr<Window>& window);
-    ~Driver();
+    explicit driver(const String::ApplicationInfo& info, const std::shared_ptr<String::Window>& window);
+    ~driver();
 
     auto get_instance() -> VkInstance&;
 };

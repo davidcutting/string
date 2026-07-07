@@ -15,7 +15,7 @@ PassBuilder::PassBuilder(GraphBuilder& graph_builder, const std::string& name)
 
 }
 
-auto PassBuilder::use(ResourceID resource, Access access, VkPipelineStageFlags2 stage) -> PassBuilder&
+auto PassBuilder::use(string::gpu::resource_id resource, Access access, VkPipelineStageFlags2 stage) -> PassBuilder&
 {
     building_.usages.push_back({ resource, access, stage });
     return *this;
@@ -57,8 +57,8 @@ auto GraphBuilder::build() -> RenderGraph
     graph.adjacency.assign(num_passes, {});
 
     // 1) Collect writers/readers lists per resource (read vs write derived from the Access)
-    std::unordered_map<ResourceID, std::vector<uint32_t>> resource_writers;
-    std::unordered_map<ResourceID, std::vector<uint32_t>> resource_readers;
+    std::unordered_map<string::gpu::resource_id, std::vector<uint32_t>> resource_writers;
+    std::unordered_map<string::gpu::resource_id, std::vector<uint32_t>> resource_readers;
 
     for (int i = 0; i < num_passes; ++i)
     {
@@ -144,9 +144,9 @@ using namespace String;
 
 int main() {
     // Fake resource IDs for now
-    ResourceID depth_id   = 1;
-    ResourceID color_id   = 2;
-    ResourceID lightgrid_id = 3;
+    string::gpu::resource_id depth_id   = 1;
+    string::gpu::resource_id color_id   = 2;
+    string::gpu::resource_id lightgrid_id = 3;
 
     RenderGraph graph = GraphBuilder()
         .add_pass("depth_prepass")

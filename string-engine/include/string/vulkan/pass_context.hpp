@@ -3,9 +3,9 @@
 #include <cstdint>
 #include <filesystem>
 
-#include <string/vulkan/device.hpp>
-#include <string/vulkan/resource_allocator.hpp>
-#include <string/vulkan/descriptor_allocator.hpp>
+#include <string/gpu/device.hpp>
+#include <string/gpu/resource_allocator.hpp>
+#include <string/gpu/descriptor_allocator.hpp>
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/platform/input.hpp>
 
@@ -19,9 +19,9 @@ namespace String
 // context, which only exists inside the Renderer). See render_plan.hpp for how it's injected.
 struct PassContext
 {
-    Device& device;
-    ResourceAllocator& allocator;
-    DescriptorTable& descriptor_table;
+    string::gpu::device& device;
+    string::gpu::resource_allocator& allocator;
+    string::gpu::descriptor_table& descriptor_table;
     // Batches a pass's one-time uploads (mesh/texture staging copies); flushed once by the
     // renderer after all passes are built, so uploads cost a single submit, not one per copy.
     TransferBatch& transfer;
@@ -30,8 +30,8 @@ struct PassContext
     const Input& input;
     // The offscreen render targets a scene pass draws into, so it can declare its ColorWrite /
     // DepthWrite usages (the render graph orders + barriers passes from these).
-    ResourceID color_target;
-    ResourceID depth_target;
+    string::gpu::resource_id color_target;
+    string::gpu::resource_id depth_target;
     // Root that contains shaders/ (and, at runtime, assets/); passes resolve their files here.
     std::filesystem::path resources_path;
     uint16_t frames_in_flight;

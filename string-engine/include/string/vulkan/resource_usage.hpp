@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include <string/vulkan/resource.hpp>
+#include <string/gpu/resource.hpp>
 
 #include <volk.h>
 
@@ -92,7 +92,7 @@ constexpr AccessScope access_scope(Access access)
 // pipeline stage(s) at which this pass touches it.
 struct ResourceUsage
 {
-    ResourceID resource;
+    string::gpu::resource_id resource;
     Access access;
     VkPipelineStageFlags2 stage;
 };

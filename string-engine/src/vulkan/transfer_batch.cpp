@@ -4,7 +4,7 @@
 namespace String
 {
 
-TransferBatch::TransferBatch(CommandRecorder& recorder, ResourceAllocator& allocator)
+TransferBatch::TransferBatch(string::gpu::command_recorder& recorder, string::gpu::resource_allocator& allocator)
 : recorder_(recorder)
 , allocator_(allocator)
 {
@@ -20,11 +20,11 @@ VkCommandBuffer TransferBatch::begin_if_needed()
     return recorder_.get_command_buffer();
 }
 
-void TransferBatch::upload_buffer(const void* data, VkDeviceSize size, ResourceID dst_buffer)
+void TransferBatch::upload_buffer(const void* data, VkDeviceSize size, string::gpu::resource_id dst_buffer)
 {
     VkCommandBuffer command_buffer = begin_if_needed();
 
-    const ResourceID staging = allocator_.create_staging(size);
+    const string::gpu::resource_id staging = allocator_.create_staging(size);
     allocator_.copy_data_to_buffer(data, staging);
     pending_staging_.push_back(staging);
 
@@ -33,10 +33,10 @@ void TransferBatch::upload_buffer(const void* data, VkDeviceSize size, ResourceI
         allocator_.get_buffer(dst_buffer).buffer, 1, &region);
 }
 
-void TransferBatch::upload_image(const void* pixels, VkDeviceSize size, ResourceID dst_image)
+void TransferBatch::upload_image(const void* pixels, VkDeviceSize size, string::gpu::resource_id dst_image)
 {
     VkCommandBuffer command_buffer = begin_if_needed();
-    const AllocatedImage& image = allocator_.get_image(dst_image);
+    const string::gpu::allocated_image& image = allocator_.get_image(dst_image);
 
     vku::transition_image(command_buffer, {
         .image = image.image,
@@ -48,7 +48,7 @@ void TransferBatch::upload_image(const void* pixels, VkDeviceSize size, Resource
         .dst_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
     });
 
-    const ResourceID staging = allocator_.create_staging(size);
+    const string::gpu::resource_id staging = allocator_.create_staging(size);
     allocator_.copy_data_to_buffer(pixels, staging);
     pending_staging_.push_back(staging);
 
@@ -111,7 +111,7 @@ void TransferBatch::flush()
     recorder_.reset();
     recording_ = false;
 
-    for (const ResourceID staging : pending_staging_)
+    for (const string::gpu::resource_id staging : pending_staging_)
     {
         allocator_.destroy_resource(staging);
     }
