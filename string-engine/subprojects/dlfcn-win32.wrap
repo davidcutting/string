@@ -1,0 +1,13 @@
+[wrap-file]
+directory = dlfcn-win32-1.4.2
+source_url = https://github.com/dlfcn-win32/dlfcn-win32/archive/refs/tags/v1.4.2.tar.gz
+source_filename = dlfcn-win32-1.4.2.tar.gz
+source_hash = f61a874bc9163ab488accb364fd681d109870c86e8071f4710cbcdcbaf9f2565
+patch_filename = dlfcn-win32_1.4.2-1_patch.zip
+patch_url = https://wrapdb.mesonbuild.com/v2/dlfcn-win32_1.4.2-1/get_patch
+patch_hash = a1331bda3bd47e4b4a7fb91eb820c70e4d20e34615f8849d26d59602609e8db6
+source_fallback_url = https://github.com/mesonbuild/wrapdb/releases/download/dlfcn-win32_1.4.2-1/dlfcn-win32-1.4.2.tar.gz
+wrapdb_version = 1.4.2-1
+
+[provide]
+dl = dlfcn_win32_dep

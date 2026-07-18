@@ -1,0 +1,6 @@
+# The only thing tracked here is the link to the sibling engine project; everything else
+# (meson's promoted redirect wraps, .wraplock, extracted sources, packagecache) is a
+# regenerable build artifact.
+*
+!.gitignore
+!string-engine

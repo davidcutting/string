@@ -1,0 +1,12 @@
+[wrap-file]
+directory = volk-1.4.350
+source_url = https://github.com/zeux/volk/archive/refs/tags/1.4.350.tar.gz
+source_filename = volk-1.4.350.tar.gz
+source_hash = e47c6efe5294bb03729a976b385864bba5daf46ec60f0bdea11e1d1446345f9a
+# volk is a single source file; the patch_directory supplies a minimal Meson build that
+# compiles volk.c against the vulkan-headers wrap (rather than volk's CMake, which would try
+# to find_package(Vulkan) from the system). volk loads the loader dynamically at runtime.
+patch_directory = volk
+
+[provide]
+volk = volk_dep

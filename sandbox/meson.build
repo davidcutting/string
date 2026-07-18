@@ -1,12 +1,28 @@
+project(
+    'string-demo',
+    'cpp',
+    version : '0.0.1',
+    license : 'MIT',
+    default_options : [
+        'cpp_std=c++26',
+        'buildtype=debugoptimized',
+        'warning_level=3',
+    ]
+)
+
 # ======
 # Sandbox application
 # ======
 #
-# The runnable demo: it depends on the engine library (string_dep, exported by
-# string-engine/) and supplies the content — the render plan, the concrete scene passes
-# (grid/geometry/ui, built entirely from the engine's public API), the demo UI layout, and
-# the assets (viking_room, under sandbox/assets). Kept out of the library so the engine can
-# be "done" on its own.
+# The runnable demo — deliberately its OWN meson project that consumes the engine as an
+# external dependency, so it doubles as the worked example of "how to include String" and as
+# the integration test that the engine's public API + exported dependency actually work.
+#
+# string-engine is pulled in as a subproject (see subprojects/string-engine, a link to the
+# sibling engine project); dependency('string-engine') resolves to the engine's exported
+# `project_deps` via its meson.override_dependency(). All of the engine's own wrap
+# dependencies resolve transitively from the engine's subprojects/ dir.
+string_dep = dependency('string-engine', fallback : ['string-engine', 'project_deps'])
 
 sandbox_inc = include_directories('.')
 
@@ -24,6 +40,5 @@ executable(
     ],
     include_directories : sandbox_inc,
     dependencies : string_dep,
-    cpp_args : build_args,
     install : true,
 )

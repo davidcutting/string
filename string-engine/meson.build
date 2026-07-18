@@ -1,76 +1,116 @@
-# The engine library. project(), build_args, and the demo/sandbox live at the repo root
-# (../meson.build); this file builds only the library, shaders, tests, and exports string_dep.
+project(
+    'string-engine',
+    'cpp',
+    version : '0.0.1',
+    license : 'MIT',
+    default_options : [
+        'cpp_std=c++26',
+        'buildtype=debugoptimized',
+        'warning_level=3',
+        'default_library=static'
+    ]
+)
 
-# ======
+project_description = 'Simple Tiny RenderING engine.'
+
+# ==================================================
+# Defines
+# ==================================================
+
+# public_args: defines that also belong on the installed pkg-config (extra_cflags), so
+# external consumers (e.g. sandbox/) compile the public headers against the same platform,
+# config, and WSI choices. PROJECT_NAME/VERSION stay build-only.
+public_args = []
+build_args = [
+    '-DPROJECT_NAME=' + meson.project_name(),
+    '-DPROJECT_VERSION=' + meson.project_version()
+]
+
+compiler = meson.get_compiler('cpp')
+system = host_machine.system()
+message('Compiler: ' + compiler.get_id())
+
+# Optimization is owned by buildtype; only the config define is ours to set.
+if get_option('buildtype') == 'release'
+    message('Building in Release mode')
+    public_args += '-DSTRING_RELEASE'
+else
+    message('Building in Debug mode')
+    public_args += '-DSTRING_DEBUG'
+endif
+
+if system == 'windows'
+    message('Building for Windows')
+    public_args += '-DSTRING_PLATFORM_WINDOWS'
+elif system == 'linux'
+    message('Building for Linux')
+    public_args += '-DSTRING_PLATFORM_LINUX'
+endif
+
+build_args += public_args
+
+# ==================================================
 # Dependencies
-# ======
+# ==================================================
 
-# Core deps. On NixOS these are provided (pinned) by the flake; wrapfiles under
-# subprojects/ act as the portable fallback for off-Nix targets.
 deps = [
     dependency('threads'),
     dependency('spdlog', static : true),
+    dependency('fastgltf'),   # built via CMake integration; pulls its own simdjson
     dependency('glm'),
     dependency('entt'),
-    dependency('vulkan'),
+    # Vulkan headers only — no loader link. volk loads the loader dynamically at runtime,
+    # so we never link libvulkan at build time (leaner, and hermetic across platforms).
+    dependency('VulkanHeaders'),
 ]
 
-# --- Vulkan Memory Allocator (header-only) -----------------------------------
-# resource_allocator.cpp / allocator.hpp #include <vk_mem_alloc.h>. Try a
-# pkg-config/wrap dep first, then fall back to the header on the system include
-# path (the Nix `vulkan-memory-allocator` package puts it there).
-vma_dep = dependency('VulkanMemoryAllocator', required : false)
+# --- VulkanMemoryAllocator (header-only; impl compiled in the engine) ---------
+# nixpkgs ships VMA header-only with no pkg-config/cmake meson can resolve by name, so on
+# nix (where wraps can't download) we fall back to the system header. Off-nix, where the
+# header isn't on the system path, we use the wrap. allow_fallback:false keeps the first
+# probe from erroring on --wrap-mode=nodownload before we get to the header check.
+vma_dep = dependency('VulkanMemoryAllocator', required : false, allow_fallback : false)
 if not vma_dep.found()
-    assert(compiler.has_header('vk_mem_alloc.h'),
-           'vk_mem_alloc.h not found — add VulkanMemoryAllocator (flake pkg or wrap)')
-    vma_dep = declare_dependency()
+    if compiler.has_header('vk_mem_alloc.h')
+        vma_dep = declare_dependency()                        # nix: system header
+    else
+        vma_dep = dependency('VulkanMemoryAllocator', static : true)  # off-nix: wrap
+    endif
 endif
 deps += vma_dep
 
-# --- volk (Vulkan meta-loader; header-only, impl compiled in driver.cpp) ------
-# No pkg-config is shipped; just ensure the header is reachable.
-volk_dep = dependency('volk', required : false)
-if not volk_dep.found()
-    assert(compiler.has_header('volk.h'),
-           'volk.h not found — add vulkan-volk (flake pkg or wrap)')
-    volk_dep = declare_dependency()
+# --- simdjson (fastgltf's dependency) ----------------------------------------
+# Only linked when a *system* simdjson is present. The fastgltf wrap bundles its own
+# simdjson (self-contained), so off-nix this is absent and skipped; a system/nixpkgs
+# fastgltf, however, does not bundle it and needs simdjson linked alongside.
+simdjson_dep = dependency('simdjson', required : false)
+if simdjson_dep.found()
+    deps += simdjson_dep
 endif
-deps += volk_dep
 
-# --- fastgltf (glTF 2.0 importer; SIMD-accelerated, used for Sponza et al.) ---
-# Nix provides it via buildInputs (resolved here by pkg-config/cmake); off-Nix falls back to
-# the git wrap under subprojects/, which builds it over simdjson (WrapDB wrap).
-deps += dependency('fastgltf', fallback : ['fastgltf', 'fastgltf_dep'])
-# fastgltf is a static lib that links simdjson, so the final consumer must link simdjson too
-# (static libs don't embed their deps, and neither build path propagates it reliably). List it
-# explicitly: Nix resolves it from buildInputs (cmake), off-Nix from the WrapDB wrap.
-deps += dependency('simdjson', fallback : ['simdjson', 'simdjson_dep'])
+# --- volk (Vulkan meta-loader) -----------------------------------------------
+# Provided by the volk wrap (header-only; the engine compiles the impl in driver.cpp).
+deps += dependency('volk')
 
 # --- Slang (shader compiler runtime; shader.hpp uses <slang.h>) --------------
-slang_dep = dependency('slang', required : false)
-if not slang_dep.found()
-    slang_lib = compiler.find_library('slang', required : true,
-        has_headers : ['slang.h', 'slang-com-ptr.h'])
-    slang_dep = declare_dependency(dependencies : slang_lib)
-endif
-deps += slang_dep
+# Prebuilt shared lib via the slang wrap; runs in-process for shader hot-reload.
+deps += dependency('slang')
 
 # --- WSI backend (selectable via -Dwsi=) -------------------------------------
 wsi = get_option('wsi')
 message('WSI backend: ' + wsi)
 
-if wsi == 'glfw'
-    deps += dependency('glfw3', static : true)
-    platform_src = [ 'src/platform/glfw_window.cpp' ]
-    build_args += '-DSTRING_WSI_GLFW'
-elif wsi == 'sdl'
+if wsi == 'sdl'
     deps += dependency('sdl3')
     platform_src = [ 'src/platform/sdl_window.cpp' ]
     build_args += '-DSTRING_WSI_SDL'
 elif wsi == 'wayland'
-    # EXPERIMENTAL: the from-scratch client also needs wayland-protocols
-    # scanning (wl_scanner) wired up before it will link. Left minimal on
-    # purpose; revisit when reviving the raw-Wayland path.
+    # EXPERIMENTAL, Linux-only: the from-scratch client still needs wayland-protocols
+    # scanning (wayland-scanner, shipped by the wayland wrap) wired up before it will
+    # link. Left minimal on purpose; revisit when reviving the raw-Wayland path.
+    if system != 'linux'
+        error('wsi=wayland is Linux-only')
+    endif
     deps += dependency('wayland-client')
     platform_src = [
         'src/platform/wayland/client.cpp',
@@ -78,19 +118,30 @@ elif wsi == 'wayland'
         'src/platform/wayland/presenter.cpp',
     ]
     build_args += '-DSTRING_WSI_WAYLAND'
+elif wsi == 'glfw'
+    # The glfw backend source (glfw_window.cpp) is kept in-tree but is not wired into the
+    # wrap-based build (no glfw wrap). Reintroduce a glfw wrap here to revive it.
+    error('wsi=glfw is not supported in the wrap-based build; use wsi=sdl')
+endif
+
+# --- Tracy profiler client (optional; -Dtracy=true) --------------------------
+# STRING_PROFILE gates the profiler.hpp macros and is public (it appears in a public
+# header), so it rides along on public_args. tracy_enable turns on the client in the wrap.
+if get_option('tracy')
+    message('Tracy profiler: enabled')
+    deps += dependency('tracy', default_options : ['tracy_enable=true'])
+    public_args += '-DSTRING_PROFILE'
+    build_args += '-DSTRING_PROFILE'
 endif
 
 # --------------------------------------------------
 
-# ======
+# ==================================================
 # Library
-# ======
+# ==================================================
 
 include_dir = include_directories('include')
 
-# rewrite-6 engine sources.
-# NOTE: the standalone render-graph prototype (its own main()) now lives under
-# examples/render_graph.cpp; graph types still live in headers for the future tier.
 core_src = [
     'src/application.cpp',
     'src/scene.cpp',
@@ -122,23 +173,21 @@ static_target = static_library(
 )
 
 install_subdir('include/string', install_dir : 'include')
-# NOTE: assets are intentionally NOT copied here. The Nix build symlinks them under
-# include/string/assets (see flake.nix postInstall) so large models aren't duplicated into
-# every build output. Non-Nix builds point STRING_RESOURCES_DIR at a tree that has them.
+# NOTE: assets are intentionally NOT copied here
 
 # --------------------------------------------------
 
-# ======
+# ==================================================
 # Shaders
-# ======
+# ==================================================
 
 subdir('shaders')
 
 # --------------------------------------------------
 
-# ======
+# ==================================================
 # Package / exported dependency
-# ======
+# ==================================================
 
 pkg_mod = import('pkgconfig')
 pkg_mod.generate(
@@ -146,32 +195,33 @@ pkg_mod.generate(
     filebase : meson.project_name(),
     description : project_description,
     libraries : static_target,
-    version : meson.project_version()
+    version : meson.project_version(),
+    extra_cflags : public_args,
 )
 
 project_deps = declare_dependency(
     include_directories : include_dir,
     link_with : [ static_target ],
-    dependencies : deps
+    dependencies : deps,
+    # Propagate the public defines (config/platform/WSI, and STRING_PROFILE when tracy is on)
+    # so external consumers compile their engine-header usage against the same choices.
+    compile_args : public_args,
 )
 
-set_variable(meson.project_name() + '_dep', project_deps)
+meson.override_dependency(meson.project_name(), project_deps)
 
 # --------------------------------------------------
 
-# ======
-# Tests
-# ======
+# ==================================================
+# Tests, Benchmarks, Examples
+# ==================================================
 
-if get_option('tests') and not meson.is_subproject()
-    subdir('test')
-
-    test('all_tests',
-        executable(
-            'run_tests',
-            test_files,
-            dependencies : [ project_deps, test_dep ],
-            install : false
-        )
-    )
+if get_option('tests')
+  subdir('test')
 endif
+#if get_option('benchmarks')
+#  subdir('bench')
+#endif
+#if get_option('examples')
+#  subdir('examples')
+#endif

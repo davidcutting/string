@@ -1,0 +1,15 @@
+# Window System Integration backend.
+#   sdl     - default; SDL3 backend (from the sdl3 wrap)
+#   wayland - from-scratch Wayland client (EXPERIMENTAL, Linux-only, needs protocol codegen)
+#   glfw    - source kept in-tree but not wired into the wrap-based build
+option('wsi', type: 'combo', choices: ['sdl', 'wayland', 'glfw'], value: 'sdl',
+       description: 'Windowing / input backend')
+
+# Build the unit/integration tests (requires the gtest wrap).
+option('tests', type: 'boolean', value: false,
+       description: 'Build the test suite')
+
+# Compile in the Tracy profiler client (links the tracy wrap, defines STRING_PROFILE).
+# The profiler viewer is a separate tool (nixpkgs `tracy` in the dev shell).
+option('tracy', type: 'boolean', value: false,
+       description: 'Enable the Tracy profiler client')

@@ -16,7 +16,7 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Building..."
-out="$(nix build --no-link --print-out-paths "$repo#")"
+out="$(nix build --no-link --print-out-paths "$repo#demo")"
 
 res="$(mktemp -d -t string-resources.XXXXXX)"
 trap 'rm -rf "$res"' EXIT

@@ -44,50 +44,43 @@
           pname = "string-engine-tests";
           doCheck = true;
           buildInputs = old.buildInputs ++ [ pkgs.gtest ];
-          mesonFlags = [ "-Dwsi=sdl" "-Dtests=true" "-Ddemo=false" ];
-          postInstall = "";   # no demo binary to wrap when -Ddemo=false
+          mesonFlags = [ "-Dwsi=sdl" "-Dtests=true" ];
         });
 
-        # packages.default builds the engine (static lib + `string_demo`)
-        # directly with Meson, using the pinned nixpkgs toolchain and deps.
-        # Build with `nix build`, run with `nix run` (or ./result/bin/string_demo).
+        # packages.default builds ONLY the engine library (String, as intended). Its meson
+        # project is self-contained under string-engine/ (own meson.build, meson_options.txt,
+        # and subprojects/). Off-nix the deps come from the meson wraps; here they come from
+        # nixpkgs (nix builds have no network, so `--wrap-mode=nodownload` is in effect and the
+        # wraps are never fetched). Build with `nix build`.
         packages.default = pkgs.clangStdenv.mkDerivation {
           pname = "string-engine";
           version = "0.0.1";
-          # Whole repo: the meson project root is now the top-level meson.build, which builds
-          # the string-engine/ library and the sandbox/ demo application.
-          src = ./.;
+          src = ./string-engine;
 
           nativeBuildInputs = with pkgs; [
             meson
             ninja
             pkg-config
-            cmake         # lets Meson's cmake dependency method find fastgltf (no .pc, cmake-only)
-            makeWrapper   # wrap string_demo to point at its installed resources
+            cmake         # lets Meson's cmake dependency method read fastgltf's config (no .pc)
             glslang       # glslangValidator, for GLSL -> SPIR-V
-            shader-slang  # slangc, for Slang -> SPIR-V
           ];
 
           buildInputs = with pkgs; [
             spdlog
             glm
             entt
-            glfw                       # WSI backend (-Dwsi=glfw)
-            sdl3                       # WSI backend (-Dwsi=sdl); current default
-            vulkan-headers
-            vulkan-loader
+            sdl3                       # WSI backend (-Dwsi=sdl)
+            vulkan-headers             # headers only; volk loads the loader at runtime (no link)
             vulkan-memory-allocator    # vk_mem_alloc.h
-            vulkan-volk                # volk.h (Vulkan meta-loader)
+            vulkan-volk                # volk.h (impl compiled in src/gpu/driver.cpp)
             shader-slang               # libslang runtime (shader.hpp)
-            fastgltf                   # glTF 2.0 importer (Sponza et al.)
-            simdjson                   # fastgltf's (public) dependency; needed on the prefix path
+            fastgltf                   # glTF 2.0 importer (custom derivation below; not in nixpkgs)
+            simdjson                   # system fastgltf does not bundle simdjson; link it alongside
           ];
 
-          # Default WSI is glfw; flip to sdl/wayland here if desired.
           mesonFlags = [
-            "-Dwsi=sdl"     # sdl_window is current; glfw port is a follow-up
+            "-Dwsi=sdl"
             "-Dtests=false"
-            "-Ddemo=true"
           ];
 
           # Build with debug info (nixpkgs' meson hook defaults to --buildtype=plain, which
@@ -100,21 +93,53 @@
           # _FORTIFY_SOURCE (a default hardening flag) requires -O; the debug build is -O0,
           # so drop just that flag to avoid a warning on every TU.
           hardeningDisable = [ "fortify" ];
+        };
 
-          # Point the demo at the shaders installed under $out/include/string/shaders, and
-          # make the Khronos validation layer discoverable (debug builds require it). This
-          # lets `nix run` / ./result/bin/string_demo work without the devShell env.
+        # packages.demo builds the sandbox app as an EXTERNAL consumer of the engine: sandbox/
+        # is its own meson project that pulls string-engine in as a subproject (via the
+        # sandbox/subprojects/string-engine link to the sibling engine). This is both the
+        # worked example of "how to include String" and the integration test that the exported
+        # dependency links. Build/run with `nix run .#demo`.
+        packages.demo = pkgs.clangStdenv.mkDerivation {
+          pname = "string-demo";
+          version = "0.0.1";
+          # Whole repo so both sandbox/ and its string-engine subproject link are present.
+          # The flake self-src unpacks under a hash-named dir, so glob for the sandbox subdir
+          # rather than hardcoding it.
+          src = ./.;
+          setSourceRoot = "sourceRoot=$(echo */sandbox)";
+
+          nativeBuildInputs = with pkgs; [
+            meson ninja pkg-config cmake makeWrapper glslang
+          ];
+
+          buildInputs = with pkgs; [
+            spdlog glm entt sdl3
+            vulkan-headers vulkan-memory-allocator vulkan-volk
+            shader-slang fastgltf simdjson
+          ];
+
+          # WSI is an option of the engine subproject, so it is namespaced.
+          mesonFlags = [ "-Dstring-engine:wsi=sdl" ];
+
+          mesonBuildType = "debug";
+          dontUseCmakeConfigure = true;
+          dontStrip = true;
+          hardeningDisable = [ "fortify" ];
+
+          # Point the demo at the shaders installed under $out/include/string/shaders, and make
+          # the loader + Khronos validation layer discoverable (debug builds require it), so
+          # `nix run .#demo` / ./result/bin/string_demo work without the devShell env.
           postInstall = ''
-            # Symlink assets under STRING_RESOURCES_DIR rather than copying them into the
-            # output. They live once in the store (content-addressed) and are shared across
-            # builds, so large models don't get duplicated into every build result. Assets are
-            # app content, so they live under sandbox/.
+            # Symlink assets under STRING_RESOURCES_DIR rather than copying them in: they live
+            # once in the store (content-addressed) and are shared across builds, so large
+            # models don't get duplicated into every result.
             ln -s ${./sandbox/assets} $out/include/string/assets
 
             wrapProgram $out/bin/string_demo \
               --set-default STRING_RESOURCES_DIR $out/include/string \
               --prefix VK_LAYER_PATH : ${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d \
-              --prefix LD_LIBRARY_PATH : ${pkgs.vulkan-validation-layers}/lib
+              --prefix LD_LIBRARY_PATH : ${pkgs.vulkan-loader}/lib:${pkgs.vulkan-validation-layers}/lib
           '';
 
           meta.mainProgram = "string_demo";
@@ -125,40 +150,23 @@
         devShells = {
           default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
             packages = with pkgs; [
-              clang-tools
-              cmake
-              pkg-config
-              llvm
-              lcov
-              gdb
-              dbus
-              gtest
-              gcc
-              gcovr
-              meson
-              ninja
-              wget
-              entt
-              yaml-cpp
-              argparse
-              spdlog
-              glm
-              glfw
-              sdl3
-              glslang
-              shader-slang
-              vulkan-headers
-              vulkan-loader
-              vulkan-validation-layers
-              vulkan-tools
-              vulkan-tools-lunarg
-              vulkan-volk
-              vulkan-memory-allocator
-              fastgltf
-              simdjson
-              liburing
+              # Toolchain
+              meson ninja pkg-config cmake
+              clang-tools gdb
+              # Shader compilers
+              glslang shader-slang
+              # Engine dependencies (mirror the wraps; here from nixpkgs)
+              spdlog glm entt sdl3
+              vulkan-headers vulkan-memory-allocator vulkan-volk
+              fastgltf simdjson
+              gtest                       # for -Dtests=true in-shell
+              # Profiler: the tracy client links into the engine (-Dtracy=true); this is also
+              # the standalone Tracy viewer so you don't have to build it manually.
+              tracy
+              # EXPERIMENTAL Linux WSI (wsi=wayland), not yet wired in code
               wayland
-              perf
+              # Runtime: loader + validation layers + tools for running the demo
+              vulkan-loader vulkan-validation-layers vulkan-tools
             ];
             shellHook = ''
             export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib:${pkgs.wayland}/lib:$LD_LIBRARY_PATH"
