@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -35,30 +36,53 @@ struct GltfMaterial
 };
 
 // One draw call: a contiguous range of the model's shared index buffer, the material to bind,
-// and the world-space transform of the node that instances this mesh primitive.
+// the world-space transform of the node that instances this mesh primitive, and the draw's
+// world-space AABB (for GPU frustum culling).
 struct GltfDraw
 {
     uint32_t index_offset = 0;
     uint32_t index_count = 0;
     int32_t material = -1;
     glm::mat4 transform{ 1.0f };
+    glm::vec3 aabb_min{ 0.0f };
+    glm::vec3 aabb_max{ 0.0f };
 };
 
-// A glTF scene flattened into GPU-ready form: a single shared vertex + index buffer (geometry
-// deduplicated across instances), one draw per node-instanced mesh primitive, and the decoded
-// materials + textures they reference. Coordinates stay in glTF space (Y-up, right-handed).
-struct GltfModel
+// Geometry flattened from a parsed glTF: a single shared vertex + index buffer (deduplicated
+// across instances) and one draw per node-instanced mesh primitive. Coordinates stay in glTF
+// space (Y-up, right-handed).
+struct GltfGeometry
 {
     std::vector<String::Vertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<GltfDraw> draws;
-    std::vector<GltfMaterial> materials;
-    std::vector<GltfTexture> textures;
 };
 
-// Parses a .gltf/.glb file into a GltfModel. Throws std::runtime_error on parse failure.
-// External buffers (.bin) are loaded; texture *sources* are resolved but not decoded (the pass
-// streams them one at a time — see GltfTexture).
-GltfModel load_gltf(const std::filesystem::path& path);
+// A parsed glTF: resolved (still-encoded) texture sources + materials, plus an opaque handle to
+// the fastgltf asset that flatten_geometry() reads. Parsing is split from flattening so the
+// caller can kick off texture decode (from `textures`, on worker threads) while it flattens the
+// geometry on the main thread — the two overlap. Move-only; keeps the parsed asset alive until
+// flatten_geometry() has run.
+struct GltfParsed
+{
+    std::vector<GltfTexture> textures;
+    std::vector<GltfMaterial> materials;
+
+    struct Impl;                 // holds the fastgltf::Asset (kept out of this header)
+    std::unique_ptr<Impl> impl;
+
+    GltfParsed();
+    ~GltfParsed();
+    GltfParsed(GltfParsed&&) noexcept;
+    GltfParsed& operator=(GltfParsed&&) noexcept;
+};
+
+// Parses a .gltf/.glb file: loads external buffers, resolves (but does not decode) texture
+// sources, and reads materials. Throws std::runtime_error on failure.
+GltfParsed parse_gltf(const std::filesystem::path& path);
+
+// Flattens the parsed asset's meshes/instances into shared vertex/index buffers + a draw list.
+// Takes a non-const ref because fastgltf's scene-node traversal requires a mutable asset.
+GltfGeometry flatten_geometry(GltfParsed& parsed);
 
 }  // namespace sandbox

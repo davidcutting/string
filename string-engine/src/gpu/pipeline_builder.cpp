@@ -254,7 +254,11 @@ pipeline_builder& pipeline_builder::enable_depth_stencil(bool depth_test, bool d
         .flags = 0,
         .depthTestEnable = depth_test ? VK_TRUE : VK_FALSE,
         .depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE,
-        .depthCompareOp = VK_COMPARE_OP_LESS,
+        // Reverse-Z: the projection maps near->1, far->0, and the depth buffer is cleared to 0,
+        // so nearer fragments have GREATER depth. Paired with a D32_SFLOAT buffer this spreads
+        // float precision far more evenly than standard Z, killing distant z-fighting (which
+        // GPU-driven non-deterministic draw order would otherwise expose as flicker).
+        .depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL,
         .depthBoundsTestEnable = VK_FALSE,
         .stencilTestEnable = VK_FALSE,
         .front = {},

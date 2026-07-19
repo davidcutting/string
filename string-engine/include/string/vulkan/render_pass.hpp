@@ -27,6 +27,10 @@ struct Pass
     // Per-frame CPU update. Defaults to a no-op so passes that don't need one (grid, most
     // static passes) can skip it; record() is the only method a pass must implement.
     virtual void update(float /*delta_time*/, uint16_t /*current_frame*/) {}
+    // Optional compute prepass, recorded *outside* dynamic rendering before the graphics groups
+    // (e.g. GPU culling that writes an indirect buffer the pass's record() then draws). Returns
+    // true if it recorded any compute work, so the renderer knows to barrier compute->draw.
+    virtual bool record_compute(string::gpu::command_recorder& /*recorder*/, uint16_t /*current_frame*/) { return false; }
     virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) = 0;
     void resize(VkExtent2D extent) { screen_size = extent; }
 };

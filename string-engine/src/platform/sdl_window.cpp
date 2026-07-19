@@ -17,22 +17,114 @@ namespace String
 namespace
 {
 
-// Map the SDL scancodes we care about to our backend-neutral KeyCode (others are ignored).
+// Map an SDL scancode to our backend-neutral KeyCode. Full coverage so the action-mapping layer
+// (InputMap) can bind any key; unmapped/exotic scancodes fall through to UNKNOWN.
 KeyCode translate_scancode(SDL_Scancode scancode)
 {
     switch (scancode)
     {
-        case SDL_SCANCODE_W:      return KeyCode::W;
-        case SDL_SCANCODE_A:      return KeyCode::A;
-        case SDL_SCANCODE_S:      return KeyCode::S;
-        case SDL_SCANCODE_D:      return KeyCode::D;
-        case SDL_SCANCODE_Q:      return KeyCode::Q;
-        case SDL_SCANCODE_E:      return KeyCode::E;
-        case SDL_SCANCODE_SPACE:  return KeyCode::SPACE;
+        // Letters
+        case SDL_SCANCODE_A: return KeyCode::A;
+        case SDL_SCANCODE_B: return KeyCode::B;
+        case SDL_SCANCODE_C: return KeyCode::C;
+        case SDL_SCANCODE_D: return KeyCode::D;
+        case SDL_SCANCODE_E: return KeyCode::E;
+        case SDL_SCANCODE_F: return KeyCode::F;
+        case SDL_SCANCODE_G: return KeyCode::G;
+        case SDL_SCANCODE_H: return KeyCode::H;
+        case SDL_SCANCODE_I: return KeyCode::I;
+        case SDL_SCANCODE_J: return KeyCode::J;
+        case SDL_SCANCODE_K: return KeyCode::K;
+        case SDL_SCANCODE_L: return KeyCode::L;
+        case SDL_SCANCODE_M: return KeyCode::M;
+        case SDL_SCANCODE_N: return KeyCode::N;
+        case SDL_SCANCODE_O: return KeyCode::O;
+        case SDL_SCANCODE_P: return KeyCode::P;
+        case SDL_SCANCODE_Q: return KeyCode::Q;
+        case SDL_SCANCODE_R: return KeyCode::R;
+        case SDL_SCANCODE_S: return KeyCode::S;
+        case SDL_SCANCODE_T: return KeyCode::T;
+        case SDL_SCANCODE_U: return KeyCode::U;
+        case SDL_SCANCODE_V: return KeyCode::V;
+        case SDL_SCANCODE_W: return KeyCode::W;
+        case SDL_SCANCODE_X: return KeyCode::X;
+        case SDL_SCANCODE_Y: return KeyCode::Y;
+        case SDL_SCANCODE_Z: return KeyCode::Z;
+
+        // Number row
+        case SDL_SCANCODE_0: return KeyCode::KEY_0;
+        case SDL_SCANCODE_1: return KeyCode::KEY_1;
+        case SDL_SCANCODE_2: return KeyCode::KEY_2;
+        case SDL_SCANCODE_3: return KeyCode::KEY_3;
+        case SDL_SCANCODE_4: return KeyCode::KEY_4;
+        case SDL_SCANCODE_5: return KeyCode::KEY_5;
+        case SDL_SCANCODE_6: return KeyCode::KEY_6;
+        case SDL_SCANCODE_7: return KeyCode::KEY_7;
+        case SDL_SCANCODE_8: return KeyCode::KEY_8;
+        case SDL_SCANCODE_9: return KeyCode::KEY_9;
+
+        // Punctuation
+        case SDL_SCANCODE_SPACE:        return KeyCode::SPACE;
+        case SDL_SCANCODE_APOSTROPHE:   return KeyCode::APOSTROPHE;
+        case SDL_SCANCODE_COMMA:        return KeyCode::COMMA;
+        case SDL_SCANCODE_MINUS:        return KeyCode::MINUS;
+        case SDL_SCANCODE_PERIOD:       return KeyCode::PERIOD;
+        case SDL_SCANCODE_SLASH:        return KeyCode::SLASH;
+        case SDL_SCANCODE_SEMICOLON:    return KeyCode::SEMICOLON;
+        case SDL_SCANCODE_EQUALS:       return KeyCode::EQUAL;
+        case SDL_SCANCODE_LEFTBRACKET:  return KeyCode::LEFT_BRACKET;
+        case SDL_SCANCODE_BACKSLASH:    return KeyCode::BACKSLASH;
+        case SDL_SCANCODE_RIGHTBRACKET: return KeyCode::RIGHT_BRACKET;
+        case SDL_SCANCODE_GRAVE:        return KeyCode::GRAVE_ACCENT;
+
+        // Editing / navigation
+        case SDL_SCANCODE_ESCAPE:    return KeyCode::ESCAPE;
+        case SDL_SCANCODE_RETURN:    return KeyCode::ENTER;
+        case SDL_SCANCODE_TAB:       return KeyCode::TAB;
+        case SDL_SCANCODE_BACKSPACE: return KeyCode::BACKSPACE;
+        case SDL_SCANCODE_INSERT:    return KeyCode::INSERT;
+        case SDL_SCANCODE_DELETE:    return KeyCode::DELETE;
+        case SDL_SCANCODE_RIGHT:     return KeyCode::RIGHT;
+        case SDL_SCANCODE_LEFT:      return KeyCode::LEFT;
+        case SDL_SCANCODE_DOWN:      return KeyCode::DOWN;
+        case SDL_SCANCODE_UP:        return KeyCode::UP;
+        case SDL_SCANCODE_PAGEUP:    return KeyCode::PAGE_UP;
+        case SDL_SCANCODE_PAGEDOWN:  return KeyCode::PAGE_DOWN;
+        case SDL_SCANCODE_HOME:      return KeyCode::HOME;
+        case SDL_SCANCODE_END:       return KeyCode::END;
+
+        // Locks / system
+        case SDL_SCANCODE_CAPSLOCK:    return KeyCode::CAPS_LOCK;
+        case SDL_SCANCODE_SCROLLLOCK:  return KeyCode::SCROLL_LOCK;
+        case SDL_SCANCODE_NUMLOCKCLEAR:return KeyCode::NUM_LOCK;
+        case SDL_SCANCODE_PRINTSCREEN: return KeyCode::PRINT_SCREEN;
+        case SDL_SCANCODE_PAUSE:       return KeyCode::PAUSE;
+
+        // Function keys
+        case SDL_SCANCODE_F1:  return KeyCode::F1;
+        case SDL_SCANCODE_F2:  return KeyCode::F2;
+        case SDL_SCANCODE_F3:  return KeyCode::F3;
+        case SDL_SCANCODE_F4:  return KeyCode::F4;
+        case SDL_SCANCODE_F5:  return KeyCode::F5;
+        case SDL_SCANCODE_F6:  return KeyCode::F6;
+        case SDL_SCANCODE_F7:  return KeyCode::F7;
+        case SDL_SCANCODE_F8:  return KeyCode::F8;
+        case SDL_SCANCODE_F9:  return KeyCode::F9;
+        case SDL_SCANCODE_F10: return KeyCode::F10;
+        case SDL_SCANCODE_F11: return KeyCode::F11;
+        case SDL_SCANCODE_F12: return KeyCode::F12;
+
+        // Modifiers
         case SDL_SCANCODE_LSHIFT: return KeyCode::LEFT_SHIFT;
         case SDL_SCANCODE_LCTRL:  return KeyCode::LEFT_CONTROL;
-        case SDL_SCANCODE_ESCAPE: return KeyCode::ESCAPE;
-        default:                  return KeyCode::UNKNOWN;
+        case SDL_SCANCODE_LALT:   return KeyCode::LEFT_ALT;
+        case SDL_SCANCODE_LGUI:   return KeyCode::LEFT_SUPER;
+        case SDL_SCANCODE_RSHIFT: return KeyCode::RIGHT_SHIFT;
+        case SDL_SCANCODE_RCTRL:  return KeyCode::RIGHT_CONTROL;
+        case SDL_SCANCODE_RALT:   return KeyCode::RIGHT_ALT;
+        case SDL_SCANCODE_RGUI:   return KeyCode::RIGHT_SUPER;
+
+        default: return KeyCode::UNKNOWN;
     }
 }
 

@@ -71,13 +71,14 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     // uses a FRAGMENT_SHADER dst stage (only valid on a graphics-capable queue), and keeping
     // upload + sampling on one queue family avoids a queue-ownership transfer. (A dedicated
     // async-transfer queue would need explicit ownership transfers instead.)
-    transfer_command_recorder_.init(device_.get_device(), graphics_queue_);
-
+    //
     // Build the application's declared passes now that the GPU context is ready. The plan
     // authors the content (which passes, in what order); the renderer just supplies the
     // context and executes. Passes that upload (e.g. geometry) record into the transfer batch
-    // and bind into the bindless table during construction.
-    TransferBatch transfer_batch{ transfer_command_recorder_, allocator_ };
+    // and bind into the bindless table during construction. The batch streams uploads
+    // asynchronously (a ring of command buffers on a timeline), so building passes doesn't
+    // stall per upload; wait_idle() below drains it once before the first frame.
+    TransferBatch transfer_batch{ device_, allocator_, graphics_queue_ };
 
     PassContext pass_context{
         device_,
@@ -85,6 +86,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         global_descriptor_table_,
         transfer_batch,
         window_->get_input(),
+        input_map_,
         string::gpu::COLOR_TARGET,
         string::gpu::DEPTH_TARGET,
         resources_path,
@@ -110,8 +112,9 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
             if (is_write(usage.access))
                 written_resources_.insert(usage.resource);
 
-    // Submit every pass's recorded uploads in one batch and wait before the first frame.
-    transfer_batch.flush();
+    // Drain the async upload ring: submit any pending batch and wait for every in-flight batch
+    // to finish (freeing all staging) before the first frame draws the uploaded resources.
+    transfer_batch.wait_idle();
 
     for (auto& pass : scene_passes_)
     {
@@ -161,8 +164,6 @@ Renderer::~Renderer()
         frame.garbage_collector.flush();
         frame.recorder.destroy();
     }
-
-    transfer_command_recorder_.destroy();
 
     allocator_.destroy_resource(depth_attachment_);
     allocator_.destroy_resource(color_attachment_);
@@ -225,6 +226,36 @@ void Renderer::record_frame()
         .minDepth = 0.0f, .maxDepth = 1.0f,
     };
     const VkRect2D scissor = { .offset = { 0, 0 }, .extent = extent };
+
+    // Compute prepass: passes may dispatch GPU work (e.g. frustum culling that fills an indirect
+    // buffer) outside dynamic rendering, before any graphics group. If any did, one barrier makes
+    // those storage writes visible to the indirect draws / vertex-stage reads that follow.
+    bool recorded_compute = false;
+    for (Pass* pass : frame_passes_)
+        recorded_compute |= pass->record_compute(frame.recorder, static_cast<uint16_t>(current_frame_));
+    if (recorded_compute)
+    {
+        const VkMemoryBarrier2 compute_to_draw = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .pNext = nullptr,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        };
+        const VkDependencyInfo dependency = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &compute_to_draw,
+            .bufferMemoryBarrierCount = 0,
+            .pBufferMemoryBarriers = nullptr,
+            .imageMemoryBarrierCount = 0,
+            .pImageMemoryBarriers = nullptr,
+        };
+        vkCmdPipelineBarrier2(command_buffer, &dependency);
+    }
 
     // The color / depth target a pass renders into (every frame pass writes exactly one color
     // target; string::gpu::SWAPCHAIN_TARGET means the screen).
@@ -297,7 +328,8 @@ void Renderer::record_frame()
             .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            .clearValue = { .depthStencil = { 1.0f, 0 } },
+            // Reverse-Z: far plane is 0 (see the depth pipeline's GREATER_OR_EQUAL compare).
+            .clearValue = { .depthStencil = { 0.0f, 0 } },
         };
         const VkRenderingInfo rendering_info = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,

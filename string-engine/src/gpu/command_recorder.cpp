@@ -122,4 +122,43 @@ auto command_recorder::immediate_submit() -> command_recorder&
     return *this;
 }
 
+auto command_recorder::submit_async(VkSemaphore timeline, uint64_t signal_value) -> command_recorder&
+{
+    const VkCommandBufferSubmitInfo command_buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .pNext = nullptr,
+        .commandBuffer = primary_command_buffer_,
+        .deviceMask = 0,
+    };
+
+    const VkSemaphoreSubmitInfo signal_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .semaphore = timeline,
+        .value = signal_value,
+        // The batch's trailing memory barrier already scopes the transfer writes; signalling
+        // after all commands complete is enough for the timeline to gate staging reclamation.
+        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .deviceIndex = 0,
+    };
+
+    const VkSubmitInfo2 submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .pNext = nullptr,
+        .flags = 0,
+        .waitSemaphoreInfoCount = 0,
+        .pWaitSemaphoreInfos = nullptr,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &command_buffer_info,
+        .signalSemaphoreInfoCount = 1,
+        .pSignalSemaphoreInfos = &signal_info,
+    };
+
+    if (vkQueueSubmit2(queue_.queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to submit async transfer batch!");
+    }
+    return *this;
+}
+
 }

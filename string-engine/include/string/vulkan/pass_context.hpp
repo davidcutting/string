@@ -8,6 +8,7 @@
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/platform/input.hpp>
+#include <string/platform/input_map.hpp>
 
 namespace String
 {
@@ -28,6 +29,9 @@ struct PassContext
     // Polled per-frame input (keyboard/mouse), for passes that respond to it (e.g. a camera).
     // Stable for the app's lifetime; a pass may store the reference and read it in update().
     const Input& input;
+    // Remappable action layer over `input`. Passes bind their actions here (or via a helper like
+    // Camera::bind_default_controls) and query them by name, instead of reading raw key codes.
+    InputMap& input_map;
     // The offscreen render targets a scene pass draws into, so it can declare its ColorWrite /
     // DepthWrite usages (the render graph orders + barriers passes from these).
     string::gpu::resource_id color_target;

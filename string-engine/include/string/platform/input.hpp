@@ -143,10 +143,33 @@ constexpr bool has_modifier(KeyModifier modifiers, KeyModifier flag)
 class Input
 {
 public:
+    // Held: key/button is currently down. Pressed/released: the down-state changed *this frame*
+    // (edge), computed against the previous frame's snapshot taken in new_frame(). Edge queries
+    // are what one-shot actions (jump, toggle) want; held is for continuous ones (movement).
     bool key_down(KeyCode key) const { return keys_[static_cast<std::size_t>(key)]; }
+    bool key_pressed(KeyCode key) const
+    {
+        const std::size_t i = static_cast<std::size_t>(key);
+        return keys_[i] && !prev_keys_[i];
+    }
+    bool key_released(KeyCode key) const
+    {
+        const std::size_t i = static_cast<std::size_t>(key);
+        return !keys_[i] && prev_keys_[i];
+    }
     bool mouse_button_down(MouseButton button) const
     {
         return buttons_[static_cast<std::size_t>(button)];
+    }
+    bool mouse_button_pressed(MouseButton button) const
+    {
+        const std::size_t i = static_cast<std::size_t>(button);
+        return buttons_[i] && !prev_buttons_[i];
+    }
+    bool mouse_button_released(MouseButton button) const
+    {
+        const std::size_t i = static_cast<std::size_t>(button);
+        return !buttons_[i] && prev_buttons_[i];
     }
     glm::vec2 mouse_delta() const { return mouse_delta_; }
     bool mouse_captured() const { return mouse_captured_; }
@@ -159,13 +182,23 @@ public:
     }
     void add_mouse_delta(glm::vec2 delta) { mouse_delta_ += delta; }
     void set_mouse_captured(bool captured) { mouse_captured_ = captured; }
-    void new_frame() { mouse_delta_ = glm::vec2(0.0f); }
+    // Called at the top of each window update, *before* polling events: snapshots the current
+    // key/button state as "previous" (so pressed/released can detect this frame's edges) and
+    // resets the per-frame mouse delta.
+    void new_frame()
+    {
+        prev_keys_ = keys_;
+        prev_buttons_ = buttons_;
+        mouse_delta_ = glm::vec2(0.0f);
+    }
 
 private:
     // KeyCode values are sparse GLFW codes topping out at 347; a flat array covers them.
     static constexpr std::size_t MAX_KEYS = 512;
     std::array<bool, MAX_KEYS> keys_{};
+    std::array<bool, MAX_KEYS> prev_keys_{};
     std::array<bool, 8> buttons_{};
+    std::array<bool, 8> prev_buttons_{};
     glm::vec2 mouse_delta_{ 0.0f };
     bool mouse_captured_ = false;
 };

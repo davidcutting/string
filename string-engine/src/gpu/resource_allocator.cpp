@@ -97,7 +97,21 @@ auto resource_allocator::create_resource(const buffer_info& info) -> resource_id
         throw std::runtime_error("Failed to create a buffer with VMA");
     }
 
+    // Fetch the GPU virtual address for buffers that opted into device addressing, so shaders
+    // can access them by pointer (buffer_reference). Only valid when the usage bit is set; the
+    // allocator was created with VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT.
+    if (info.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+    {
+        const VkBufferDeviceAddressInfo address_info = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .pNext = nullptr,
+            .buffer = new_buffer.buffer,
+        };
+        new_buffer.device_address = vkGetBufferDeviceAddress(device_, &address_info);
+    }
+
     const auto& id = registry_.get_id();
+    new_buffer.id = id;
     buffers_[id] = std::move(new_buffer);
     return id;
 }
@@ -158,6 +172,7 @@ auto resource_allocator::create_resource(const image_info& info) -> resource_id
     create_image_view(new_image, info.aspect_flags);
 
     const auto& id = registry_.get_id();
+    new_image.id = id;
     images_[id] = std::move(new_image);
     return id;
 }

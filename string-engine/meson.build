@@ -145,6 +145,9 @@ include_dir = include_directories('include')
 core_src = [
     'src/application.cpp',
     'src/scene.cpp',
+    'src/core/job_system.cpp',
+    'src/platform/input_map.cpp',
+    'src/scene/camera.cpp',
     'src/vulkan/renderer.cpp',
     'src/gpu/driver.cpp',
     'src/gpu/device.cpp',

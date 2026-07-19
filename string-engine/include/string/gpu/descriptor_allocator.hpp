@@ -69,11 +69,13 @@ class descriptor_table
     descriptor_allocator tlas_descriptor_allocator_;
     descriptor_allocator blas_descriptor_allocator_;
 
+public:
+    // Advertised bindless capacities. Public so device suitability can verify the physical
+    // device's update-after-bind limits are at least this large before selecting it.
     static constexpr uint32_t MAX_BINDLESS_IMAGES   = 65536;
     static constexpr uint32_t MAX_BINDLESS_BUFFERS  = 16384;
     static constexpr uint32_t MAX_BINDLESS_ACCEL_STRUCT = 1024;
 
-public:
     explicit descriptor_table(VkDevice device, resource_allocator& allocator);
     ~descriptor_table();
 

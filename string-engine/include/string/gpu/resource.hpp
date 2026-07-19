@@ -88,6 +88,10 @@ struct allocated_buffer
     VkDeviceSize size;
     VmaAllocation allocation;
     VmaAllocationInfo allocation_info;
+    // GPU virtual address for shader access, non-zero only when the buffer was created with
+    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT. Lets shaders read the buffer by pointer
+    // (buffer_reference) instead of a bound descriptor — the basis for GPU-driven draws.
+    VkDeviceAddress device_address = 0;
 };
 
 class id_registry

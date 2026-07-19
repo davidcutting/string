@@ -39,6 +39,11 @@ public:
     auto get_queue() -> queue&;
 
     auto immediate_submit() -> command_recorder&;
+    // Submits the recorded buffer without waiting, signalling `signal_value` on the given
+    // timeline semaphore when the GPU completes. The caller polls/waits the timeline to know
+    // when the work is done (and when any staging it used can be freed). Used by the async
+    // upload path so loads don't stall the CPU on vkQueueWaitIdle per batch.
+    auto submit_async(VkSemaphore timeline, uint64_t signal_value) -> command_recorder&;
 };
 
 } // namespace string::gpu

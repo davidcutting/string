@@ -16,6 +16,7 @@
 #include <string/vulkan/render_plan.hpp>
 #include <string/vulkan/pass_context.hpp>
 #include <string/vulkan/passes/composite_pass.hpp>
+#include <string/platform/input_map.hpp>
 
 #include <volk.h>
 
@@ -39,6 +40,9 @@ class Renderer
     static constexpr uint32_t frames_in_flight_ = 3;
     ApplicationInfo application_info_;
     std::shared_ptr<Window> window_;
+    // Remappable action layer over the window's polled Input, handed to passes via PassContext.
+    // Declared right after window_ so its default initializer sees an initialized window_.
+    InputMap input_map_{ window_->get_input() };
     string::gpu::driver driver_;
     string::gpu::device device_;
     string::gpu::queue graphics_queue_;
@@ -49,7 +53,6 @@ class Renderer
     // Derives the frame's image-layout barriers from tracked state (see begin/end_rendering).
     ResourceStateTracker resource_states_;
     CompositePass composite_pass_;
-    string::gpu::command_recorder transfer_command_recorder_;
     // Ordered passes that draw into the offscreen HDR target (color_attachment_), recorded
     // between begin_rendering() and end_rendering(). composite_pass_ is the fixed resolve
     // (offscreen -> swapchain) and is intentionally NOT in this list. Built in the ctor body

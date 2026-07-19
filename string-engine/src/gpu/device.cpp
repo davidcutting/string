@@ -2,6 +2,7 @@
 #include <set>
 #include <stdexcept>
 #include <string/gpu/device.hpp>
+#include <string/gpu/descriptor_allocator.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 #include <string/gpu/command_recorder.hpp>
 #include <string/core/logger.hpp>
@@ -84,18 +85,46 @@ bool device::is_device_suitable(const VkPhysicalDevice& device) {
     supported_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     supported_features.pNext = &vulkan13_features;
 
-    // Query what features are supported
+    // Query what features are supported (the structs above are filled in by the driver).
     vkGetPhysicalDeviceFeatures2(device, &supported_features);
 
-    // TODO(DCut): Fix this so that we properly query for bindless support
+    // Bindless requires runtime-sized descriptor arrays, non-uniform indexing into them,
+    // partially-bound sets, and update-after-bind for the descriptor types the global table
+    // exposes (storage buffers + sampled images). These are what the descriptor_table relies
+    // on; a device missing any of them cannot drive the renderer.
+    const bool has_bindless_features = vulkan12_features.runtimeDescriptorArray == VK_TRUE
+        && vulkan12_features.descriptorBindingPartiallyBound == VK_TRUE
+        && vulkan12_features.shaderSampledImageArrayNonUniformIndexing == VK_TRUE
+        && vulkan12_features.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE
+        && vulkan12_features.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE
+        && vulkan12_features.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE
+        && vulkan12_features.descriptorBindingStorageImageUpdateAfterBind == VK_TRUE
+        && vulkan12_features.descriptorBindingVariableDescriptorCount == VK_TRUE;
+
+    // And the arrays must be large enough for the table's advertised capacities.
+    VkPhysicalDeviceDescriptorIndexingProperties indexing_props{};
+    indexing_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+    VkPhysicalDeviceProperties2 device_props{};
+    device_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    device_props.pNext = &indexing_props;
+    vkGetPhysicalDeviceProperties2(device, &device_props);
+
+    const bool has_bindless_capacity =
+        indexing_props.maxDescriptorSetUpdateAfterBindSampledImages >= descriptor_table::MAX_BINDLESS_IMAGES
+        && indexing_props.maxDescriptorSetUpdateAfterBindStorageBuffers >= descriptor_table::MAX_BINDLESS_BUFFERS;
+
     // Check if desired features are supported
     bool has_desired_features = supported_features.features.samplerAnisotropy
+        && supported_features.features.multiDrawIndirect
+        && supported_features.features.drawIndirectFirstInstance
         && vulkan13_features.dynamicRendering == VK_TRUE
         && vulkan13_features.synchronization2 == VK_TRUE
         && vulkan13_features.shaderDemoteToHelperInvocation == VK_TRUE
         && vulkan12_features.timelineSemaphore == VK_TRUE
         && vulkan12_features.bufferDeviceAddress == VK_TRUE
-        && extended_dynamic_state2_features.extendedDynamicState2 == VK_TRUE;
+        && extended_dynamic_state2_features.extendedDynamicState2 == VK_TRUE
+        && has_bindless_features
+        && has_bindless_capacity;
 
     return indices.can_render() && extensions_supported && swap_chain_adequate && has_desired_features;
 }
@@ -148,11 +177,19 @@ void device::create_logical_device()
     const queue_family_indices& indices = queue_family_indices_;
 
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-    std::set<uint32_t> uniqueQueueFamilies = {
-        indices.graphics_family.value(),
-        indices.compute_family.value(),
-        indices.present_family.value()
-    };
+    // Only request families the device actually reports. compute/transfer are optional
+    // (many GPUs expose no dedicated compute or transfer family), so calling .value()
+    // unconditionally would throw on them. graphics is guaranteed by is_device_suitable().
+    std::set<uint32_t> uniqueQueueFamilies;
+    for (const std::optional<uint32_t>& family : {
+             indices.graphics_family,
+             indices.compute_family,
+             indices.transfer_family,
+             indices.present_family })
+    {
+        if (family.has_value())
+            uniqueQueueFamilies.insert(family.value());
+    }
 
     float queuePriority = 1.0f;
     for (uint32_t queueFamily : uniqueQueueFamilies) {
@@ -201,6 +238,11 @@ void device::create_logical_device()
 
     VkPhysicalDeviceFeatures enabled_device_features{};
     enabled_device_features.samplerAnisotropy = VK_TRUE;
+    // GPU-driven draws: multiDrawIndirect issues many draws from one indirect buffer in a single
+    // command; drawIndirectFirstInstance lets each indirect command carry a non-zero firstInstance
+    // (used as the per-draw index the vertex shader reads via gl_InstanceIndex).
+    enabled_device_features.multiDrawIndirect = VK_TRUE;
+    enabled_device_features.drawIndirectFirstInstance = VK_TRUE;
 
     // clang-format off
     VkPhysicalDeviceFeatures2 enabled_device_features2 = {
