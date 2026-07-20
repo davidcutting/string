@@ -66,7 +66,7 @@ struct CullPush
     VkDeviceAddress cull_in;
     VkDeviceAddress indirect_out;
     uint32_t draw_count;
-    uint32_t _pad = 0;
+    uint32_t cull_enabled;
 };
 
 // Renders a whole glTF model: uploads its shared vertex/index buffers plus every texture (each
@@ -120,6 +120,8 @@ class GeometryPass final : public String::Pass
     // moving the camera reveals what culling removes (geometry outside the frozen view vanishes).
     bool cull_frozen_ = false;
     glm::mat4 frozen_cull_view_proj_{ 1.0f };
+    // Debug: toggle GPU frustum culling off entirely (C) — for isolating culling from geometry.
+    bool cull_enabled_ = true;
 
 public:
     // model_path is a .gltf/.glb resolved relative to context.resources_path.

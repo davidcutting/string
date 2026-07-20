@@ -229,13 +229,13 @@ pipeline_builder& pipeline_builder::set_rasterization(
     return *this;
 }
 
-pipeline_builder& pipeline_builder::set_multisampling()
+pipeline_builder& pipeline_builder::set_multisampling(VkSampleCountFlagBits samples)
 {
     VkPipelineMultisampleStateCreateInfo multisampling_state_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .rasterizationSamples = samples,
         .sampleShadingEnable = VK_FALSE,
         .minSampleShading = 0,
         .pSampleMask = nullptr,

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <span>
 #include <vector>
 
 #include <string/gpu/command_recorder.hpp>
@@ -77,8 +78,23 @@ public:
     // batch may be submitted asynchronously once the staging budget is hit.
     void upload_buffer(const void* data, VkDeviceSize size, string::gpu::resource_id dst_buffer);
     // Records UNDEFINED -> TRANSFER_DST, a staging copy, then TRANSFER_DST -> SHADER_READ for
-    // the destination image (extent taken from the allocated image).
+    // the destination image (extent taken from the allocated image). Generates the mip chain by
+    // blitting when the image has more than one level — for CPU-decoded RGBA8 textures.
     void upload_image(const void* pixels, VkDeviceSize size, string::gpu::resource_id dst_image);
+
+    // One precomputed mip level inside the blob handed to upload_image_levels: its byte offset
+    // into that blob and the level's texel extent.
+    struct level_copy
+    {
+        VkDeviceSize offset;
+        VkExtent3D extent;
+    };
+    // Uploads an image whose mip levels are already laid out in `data` (e.g. a transcoded KTX2
+    // texture): stages the whole blob once, copies each level verbatim into its mip, then moves
+    // the whole image to SHADER_READ. No blit — levels are taken as-is, so block-compressed
+    // formats (BC7) work. levels.size() must equal the image's mip_levels.
+    void upload_image_levels(const void* data, VkDeviceSize total_size,
+                             std::span<const level_copy> levels, string::gpu::resource_id dst_image);
 
     // Submits any pending batch without waiting (so its GPU work can overlap what follows).
     void flush();

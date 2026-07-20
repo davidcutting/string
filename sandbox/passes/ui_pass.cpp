@@ -139,7 +139,7 @@ UIPass::UIPass(PassContext& context, std::vector<string::layout_node> nodes)
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
         .set_tessellation()
         .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
-        .set_multisampling()
+        .set_multisampling(context.sample_count)
         .enable_depth_stencil(false, false)
         .enable_color_blending()
         .build_graphics_pipeline(pipeline_.pipeline_layout);

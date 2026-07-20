@@ -44,7 +44,9 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 
     VkExtent2D extent = presenter_.get_extent();
 
-    // Allocate render target
+    // Render targets. color_attachment_ is 1-sample: it's the MSAA resolve destination and the
+    // texture the composite pass samples. msaa_color_ / msaa_depth_ are the multisampled targets
+    // the scene passes actually render into.
     color_attachment_ = allocator_.create_resource(string::gpu::image_info{
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -54,14 +56,25 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
     });
-    depth_attachment_ = allocator_.create_resource(string::gpu::image_info{
+    msaa_color_ = allocator_.create_resource(string::gpu::image_info{
+        .extent = {extent.width, extent.height, 1},
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+        .samples = msaa_samples_,
+    });
+    msaa_depth_ = allocator_.create_resource(string::gpu::image_info{
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_D32_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
         .aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
+        .samples = msaa_samples_,
     });
 
     // Make the offscreen HDR target samplable by the composite pass via the bindless table.
@@ -91,6 +104,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         string::gpu::DEPTH_TARGET,
         resources_path,
         static_cast<uint16_t>(frames_in_flight_),
+        msaa_samples_,
     };
     scene_passes_ = plan.build(pass_context);
 
@@ -165,7 +179,8 @@ Renderer::~Renderer()
         frame.recorder.destroy();
     }
 
-    allocator_.destroy_resource(depth_attachment_);
+    allocator_.destroy_resource(msaa_depth_);
+    allocator_.destroy_resource(msaa_color_);
     allocator_.destroy_resource(color_attachment_);
 }
 
@@ -306,16 +321,31 @@ void Renderer::record_frame()
                 usage.access, usage.stage, /*discard=*/is_write(usage.access));
         }
 
+        // The scene group (COLOR_TARGET) is multisampled: passes render into msaa_color_ and it's
+        // resolved into color_attachment_ (which the group_transitions loop already moved to
+        // COLOR_ATTACHMENT_OPTIMAL as the resolve dest). The composite group (SWAPCHAIN) is
+        // single-sample and renders straight into the swapchain image.
+        const bool msaa_group = (group_color == string::gpu::COLOR_TARGET);
+        if (msaa_group)
+        {
+            // msaa_color_ isn't a graph resource; transition it here (discard — fully cleared).
+            resource_states_.transition(command_buffer, allocator_.get_image(msaa_color_).image,
+                VK_IMAGE_ASPECT_COLOR_BIT, Access::ColorWrite,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, /*discard=*/true);
+        }
+
         const VkRenderingAttachmentInfo color_attachment_info = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .pNext = nullptr,
-            .imageView = image_view_of(group_color),
+            .imageView = msaa_group ? allocator_.get_image(msaa_color_).view : image_view_of(group_color),
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .resolveMode = VK_RESOLVE_MODE_NONE,
-            .resolveImageView = VK_NULL_HANDLE,
-            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            // Resolve the multisampled scene color down into color_attachment_ (image_view_of the
+            // group's COLOR_TARGET) at end of rendering; the MS samples themselves aren't kept.
+            .resolveMode = msaa_group ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_NONE,
+            .resolveImageView = msaa_group ? image_view_of(group_color) : VK_NULL_HANDLE,
+            .resolveImageLayout = msaa_group ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .storeOp = msaa_group ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = { .color = {{ 0.0f, 0.0f, 0.0f, 0.0f }} },
         };
         const VkRenderingAttachmentInfo depth_attachment_info = {
@@ -368,7 +398,7 @@ VkImage Renderer::image_of(string::gpu::resource_id target) const
     {
         case string::gpu::SWAPCHAIN_TARGET: return acquired_image_;
         case string::gpu::COLOR_TARGET:     return allocator_.get_image(color_attachment_).image;
-        case string::gpu::DEPTH_TARGET:     return allocator_.get_image(depth_attachment_).image;
+        case string::gpu::DEPTH_TARGET:     return allocator_.get_image(msaa_depth_).image;
         default:               return allocator_.get_image(target).image;
     }
 }
@@ -379,7 +409,7 @@ VkImageView Renderer::image_view_of(string::gpu::resource_id target) const
     {
         case string::gpu::SWAPCHAIN_TARGET: return acquired_image_view_;
         case string::gpu::COLOR_TARGET:     return allocator_.get_image(color_attachment_).view;
-        case string::gpu::DEPTH_TARGET:     return allocator_.get_image(depth_attachment_).view;
+        case string::gpu::DEPTH_TARGET:     return allocator_.get_image(msaa_depth_).view;
         default:               return allocator_.get_image(target).view;
     }
 }
@@ -492,18 +522,32 @@ void Renderer::handle_resize(const String::View::Extent& extent)
     // Re-bind the new HDR target into the table and refresh the composite pass's slot.
     bind_composite_source();
 
-    allocator_.destroy_resource(depth_attachment_);
-    depth_attachment_ = allocator_.create_resource(string::gpu::image_info{
+    // Recreate the multisampled scene targets at the new size.
+    allocator_.destroy_resource(msaa_color_);
+    msaa_color_ = allocator_.create_resource(string::gpu::image_info{
+        .extent = {extent.width, extent.height, 1},
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+        .samples = msaa_samples_,
+    });
+
+    allocator_.destroy_resource(msaa_depth_);
+    msaa_depth_ = allocator_.create_resource(string::gpu::image_info{
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_D32_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
         .aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
+        .samples = msaa_samples_,
     });
 
-    // The swapchain images and both attachments were just recreated — their old VkImage handles
+    // The swapchain images and attachments were just recreated — their old VkImage handles
     // (and tracked layouts) are stale.
     resource_states_.clear();
 }

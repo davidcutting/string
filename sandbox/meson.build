@@ -24,6 +24,12 @@ project(
 # dependencies resolve transitively from the engine's subprojects/ dir.
 string_dep = dependency('string-engine', fallback : ['string-engine', 'project_deps'])
 
+# libktx (KTX-Software): the sandbox loader reads cooked .ktx2 textures and transcodes them to
+# BC7 (see passes/geometry_pass.cpp). The engine core stays KTX-agnostic — only the app links it.
+# Resolved from its CMake config (KTX::ktx): on nix from nixpkgs' ktx-tools; off-nix from a
+# system KTX-Software install (there's no meson wrap — its CMake build isn't wired as a subproject).
+ktx_dep = dependency('Ktx', method : 'cmake', modules : ['KTX::ktx'])
+
 sandbox_inc = include_directories('.')
 
 subdir('shaders')
@@ -39,6 +45,6 @@ executable(
         'passes/ui_pass.cpp',
     ],
     include_directories : sandbox_inc,
-    dependencies : string_dep,
+    dependencies : [ string_dep, ktx_dep ],
     install : true,
 )

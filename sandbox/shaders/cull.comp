@@ -34,6 +34,7 @@ layout(push_constant) uniform Push {
     CullDrawRef  cull_in;
     IndirectRef  indirect_out;
     uint         draw_count;
+    uint         cull_enabled;   // 0 = emit every draw (debug), 1 = frustum cull
 } pc;
 
 layout(local_size_x = 64) in;
@@ -76,7 +77,8 @@ void main() {
     }
 
     CullDraw d = pc.cull_in.draws[i];
-    const bool visible = !aabb_outside_frustum(d.aabb_min.xyz, d.aabb_max.xyz);
+    const bool visible = (pc.cull_enabled == 0u)
+        || !aabb_outside_frustum(d.aabb_min.xyz, d.aabb_max.xyz);
 
     // Fixed slot == draw index: deterministic order; culled draws get instanceCount 0.
     pc.indirect_out.cmds[i] = IndirectCommand(

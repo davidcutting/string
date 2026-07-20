@@ -44,7 +44,7 @@ public:
         VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL,
         VkCullModeFlags cull_mode = VK_CULL_MODE_BACK_BIT,
         VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE);
-    pipeline_builder& set_multisampling();
+    pipeline_builder& set_multisampling(VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
     // Declares a D32 depth attachment (matching the offscreen pass). test/write default on
     // for 3D passes; a 2D background pass (e.g. the grid) passes false to declare the format
     // without depth-testing so it doesn't occlude geometry drawn after it.

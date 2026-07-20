@@ -59,6 +59,12 @@ struct image_info
     VkImageAspectFlags aspect_flags;
     VmaMemoryUsage memory_usage;
     VmaAllocationCreateFlags allocation_flags;
+    // Number of mip levels; >1 means the image is created with a full/partial mip chain (the
+    // uploader generates the smaller levels by blitting). Requires TRANSFER_SRC usage too.
+    uint32_t mip_levels = 1;
+    // MSAA sample count. >1 for multisampled render targets (which are resolved to a 1-sample
+    // image for sampling); such images can't have a mip chain and aren't sampled directly.
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 struct allocated_image
@@ -69,6 +75,7 @@ struct allocated_image
     VkSampler sampler;
     VkFormat format;
     VkExtent3D extent;
+    uint32_t mip_levels = 1;
     VmaAllocation allocation;
     VmaAllocationInfo allocation_info;
 };

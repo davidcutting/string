@@ -153,7 +153,9 @@ void TransferBatch::upload_image(const void* pixels, VkDeviceSize size, string::
 {
     VkCommandBuffer command_buffer = begin_if_needed();
     const string::gpu::allocated_image& image = allocator_.get_image(dst_image);
+    const uint32_t mip_levels = image.mip_levels;
 
+    // Move every mip level to TRANSFER_DST, then copy the source pixels into level 0.
     vku::transition_image(command_buffer, {
         .image = image.image,
         .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -162,6 +164,7 @@ void TransferBatch::upload_image(const void* pixels, VkDeviceSize size, string::
         .src_access = 0,
         .dst_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
         .dst_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .level_count = mip_levels,
     });
 
     const string::gpu::resource_id staging = allocator_.create_staging(size);
@@ -180,6 +183,56 @@ void TransferBatch::upload_image(const void* pixels, VkDeviceSize size, string::
     vkCmdCopyBufferToImage(command_buffer, allocator_.get_buffer(staging).buffer, image.image,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
+    // Generate the mip chain by successively halving with a linear blit: level i-1 (as SRC) ->
+    // level i (still DST). Each source level is moved DST->SRC just before it's read.
+    int32_t mip_width = static_cast<int32_t>(image.extent.width);
+    int32_t mip_height = static_cast<int32_t>(image.extent.height);
+    for (uint32_t level = 1; level < mip_levels; ++level)
+    {
+        vku::transition_image(command_buffer, {
+            .image = image.image,
+            .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .new_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .src_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            .src_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dst_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            .dst_access = VK_ACCESS_2_TRANSFER_READ_BIT,
+            .base_mip = level - 1,
+            .level_count = 1,
+        });
+
+        const int32_t next_width = mip_width > 1 ? mip_width / 2 : 1;
+        const int32_t next_height = mip_height > 1 ? mip_height / 2 : 1;
+        const VkImageBlit blit = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1 },
+            .srcOffsets = { { 0, 0, 0 }, { mip_width, mip_height, 1 } },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1 },
+            .dstOffsets = { { 0, 0, 0 }, { next_width, next_height, 1 } },
+        };
+        vkCmdBlitImage(command_buffer,
+            image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &blit, VK_FILTER_LINEAR);
+
+        mip_width = next_width;
+        mip_height = next_height;
+    }
+
+    // Move everything to SHADER_READ: levels 0..n-2 are SRC (post-blit), level n-1 is still DST.
+    if (mip_levels > 1)
+    {
+        vku::transition_image(command_buffer, {
+            .image = image.image,
+            .old_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .src_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            .src_access = VK_ACCESS_2_TRANSFER_READ_BIT,
+            .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dst_access = VK_ACCESS_2_SHADER_READ_BIT,
+            .base_mip = 0,
+            .level_count = mip_levels - 1,
+        });
+    }
     vku::transition_image(command_buffer, {
         .image = image.image,
         .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -188,6 +241,69 @@ void TransferBatch::upload_image(const void* pixels, VkDeviceSize size, string::
         .src_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
         .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
         .dst_access = VK_ACCESS_2_SHADER_READ_BIT,
+        .base_mip = mip_levels - 1,
+        .level_count = 1,
+    });
+
+    if (pending_bytes_ >= STAGING_BUDGET)
+    {
+        submit_current();
+    }
+}
+
+void TransferBatch::upload_image_levels(const void* data, VkDeviceSize total_size,
+    std::span<const level_copy> levels, string::gpu::resource_id dst_image)
+{
+    VkCommandBuffer command_buffer = begin_if_needed();
+    const string::gpu::allocated_image& image = allocator_.get_image(dst_image);
+    const uint32_t mip_levels = static_cast<uint32_t>(levels.size());
+
+    // All mip levels UNDEFINED -> TRANSFER_DST.
+    vku::transition_image(command_buffer, {
+        .image = image.image,
+        .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .new_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+        .src_access = 0,
+        .dst_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+        .dst_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .level_count = mip_levels,
+    });
+
+    // Stage the whole blob once, then copy each precomputed level into its mip. Tightly packed
+    // (row length / image height 0); Vulkan derives the block layout from the image's format.
+    const string::gpu::resource_id staging = allocator_.create_staging(total_size);
+    allocator_.copy_data_to_buffer(data, staging);
+    ring_[current_].staging.push_back(staging);
+    pending_bytes_ += total_size;
+
+    std::vector<VkBufferImageCopy> regions;
+    regions.reserve(mip_levels);
+    for (uint32_t level = 0; level < mip_levels; ++level)
+    {
+        regions.push_back(VkBufferImageCopy{
+            .bufferOffset = levels[level].offset,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1 },
+            .imageOffset = { 0, 0, 0 },
+            .imageExtent = levels[level].extent,
+        });
+    }
+    vkCmdCopyBufferToImage(command_buffer, allocator_.get_buffer(staging).buffer, image.image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        static_cast<uint32_t>(regions.size()), regions.data());
+
+    // All mip levels TRANSFER_DST -> SHADER_READ.
+    vku::transition_image(command_buffer, {
+        .image = image.image,
+        .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .src_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+        .src_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .dst_access = VK_ACCESS_2_SHADER_READ_BIT,
+        .level_count = mip_levels,
     });
 
     if (pending_bytes_ >= STAGING_BUDGET)

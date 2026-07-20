@@ -39,6 +39,9 @@ struct PassContext
     // Root that contains shaders/ (and, at runtime, assets/); passes resolve their files here.
     std::filesystem::path resources_path;
     uint16_t frames_in_flight;
+    // MSAA sample count of the scene color/depth targets. Scene-pass pipelines must set their
+    // rasterizationSamples to this (via set_multisampling) to be compatible with the render pass.
+    VkSampleCountFlagBits sample_count;
 };
 
 }  // namespace String

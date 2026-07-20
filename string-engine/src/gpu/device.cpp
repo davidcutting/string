@@ -117,6 +117,9 @@ bool device::is_device_suitable(const VkPhysicalDevice& device) {
     bool has_desired_features = supported_features.features.samplerAnisotropy
         && supported_features.features.multiDrawIndirect
         && supported_features.features.drawIndirectFirstInstance
+        // BC (block-compression) texture formats: cooked assets load as KTX2 transcoded to BC7,
+        // so a device that can't sample BC formats can't render the scene. Desktop-baseline.
+        && supported_features.features.textureCompressionBC == VK_TRUE
         && vulkan13_features.dynamicRendering == VK_TRUE
         && vulkan13_features.synchronization2 == VK_TRUE
         && vulkan13_features.shaderDemoteToHelperInvocation == VK_TRUE
@@ -243,6 +246,9 @@ void device::create_logical_device()
     // (used as the per-draw index the vertex shader reads via gl_InstanceIndex).
     enabled_device_features.multiDrawIndirect = VK_TRUE;
     enabled_device_features.drawIndirectFirstInstance = VK_TRUE;
+    // Sampling BC7 (transcoded from cooked KTX2 textures) requires this feature enabled;
+    // is_device_suitable() already rejects any device that doesn't support it.
+    enabled_device_features.textureCompressionBC = VK_TRUE;
 
     // clang-format off
     VkPhysicalDeviceFeatures2 enabled_device_features2 = {

@@ -2,10 +2,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
+#include <string/core/job_system.hpp>
 #include <string/core/logger.hpp>
 
 #include <glm/glm.hpp>
@@ -177,41 +180,32 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
     GltfGeometry model;
 
     // --- Geometry: flatten every mesh primitive into the shared vertex/index buffers ---------
-    // Pre-pass: sum the total vertex + index counts across all primitives and reserve once.
-    // Growing the shared buffers per primitive (resize/reserve to the exact new size, ~hundreds
-    // of times) reallocates and copies the whole buffer each time — O(n^2), and the dominant
-    // load cost on large scenes (Sponza: ~2M verts / 11M indices). One reservation makes the
-    // per-primitive resize()s stay within capacity (no reallocation).
+    // Plan pass (sequential, cheap): assign each triangle primitive a disjoint slice of the shared
+    // vertex/index buffers via running prefix sums, and size both buffers exactly once. Because the
+    // slices don't overlap, the expensive attribute copies below can then run in parallel across a
+    // worker pool with no locking — this is the dominant load cost on large scenes (Sponza: ~2M
+    // verts / 11M indices), previously all on one thread.
+    struct PrimitivePlan
+    {
+        std::size_t mesh_index;
+        std::size_t primitive_index;   // index within mesh.primitives
+        uint32_t base_vertex;
+        uint32_t vertex_count;
+        uint32_t index_offset;
+        uint32_t index_count;
+        glm::vec3 local_min{ 0.0f };   // primitive's local-space AABB, filled by the parallel pass
+        glm::vec3 local_max{ 0.0f };
+    };
+
+    std::vector<PrimitivePlan> plans;
     std::size_t total_vertices = 0;
     std::size_t total_indices = 0;
-    for (const auto& mesh : asset.meshes)
-    {
-        for (const auto& primitive : mesh.primitives)
-        {
-            if (primitive.type != fastgltf::PrimitiveType::Triangles)
-            {
-                continue;
-            }
-            const auto* position = primitive.findAttribute("POSITION");
-            if (position == primitive.attributes.end())
-            {
-                continue;
-            }
-            const auto& position_accessor = asset.accessors[position->accessorIndex];
-            total_vertices += position_accessor.count;
-            total_indices += primitive.indicesAccessor.has_value()
-                ? asset.accessors[primitive.indicesAccessor.value()].count
-                : position_accessor.count;
-        }
-    }
-    model.vertices.reserve(total_vertices);
-    model.indices.reserve(total_indices);
-
-    std::vector<std::vector<MeshPrimitive>> mesh_primitives(asset.meshes.size());
     for (std::size_t mesh_index = 0; mesh_index < asset.meshes.size(); ++mesh_index)
     {
-        for (const auto& primitive : asset.meshes[mesh_index].primitives)
+        const auto& mesh = asset.meshes[mesh_index];
+        for (std::size_t p = 0; p < mesh.primitives.size(); ++p)
         {
+            const auto& primitive = mesh.primitives[p];
             if (primitive.type != fastgltf::PrimitiveType::Triangles)
             {
                 continue;   // only triangle lists for now
@@ -221,63 +215,105 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
             {
                 continue;
             }
-
             const auto& position_accessor = asset.accessors[position->accessorIndex];
-            const uint32_t base_vertex = static_cast<uint32_t>(model.vertices.size());
-            model.vertices.resize(base_vertex + position_accessor.count);
-
-            // Accumulate the primitive's local-space AABB from its positions (for culling).
-            glm::vec3 local_min(std::numeric_limits<float>::max());
-            glm::vec3 local_max(std::numeric_limits<float>::lowest());
-            fastgltf::iterateAccessorWithIndex<glm::vec3>(
-                asset, position_accessor, [&](glm::vec3 value, std::size_t i) {
-                    model.vertices[base_vertex + i].pos = value;
-                    model.vertices[base_vertex + i].color = glm::vec3(1.0f);
-                    local_min = glm::min(local_min, value);
-                    local_max = glm::max(local_max, value);
-                });
-
-            if (const auto* normal = primitive.findAttribute("NORMAL"); normal != primitive.attributes.end())
-            {
-                fastgltf::iterateAccessorWithIndex<glm::vec3>(
-                    asset, asset.accessors[normal->accessorIndex], [&](glm::vec3 value, std::size_t i) {
-                        model.vertices[base_vertex + i].normal = value;
-                    });
-            }
-
-            if (const auto* uv = primitive.findAttribute("TEXCOORD_0"); uv != primitive.attributes.end())
-            {
-                fastgltf::iterateAccessorWithIndex<glm::vec2>(
-                    asset, asset.accessors[uv->accessorIndex], [&](glm::vec2 value, std::size_t i) {
-                        model.vertices[base_vertex + i].texCoord = value;
-                    });
-            }
-
-            const uint32_t index_offset = static_cast<uint32_t>(model.indices.size());
-            if (primitive.indicesAccessor.has_value())
-            {
-                const auto& index_accessor = asset.accessors[primitive.indicesAccessor.value()];
-                model.indices.reserve(model.indices.size() + index_accessor.count);
-                fastgltf::iterateAccessor<uint32_t>(asset, index_accessor, [&](uint32_t index) {
-                    model.indices.push_back(base_vertex + index);
-                });
-            }
-            else
-            {
-                // Non-indexed primitive: synthesise a trivial index run.
-                for (uint32_t i = 0; i < position_accessor.count; ++i)
-                {
-                    model.indices.push_back(base_vertex + i);
-                }
-            }
-
-            const uint32_t index_count = static_cast<uint32_t>(model.indices.size()) - index_offset;
-            const int32_t material = primitive.materialIndex.has_value()
-                ? static_cast<int32_t>(primitive.materialIndex.value())
-                : -1;
-            mesh_primitives[mesh_index].push_back(
-                { index_offset, index_count, material, local_min, local_max });
+            const uint32_t vertex_count = static_cast<uint32_t>(position_accessor.count);
+            const uint32_t index_count = primitive.indicesAccessor.has_value()
+                ? static_cast<uint32_t>(asset.accessors[primitive.indicesAccessor.value()].count)
+                : vertex_count;
+            plans.push_back(PrimitivePlan{
+                .mesh_index = mesh_index,
+                .primitive_index = p,
+                .base_vertex = static_cast<uint32_t>(total_vertices),
+                .vertex_count = vertex_count,
+                .index_offset = static_cast<uint32_t>(total_indices),
+                .index_count = index_count,
+            });
+            total_vertices += vertex_count;
+            total_indices += index_count;
         }
+    }
+    model.vertices.resize(total_vertices);
+    model.indices.resize(total_indices);
+
+    // Parallel fill: each primitive writes only its own [base_vertex, +count) vertex range and
+    // [index_offset, +count) index range, so the workers never touch the same element. Reads of
+    // the (const) asset are thread-safe. Each job also records its primitive's local AABB.
+    {
+        const fastgltf::Asset& casset = asset;
+        string::core::job_system pool;
+        std::vector<std::future<void>> jobs;
+        jobs.reserve(plans.size());
+        for (PrimitivePlan& plan : plans)
+        {
+            jobs.push_back(pool.enqueue([&casset, &model, &plan]() {
+                const auto& primitive = casset.meshes[plan.mesh_index].primitives[plan.primitive_index];
+                const auto& position_accessor = casset.accessors[
+                    primitive.findAttribute("POSITION")->accessorIndex];
+
+                glm::vec3 local_min(std::numeric_limits<float>::max());
+                glm::vec3 local_max(std::numeric_limits<float>::lowest());
+                fastgltf::iterateAccessorWithIndex<glm::vec3>(
+                    casset, position_accessor, [&](glm::vec3 value, std::size_t i) {
+                        String::Vertex& v = model.vertices[plan.base_vertex + i];
+                        v.pos = value;
+                        v.color = glm::vec3(1.0f);
+                        local_min = glm::min(local_min, value);
+                        local_max = glm::max(local_max, value);
+                    });
+
+                if (const auto* normal = primitive.findAttribute("NORMAL"); normal != primitive.attributes.end())
+                {
+                    fastgltf::iterateAccessorWithIndex<glm::vec3>(
+                        casset, casset.accessors[normal->accessorIndex], [&](glm::vec3 value, std::size_t i) {
+                            model.vertices[plan.base_vertex + i].normal = value;
+                        });
+                }
+
+                if (const auto* uv = primitive.findAttribute("TEXCOORD_0"); uv != primitive.attributes.end())
+                {
+                    fastgltf::iterateAccessorWithIndex<glm::vec2>(
+                        casset, casset.accessors[uv->accessorIndex], [&](glm::vec2 value, std::size_t i) {
+                            model.vertices[plan.base_vertex + i].texCoord = value;
+                        });
+                }
+
+                if (primitive.indicesAccessor.has_value())
+                {
+                    const auto& index_accessor = casset.accessors[primitive.indicesAccessor.value()];
+                    fastgltf::iterateAccessorWithIndex<uint32_t>(
+                        casset, index_accessor, [&](uint32_t index, std::size_t i) {
+                            model.indices[plan.index_offset + i] = plan.base_vertex + index;
+                        });
+                }
+                else
+                {
+                    // Non-indexed primitive: synthesise a trivial index run.
+                    for (uint32_t i = 0; i < plan.vertex_count; ++i)
+                    {
+                        model.indices[plan.index_offset + i] = plan.base_vertex + i;
+                    }
+                }
+
+                plan.local_min = local_min;
+                plan.local_max = local_max;
+            }));
+        }
+        for (auto& job : jobs)
+        {
+            job.get();   // sync + rethrow any decode error
+        }
+    }
+
+    // Regroup the filled primitives by mesh (preserving order) for the instance pass below.
+    std::vector<std::vector<MeshPrimitive>> mesh_primitives(asset.meshes.size());
+    for (const PrimitivePlan& plan : plans)
+    {
+        const auto& primitive = asset.meshes[plan.mesh_index].primitives[plan.primitive_index];
+        const int32_t material = primitive.materialIndex.has_value()
+            ? static_cast<int32_t>(primitive.materialIndex.value())
+            : -1;
+        mesh_primitives[plan.mesh_index].push_back(
+            { plan.index_offset, plan.index_count, material, plan.local_min, plan.local_max });
     }
 
     // --- Instances: one draw per node-instanced mesh primitive, world transform baked in ------

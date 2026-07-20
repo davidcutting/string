@@ -87,8 +87,12 @@ public:
     void end_frame();
 
 private:
-    string::gpu::resource_id color_attachment_;
-    string::gpu::resource_id depth_attachment_;
+    // MSAA: scene passes render into the multisampled color + depth targets, and the color is
+    // resolved into color_attachment_ (1-sample), which the composite pass samples.
+    static constexpr VkSampleCountFlagBits msaa_samples_ = VK_SAMPLE_COUNT_4_BIT;
+    string::gpu::resource_id color_attachment_;   // 1-sample resolve target (sampled by composite)
+    string::gpu::resource_id msaa_color_;         // multisampled scene color target
+    string::gpu::resource_id msaa_depth_;         // multisampled scene depth target
 
     // Records the whole frame's render work: groups frame_passes_ into render-pass instances by
     // their color target, derives every image barrier from the passes' declared usages (via

@@ -1,11 +1,14 @@
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <future>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -23,6 +26,11 @@
 // The single stb_image implementation for the sandbox lives here (this pass decodes textures).
 #define STB_IMAGE_IMPLEMENTATION
 #include <string/core/stb_image.h>
+
+// libktx: cooked .ktx2 textures (KTX2/UASTC) are transcoded to BC7 and uploaded without any CPU
+// pixel decode — the fast path that avoids the stb_image load-time floor. See tools/cook_textures.sh.
+// ktxvulkan.h (VkFormat query) requires the Vulkan headers above it and pulls in ktx.h itself.
+#include <ktxvulkan.h>
 
 namespace sandbox
 {
@@ -75,19 +83,122 @@ void upload_decoded(string::gpu::resource_allocator& allocator,
                     const DecodedTexture& decoded,
                     string::gpu::resource_id& out_image, uint32_t& out_slot)
 {
+    // Full mip chain: floor(log2(max dimension)) + 1 levels. TRANSFER_SRC is needed too because
+    // mip generation blits from each level down to the next.
+    const uint32_t max_dim = static_cast<uint32_t>(std::max(decoded.width, decoded.height));
+    const uint32_t mip_levels = static_cast<uint32_t>(std::floor(std::log2(max_dim))) + 1;
+
     out_image = allocator.create_resource(string::gpu::image_info{
         .extent = { static_cast<uint32_t>(decoded.width), static_cast<uint32_t>(decoded.height), 1 },
         .format = decoded.format,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+               | VK_IMAGE_USAGE_SAMPLED_BIT,
         .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
+        .mip_levels = mip_levels,
     });
     // upload_image copies the pixels into staging immediately; the batch streams it to the GPU
     // asynchronously (bounded by its staging budget), so no per-texture stall.
     const VkDeviceSize size = static_cast<VkDeviceSize>(decoded.width) * decoded.height * 4;
     transfer.upload_image(decoded.pixels.get(), size, out_image);
+
+    descriptor_table.bind(out_image, string::gpu::descriptor_type::TEXTURE);
+    out_slot = descriptor_table.get_binding_slot(out_image, string::gpu::descriptor_type::TEXTURE);
+}
+
+// The cooked `.ktx2` sibling of an external texture source, if one exists on disk. Embedded
+// textures (no file path) have no sibling and always take the stb path. This lets cooking be
+// incremental: a texture with a sibling loads via the fast KTX path, the rest fall back to stb.
+std::optional<std::filesystem::path> ktx_sibling(const GltfTexture& source)
+{
+    if (source.file.empty())
+    {
+        return std::nullopt;
+    }
+    std::filesystem::path candidate = source.file;
+    candidate.replace_extension(".ktx2");
+    std::error_code ec;
+    if (std::filesystem::exists(candidate, ec))
+    {
+        return candidate;
+    }
+    return std::nullopt;
+}
+
+// CPU work (safe on a job thread): load a cooked .ktx2 and transcode its Basis payload to BC7.
+// This is the expensive part (the transcode), so it runs in parallel across the decode pool just
+// like stb decode does — collected and uploaded serially on the main thread. Returns an owning
+// ktxTexture2* (destroyed by upload_ktx2). Throws on failure (rethrown at the future's .get()).
+ktxTexture2* load_ktx2(const std::filesystem::path& path)
+{
+    ktxTexture2* ktx = nullptr;
+    KTX_error_code rc = ktxTexture2_CreateFromNamedFile(
+        path.string().c_str(), KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT, &ktx);
+    if (rc != KTX_SUCCESS)
+    {
+        throw std::runtime_error("ktx: failed to load " + path.string() + ": " + ktxErrorString(rc));
+    }
+
+    // Basis Universal payloads (UASTC/ETC1S) are transcoded to a GPU block format; BC7 is our
+    // target (desktop-baseline, high quality). Uncompressed KTX2s pass through unchanged.
+    if (ktxTexture2_NeedsTranscoding(ktx))
+    {
+        rc = ktxTexture2_TranscodeBasis(ktx, KTX_TTF_BC7_RGBA, 0);
+        if (rc != KTX_SUCCESS)
+        {
+            ktxTexture_Destroy(ktxTexture(ktx));
+            throw std::runtime_error("ktx: BC7 transcode failed for " + path.string() + ": " +
+                                     ktxErrorString(rc));
+        }
+    }
+    return ktx;
+}
+
+// GPU work (main thread): upload an already-loaded/transcoded KTX texture — every mip level
+// verbatim, no blit — and bind it into the bindless table. Consumes (destroys) `ktx`. The KTX
+// file carries the transfer function, so its resolved VkFormat is the correct BC7 sRGB/UNORM
+// variant (the cook sets sRGB for base-color, linear for data maps).
+void upload_ktx2(string::gpu::resource_allocator& allocator,
+                 string::gpu::descriptor_table& descriptor_table, TransferBatch& transfer,
+                 ktxTexture2* ktx,
+                 string::gpu::resource_id& out_image, uint32_t& out_slot)
+{
+    const VkFormat format = static_cast<VkFormat>(ktxTexture2_GetVkFormat(ktx));
+    const uint32_t mip_levels = ktx->numLevels;
+    const uint32_t width = ktx->baseWidth;
+    const uint32_t height = ktx->baseHeight;
+
+    out_image = allocator.create_resource(string::gpu::image_info{
+        .extent = { width, height, 1 },
+        .format = format,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        // Block-compressed: no TRANSFER_SRC / blit — every level is precomputed in the file.
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+        .mip_levels = mip_levels,
+    });
+
+    // Map each mip level to its byte offset within the loaded KTX blob; extents halve per level.
+    std::vector<TransferBatch::level_copy> levels(mip_levels);
+    for (uint32_t level = 0; level < mip_levels; ++level)
+    {
+        ktx_size_t offset = 0;
+        ktxTexture_GetImageOffset(ktxTexture(ktx), level, 0, 0, &offset);
+        levels[level] = TransferBatch::level_copy{
+            .offset = static_cast<VkDeviceSize>(offset),
+            .extent = { std::max(width >> level, 1u), std::max(height >> level, 1u), 1 },
+        };
+    }
+
+    // upload_image_levels copies the data into staging synchronously, so the KTX texture can be
+    // freed right after (the transfer batch owns the staging until the GPU consumes it).
+    transfer.upload_image_levels(ktxTexture_GetData(ktxTexture(ktx)),
+        static_cast<VkDeviceSize>(ktxTexture_GetDataSize(ktxTexture(ktx))), levels, out_image);
+    ktxTexture_Destroy(ktxTexture(ktx));
 
     descriptor_table.bind(out_image, string::gpu::descriptor_type::TEXTURE);
     out_slot = descriptor_table.get_binding_slot(out_image, string::gpu::descriptor_type::TEXTURE);
@@ -113,13 +224,26 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     // main thread does the geometry work below. Each decode is independent CPU work; the GPU
     // upload stays on this thread (VMA + command recording aren't thread-safe), collected in
     // order and streamed asynchronously by the transfer batch.
+    // Decide per texture: a cooked .ktx2 sibling takes the BC7 path (load + transcode, no pixel
+    // decode); the rest are stb-decoded. Both run in parallel on the pool — the KTX transcode is
+    // CPU-bound too, so serialising it would erase the win. Only the GPU upload stays serial.
     string::core::job_system decode_pool;
-    std::vector<std::future<DecodedTexture>> decode_jobs;
-    decode_jobs.reserve(parsed.textures.size());
+    std::vector<std::optional<std::filesystem::path>> ktx_paths(parsed.textures.size());
+    std::vector<std::future<ktxTexture2*>> ktx_jobs(parsed.textures.size());
+    std::vector<std::future<DecodedTexture>> decode_jobs(parsed.textures.size());
     for (std::size_t i = 0; i < parsed.textures.size(); ++i)
     {
-        const GltfTexture* source = &parsed.textures[i];
-        decode_jobs.push_back(decode_pool.enqueue([source]() { return decode_texture(*source); }));
+        ktx_paths[i] = ktx_sibling(parsed.textures[i]);
+        if (ktx_paths[i])
+        {
+            const std::filesystem::path path = *ktx_paths[i];
+            ktx_jobs[i] = decode_pool.enqueue([path]() { return load_ktx2(path); });
+        }
+        else
+        {
+            const GltfTexture* source = &parsed.textures[i];
+            decode_jobs[i] = decode_pool.enqueue([source]() { return decode_texture(*source); });
+        }
     }
 
     // Flatten geometry on this thread (overlaps the decode jobs above).
@@ -156,9 +280,17 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     texture_slots_.resize(parsed.textures.size());
     for (std::size_t i = 0; i < parsed.textures.size(); ++i)
     {
-        const DecodedTexture decoded = decode_jobs[i].get();
-        upload_decoded(allocator_, descriptor_table_, context.transfer, decoded,
-                       texture_images_[i], texture_slots_[i]);
+        if (ktx_paths[i])
+        {
+            upload_ktx2(allocator_, descriptor_table_, context.transfer, ktx_jobs[i].get(),
+                        texture_images_[i], texture_slots_[i]);
+        }
+        else
+        {
+            const DecodedTexture decoded = decode_jobs[i].get();
+            upload_decoded(allocator_, descriptor_table_, context.transfer, decoded,
+                           texture_images_[i], texture_slots_[i]);
+        }
     }
     const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - load_start).count();
@@ -289,8 +421,9 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         aabb_max = glm::vec3(1.0f);
     }
     String::Camera::bind_default_controls(input_map_);
-    // Debug: F freezes/unfreezes the culling frustum (see update()).
+    // Debug: F freezes/unfreezes the culling frustum, C toggles culling off entirely (see update()).
     input_map_.bind_button("freeze_culling", String::KeyCode::F);
+    input_map_.bind_button("toggle_culling", String::KeyCode::C);
     camera_.frame_bounds(aabb_min, aabb_max);
 
     // Declared graph usages: the shared buffers + the render targets. The uploaded textures are
@@ -328,10 +461,10 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
         .set_tessellation()
         // Back-face cull with a CCW front face: glTF winds front faces CCW, and this pipeline's
-        // GLM projection + Y-flip keep that winding front-facing in the framebuffer (same setup
-        // the OBJ viking-room rendered correctly with). CLOCKWISE here culls the wrong faces.
+        // GLM projection + Y-flip keep that winding front-facing in the framebuffer. CLOCKWISE
+        // here culls the wrong faces.
         .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
-        .set_multisampling()
+        .set_multisampling(context.sample_count)
         .enable_depth_stencil()
         .enable_color_blending()
         .build_graphics_pipeline(pipeline_.pipeline_layout);
@@ -388,6 +521,11 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         }
         STRING_LOG_INFO("Cull frustum {}", cull_frozen_ ? "FROZEN (debug)" : "live");
     }
+    if (input_map_.pressed("toggle_culling"))
+    {
+        cull_enabled_ = !cull_enabled_;
+        STRING_LOG_INFO("GPU frustum culling {}", cull_enabled_ ? "ON" : "OFF (debug)");
+    }
 }
 
 bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint16_t current_frame)
@@ -409,6 +547,7 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
         .cull_in = allocator_.get_buffer(cull_draw_buffer_).device_address,
         .indirect_out = allocator_.get_buffer(indirect_id).device_address,
         .draw_count = draw_count_,
+        .cull_enabled = cull_enabled_ ? 1u : 0u,
     };
     vkCmdPushConstants(command_buffer, cull_pipeline_.pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullPush), &push);

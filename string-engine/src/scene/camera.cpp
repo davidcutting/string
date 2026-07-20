@@ -28,8 +28,12 @@ void Camera::frame_bounds(const glm::vec3& aabb_min, const glm::vec3& aabb_max)
     pitch_ = std::asin(glm::clamp(to_center.y, -1.0f, 1.0f));
 
     move_speed_ = radius * 0.5f;   // ~2 s to cross the scene; sprint is faster
+    // near/far are fixed at framing time, but this is a fly camera that roams well past the
+    // model's initial bounds — a tight far plane clips distant geometry (a clean cutoff line
+    // where a receding surface crosses it). Reverse-Z keeps depth precision excellent even with
+    // a very distant far plane, so push it far out to avoid clipping anything the camera reaches.
     near_ = radius * 0.01f;
-    far_ = radius * 4.0f;
+    far_ = radius * 100.0f;
 }
 
 void Camera::update(const InputMap& input, float delta_time, float aspect)

@@ -32,6 +32,10 @@ struct ImageTransition
     VkPipelineStageFlags2 dst_stage;
     VkAccessFlags2 dst_access;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    // Mip range to transition; defaults to just the base level (mip generation transitions
+    // individual levels as it blits down the chain).
+    uint32_t base_mip = 0;
+    uint32_t level_count = 1;
 };
 
 inline void transition_image(VkCommandBuffer command_buffer, const ImageTransition& t)
@@ -48,7 +52,7 @@ inline void transition_image(VkCommandBuffer command_buffer, const ImageTransiti
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = t.image,
-        .subresourceRange = { t.aspect, 0, 1, 0, 1 },
+        .subresourceRange = { t.aspect, t.base_mip, t.level_count, 0, 1 },
     };
     const VkDependencyInfo dependency = {
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,

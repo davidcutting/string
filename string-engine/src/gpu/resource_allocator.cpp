@@ -140,9 +140,9 @@ auto resource_allocator::create_resource(const image_info& info) -> resource_id
             .height = info.extent.height,
             .depth = info.extent.depth,
         },
-        .mipLevels = 1,
+        .mipLevels = info.mip_levels,
         .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .samples = info.samples,
         .tiling = info.tiling,
         .usage = info.usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -168,6 +168,7 @@ auto resource_allocator::create_resource(const image_info& info) -> resource_id
         throw std::runtime_error("Failed to create an image with VMA");
     }
 
+    new_image.mip_levels = info.mip_levels;
     create_image_sampler(new_image);
     create_image_view(new_image, info.aspect_flags);
 
@@ -249,7 +250,9 @@ void resource_allocator::create_image_sampler(allocated_image& allocated_image)
         .compareEnable = VK_FALSE,
         .compareOp = VK_COMPARE_OP_ALWAYS,
         .minLod = 0.f,
-        .maxLod = 0.f,
+        // Sample across the whole mip chain (trilinear). VK_LOD_CLAMP_NONE lets the hardware pick
+        // the level from the derivative regardless of how many levels the image actually has.
+        .maxLod = VK_LOD_CLAMP_NONE,
         .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
         .unnormalizedCoordinates = VK_FALSE
     };
@@ -273,7 +276,7 @@ void resource_allocator::create_image_view(allocated_image& allocated_image, VkI
         .subresourceRange = {
             .aspectMask = aspect_flags,
             .baseMipLevel = 0,
-            .levelCount = 1,
+            .levelCount = allocated_image.mip_levels,
             .baseArrayLayer = 0,
             .layerCount = 1
         }
