@@ -39,6 +39,30 @@ struct GeometryPush
     glm::mat4 view_proj;
     VkDeviceAddress vertex_address;
     uint32_t drawdata_slot;
+    uint32_t _pad0;
+    // Per-frame forward-lighting constants (read in the fragment stage). Padded so each vec3 sits on
+    // a 16-byte boundary, matching the Push block in shaders/3d_shader.frag (std140-like scalars).
+    glm::vec3 camera_pos;      float _pad1;
+    glm::vec3 sun_dir;         float sun_intensity;   // direction TO the light (normalized)
+    glm::vec3 sun_color;       float _pad2;
+    glm::vec3 ambient_sky;     float _pad3;           // hemispheric ambient, up-facing
+    glm::vec3 ambient_ground;  float _pad4;           // hemispheric ambient, down-facing
+    // Directional shadow map: the light's view-projection (fragment reprojects world pos into it),
+    // the shadow map's bindless slot, its texel size (1/resolution) for PCF, and a depth bias.
+    glm::mat4 light_view_proj;
+    std::uint32_t shadow_slot;
+    float shadow_texel;
+    float shadow_bias;             // constant depth bias (reverse-Z units)
+    float shadow_normal_offset;    // world-space offset along the normal (anti-acne)
+};
+
+// Push constant for the depth-only shadow pass (shadow.vert): the light's view-projection plus the
+// same vertex-pulling address + draw-data slot the main pass uses.
+struct ShadowPush
+{
+    glm::mat4 light_view_proj;
+    VkDeviceAddress vertex_address;
+    uint32_t drawdata_slot;
 };
 
 // Per-draw record read by the vertex shader (indexed by gl_InstanceIndex). Baked at load: the
@@ -48,8 +72,12 @@ struct DrawData
 {
     glm::mat4 model;
     glm::vec4 base_color;
-    uint32_t texture_slot;
-    uint32_t _pad[3];
+    uint32_t base_slot;    // bindless slot of the base-color texture (or white fallback)
+    uint32_t normal_slot;  // normal map (or flat-normal fallback)
+    uint32_t mr_slot;      // metallic-roughness map (or white fallback)
+    float metallic;        // scalar factor (multiplies the MR texture)
+    float roughness;
+    uint32_t _pad[3];      // pad to a 16-byte-aligned std430 stride
 };
 
 // Per-draw input to the GPU cull compute shader (scalar layout): world-space AABB + the fields
@@ -128,9 +156,29 @@ class GeometryPass final : public String::Pass
     std::vector<string::gpu::resource_id> texture_images_;
     std::vector<uint32_t> texture_slots_;
     // 1x1 white fallback, used for draws whose material has no base-color texture (the
-    // base-color factor still tints it).
+    // base-color factor still tints it) — also the metallic-roughness fallback (white .g/.b = 1,
+    // so metallic/roughness reduce to the scalar factors).
     string::gpu::resource_id white_image_;
     uint32_t white_slot_ = 0;
+    // 1x1 flat-normal fallback (tangent-space +Z = RGBA 128,128,255), for draws with no normal map:
+    // sampling it yields the geometric normal, so the shader needs no branch.
+    string::gpu::resource_id flat_normal_image_;
+    uint32_t flat_normal_slot_ = 0;
+
+    // Directional shadow map. A depth-only prepass (in record_compute) renders the scene from the
+    // sun's orthographic view into a per-frame-in-flight D32 image, sampled by the lit fragment
+    // shader for PCF shadows. Single map fit to the scene AABB (Sponza is bounded); CSM later.
+    static constexpr uint32_t kShadowResolution = 2048;
+    glm::vec3 sun_dir_ = glm::normalize(glm::vec3(0.5f, 0.72f, 0.45f));  // direction TO the light
+    glm::mat4 light_view_proj_{ 1.0f };                                 // computed once from bounds
+    float shadow_world_texel_ = 0.0f;  // world units per shadow texel (for normal-offset bias)
+    string::gpu::pipeline shadow_pipeline_;
+    std::vector<string::gpu::resource_id> shadow_images_;   // one per frame in flight
+    std::vector<uint32_t> shadow_slots_;
+    VkSampler shadow_sampler_ = VK_NULL_HANDLE;             // nearest + clamp, for manual PCF
+    string::gpu::resource_id shadow_indirect_buffer_ = 0;   // static, all draws visible (no cull)
+    // Compute the orthographic light view-projection that tightly fits the scene AABB along sun_dir_.
+    void compute_light_matrix();
 
     // Texture residency streaming: the streamer (a residency_provider) owns each texture's mip
     // levels and adjustable-minLod sampler; the manager drives what streams in per frame. Only

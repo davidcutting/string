@@ -47,8 +47,13 @@ public:
     pipeline_builder& set_multisampling(VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
     // Declares a D32 depth attachment (matching the offscreen pass). test/write default on
     // for 3D passes; a 2D background pass (e.g. the grid) passes false to declare the format
-    // without depth-testing so it doesn't occlude geometry drawn after it.
-    pipeline_builder& enable_depth_stencil(bool depth_test = true, bool depth_write = true);
+    // without depth-testing so it doesn't occlude geometry drawn after it. compare_op defaults to
+    // the engine's reverse-Z (GREATER_OR_EQUAL); pass another op for e.g. a standard-Z shadow map.
+    pipeline_builder& enable_depth_stencil(bool depth_test = true, bool depth_write = true,
+                                           VkCompareOp compare_op = VK_COMPARE_OP_GREATER_OR_EQUAL);
+    // Depth-only pipeline: no color attachment (colorAttachmentCount 0). For a shadow/depth prepass
+    // that writes only depth. Combine with a vertex-only pipeline (no fragment shader added).
+    pipeline_builder& depth_only();
     pipeline_builder& enable_color_blending();
     // Opaque single-attachment color state (blendEnable = false, RGBA writes). For passes
     // that fully cover their target and want a straight write, e.g. the composite copy.
@@ -85,6 +90,7 @@ private:
     // composite pass) don't declare one.
     VkFormat color_format_ = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    bool color_enabled_ = true;   // depth_only() clears this (no color attachment)
 };
 
 }

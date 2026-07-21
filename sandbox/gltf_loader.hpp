@@ -30,6 +30,8 @@ struct GltfTexture
 struct GltfMaterial
 {
     glm::vec4 base_color_factor{ 1.0f };
+    float metallic_factor = 1.0f;   // scales the MR texture's blue channel (glTF metalness)
+    float roughness_factor = 1.0f;  // scales the MR texture's green channel
     int32_t base_color_texture = -1;
     int32_t metallic_roughness_texture = -1;
     int32_t normal_texture = -1;

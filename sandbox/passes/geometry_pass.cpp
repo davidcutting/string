@@ -324,6 +324,22 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     white_slot_ = descriptor_table_.get_binding_slot(white_image_, string::gpu::descriptor_type::TEXTURE);
     const string::gpu::allocated_image& white = allocator_.get_image(white_image_);
 
+    // 1x1 flat-normal fallback (tangent-space +Z): draws with no normal map sample this and get the
+    // geometric normal back, so the fragment shader never branches on "has a normal map".
+    const std::array<uint8_t, 4> flat_normal_pixel = { 128, 128, 255, 255 };
+    flat_normal_image_ = allocator_.create_resource(string::gpu::image_info{
+        .extent = { 1, 1, 1 },
+        .format = VK_FORMAT_R8G8B8A8_UNORM,   // linear, not sRGB — it's data, not colour
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    });
+    context.transfer.upload_image(flat_normal_pixel.data(), flat_normal_pixel.size(), flat_normal_image_);
+    descriptor_table_.bind(flat_normal_image_, string::gpu::descriptor_type::TEXTURE);
+    flat_normal_slot_ = descriptor_table_.get_binding_slot(flat_normal_image_, string::gpu::descriptor_type::TEXTURE);
+
     // Collect textures: cooked KTX2 register with the streamer (BC7 image + placeholder slot now,
     // mips streamed in on demand from the coarse tail up); stb fallbacks upload whole here.
     texture_streamer_ = std::make_unique<TextureStreamer>(
@@ -383,14 +399,26 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
             {
                 const GltfMaterial& material = materials_[draw.material];
                 data.base_color = material.base_color_factor;
-                data.texture_slot = material.base_color_texture >= 0
+                data.base_slot = material.base_color_texture >= 0
                     ? texture_slots_[material.base_color_texture]
                     : white_slot_;
+                data.normal_slot = material.normal_texture >= 0
+                    ? texture_slots_[material.normal_texture]
+                    : flat_normal_slot_;
+                data.mr_slot = material.metallic_roughness_texture >= 0
+                    ? texture_slots_[material.metallic_roughness_texture]
+                    : white_slot_;
+                data.metallic = material.metallic_factor;
+                data.roughness = material.roughness_factor;
             }
             else
             {
                 data.base_color = glm::vec4(1.0f);
-                data.texture_slot = white_slot_;
+                data.base_slot = white_slot_;
+                data.normal_slot = flat_normal_slot_;
+                data.mr_slot = white_slot_;
+                data.metallic = 1.0f;
+                data.roughness = 1.0f;
             }
 
             cull_data[i] = CullDraw{
@@ -533,7 +561,7 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     // view_proj + drawdata_slot are read only by the vertex stage now (the fragment stage reads
     // the material tint/slot from varyings).
     const VkPushConstantRange push_constant_range = {
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
         .size = sizeof(GeometryPush),
     };
@@ -559,6 +587,138 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         .enable_color_blending()
         .build_graphics_pipeline(pipeline_.pipeline_layout);
     pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+
+    // --- Directional shadow map ---------------------------------------------------------------
+    if (draw_count_ > 0)
+    {
+        compute_light_matrix();
+
+        // Nearest + clamp sampler: manual PCF compares raw depth samples, so no linear filtering.
+        const VkSamplerCreateInfo shadow_sampler_info = {
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter = VK_FILTER_NEAREST,
+            .minFilter = VK_FILTER_NEAREST,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+        };
+        if (vkCreateSampler(device_.get_device(), &shadow_sampler_info, nullptr, &shadow_sampler_) != VK_SUCCESS)
+        {
+            throw std::runtime_error("GeometryPass: failed to create shadow sampler");
+        }
+
+        // One shadow depth image per frame in flight so frame N+1's render doesn't race N's sample.
+        shadow_images_.resize(frames_in_flight_);
+        shadow_slots_.resize(frames_in_flight_);
+        for (uint32_t f = 0; f < frames_in_flight_; ++f)
+        {
+            shadow_images_[f] = allocator_.create_resource(string::gpu::image_info{
+                .extent = { kShadowResolution, kShadowResolution, 1 },
+                .format = VK_FORMAT_D32_SFLOAT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                .aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT,
+                .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+                .allocation_flags = {},
+            });
+            descriptor_table_.bind(shadow_images_[f], string::gpu::descriptor_type::TEXTURE);
+            shadow_slots_[f] = descriptor_table_.get_binding_slot(shadow_images_[f], string::gpu::descriptor_type::TEXTURE);
+            descriptor_table_.update_texture(shadow_slots_[f], allocator_.get_image(shadow_images_[f]).view, shadow_sampler_);
+        }
+
+        // Static all-visible indirect: every draw is rendered into the shadow map (no camera cull).
+        std::vector<VkDrawIndexedIndirectCommand> shadow_cmds(draws_.size());
+        for (std::size_t i = 0; i < draws_.size(); ++i)
+        {
+            shadow_cmds[i] = VkDrawIndexedIndirectCommand{
+                .indexCount = draws_[i].index_count,
+                .instanceCount = 1,
+                .firstIndex = draws_[i].index_offset,
+                .vertexOffset = 0,
+                .firstInstance = static_cast<uint32_t>(i),   // -> gl_InstanceIndex -> DrawData
+            };
+        }
+        const VkDeviceSize shadow_indirect_size = sizeof(VkDrawIndexedIndirectCommand) * shadow_cmds.size();
+        shadow_indirect_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
+            .size = shadow_indirect_size,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+            .allocation_flags = {},
+        });
+        context.transfer.upload_buffer(shadow_cmds.data(), shadow_indirect_size, shadow_indirect_buffer_);
+
+        // Depth-only shadow pipeline (vertex-only, reverse-Z to match the engine). Cull nothing so
+        // single-sided geometry still casts (avoids light leaks); rely on depth bias for acne.
+        const VkPushConstantRange shadow_push_range = {
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+            .offset = 0,
+            .size = sizeof(ShadowPush),
+        };
+        shadow_pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
+            .set_descriptor_set_layout({ descriptor_table_.get_layout() })
+            .set_push_constant_ranges({ shadow_push_range })
+            .build(device_);
+        shadow_pipeline_.pipeline = string::gpu::pipeline_builder(device_)
+            .add_vertex_shader(context.resources_path / "shaders/shadow.vert.spv")
+            .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+            .set_tessellation()
+            .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+            .set_multisampling()
+            .enable_depth_stencil()
+            .depth_only()
+            .build_graphics_pipeline(shadow_pipeline_.pipeline_layout);
+        shadow_pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+    }
+}
+
+void GeometryPass::compute_light_matrix()
+{
+    // World-space scene AABB (union of every draw's box).
+    glm::vec3 mn(std::numeric_limits<float>::max());
+    glm::vec3 mx(std::numeric_limits<float>::lowest());
+    for (const GltfDraw& d : draws_)
+    {
+        mn = glm::min(mn, d.aabb_min);
+        mx = glm::max(mx, d.aabb_max);
+    }
+    const glm::vec3 center = (mn + mx) * 0.5f;
+    const float radius = glm::length(mx - mn) * 0.5f;
+
+    const glm::vec3 L = glm::normalize(sun_dir_);   // direction TO the light
+    const glm::vec3 up = std::abs(L.y) > 0.99f ? glm::vec3(0, 0, 1) : glm::vec3(0, 1, 0);
+    const glm::vec3 eye = center + L * radius;       // place the light just outside the scene sphere
+    const glm::mat4 view = glm::lookAt(eye, center, up);
+
+    // Fit an orthographic box to the AABB's 8 corners in light space.
+    glm::vec3 lo(std::numeric_limits<float>::max());
+    glm::vec3 hi(std::numeric_limits<float>::lowest());
+    for (int i = 0; i < 8; ++i)
+    {
+        const glm::vec3 corner((i & 1) ? mx.x : mn.x, (i & 2) ? mx.y : mn.y, (i & 4) ? mx.z : mn.z);
+        const glm::vec3 ls = glm::vec3(view * glm::vec4(corner, 1.0f));
+        lo = glm::min(lo, ls);
+        hi = glm::max(hi, ls);
+    }
+    // RH view looks down -z (nearer = larger z); glm::ortho near/far are positive distances in
+    // front of the eye, so near = -hi.z, far = -lo.z. Pull near toward the light so occluders
+    // between it and the box still cast.
+    const float near_plane = -hi.z - radius * 0.5f;
+    const float far_plane = -lo.z;
+    // World units per shadow texel (light space is a pure rotation, so it preserves world scale) —
+    // used to size the normal-offset bias in the fragment shader.
+    shadow_world_texel_ = std::max(hi.x - lo.x, hi.y - lo.y) / static_cast<float>(kShadowResolution);
+    glm::mat4 proj = glm::ortho(lo.x, hi.x, lo.y, hi.y, near_plane, far_plane);  // ZERO_TO_ONE depth
+    proj[1][1] *= -1.0f;  // Vulkan Y-flip
+
+    // Reverse-Z (near->1, far->0) to match the engine (GREATER_OR_EQUAL compare, clear 0).
+    glm::mat4 reverse_z(1.0f);
+    reverse_z[2][2] = -1.0f;
+    reverse_z[3][2] = 1.0f;
+    proj = reverse_z * proj;
+
+    light_view_proj_ = proj * view;
 }
 
 GeometryPass::~GeometryPass()
@@ -566,8 +726,23 @@ GeometryPass::~GeometryPass()
     vkDestroyPipeline(device_.get_device(), pipeline_.pipeline, nullptr);
     vkDestroyPipelineLayout(device_.get_device(), pipeline_.pipeline_layout, nullptr);
 
+    if (!shadow_images_.empty())
+    {
+        vkDestroyPipeline(device_.get_device(), shadow_pipeline_.pipeline, nullptr);
+        vkDestroyPipelineLayout(device_.get_device(), shadow_pipeline_.pipeline_layout, nullptr);
+        vkDestroySampler(device_.get_device(), shadow_sampler_, nullptr);
+        for (const string::gpu::resource_id image : shadow_images_)
+        {
+            descriptor_table_.unbind(image, string::gpu::descriptor_type::TEXTURE);
+            allocator_.destroy_resource(image);
+        }
+        allocator_.destroy_resource(shadow_indirect_buffer_);
+    }
+
     descriptor_table_.unbind(white_image_, string::gpu::descriptor_type::TEXTURE);
     allocator_.destroy_resource(white_image_);
+    descriptor_table_.unbind(flat_normal_image_, string::gpu::descriptor_type::TEXTURE);
+    allocator_.destroy_resource(flat_normal_image_);
     for (const string::gpu::resource_id image : texture_images_)
     {
         descriptor_table_.unbind(image, string::gpu::descriptor_type::TEXTURE);
@@ -733,6 +908,79 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
     vkCmdPushConstants(command_buffer, cull_pipeline_.pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullPush), &push);
     vkCmdDispatch(command_buffer, (draw_count_ + 63) / 64, 1, 1);
+
+    // --- Shadow map: render scene depth from the sun into this frame's shadow image. Self-contained
+    // dynamic rendering (outside the main group), at shadow resolution, then transitioned to
+    // SHADER_READ so the lit fragment shader can sample it. The all-visible indirect is static, so
+    // this needs no barrier against the cull dispatch above.
+    if (!shadow_images_.empty())
+    {
+        const string::gpu::allocated_image& shadow = allocator_.get_image(shadow_images_[current_frame]);
+
+        vku::transition_image(command_buffer, {
+            .image = shadow.image,
+            .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .new_layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            .src_access = 0,
+            .dst_stage = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            .dst_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+        });
+
+        const VkRenderingAttachmentInfo depth_att = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = shadow.view,
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = { .depthStencil = { 0.0f, 0 } },  // reverse-Z far plane = 0
+        };
+        const VkRenderingInfo shadow_render = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = { { 0, 0 }, { kShadowResolution, kShadowResolution } },
+            .layerCount = 1,
+            .colorAttachmentCount = 0,
+            .pColorAttachments = nullptr,
+            .pDepthAttachment = &depth_att,
+        };
+        vkCmdBeginRendering(command_buffer, &shadow_render);
+
+        const VkViewport vp = { 0.0f, 0.0f, static_cast<float>(kShadowResolution),
+                                static_cast<float>(kShadowResolution), 0.0f, 1.0f };
+        const VkRect2D sc = { { 0, 0 }, { kShadowResolution, kShadowResolution } };
+        vkCmdSetViewport(command_buffer, 0, 1, &vp);
+        vkCmdSetScissor(command_buffer, 0, 1, &sc);
+
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline_.pipeline);
+        VkDescriptorSet set = descriptor_table_.get_set();
+        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            shadow_pipeline_.pipeline_layout, 0, 1, &set, 0, nullptr);
+        vkCmdBindIndexBuffer(command_buffer, allocator_.get_buffer(index_buffer_).buffer, 0, VK_INDEX_TYPE_UINT32);
+        const ShadowPush spush = {
+            .light_view_proj = light_view_proj_,
+            .vertex_address = allocator_.get_buffer(vertex_buffer_).device_address,
+            .drawdata_slot = draw_data_slot_,
+        };
+        vkCmdPushConstants(command_buffer, shadow_pipeline_.pipeline_layout,
+            VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ShadowPush), &spush);
+        vkCmdDrawIndexedIndirect(command_buffer, allocator_.get_buffer(shadow_indirect_buffer_).buffer,
+            0, draw_count_, sizeof(VkDrawIndexedIndirectCommand));
+
+        vkCmdEndRendering(command_buffer);
+
+        vku::transition_image(command_buffer, {
+            .image = shadow.image,
+            .old_layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .src_stage = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            .src_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+        });
+    }
     return true;
 }
 
@@ -759,16 +1007,28 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
         command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
         pipeline_.pipeline_layout, 0, 1, &set, 0, nullptr);
 
-    // Per-frame camera, the vertex SSBO's device address (pulled per-vertex in the shader), and the
-    // per-draw data buffer's bindless slot; the rest is on the GPU.
+    // Per-frame camera + vertex SSBO address + draw-data slot (vertex stage), plus the forward
+    // lighting constants (fragment stage): a single fixed directional sun and a hemispheric ambient.
+    // Sun points down from front-left; warm sun, cool sky, warm bounce.
     const GeometryPush push{
         .view_proj = camera_.view_proj(),
         .vertex_address = vertex_buffer.device_address,
         .drawdata_slot = draw_data_slot_,
+        .camera_pos = camera_.position(),
+        .sun_dir = sun_dir_,
+        .sun_intensity = 3.0f,
+        .sun_color = glm::vec3(1.0f, 0.96f, 0.9f),
+        .ambient_sky = glm::vec3(0.10f, 0.13f, 0.20f),
+        .ambient_ground = glm::vec3(0.10f, 0.08f, 0.06f),
+        .light_view_proj = light_view_proj_,
+        .shadow_slot = shadow_slots_.empty() ? 0u : shadow_slots_[current_frame],
+        .shadow_texel = 1.0f / static_cast<float>(kShadowResolution),
+        .shadow_bias = 0.0006f,
+        .shadow_normal_offset = shadow_world_texel_ * 2.5f,
     };
     vkCmdPushConstants(
         command_buffer, pipeline_.pipeline_layout,
-        VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(GeometryPush), &push);
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GeometryPush), &push);
 
     // Draw every command the cull compute shader emitted this frame; culled draws carry
     // instanceCount 0 so the GPU skips them. Each selects its DrawData via firstInstance ->

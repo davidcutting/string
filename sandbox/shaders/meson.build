@@ -4,6 +4,7 @@
 shaders = [
     '3d_shader.frag',
     '3d_shader.vert',
+    'shadow.vert',
     'cull.comp',
     'grid_2d_shader.vert',
     'grid_2d_shader.frag',

@@ -11,7 +11,7 @@ CompositePass::CompositePass(string::gpu::device& device, const std::filesystem:
     const VkPushConstantRange push_constant_range = {
         .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
-        .size = sizeof(uint32_t),   // source_slot
+        .size = 2 * sizeof(uint32_t),   // { source_slot, exposure }
     };
 
     pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
@@ -61,8 +61,10 @@ void CompositePass::record(string::gpu::command_recorder& recorder, uint16_t cur
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.pipeline);
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
         pipeline_.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
+    // { source_slot, exposure } — exposure scales the HDR before the tonemap curve (see composite.frag).
+    struct { uint32_t source_slot; float exposure; } push{ source_slot_, 1.0f };
     vkCmdPushConstants(command_buffer, pipeline_.pipeline_layout,
-        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t), &source_slot_);
+        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
     vkCmdDraw(command_buffer, 3, 1, 0, 0);
 }
 

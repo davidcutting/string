@@ -156,6 +156,8 @@ GltfParsed parse_gltf(const std::filesystem::path& path)
         GltfMaterial out;
         const auto& factor = material.pbrData.baseColorFactor;
         out.base_color_factor = { factor[0], factor[1], factor[2], factor[3] };
+        out.metallic_factor = material.pbrData.metallicFactor;
+        out.roughness_factor = material.pbrData.roughnessFactor;
         out.base_color_texture = image_index_of(asset, material.pbrData.baseColorTexture);
         out.metallic_roughness_texture = image_index_of(asset, material.pbrData.metallicRoughnessTexture);
         out.normal_texture = image_index_of(asset, material.normalTexture);

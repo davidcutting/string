@@ -246,7 +246,8 @@ pipeline_builder& pipeline_builder::set_multisampling(VkSampleCountFlagBits samp
     return *this;
 }
 
-pipeline_builder& pipeline_builder::enable_depth_stencil(bool depth_test, bool depth_write)
+pipeline_builder& pipeline_builder::enable_depth_stencil(bool depth_test, bool depth_write,
+                                                         VkCompareOp compare_op)
 {
     VkPipelineDepthStencilStateCreateInfo depth_stencil_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
@@ -254,11 +255,11 @@ pipeline_builder& pipeline_builder::enable_depth_stencil(bool depth_test, bool d
         .flags = 0,
         .depthTestEnable = depth_test ? VK_TRUE : VK_FALSE,
         .depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE,
-        // Reverse-Z: the projection maps near->1, far->0, and the depth buffer is cleared to 0,
-        // so nearer fragments have GREATER depth. Paired with a D32_SFLOAT buffer this spreads
+        // Default reverse-Z: the projection maps near->1, far->0, and the depth buffer is cleared to
+        // 0, so nearer fragments have GREATER depth. Paired with a D32_SFLOAT buffer this spreads
         // float precision far more evenly than standard Z, killing distant z-fighting (which
         // GPU-driven non-deterministic draw order would otherwise expose as flicker).
-        .depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL,
+        .depthCompareOp = compare_op,
         .depthBoundsTestEnable = VK_FALSE,
         .stencilTestEnable = VK_FALSE,
         .front = {},
@@ -268,6 +269,12 @@ pipeline_builder& pipeline_builder::enable_depth_stencil(bool depth_test, bool d
     };
     depth_stencil_info_ = depth_stencil_info;
     depth_format_ = VK_FORMAT_D32_SFLOAT;
+    return *this;
+}
+
+pipeline_builder& pipeline_builder::depth_only()
+{
+    color_enabled_ = false;
     return *this;
 }
 
@@ -368,6 +375,9 @@ VkPipeline pipeline_builder::build_graphics_pipeline(const VkPipelineLayout& pip
     // Defaults to the offscreen HDR target (color_format_); composite/present passes
     // override via set_color_format(). Depth is UNDEFINED unless enable_depth_stencil().
     VkFormat color_format = color_format_;
+    // A depth-only pipeline (e.g. a shadow prepass) may have no fragment shader — record just the
+    // vertex stage in that case.
+    const bool has_fragment = fragment_shader_module_ != VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo shader_stages[] = { vertex_shader_stage_info_, fragment_shader_stage_info_ };
 
     VkPipelineRenderingCreateInfo pipeline_render_info
@@ -375,8 +385,8 @@ VkPipeline pipeline_builder::build_graphics_pipeline(const VkPipelineLayout& pip
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .pNext = nullptr,
         .viewMask = 0,
-        .colorAttachmentCount = 1,
-        .pColorAttachmentFormats = &color_format,
+        .colorAttachmentCount = color_enabled_ ? 1u : 0u,
+        .pColorAttachmentFormats = color_enabled_ ? &color_format : nullptr,
         .depthAttachmentFormat = depth_format_,
         .stencilAttachmentFormat = {}
     };
@@ -385,7 +395,7 @@ VkPipeline pipeline_builder::build_graphics_pipeline(const VkPipelineLayout& pip
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &pipeline_render_info,
         .flags = 0,
-        .stageCount = 2,
+        .stageCount = has_fragment ? 2u : 1u,
         .pStages = shader_stages,
         .pVertexInputState = &vertex_input_info_,
         .pInputAssemblyState = &input_assembly_,
@@ -395,7 +405,8 @@ VkPipeline pipeline_builder::build_graphics_pipeline(const VkPipelineLayout& pip
         .pMultisampleState = &multisampling_state_info_,
         // No depth attachment (composite pass) => no depth-stencil state.
         .pDepthStencilState = (depth_format_ == VK_FORMAT_UNDEFINED) ? nullptr : &depth_stencil_info_,
-        .pColorBlendState = &color_blending_info_,
+        // With no color attachment (depth-only), color-blend state is unused.
+        .pColorBlendState = color_enabled_ ? &color_blending_info_ : nullptr,
         .pDynamicState = &dynamic_state,
         .layout = pipeline_layout,
         .renderPass = 0,
