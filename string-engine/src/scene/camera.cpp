@@ -55,18 +55,23 @@ void Camera::update(const InputMap& input, float delta_time, float aspect)
     const glm::vec3 right = glm::normalize(glm::cross(forward, world_up));
 
     // Movement from remappable axis actions; forward/right in the look plane, up in world space.
-    glm::vec3 move = forward * input.axis("move_forward")
-                   + right * input.axis("move_right")
-                   + world_up * input.axis("move_up");
+    // Only in game mode (cursor captured) — while the cursor is free for UI, WASD belongs to the UI
+    // (a focused text field), and the camera holds still. Look already zeroes when free.
+    if (input.input().mouse_captured())
+    {
+        glm::vec3 move = forward * input.axis("move_forward")
+                       + right * input.axis("move_right")
+                       + world_up * input.axis("move_up");
 
-    float speed = move_speed_;
-    if (input.held("sprint"))
-    {
-        speed *= sprint_multiplier_;
-    }
-    if (glm::length(move) > 0.0f)
-    {
-        position_ += glm::normalize(move) * speed * delta_time;
+        float speed = move_speed_;
+        if (input.held("sprint"))
+        {
+            speed *= sprint_multiplier_;
+        }
+        if (glm::length(move) > 0.0f)
+        {
+            position_ += glm::normalize(move) * speed * delta_time;
+        }
     }
 
     const float safe_aspect = aspect <= 0.0f ? 1.0f : aspect;

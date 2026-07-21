@@ -3,6 +3,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 #include <glm/glm.hpp>
 
@@ -173,6 +175,18 @@ public:
     }
     glm::vec2 mouse_delta() const { return mouse_delta_; }
     bool mouse_captured() const { return mouse_captured_; }
+    // Desired capture state (game vs UI mode), set by the app (a UI pass) and reconciled by the WSI
+    // backend each frame into the actual mouse_captured() state. Lets the UI decide when a click
+    // frees/grabs the cursor (it gets first dibs on a click) rather than the window guessing.
+    bool capture_requested() const { return capture_requested_; }
+    void set_capture_requested(bool requested) { capture_requested_ = requested; }
+    // Absolute cursor position in window pixels (top-left origin), for UI hit-testing. Unlike the
+    // delta this persists across frames (last known position), and is tracked even while captured.
+    glm::vec2 mouse_position() const { return mouse_position_; }
+    // Unicode text typed *this frame* as UTF-8 (empty if none), for text fields. Distinct from
+    // key_* state: this is composed character input (honours layout, shift, IME), cleared each
+    // new_frame(). Backspace/enter/etc. are not here — read those via key_pressed().
+    std::string_view typed_text() const { return typed_text_; }
 
     // --- Filled by the WSI backend ---
     void set_key(KeyCode key, bool down) { keys_[static_cast<std::size_t>(key)] = down; }
@@ -181,15 +195,18 @@ public:
         buttons_[static_cast<std::size_t>(button)] = down;
     }
     void add_mouse_delta(glm::vec2 delta) { mouse_delta_ += delta; }
+    void set_mouse_position(glm::vec2 position) { mouse_position_ = position; }
     void set_mouse_captured(bool captured) { mouse_captured_ = captured; }
+    void add_typed_text(std::string_view utf8) { typed_text_ += utf8; }
     // Called at the top of each window update, *before* polling events: snapshots the current
     // key/button state as "previous" (so pressed/released can detect this frame's edges) and
-    // resets the per-frame mouse delta.
+    // resets the per-frame accumulators (mouse delta, typed text).
     void new_frame()
     {
         prev_keys_ = keys_;
         prev_buttons_ = buttons_;
         mouse_delta_ = glm::vec2(0.0f);
+        typed_text_.clear();
     }
 
 private:
@@ -200,7 +217,10 @@ private:
     std::array<bool, 8> buttons_{};
     std::array<bool, 8> prev_buttons_{};
     glm::vec2 mouse_delta_{ 0.0f };
+    glm::vec2 mouse_position_{ 0.0f };
     bool mouse_captured_ = false;
+    bool capture_requested_ = true;   // start in game mode (mouse-look)
+    std::string typed_text_;
 };
 
 }

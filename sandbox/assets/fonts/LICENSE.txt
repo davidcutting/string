@@ -1,0 +1,4 @@
+DejaVu Sans (DejaVuSans.ttf) — bundled for text rendering.
+Font Software licensed under the DejaVu Fonts License (a permissive, Bitstream Vera–derived
+license allowing free use, redistribution, and modification). See:
+https://dejavu-fonts.github.io/License.html

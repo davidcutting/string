@@ -146,6 +146,7 @@ core_src = [
     'src/application.cpp',
     'src/scene.cpp',
     'src/core/job_system.cpp',
+    'src/core/font.cpp',
     'src/platform/input_map.cpp',
     'src/scene/camera.cpp',
     'src/vulkan/renderer.cpp',

@@ -27,8 +27,9 @@ struct PassContext
     // renderer after all passes are built, so uploads cost a single submit, not one per copy.
     TransferBatch& transfer;
     // Polled per-frame input (keyboard/mouse), for passes that respond to it (e.g. a camera).
-    // Stable for the app's lifetime; a pass may store the reference and read it in update().
-    const Input& input;
+    // Stable for the app's lifetime; a pass may store the reference and read it in update(). Non-
+    // const so a UI pass can write intent back (e.g. request game/UI capture mode).
+    Input& input;
     // Remappable action layer over `input`. Passes bind their actions here (or via a helper like
     // Camera::bind_default_controls) and query them by name, instead of reading raw key codes.
     InputMap& input_map;

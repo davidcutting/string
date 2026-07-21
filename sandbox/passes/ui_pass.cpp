@@ -1,45 +1,42 @@
 #include <algorithm>
 #include <array>
-#include <cstdint>
-#include <cmath>
+#include <cstring>
+#include <filesystem>
 #include <span>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "ui_pass.hpp"
+#include "overlay_common.hpp"
+
+#include <string/core/logger.hpp>
+#include <string/core/text_measurer.hpp>
 #include <string/gpu/pipeline_builder.hpp>
-#include <string/core/layout.hpp>
 
 namespace sandbox
 {
 using namespace String;
+
 namespace
 {
 
-// GPU shape, std430-compatible: matches `struct Shape` in shaders/ui_shader.vert. All-vec4
-// so the layout is unambiguous (16-byte aligned, 64-byte stride).
-//   rect   = { pos.x, pos.y, size.x, size.y }  (pixels)
-//   fill   = { r, g, b, a }                    (LINEAR — see srgb_to_linear)
-//   stroke = { r, g, b, a }                    (LINEAR border colour)
-//   params = { corner_radius, stroke_width, _, _ }  (pixels)
+// --- Shapes (rounded-rect SDF); matches `struct Shape` in shaders/ui_shader.vert -------------
 struct GpuShape
 {
-    float rect[4];
-    float fill[4];
-    float stroke[4];
-    float params[4];
+    float rect[4];    // pos.xy, size.xy (px)
+    float fill[4];    // linear rgba
+    float stroke[4];  // linear rgba
+    float params[4];  // corner_radius, stroke_width, _, _
+};
+struct ShapePush
+{
+    float screen_size[2];
+    std::uint32_t shape_slot;
 };
 
-// Authored UI colors are sRGB, but they're written into the linear HDR offscreen (which the
-// composite then re-encodes to sRGB) — so decode to linear on the way in, or they brighten.
-// Alpha is already linear and left alone.
-float srgb_to_linear(float c)
-{
-    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
-}
-
-// Honor the shape enum by resolving it to a corner radius the SDF can render directly:
-// RECTANGLE is sharp, ROUNDED_RECTANGLE uses `radius`, CIRCLE fills to half the smaller side
-// (a perfect circle for a square element, a pill otherwise). The shader stays shape-agnostic.
+// Resolve an element's shape enum to the SDF corner radius: sharp rect = 0, rounded = its radius,
+// circle/pill = half the smaller side.
 float effective_radius(const string::element& e, float w, float h)
 {
     switch (e.shape)
@@ -51,33 +48,21 @@ float effective_radius(const string::element& e, float w, float h)
     return 0.0f;
 }
 
-struct UIPush
-{
-    float screen_size[2];
-    uint32_t shape_slot;
-};
-
-// Pack already-laid-out nodes into GPU shapes. This is the library's half of the UI: the
-// application authored the layout (which elements, colors, shapes); here each node becomes a
-// std430 GpuShape with linearized colors and a shape-resolved corner radius. This is where
-// core/layout.hpp (namespace `string`) meets the renderer (namespace `String`).
+// Pack the non-text nodes of a laid-out tree into GPU shapes (text nodes are drawn as glyphs).
 std::vector<GpuShape> pack_shapes(std::span<const string::layout_node> nodes)
 {
-    using namespace string;
-
-    const auto to_linear = [](color c) {
-        return std::array<float, 4>{ srgb_to_linear(c.r / 255.0f), srgb_to_linear(c.g / 255.0f),
-                                     srgb_to_linear(c.b / 255.0f), c.a / 255.0f };
-    };
-
     std::vector<GpuShape> shapes;
     shapes.reserve(nodes.size());
-    for (const auto& n : nodes)
+    for (const string::layout_node& n : nodes)
     {
+        if (n.element.text != 0)
+        {
+            continue;  // text node -> glyphs, not a rect
+        }
         const float w = static_cast<float>(n.box.dimension.width);
         const float h = static_cast<float>(n.box.dimension.height);
-        const auto fill = to_linear(n.element.color);
-        const auto stroke = to_linear(n.element.stroke_color);
+        const std::array<float, 4> fill = to_linear(n.element.color);
+        const std::array<float, 4> stroke = to_linear(n.element.stroke_color);
         shapes.push_back(GpuShape{
             { static_cast<float>(n.box.x), static_cast<float>(n.box.y), w, h },
             { fill[0], fill[1], fill[2], fill[3] },
@@ -88,52 +73,141 @@ std::vector<GpuShape> pack_shapes(std::span<const string::layout_node> nodes)
     return shapes;
 }
 
+// --- Glyphs (SDF text); matches `struct Glyph` in shaders/text_shader.vert --------------------
+struct GpuGlyph
+{
+    float rect[4];   // x, y, w, h (px)
+    float uv[4];     // u0, v0, u1, v1
+    float color[4];  // linear rgba
+};
+struct TextPush
+{
+    float screen_size[2];
+    std::uint32_t glyph_slot;
+    std::uint32_t atlas_slot;
+};
+
+// Shape the text nodes' strings into positioned glyph quads (see the phase-1 text pass).
+std::vector<GpuGlyph> shape_glyphs(const string::font_atlas& atlas,
+                                   std::span<const string::layout_node> nodes,
+                                   std::span<const string::text_run> texts)
+{
+    std::vector<GpuGlyph> glyphs;
+    for (const string::layout_node& n : nodes)
+    {
+        if (n.element.text == 0 || n.element.text >= texts.size())
+        {
+            continue;
+        }
+        const std::array<float, 4> color = to_linear(n.element.color);
+        const std::string_view str = texts[n.element.text].str;
+
+        const float origin_x = static_cast<float>(n.box.x);
+        float pen_x = origin_x;
+        float baseline_y = static_cast<float>(n.box.y) + atlas.ascent;
+        for (const char c : str)
+        {
+            if (c == '\n')
+            {
+                pen_x = origin_x;
+                baseline_y += atlas.line_height();
+                continue;
+            }
+            const string::glyph_metrics& g = atlas.glyph(c);
+            if (g.w > 0 && g.h > 0)
+            {
+                glyphs.push_back(GpuGlyph{
+                    { pen_x + g.xoff, baseline_y + g.yoff, static_cast<float>(g.w), static_cast<float>(g.h) },
+                    { g.u0, g.v0, g.u1, g.v1 },
+                    { color[0], color[1], color[2], color[3] },
+                });
+            }
+            pen_x += g.xadvance;
+        }
+    }
+    return glyphs;
+}
+
 }  // namespace
 
-UIPass::UIPass(PassContext& context, std::vector<string::layout_node> nodes)
+void UIPass::make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight,
+                       std::uint32_t capacity, std::size_t stride)
+{
+    ring.resize(frames_in_flight);
+    for (Ring& r : ring)
+    {
+        r.buffer = allocator_.create_resource(string::gpu::buffer_info{
+            .size = capacity * stride,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+            .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
+                              | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+        });
+        descriptor_table_.bind(r.buffer, string::gpu::descriptor_type::STORAGE_BUFFER);
+        r.slot = descriptor_table_.get_binding_slot(r.buffer, string::gpu::descriptor_type::STORAGE_BUFFER);
+        r.mapped = allocator_.get_buffer(r.buffer).allocation_info.pMappedData;
+    }
+}
+
+UIPass::UIPass(PassContext& context, std::shared_ptr<const string::font_atlas> atlas, Author author)
 : device_(context.device)
 , allocator_(context.allocator)
 , descriptor_table_(context.descriptor_table)
+, atlas_(std::move(atlas))
+, author_(std::move(author))
+, input_(context.input)
 {
     const std::filesystem::path& resources_path = context.resources_path;
 
-    // Pack the application-authored layout and upload it to a persistent, host-visible storage
-    // buffer (static UI: no per-frame ring needed yet).
-    const std::vector<GpuShape> shapes = pack_shapes(nodes);
-    shape_count_ = static_cast<uint32_t>(shapes.size());
-
-    shape_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
-        .size = shape_count_ * sizeof(GpuShape),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+    // --- SDF atlas: an R8 sampled image, uploaded once and bound bindlessly ---
+    atlas_image_ = allocator_.create_resource(string::gpu::image_info{
+        .extent = { atlas_->atlas_w, atlas_->atlas_h, 1 },
+        .format = VK_FORMAT_R8_UNORM,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
+        .mip_levels = 1,
     });
-    allocator_.copy_data_to_buffer(shapes.data(), shape_buffer_);
+    context.transfer.upload_image(atlas_->pixels.data(), atlas_->pixels.size(), atlas_image_);
+    descriptor_table_.bind(atlas_image_, string::gpu::descriptor_type::TEXTURE);
+    atlas_slot_ = descriptor_table_.get_binding_slot(atlas_image_, string::gpu::descriptor_type::TEXTURE);
+    const VkSamplerCreateInfo sampler_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .maxLod = VK_LOD_CLAMP_NONE,
+        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+    };
+    if (vkCreateSampler(device_.get_device(), &sampler_info, nullptr, &atlas_sampler_) != VK_SUCCESS)
+    {
+        throw std::runtime_error("UIPass: failed to create atlas sampler");
+    }
+    descriptor_table_.update_texture(atlas_slot_, allocator_.get_image(atlas_image_).view, atlas_sampler_);
 
-    descriptor_table_.bind(shape_buffer_, string::gpu::descriptor_type::STORAGE_BUFFER);
+    // --- Per-frame ring buffers: shapes + glyphs ---
+    make_ring(shape_ring_, context.frames_in_flight, kMaxShapes, sizeof(GpuShape));
+    make_ring(glyph_ring_, context.frames_in_flight, kMaxGlyphs, sizeof(GpuGlyph));
     descriptor_set_ = descriptor_table_.get_set();
-    shape_slot_ = descriptor_table_.get_binding_slot(shape_buffer_, string::gpu::descriptor_type::STORAGE_BUFFER);
 
-    // Declare the storage buffer this pass reads (vertex shader) + the color target it draws
-    // into (overlay; no depth), for the render graph.
     usages = {
-        { shape_buffer_,        Access::StorageRead, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT },
-        { context.color_target, Access::ColorWrite,  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
+        { context.color_target, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
     };
 
-    const VkPushConstantRange push_constant_range = {
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-        .offset = 0,
-        .size = sizeof(UIPush),
+    // --- Shape pipeline (ui_shader): push = { screen, shape_slot }, vertex stage only ---
+    const VkPushConstantRange shape_push = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = sizeof(ShapePush),
     };
-    pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
+    shape_pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
         .set_descriptor_set_layout({ descriptor_table_.get_layout() })
-        .set_push_constant_ranges({ push_constant_range })
+        .set_push_constant_ranges({ shape_push })
         .build(device_);
-
-    // Overlay: procedural quads (no vertex input), alpha-blended, no depth test (but declares
-    // the offscreen D32 format so the pipeline matches the pass), offscreen R16F target.
-    pipeline_.pipeline = string::gpu::pipeline_builder(device_)
+    shape_pipeline_.pipeline = string::gpu::pipeline_builder(device_)
         .add_vertex_shader(resources_path / "shaders/ui_shader.vert.spv")
         .add_fragment_shader(resources_path / "shaders/ui_shader.frag.spv")
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -142,41 +216,148 @@ UIPass::UIPass(PassContext& context, std::vector<string::layout_node> nodes)
         .set_multisampling(context.sample_count)
         .enable_depth_stencil(false, false)
         .enable_color_blending()
-        .build_graphics_pipeline(pipeline_.pipeline_layout);
-    pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+        .build_graphics_pipeline(shape_pipeline_.pipeline_layout);
+    shape_pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+
+    // --- Text pipeline (text_shader): push = { screen, glyph_slot, atlas_slot }, both stages ---
+    const VkPushConstantRange text_push = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0, .size = sizeof(TextPush),
+    };
+    text_pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
+        .set_descriptor_set_layout({ descriptor_table_.get_layout() })
+        .set_push_constant_ranges({ text_push })
+        .build(device_);
+    text_pipeline_.pipeline = string::gpu::pipeline_builder(device_)
+        .add_vertex_shader(resources_path / "shaders/text_shader.vert.spv")
+        .add_fragment_shader(resources_path / "shaders/text_shader.frag.spv")
+        .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+        .set_tessellation()
+        .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
+        .set_multisampling(context.sample_count)
+        .enable_depth_stencil(false, false)
+        .enable_color_blending()
+        .build_graphics_pipeline(text_pipeline_.pipeline_layout);
+    text_pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
 }
 
 UIPass::~UIPass()
 {
-    vkDestroyPipeline(device_.get_device(), pipeline_.pipeline, nullptr);
-    vkDestroyPipelineLayout(device_.get_device(), pipeline_.pipeline_layout, nullptr);
-    descriptor_table_.unbind(shape_buffer_, string::gpu::descriptor_type::STORAGE_BUFFER);
-    allocator_.destroy_resource(shape_buffer_);
+    vkDestroyPipeline(device_.get_device(), shape_pipeline_.pipeline, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), shape_pipeline_.pipeline_layout, nullptr);
+    vkDestroyPipeline(device_.get_device(), text_pipeline_.pipeline, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), text_pipeline_.pipeline_layout, nullptr);
+    for (Ring& r : shape_ring_)
+    {
+        descriptor_table_.unbind(r.buffer, string::gpu::descriptor_type::STORAGE_BUFFER);
+        allocator_.destroy_resource(r.buffer);
+    }
+    for (Ring& r : glyph_ring_)
+    {
+        descriptor_table_.unbind(r.buffer, string::gpu::descriptor_type::STORAGE_BUFFER);
+        allocator_.destroy_resource(r.buffer);
+    }
+    descriptor_table_.unbind(atlas_image_, string::gpu::descriptor_type::TEXTURE);
+    allocator_.destroy_resource(atlas_image_);
+    vkDestroySampler(device_.get_device(), atlas_sampler_, nullptr);
+}
+
+void UIPass::update(float /*delta_time*/, uint16_t current_frame)
+{
+    if (screen_size.width == 0 || screen_size.height == 0 || current_frame >= shape_ring_.size())
+    {
+        return;  // not sized yet
+    }
+
+    // Author + lay out the whole UI. The callback adds children to a screen-filling root; it reads
+    // last frame's hovered/focused ids to style, and the live input to route text to a focused field.
+    builder_.clear();
+    builder_.begin(string::format{ .padding = { 12, 12, 12, 12 }, .gap = 8,
+                                   .direction = string::direction::VERTICAL });
+    author_(builder_, UiContext{ input_, hovered_id_, focused_id_ });
+    const string::dimension available{
+        static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.width, 0xFFFF)),
+        static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.height, 0xFFFF)) };
+    builder_.end(available, string::text_measurer{ atlas_.get(), builder_.text_runs() });
+
+    // Pack shapes and glyphs from the one tree into this frame's ring buffers.
+    const std::vector<GpuShape> shapes = pack_shapes(builder_.nodes());
+    const std::vector<GpuGlyph> glyphs = shape_glyphs(*atlas_, builder_.nodes(), builder_.text_runs());
+    if ((shapes.size() > kMaxShapes || glyphs.size() > kMaxGlyphs) && !warned_overflow_)
+    {
+        STRING_LOG_WARN("UIPass: content exceeds ring capacity ({} shapes / {} glyphs); truncating",
+                        shapes.size(), glyphs.size());
+        warned_overflow_ = true;
+    }
+    Ring& sr = shape_ring_[current_frame];
+    sr.count = static_cast<std::uint32_t>(std::min<std::size_t>(shapes.size(), kMaxShapes));
+    std::memcpy(sr.mapped, shapes.data(), sr.count * sizeof(GpuShape));
+    Ring& gr = glyph_ring_[current_frame];
+    gr.count = static_cast<std::uint32_t>(std::min<std::size_t>(glyphs.size(), kMaxGlyphs));
+    std::memcpy(gr.mapped, glyphs.data(), gr.count * sizeof(GpuGlyph));
+
+    // Hit-test the cursor against this frame's layout for hover, and resolve focus / mode.
+    const glm::vec2 mouse = input_.mouse_position();
+    const string::layout_node* hit = builder_.hit_test(
+        static_cast<std::uint16_t>(std::clamp(mouse.x, 0.0f, 65535.0f)),
+        static_cast<std::uint16_t>(std::clamp(mouse.y, 0.0f, 65535.0f)));
+    hovered_id_ = hit != nullptr ? hit->element.id.hash : 0;
+
+    if (input_.mouse_captured())
+    {
+        focused_id_ = 0;  // game mode (mouse-look): nothing in the UI is focused
+    }
+    else if (input_.mouse_button_pressed(MouseButton::LEFT))
+    {
+        // UI mode: a click focuses the element under the cursor; a click on empty UI space falls
+        // through to request game mode (so the UI gets first dibs on the click).
+        if (hovered_id_ != 0)
+        {
+            focused_id_ = hovered_id_;
+        }
+        else
+        {
+            input_.set_capture_requested(true);
+            focused_id_ = 0;
+        }
+    }
 }
 
 void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
-    (void)current_frame;
-    if (shape_count_ == 0)
+    if (current_frame >= shape_ring_.size())
     {
         return;
     }
-
     VkCommandBuffer command_buffer = recorder.get_command_buffer();
 
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.pipeline);
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-        pipeline_.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
+    // Shapes first (under), then glyphs (over).
+    const Ring& sr = shape_ring_[current_frame];
+    if (sr.count > 0)
+    {
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shape_pipeline_.pipeline);
+        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            shape_pipeline_.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
+        const ShapePush push{
+            { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) }, sr.slot };
+        vkCmdPushConstants(command_buffer, shape_pipeline_.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+            0, sizeof(ShapePush), &push);
+        vkCmdDraw(command_buffer, 6, sr.count, 0, 0);
+    }
 
-    const UIPush push{
-        { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
-        shape_slot_,
-    };
-    vkCmdPushConstants(command_buffer, pipeline_.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-        0, sizeof(UIPush), &push);
-
-    // 6 verts (two triangles) per shape, one instance per shape.
-    vkCmdDraw(command_buffer, 6, shape_count_, 0, 0);
+    const Ring& gr = glyph_ring_[current_frame];
+    if (gr.count > 0)
+    {
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, text_pipeline_.pipeline);
+        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            text_pipeline_.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
+        const TextPush push{
+            { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
+            gr.slot, atlas_slot_ };
+        vkCmdPushConstants(command_buffer, text_pipeline_.pipeline_layout,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(TextPush), &push);
+        vkCmdDraw(command_buffer, 6, gr.count, 0, 0);
+    }
 }
 
-}
+}  // namespace sandbox

@@ -239,6 +239,9 @@ Window::Window(const Properties& properties)
     // Esc releases it (see update()), a click re-captures.
     SDL_SetWindowRelativeMouseMode(window_handle, true);
     input_.set_mouse_captured(true);
+
+    // Enable Unicode text input so SDL_EVENT_TEXT_INPUT flows to text fields (see update()).
+    SDL_StartTextInput(window_handle);
 };
 
 Window::~Window()
@@ -298,12 +301,10 @@ void Window::update(entt::dispatcher& dispatcher)
                 if (key != KeyCode::UNKNOWN)
                     input_.set_key(key, down);
 
-                // Esc releases the captured cursor (frees it to interact with the desktop/UI).
+                // Esc requests UI mode (frees the cursor); the reconcile below enacts it. The app
+                // (a UI pass) requests game mode again (e.g. a click on empty world).
                 if (down && event.key.scancode == SDL_SCANCODE_ESCAPE)
-                {
-                    SDL_SetWindowRelativeMouseMode((SDL_Window*)window_handle_, false);
-                    input_.set_mouse_captured(false);
-                }
+                    input_.set_capture_requested(false);
                 break;
             }
             case SDL_EVENT_MOUSE_MOTION:
@@ -311,6 +312,15 @@ void Window::update(entt::dispatcher& dispatcher)
                 // Only feed look-deltas while captured, so a released cursor doesn't turn.
                 if (input_.mouse_captured())
                     input_.add_mouse_delta({ event.motion.xrel, event.motion.yrel });
+                // Absolute position (window pixels) for UI hit-testing — meaningful when released.
+                input_.set_mouse_position({ event.motion.x, event.motion.y });
+                break;
+            }
+            case SDL_EVENT_TEXT_INPUT:
+            {
+                // Composed Unicode text (UTF-8), for text fields. SDL text input is started at
+                // window creation so these always flow (see the SDL_StartTextInput call there).
+                input_.add_typed_text(event.text.text);
                 break;
             }
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -318,16 +328,19 @@ void Window::update(entt::dispatcher& dispatcher)
             {
                 const bool down = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
                 input_.set_mouse_button(translate_button(event.button.button), down);
-
-                // A click while released re-captures the cursor back into mouse-look.
-                if (down && !input_.mouse_captured())
-                {
-                    SDL_SetWindowRelativeMouseMode((SDL_Window*)window_handle_, true);
-                    input_.set_mouse_captured(true);
-                }
+                // Capture (game vs UI mode) is now app-driven: a UI pass decides whether a click
+                // focuses UI or requests game mode. See the reconcile at the end of update().
                 break;
             }
         }
+    }
+
+    // Reconcile the actual cursor mode to what the app requested this frame (Esc / a UI click set
+    // the intent). Doing it once here — not per event — keeps game/UI mode fully app-driven.
+    if (input_.capture_requested() != input_.mouse_captured())
+    {
+        SDL_SetWindowRelativeMouseMode((SDL_Window*)window_handle_, input_.capture_requested());
+        input_.set_mouse_captured(input_.capture_requested());
     }
 }
 

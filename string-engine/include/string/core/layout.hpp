@@ -160,6 +160,20 @@ struct element
     uint16_t stroke_width;  // border width (px); 0 = no border
     shape shape;            // RECTANGLE by default
     sizing sizing;          // how this element sizes itself on each axis
+    // 1-based index into the layout_builder's text table (0 = no text). Text content is held
+    // out-of-line (see text_run) so `element` stays small and trivially copyable, and so text
+    // falls out as its own buffer for a text pass — the string itself never rides in the element.
+    // A text measurer resolves this index against the table (see core/text_measurer.hpp).
+    uint32_t text = 0;
+};
+
+// A run of text attached to an element, held in the layout_builder's side-table. `str` is
+// non-owning — it must outlive any layout/renderable produced from it, the same contract as
+// id.name. `font_px` is the requested pixel size (0 = the renderer's default).
+struct text_run
+{
+    std::string_view str;
+    uint16_t font_px = 0;
 };
 
 struct format
@@ -296,6 +310,8 @@ class layout_builder
 {
     std::vector<layout_node> nodes_;
     std::vector<uint32_t> open_;
+    // Text side-table; index 0 is a reserved "no text" sentinel, so element.text is 1-based.
+    std::vector<text_run> texts_{ text_run{} };
 
 public:
     // Open a container. `element` is its own visual/sizing; `format` lays out its children.
@@ -304,6 +320,10 @@ public:
     constexpr auto begin(const format& format) -> layout_builder&;
     // Add a leaf element to the current container.
     constexpr auto add_element(const element& element) -> layout_builder&;
+    // Add a leaf text element: stores the run in the text table and points `element.text` at it, so
+    // a text measurer sizes it and a text pass draws it. `element`'s own visuals (fill = text
+    // colour, sizing) still apply; use size_fit() to shrink-wrap to the measured run.
+    constexpr auto add_text(element element, std::string_view str, uint16_t font_px = 0) -> layout_builder&;
 
     // Close the current container. When it is the outermost one, its subtree is laid out.
     constexpr auto end() -> layout_builder&;
@@ -324,6 +344,12 @@ public:
     [[nodiscard]] constexpr auto nodes() const noexcept -> std::span<const layout_node>
     {
         return std::span<const layout_node>{ nodes_ };
+    }
+
+    // The text table, indexed by element.text (index 0 is the reserved "no text" sentinel).
+    [[nodiscard]] constexpr auto text_runs() const noexcept -> std::span<const text_run>
+    {
+        return std::span<const text_run>{ texts_ };
     }
 
     // Snapshot the positioned nodes into a fixed-size array, so the result can escape constant
@@ -367,6 +393,8 @@ public:
     {
         nodes_.clear();
         open_.clear();
+        texts_.clear();
+        texts_.emplace_back();  // restore the index-0 "no text" sentinel
     }
 
 private:
@@ -408,6 +436,14 @@ constexpr auto layout_builder::add_element(const element& element) -> layout_bui
         layout_node::link(nodes_, open_.back(), index);
 
     return *this;
+}
+
+constexpr auto layout_builder::add_text(element element, std::string_view str, uint16_t font_px)
+    -> layout_builder&
+{
+    element.text = static_cast<uint32_t>(texts_.size());  // 1-based (index 0 is the sentinel)
+    texts_.push_back(text_run{ str, font_px });
+    return add_element(element);
 }
 
 // Close the current container; if it was the outermost one, lay out its whole subtree. When

@@ -9,6 +9,8 @@ shaders = [
     'grid_2d_shader.frag',
     'ui_shader.frag',
     'ui_shader.vert',
+    'text_shader.frag',
+    'text_shader.vert',
 ]
 
 shader_targets = []

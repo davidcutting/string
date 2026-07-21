@@ -56,8 +56,10 @@ public:
     const Properties& get_properties() const;
     const View::Extent& get_extent() const;
     // Polled input state, refreshed by update() each frame (see Input). Stable for the window's
-    // lifetime, so consumers can hold the reference.
+    // lifetime, so consumers can hold the reference. The non-const overload lets a driver (e.g. a
+    // UI pass) write intent back, such as requesting game/UI capture mode.
     const Input& get_input() const { return input_; }
+    Input& get_input() { return input_; }
     bool should_close() const;
     void resize(const View::Extent& extent);
     void key_action(int key, int scancode, int action, int mods);
