@@ -15,6 +15,7 @@
 #include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/render_plan.hpp>
 #include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/transfer_batch.hpp>
 #include <string/vulkan/passes/composite_pass.hpp>
 #include <string/platform/input_map.hpp>
 
@@ -49,6 +50,11 @@ class Renderer
     string::gpu::queue compute_queue_;
     string::gpu::presenter presenter_;
     string::gpu::resource_allocator allocator_;
+    // Persistent upload ring on the graphics queue. Passes record their initial uploads into it
+    // during construction (drained once by wait_idle before frame 0); thereafter it streams
+    // per-frame uploads, flushed each frame in begin_frame. Declared after the queue/allocator it
+    // borrows, so its constructor sees them initialized.
+    TransferBatch transfer_batch_;
     string::gpu::descriptor_table global_descriptor_table_;
     // Derives the frame's image-layout barriers from tracked state (see begin/end_rendering).
     ResourceStateTracker resource_states_;

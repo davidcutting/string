@@ -67,6 +67,11 @@ class TransferBatch
     void free_staging(Batch& batch);
 
 public:
+    // The timeline value an upload will signal once the GPU has the data. Compare against
+    // completed_value() / is_complete() to know when a streamed resource is safe to sample.
+    // 0 is never a valid ticket (the timeline starts at 0), so it means "nothing to wait on".
+    using upload_ticket = uint64_t;
+
     TransferBatch(string::gpu::device& device, string::gpu::resource_allocator& allocator,
                   string::gpu::queue queue);
     ~TransferBatch();
@@ -74,13 +79,16 @@ public:
     TransferBatch(const TransferBatch&) = delete;
     TransferBatch& operator=(const TransferBatch&) = delete;
 
-    // Records a staging copy of `data` into a device-local buffer. Nothing is waited on; the
-    // batch may be submitted asynchronously once the staging budget is hit.
-    void upload_buffer(const void* data, VkDeviceSize size, string::gpu::resource_id dst_buffer);
+    // Records a staging copy of `data` into a device-local buffer at `dst_offset`. Nothing is
+    // waited on; the batch may be submitted asynchronously once the staging budget is hit. The
+    // returned ticket is the timeline value this upload's batch will signal once complete. The
+    // offset lets a streamer upload a sub-range into a larger buffer (e.g. one draw's vertices).
+    upload_ticket upload_buffer(const void* data, VkDeviceSize size, string::gpu::resource_id dst_buffer,
+                                VkDeviceSize dst_offset = 0);
     // Records UNDEFINED -> TRANSFER_DST, a staging copy, then TRANSFER_DST -> SHADER_READ for
     // the destination image (extent taken from the allocated image). Generates the mip chain by
     // blitting when the image has more than one level — for CPU-decoded RGBA8 textures.
-    void upload_image(const void* pixels, VkDeviceSize size, string::gpu::resource_id dst_image);
+    upload_ticket upload_image(const void* pixels, VkDeviceSize size, string::gpu::resource_id dst_image);
 
     // One precomputed mip level inside the blob handed to upload_image_levels: its byte offset
     // into that blob and the level's texel extent.
@@ -89,14 +97,25 @@ public:
         VkDeviceSize offset;
         VkExtent3D extent;
     };
-    // Uploads an image whose mip levels are already laid out in `data` (e.g. a transcoded KTX2
-    // texture): stages the whole blob once, copies each level verbatim into its mip, then moves
-    // the whole image to SHADER_READ. No blit — levels are taken as-is, so block-compressed
-    // formats (BC7) work. levels.size() must equal the image's mip_levels.
-    void upload_image_levels(const void* data, VkDeviceSize total_size,
-                             std::span<const level_copy> levels, string::gpu::resource_id dst_image);
+    // Uploads image mip levels already laid out in `data` (e.g. a transcoded KTX2 texture):
+    // stages the whole blob once, copies each level verbatim into a mip, then moves the touched
+    // levels to SHADER_READ. No blit — levels are taken as-is, so block-compressed formats (BC7)
+    // work. Level i of `levels` targets image mip `base_mip + i`, so this both does the whole-
+    // image upload (base_mip = 0, levels.size() == mip_levels) and streams a subrange of finer
+    // mips into an already-live, sampled image (base_mip > 0). Only the touched subrange is
+    // transitioned, so other mips stay readable.
+    upload_ticket upload_image_levels(const void* data, VkDeviceSize total_size,
+                                      std::span<const level_copy> levels,
+                                      string::gpu::resource_id dst_image, uint32_t base_mip = 0);
+
+    // The highest timeline value the GPU has finished (polls the timeline semaphore).
+    uint64_t completed_value() const;
+    // Whether the upload with this ticket has completed on the GPU. Note a ticket whose batch is
+    // still only recorded (never flushed) will never complete until flush()/wait_idle() submits it.
+    bool is_complete(upload_ticket ticket) const;
 
     // Submits any pending batch without waiting (so its GPU work can overlap what follows).
+    // Called once per frame by the renderer to push streamed uploads on the graphics queue.
     void flush();
     // Submits any pending batch and blocks until every in-flight batch completes, freeing all
     // staging. The one acceptable wait: called once by the renderer before the first frame.

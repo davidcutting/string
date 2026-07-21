@@ -219,6 +219,9 @@ void device::create_logical_device()
     vulkan12_features.pNext = &extended_dynamic_state2_features;
     vulkan12_features.timelineSemaphore = VK_TRUE;
     vulkan12_features.bufferDeviceAddress = VK_TRUE;
+    // Scalar block layout: lets the 3D vertex shader's buffer_reference Vertex struct pack to match
+    // the tightly-packed C++ String::Vertex (vec3/vec2 mix) instead of std430's vec3->vec4 padding.
+    vulkan12_features.scalarBlockLayout = VK_TRUE;
     vulkan12_features.descriptorBindingPartiallyBound = VK_TRUE;
     vulkan12_features.descriptorBindingVariableDescriptorCount = VK_TRUE;
     // Bindless: unbounded descriptor arrays in shaders + (non-)uniform indexing into them.

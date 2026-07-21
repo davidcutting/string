@@ -27,8 +27,8 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include <string/core/stb_image.h>
 
-// libktx: cooked .ktx2 textures (KTX2/UASTC) are transcoded to BC7 and uploaded without any CPU
-// pixel decode — the fast path that avoids the stb_image load-time floor. See tools/cook_textures.sh.
+// libktx: cooked .ktx2 textures are already BC7 (see tools/cook_textures.sh) and stream in without
+// any CPU pixel decode or transcode — the fast path that avoids the stb_image load-time floor.
 // ktxvulkan.h (VkFormat query) requires the Vulkan headers above it and pulls in ktx.h itself.
 #include <ktxvulkan.h>
 
@@ -50,6 +50,59 @@ struct DecodedTexture
     int height = 0;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
 };
+
+// The coarse-tail detail (resident mip levels from the coarsest) whose finest level is ~floor_px
+// wide — the LOD floor every streamed texture is pinned to. detail == levels means all mips.
+std::uint32_t coarse_detail_for(std::uint32_t levels, std::uint32_t base_extent, std::uint32_t floor_px)
+{
+    std::uint32_t base_mip = base_extent <= floor_px
+        ? 0u
+        : static_cast<std::uint32_t>(std::floor(std::log2(static_cast<float>(base_extent) / floor_px)));
+    base_mip = std::min(base_mip, levels - 1);
+    return levels - base_mip;
+}
+
+// Rough screen-coverage LOD: project the draw's world AABB, take its largest screen-space pixel
+// span, and pick the mip whose texel count matches that span (aim for texel:pixel ~ 1). Returns a
+// detail in [coarse_detail, levels]. Deliberately cheap and per-draw (v1 CPU feedback) — no UVs, so
+// it assumes the texture maps ~once across the surface, which is fine for a first pass.
+std::uint32_t desired_detail(const glm::mat4& view_proj, const glm::vec3& mn, const glm::vec3& mx,
+                             VkExtent2D screen, std::uint32_t levels, std::uint32_t base_extent,
+                             std::uint32_t coarse_detail)
+{
+    glm::vec2 lo(std::numeric_limits<float>::max());
+    glm::vec2 hi(std::numeric_limits<float>::lowest());
+    int in_front = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        const glm::vec4 corner((i & 1) ? mx.x : mn.x, (i & 2) ? mx.y : mn.y, (i & 4) ? mx.z : mn.z, 1.0f);
+        const glm::vec4 clip = view_proj * corner;
+        if (clip.w <= 1e-4f)
+        {
+            continue;  // behind / on the near plane — skip (a projected point would be meaningless)
+        }
+        ++in_front;
+        const glm::vec2 ndc = glm::vec2(clip) / clip.w;
+        const glm::vec2 px = (ndc * 0.5f + 0.5f) * glm::vec2(screen.width, screen.height);
+        lo = glm::min(lo, px);
+        hi = glm::max(hi, px);
+    }
+    if (in_front == 0)
+    {
+        return coarse_detail;
+    }
+    const float span = std::max(hi.x - lo.x, hi.y - lo.y);
+    if (span <= 1.0f)
+    {
+        return coarse_detail;
+    }
+    // base_extent texels spread across `span` pixels: minified by base_extent/span. The matching mip
+    // is log2 of that ratio; ratio <= 1 (magnified) wants mip 0 (full detail).
+    const float ratio = static_cast<float>(base_extent) / span;
+    std::uint32_t base_mip = ratio <= 1.0f ? 0u : static_cast<std::uint32_t>(std::floor(std::log2(ratio)));
+    base_mip = std::min(base_mip, levels - 1);
+    return std::max(levels - base_mip, coarse_detail);
+}
 
 // Decode one texture source (file or embedded bytes) to RGBA8. Pure CPU work — safe to run on a
 // job thread. Throws on failure (captured by the job's future, rethrown at .get()).
@@ -127,81 +180,26 @@ std::optional<std::filesystem::path> ktx_sibling(const GltfTexture& source)
     return std::nullopt;
 }
 
-// CPU work (safe on a job thread): load a cooked .ktx2 and transcode its Basis payload to BC7.
-// This is the expensive part (the transcode), so it runs in parallel across the decode pool just
-// like stb decode does — collected and uploaded serially on the main thread. Returns an owning
-// ktxTexture2* (destroyed by upload_ktx2). Throws on failure (rethrown at the future's .get()).
-ktxTexture2* load_ktx2(const std::filesystem::path& path)
+// Is the world-space AABB inside the frustum? Mirrors cull.comp's aabb_outside_frustum (Gribb-
+// Hartmann planes from the view-projection, ZERO_TO_ONE clip) on the CPU, for geometry-residency
+// feedback — we want a draw's geometry as soon as it's potentially visible.
+bool aabb_in_frustum(const glm::mat4& vp, const glm::vec3& mn, const glm::vec3& mx)
 {
-    ktxTexture2* ktx = nullptr;
-    KTX_error_code rc = ktxTexture2_CreateFromNamedFile(
-        path.string().c_str(), KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT, &ktx);
-    if (rc != KTX_SUCCESS)
+    const glm::vec4 r0(vp[0][0], vp[1][0], vp[2][0], vp[3][0]);
+    const glm::vec4 r1(vp[0][1], vp[1][1], vp[2][1], vp[3][1]);
+    const glm::vec4 r2(vp[0][2], vp[1][2], vp[2][2], vp[3][2]);
+    const glm::vec4 r3(vp[0][3], vp[1][3], vp[2][3], vp[3][3]);
+    const glm::vec4 planes[6] = { r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2 };
+    for (int i = 0; i < 6; ++i)
     {
-        throw std::runtime_error("ktx: failed to load " + path.string() + ": " + ktxErrorString(rc));
-    }
-
-    // Basis Universal payloads (UASTC/ETC1S) are transcoded to a GPU block format; BC7 is our
-    // target (desktop-baseline, high quality). Uncompressed KTX2s pass through unchanged.
-    if (ktxTexture2_NeedsTranscoding(ktx))
-    {
-        rc = ktxTexture2_TranscodeBasis(ktx, KTX_TTF_BC7_RGBA, 0);
-        if (rc != KTX_SUCCESS)
+        const glm::vec3 n(planes[i]);
+        const glm::vec3 p(n.x >= 0.0f ? mx.x : mn.x, n.y >= 0.0f ? mx.y : mn.y, n.z >= 0.0f ? mx.z : mn.z);
+        if (glm::dot(n, p) + planes[i].w < 0.0f)
         {
-            ktxTexture_Destroy(ktxTexture(ktx));
-            throw std::runtime_error("ktx: BC7 transcode failed for " + path.string() + ": " +
-                                     ktxErrorString(rc));
+            return false;
         }
     }
-    return ktx;
-}
-
-// GPU work (main thread): upload an already-loaded/transcoded KTX texture — every mip level
-// verbatim, no blit — and bind it into the bindless table. Consumes (destroys) `ktx`. The KTX
-// file carries the transfer function, so its resolved VkFormat is the correct BC7 sRGB/UNORM
-// variant (the cook sets sRGB for base-color, linear for data maps).
-void upload_ktx2(string::gpu::resource_allocator& allocator,
-                 string::gpu::descriptor_table& descriptor_table, TransferBatch& transfer,
-                 ktxTexture2* ktx,
-                 string::gpu::resource_id& out_image, uint32_t& out_slot)
-{
-    const VkFormat format = static_cast<VkFormat>(ktxTexture2_GetVkFormat(ktx));
-    const uint32_t mip_levels = ktx->numLevels;
-    const uint32_t width = ktx->baseWidth;
-    const uint32_t height = ktx->baseHeight;
-
-    out_image = allocator.create_resource(string::gpu::image_info{
-        .extent = { width, height, 1 },
-        .format = format,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        // Block-compressed: no TRANSFER_SRC / blit — every level is precomputed in the file.
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-        .mip_levels = mip_levels,
-    });
-
-    // Map each mip level to its byte offset within the loaded KTX blob; extents halve per level.
-    std::vector<TransferBatch::level_copy> levels(mip_levels);
-    for (uint32_t level = 0; level < mip_levels; ++level)
-    {
-        ktx_size_t offset = 0;
-        ktxTexture_GetImageOffset(ktxTexture(ktx), level, 0, 0, &offset);
-        levels[level] = TransferBatch::level_copy{
-            .offset = static_cast<VkDeviceSize>(offset),
-            .extent = { std::max(width >> level, 1u), std::max(height >> level, 1u), 1 },
-        };
-    }
-
-    // upload_image_levels copies the data into staging synchronously, so the KTX texture can be
-    // freed right after (the transfer batch owns the staging until the GPU consumes it).
-    transfer.upload_image_levels(ktxTexture_GetData(ktxTexture(ktx)),
-        static_cast<VkDeviceSize>(ktxTexture_GetDataSize(ktxTexture(ktx))), levels, out_image);
-    ktxTexture_Destroy(ktxTexture(ktx));
-
-    descriptor_table.bind(out_image, string::gpu::descriptor_type::TEXTURE);
-    out_slot = descriptor_table.get_binding_slot(out_image, string::gpu::descriptor_type::TEXTURE);
+    return true;
 }
 
 }  // namespace
@@ -212,6 +210,7 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
 , descriptor_table_(context.descriptor_table)
 , input_map_(context.input_map)
 , frames_in_flight_(context.frames_in_flight)
+, residency_(kTextureBudget, kTextureStreamPerFrame)
 {
     // Parse the glTF (fast: buffers + resolved texture sources + materials), then overlap the
     // two expensive stages: texture decode runs on the worker pool while this thread flattens
@@ -220,34 +219,26 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     const auto load_start = std::chrono::steady_clock::now();
     GltfParsed parsed = parse_gltf(context.resources_path / model_path);
 
-    // Kick off every texture decode now, before flattening — the jobs run on the pool while the
-    // main thread does the geometry work below. Each decode is independent CPU work; the GPU
-    // upload stays on this thread (VMA + command recording aren't thread-safe), collected in
-    // order and streamed asynchronously by the transfer batch.
-    // Decide per texture: a cooked .ktx2 sibling takes the BC7 path (load + transcode, no pixel
-    // decode); the rest are stb-decoded. Both run in parallel on the pool — the KTX transcode is
-    // CPU-bound too, so serialising it would erase the win. Only the GPU upload stays serial.
+    // Kick off the uncooked (stb) texture decodes now, before flattening — they run on the pool
+    // while the main thread flattens geometry. Cooked .ktx2 textures are NOT touched here: their
+    // UASTC->BC7 transcode is deferred to the streamer's background workers on first use (it's the
+    // dominant cost), so at load they only get a header read + a placeholder slot.
     string::core::job_system decode_pool;
     std::vector<std::optional<std::filesystem::path>> ktx_paths(parsed.textures.size());
-    std::vector<std::future<ktxTexture2*>> ktx_jobs(parsed.textures.size());
     std::vector<std::future<DecodedTexture>> decode_jobs(parsed.textures.size());
     for (std::size_t i = 0; i < parsed.textures.size(); ++i)
     {
         ktx_paths[i] = ktx_sibling(parsed.textures[i]);
-        if (ktx_paths[i])
-        {
-            const std::filesystem::path path = *ktx_paths[i];
-            ktx_jobs[i] = decode_pool.enqueue([path]() { return load_ktx2(path); });
-        }
-        else
+        if (!ktx_paths[i])
         {
             const GltfTexture* source = &parsed.textures[i];
             decode_jobs[i] = decode_pool.enqueue([source]() { return decode_texture(*source); });
         }
     }
 
-    // Flatten geometry on this thread (overlaps the decode jobs above).
-    const GltfGeometry geometry = flatten_geometry(parsed);
+    // Flatten geometry on this thread (overlaps the decode jobs above). Non-const so its vertex /
+    // index arrays can be moved into the geometry streamer (which uploads them on demand).
+    GltfGeometry geometry = flatten_geometry(parsed);
     materials_ = parsed.materials;
     draws_ = geometry.draws;
 
@@ -255,17 +246,58 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
                     geometry.vertices.size(), geometry.indices.size(), geometry.draws.size(),
                     parsed.materials.size(), parsed.textures.size());
 
-    // Upload the shared vertex + index buffers (device-local, recorded into the shared batch).
-    const uint32_t vertex_size = sizeof(geometry.vertices[0]) * geometry.vertices.size();
-    const uint32_t index_size = sizeof(geometry.indices[0]) * geometry.indices.size();
+    // Heap capacities (in elements). The streamer suballocates a SEPARATE range per draw, so shared
+    // vertices (instanced primitives) are duplicated — size to the sum of per-draw ranges, not the
+    // deduplicated vertex count, or everything can't fit even at 100%. kGeometryResidentPercent < 100
+    // caps below that to exercise reclaim (with pop-in / possible thrash when the visible set exceeds
+    // the budget); 100 keeps everything resident (reclaim still happens for geometry left behind as
+    // you look around, freeing ranges — visible in the [geo] logs — but no artifacts).
+    uint64_t vertex_units = 0;
+    for (const GltfDraw& d : draws_)
+    {
+        if (d.index_count == 0) continue;
+        uint32_t vmin = std::numeric_limits<uint32_t>::max();
+        uint32_t vmax = 0;
+        for (uint32_t k = 0; k < d.index_count; ++k)
+        {
+            const uint32_t v = geometry.indices[d.index_offset + k];
+            vmin = std::min(vmin, v);
+            vmax = std::max(vmax, v);
+        }
+        vertex_units += (vmax - vmin + 1);
+    }
+    const uint64_t index_units = geometry.indices.size();  // indices aren't shared across draws
+    const uint64_t vertex_capacity = std::max<uint64_t>(1, vertex_units * kGeometryResidentPercent / 100);
+    const uint64_t index_capacity = std::max<uint64_t>(1, index_units * kGeometryResidentPercent / 100);
+    const uint32_t vertex_size = static_cast<uint32_t>(sizeof(String::Vertex) * vertex_capacity);
+    const uint32_t index_size = static_cast<uint32_t>(sizeof(uint32_t) * index_capacity);
 
+    // Model AABB, computed now (before the geometry arrays are moved into the streamer below) for
+    // framing the camera.
+    glm::vec3 aabb_min(std::numeric_limits<float>::max());
+    glm::vec3 aabb_max(std::numeric_limits<float>::lowest());
+    for (const auto& vertex : geometry.vertices)
+    {
+        aabb_min = glm::min(aabb_min, vertex.pos);
+        aabb_max = glm::max(aabb_max, vertex.pos);
+    }
+    if (geometry.vertices.empty())
+    {
+        aabb_min = glm::vec3(-1.0f);
+        aabb_max = glm::vec3(1.0f);
+    }
+
+    // Shared geometry buffers allocated whole up front, but NOT uploaded here: the geometry
+    // streamer uploads each draw's vertex/index sub-range on demand (when the draw enters view).
+    // Vertices are pulled by device address in the vertex shader, so the buffer needs
+    // SHADER_DEVICE_ADDRESS (which populates allocated_buffer.device_address) rather than VERTEX_BUFFER.
     vertex_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
         .size = vertex_size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+               | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
     });
-    context.transfer.upload_buffer(geometry.vertices.data(), vertex_size, vertex_buffer_);
 
     index_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
         .size = index_size,
@@ -273,31 +305,10 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
     });
-    context.transfer.upload_buffer(geometry.indices.data(), index_size, index_buffer_);
 
-    // Collect the (already running) decodes in order and record their uploads.
-    texture_images_.resize(parsed.textures.size());
-    texture_slots_.resize(parsed.textures.size());
-    for (std::size_t i = 0; i < parsed.textures.size(); ++i)
-    {
-        if (ktx_paths[i])
-        {
-            upload_ktx2(allocator_, descriptor_table_, context.transfer, ktx_jobs[i].get(),
-                        texture_images_[i], texture_slots_[i]);
-        }
-        else
-        {
-            const DecodedTexture decoded = decode_jobs[i].get();
-            upload_decoded(allocator_, descriptor_table_, context.transfer, decoded,
-                           texture_images_[i], texture_slots_[i]);
-        }
-    }
-    const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - load_start).count();
-    STRING_LOG_INFO("[load] total ({} textures, {} decode workers): {} ms",
-                    parsed.textures.size(), decode_pool.worker_count(), load_ms);
-
-    // 1x1 white fallback for draws without a base-color texture (factor still tints it).
+    // 1x1 white fallback for draws without a base-color texture (the factor still tints it). Created
+    // first because the streamer also uses it as the placeholder shown for cooked textures until
+    // their deferred transcode+upload lands.
     const std::array<uint8_t, 4> white_pixel = { 255, 255, 255, 255 };
     white_image_ = allocator_.create_resource(string::gpu::image_info{
         .extent = { 1, 1, 1 },
@@ -311,6 +322,46 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     context.transfer.upload_image(white_pixel.data(), white_pixel.size(), white_image_);
     descriptor_table_.bind(white_image_, string::gpu::descriptor_type::TEXTURE);
     white_slot_ = descriptor_table_.get_binding_slot(white_image_, string::gpu::descriptor_type::TEXTURE);
+    const string::gpu::allocated_image& white = allocator_.get_image(white_image_);
+
+    // Collect textures: cooked KTX2 register with the streamer (BC7 image + placeholder slot now,
+    // mips streamed in on demand from the coarse tail up); stb fallbacks upload whole here.
+    texture_streamer_ = std::make_unique<TextureStreamer>(
+        device_, allocator_, descriptor_table_, context.transfer, white.view, white.sampler);
+    texture_images_.resize(parsed.textures.size());
+    texture_slots_.resize(parsed.textures.size());
+    texture_lod_.resize(parsed.textures.size());
+    frame_desired_detail_.resize(parsed.textures.size(), 0);
+    for (std::size_t i = 0; i < parsed.textures.size(); ++i)
+    {
+        if (ktx_paths[i])
+        {
+            const TextureStreamer::Registered reg =
+                texture_streamer_->add(*ktx_paths[i], parsed.textures[i].srgb);
+            texture_images_[i] = reg.image;
+            texture_slots_[i] = reg.slot;
+            residency_.register_resource(reg.image, *texture_streamer_, reg.min_detail,
+                                         reg.max_detail, reg.min_detail);
+            streamed_textures_.push_back(reg.image);
+            texture_lod_[i] = TextureLod{
+                .levels = reg.max_detail,
+                .base_extent = reg.base_extent,
+                .coarse_detail = coarse_detail_for(reg.max_detail, reg.base_extent, kCoarseFloorPixels),
+            };
+        }
+        else
+        {
+            const DecodedTexture decoded = decode_jobs[i].get();
+            upload_decoded(allocator_, descriptor_table_, context.transfer, decoded,
+                           texture_images_[i], texture_slots_[i]);
+        }
+    }
+    const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - load_start).count();
+    STRING_LOG_INFO("[load] total ({} textures, {} decode workers): {} ms",
+                    parsed.textures.size(), decode_pool.worker_count(), load_ms);
+    STRING_LOG_INFO("[stream] {} of {} textures streamed (BC7, coarse tail first); rest stb",
+                    texture_streamer_->count(), parsed.textures.size());
     // The renderer drains the transfer batch (wait_idle) once after all passes are built; no
     // per-pass flush needed here.
 
@@ -345,7 +396,10 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
             cull_data[i] = CullDraw{
                 .aabb_min = glm::vec4(draw.aabb_min, 1.0f),
                 .aabb_max = glm::vec4(draw.aabb_max, 1.0f),
-                .index_count = draw.index_count,
+                // index_count starts at 0 (not resident) — the geometry streamer writes the real
+                // count into the (host-visible) cull buffer once the draw's geometry is uploaded,
+                // so cull.comp only emits a non-empty draw for resident geometry.
+                .index_count = 0,
                 .first_index = draw.index_offset,
                 .vertex_offset = 0,
                 .draw_id = static_cast<uint32_t>(i),   // -> firstInstance -> gl_InstanceIndex
@@ -364,16 +418,22 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         draw_data_slot_ = descriptor_table_.get_binding_slot(
             draw_data_buffer_, string::gpu::descriptor_type::STORAGE_BUFFER);
 
-        // Cull input (device-addressed so the compute shader reaches it by pointer).
+        // Cull input (device-addressed so the compute shader reaches it by pointer). Host-visible
+        // and persistently mapped: the geometry streamer flips each draw's index_count between 0 and
+        // its real value directly (per-frame residency), so it must be CPU-writable. Desktop
+        // host-visible memory is coherent, and vkQueueSubmit makes prior host writes visible, so the
+        // per-frame writes in update() are seen by that frame's cull.comp. No TRANSFER_DST (no copy).
         const VkDeviceSize cull_size = sizeof(CullDraw) * cull_data.size();
         cull_draw_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
             .size = cull_size,
-            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                   | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            .allocation_flags = {},
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+            .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
+                              | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
         });
-        context.transfer.upload_buffer(cull_data.data(), cull_size, cull_draw_buffer_);
+        cull_draw_mapped_ = static_cast<CullDraw*>(
+            allocator_.get_buffer(cull_draw_buffer_).allocation_info.pMappedData);
+        std::copy(cull_data.begin(), cull_data.end(), cull_draw_mapped_);
 
         // Cull output: the compute shader fills one command per draw each frame, drawn via
         // vkCmdDrawIndexedIndirect. One per frame-in-flight so a new frame's compute doesn't
@@ -403,23 +463,54 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
             .add_compute_shader(context.resources_path / "shaders/cull.comp.spv")
             .build_compute_pipeline(cull_pipeline_.pipeline_layout);
         cull_pipeline_.pipeline_type = string::gpu::pipeline_type::COMPUTE;
+
+        // Geometry streaming: hand the CPU geometry to the streamer (suballocates + uploads per-draw
+        // ranges on demand, frees on eviction) and register every draw with the geometry residency
+        // manager. The manager's byte budget matches the heap capacity so it evicts (reclaims) once
+        // the heaps are full. On residency the streamer writes the draw's indirect-command fields
+        // into the mapped cull buffer, revealing it; on eviction it zeroes them.
+        geometry_streamer_ = std::make_unique<GeometryStreamer>(
+            allocator_, context.transfer, vertex_buffer_, index_buffer_,
+            std::move(geometry.vertices), std::move(geometry.indices),
+            vertex_capacity, index_capacity, frames_in_flight_);
+        geometry_streamer_->set_draws(draws_);
+        geometry_streamer_->set_residency_callback(
+            [this](std::uint32_t draw, std::uint32_t vertex_offset, std::uint32_t first_index,
+                   std::uint32_t index_count) {
+                cull_draw_mapped_[draw].vertex_offset = vertex_offset;
+                cull_draw_mapped_[draw].first_index = first_index;
+                cull_draw_mapped_[draw].index_count = index_count;
+            });
+
+        geometry_streaming_ = kGeometryResidentPercent < 100;
+        if (geometry_streaming_)
+        {
+            // Doesn't fit: register with the manager and stream per-frame by visibility (update()).
+            const VkDeviceSize geometry_budget = VkDeviceSize(vertex_capacity) * sizeof(String::Vertex)
+                                               + VkDeviceSize(index_capacity) * sizeof(uint32_t);
+            geometry_residency_ = std::make_unique<string::gpu::residency_manager>(
+                geometry_budget, kGeometryStreamPerFrame);
+            for (std::uint32_t d = 0; d < draw_count_; ++d)
+            {
+                geometry_residency_->register_resource(d, *geometry_streamer_, /*min=*/0, /*max=*/1, /*initial=*/0);
+            }
+        }
+        else
+        {
+            // Fits: upload every draw's geometry now (drained once by the renderer's wait_idle before
+            // frame 0) and reveal it. No per-frame streaming/eviction — same clean up-front load as
+            // before geometry streaming existed.
+            for (std::uint32_t d = 0; d < draw_count_; ++d)
+            {
+                geometry_streamer_->stream(d, 0, 1);
+                geometry_streamer_->on_resident(d, 1);
+            }
+        }
     }
 
-    // Frame the whole model with the engine camera: compute the AABB, then let it position
-    // itself to fit. Bind the conventional fly controls (WASD + Space/Ctrl + Shift) onto the
-    // shared InputMap so update() can read them by action name.
-    glm::vec3 aabb_min(std::numeric_limits<float>::max());
-    glm::vec3 aabb_max(std::numeric_limits<float>::lowest());
-    for (const auto& vertex : geometry.vertices)
-    {
-        aabb_min = glm::min(aabb_min, vertex.pos);
-        aabb_max = glm::max(aabb_max, vertex.pos);
-    }
-    if (geometry.vertices.empty())
-    {
-        aabb_min = glm::vec3(-1.0f);
-        aabb_max = glm::vec3(1.0f);
-    }
+    // Frame the whole model with the engine camera using the AABB computed above, then let it
+    // position itself to fit. Bind the conventional fly controls (WASD + Space/Ctrl + Shift) onto
+    // the shared InputMap so update() can read them by action name.
     String::Camera::bind_default_controls(input_map_);
     // Debug: F freezes/unfreezes the culling frustum, C toggles culling off entirely (see update()).
     input_map_.bind_button("freeze_culling", String::KeyCode::F);
@@ -452,12 +543,11 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         .set_push_constant_ranges({ push_constant_range })
         .build(device_);
 
-    const auto binding_description = Vertex::getBindingDescription();
-    const auto attribute_descriptions = Vertex::getAttributeDescriptions();
+    // No vertex-input state: the shader pulls vertices from a device-address SSBO by gl_VertexIndex
+    // (the builder defaults to an empty VkPipelineVertexInputStateCreateInfo).
     pipeline_.pipeline = string::gpu::pipeline_builder(device_)
         .add_vertex_shader(context.resources_path / "shaders/3d_shader.vert.spv")
         .add_fragment_shader(context.resources_path / "shaders/3d_shader.frag.spv")
-        .set_vertex_binding(binding_description, attribute_descriptions)
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
         .set_tessellation()
         // Back-face cull with a CCW front face: glTF winds front faces CCW, and this pipeline's
@@ -526,6 +616,97 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         cull_enabled_ = !cull_enabled_;
         STRING_LOG_INFO("GPU frustum culling {}", cull_enabled_ ? "ON" : "OFF (debug)");
     }
+
+    // Residency feedback — textures and geometry driven by the SAME per-draw frustum visibility.
+    //  - Textures: every streamed texture is pinned to its coarse-tail floor (so the whole scene is
+    //    blurry-but-real), and each *visible* draw raises its base-color texture toward the mip its
+    //    on-screen coverage needs (screen-coverage LOD). The finest request across all draws sharing
+    //    a texture wins; it's aggregated in frame_desired_detail_ and issued once per texture below.
+    //    Textures are never released — re-reading from disk on return is cheap but their VRAM fits —
+    //    so once resolved they stay.
+    //  - Geometry (only when streaming, i.e. the model doesn't fit): want visible draws, release the
+    //    rest, so off-screen geometry is evicted and its heap space reused. begin_frame() first
+    //    reclaims ranges whose deferred-free window has elapsed.
+    for (std::size_t i = 0; i < texture_lod_.size(); ++i)
+    {
+        frame_desired_detail_[i] = texture_lod_[i].coarse_detail;  // 0 for non-streamed (stb) textures
+    }
+    const glm::mat4 vp = camera_.view_proj();
+    if (geometry_streaming_)
+    {
+        geometry_streamer_->begin_frame(stream_frame_);
+    }
+    for (uint32_t d = 0; d < draw_count_; ++d)
+    {
+        const bool visible = aabb_in_frustum(vp, draws_[d].aabb_min, draws_[d].aabb_max);
+        if (visible && draws_[d].material >= 0)
+        {
+            const int tex = materials_[draws_[d].material].base_color_texture;
+            if (tex >= 0 && texture_lod_[tex].levels > 0)
+            {
+                const std::uint32_t want = desired_detail(vp, draws_[d].aabb_min, draws_[d].aabb_max,
+                                                          screen_size, texture_lod_[tex].levels,
+                                                          texture_lod_[tex].base_extent,
+                                                          texture_lod_[tex].coarse_detail);
+                frame_desired_detail_[tex] = std::max(frame_desired_detail_[tex], want);
+            }
+        }
+        if (geometry_streaming_)
+        {
+            if (visible)
+                geometry_residency_->want(d, 1, string::gpu::resource_priority::LAZY, stream_frame_);
+            else
+                geometry_residency_->release(d);
+        }
+    }
+    // Issue one want() per streamed texture with its aggregated desired detail. A texture wanted
+    // above its coarse floor this frame is on screen and needs sharpening now → IMMEDIATE; one still
+    // at the floor is background → LAZY (so it fills in without stalling the visible ones).
+    for (std::size_t i = 0; i < texture_lod_.size(); ++i)
+    {
+        if (texture_lod_[i].levels == 0)
+        {
+            continue;  // non-streamed (stb) texture
+        }
+        const bool on_screen = frame_desired_detail_[i] > texture_lod_[i].coarse_detail;
+        const auto priority = on_screen ? string::gpu::resource_priority::IMMEDIATE
+                                        : string::gpu::resource_priority::LAZY;
+        residency_.want(texture_images_[i], frame_desired_detail_[i], priority, stream_frame_);
+    }
+    residency_.tick(stream_frame_);
+    if (draw_count_ > 0 && geometry_streaming_)
+    {
+        geometry_residency_->tick(stream_frame_);
+        if (stream_frame_ == 1 || stream_frame_ == 5 || stream_frame_ == 60 || stream_frame_ == 300)
+        {
+            STRING_LOG_INFO("[geo] frame {}: {} of {} draws resident, {} MB streamed, {} evictions",
+                            stream_frame_, geometry_streamer_->resident_count(), draw_count_,
+                            geometry_streamer_->streamed_bytes() / (1024 * 1024),
+                            geometry_streamer_->evicted_count());
+        }
+    }
+
+    // One-shot: report the frame at which every streamed texture reached full residency (all CACHED
+    // at their desired detail), so streaming progress is observable against the load logs.
+    if (!logged_full_resident_ && !streamed_textures_.empty())
+    {
+        bool all_full = true;
+        for (const string::gpu::resource_id id : streamed_textures_)
+        {
+            if (residency_.status_of(id) != string::gpu::stream_status::CACHED)
+            {
+                all_full = false;
+                break;
+            }
+        }
+        if (all_full)
+        {
+            STRING_LOG_INFO("[stream] all {} textures fully resident at frame {}",
+                            streamed_textures_.size(), stream_frame_);
+            logged_full_resident_ = true;
+        }
+    }
+    ++stream_frame_;
 }
 
 bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint16_t current_frame)
@@ -569,9 +750,8 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
     const auto& vertex_buffer = allocator_.get_buffer(vertex_buffer_);
     const auto& index_buffer = allocator_.get_buffer(index_buffer_);
 
-    VkBuffer vertex_buffers[] = { vertex_buffer.buffer };
-    VkDeviceSize offsets[] = { 0 };
-    vkCmdBindVertexBuffers(command_buffer, 0, 1, vertex_buffers, offsets);
+    // No vertex binding — the shader pulls vertices from vertex_buffer's device address (below).
+    // Indices are still fetched fixed-function by the indexed indirect draw.
     vkCmdBindIndexBuffer(command_buffer, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
     VkDescriptorSet set = descriptor_table_.get_set();
@@ -579,8 +759,13 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
         command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
         pipeline_.pipeline_layout, 0, 1, &set, 0, nullptr);
 
-    // Per-frame camera + the per-draw data buffer's bindless slot; the rest is on the GPU.
-    const GeometryPush push{ .view_proj = camera_.view_proj(), .drawdata_slot = draw_data_slot_ };
+    // Per-frame camera, the vertex SSBO's device address (pulled per-vertex in the shader), and the
+    // per-draw data buffer's bindless slot; the rest is on the GPU.
+    const GeometryPush push{
+        .view_proj = camera_.view_proj(),
+        .vertex_address = vertex_buffer.device_address,
+        .drawdata_slot = draw_data_slot_,
+    };
     vkCmdPushConstants(
         command_buffer, pipeline_.pipeline_layout,
         VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(GeometryPush), &push);

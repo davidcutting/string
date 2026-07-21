@@ -154,6 +154,7 @@ core_src = [
     'src/gpu/presenter.cpp',
     'src/gpu/resource_allocator.cpp',
     'src/gpu/descriptor_allocator.cpp',
+    'src/gpu/residency_manager.cpp',
     'src/gpu/command_recorder.cpp',
     'src/vulkan/transfer_batch.cpp',
     'src/vulkan/resource_state.cpp',

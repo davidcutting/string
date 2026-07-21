@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 #include <string/gpu/command_recorder.hpp>
@@ -12,10 +13,13 @@
 #include <string/scene/camera.hpp>
 #include <string/gpu/pipeline.hpp>
 #include "string/gpu/descriptor_allocator.hpp"
+#include "string/gpu/residency_manager.hpp"
 #include "string/gpu/resource.hpp"
 #include "string/gpu/resource_allocator.hpp"
 
 #include "gltf_loader.hpp"
+#include "geometry_streamer.hpp"
+#include "texture_streamer.hpp"
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -26,11 +30,14 @@
 namespace sandbox
 {
 
-// Push constant for the 3D pipeline: the camera's view-projection (per frame) and the bindless
-// slot of the per-draw data buffer. Layout must match shaders/3d_shader.vert.
+// Push constant for the 3D pipeline: the camera's view-projection (per frame), the device address
+// of the vertex SSBO the shader pulls from (programmable vertex pulling), and the bindless slot of
+// the per-draw data buffer. Field order/layout must match the Push block in shaders/3d_shader.vert
+// (mat4 at 0, 8-byte device address at 64, uint at 72).
 struct GeometryPush
 {
     glm::mat4 view_proj;
+    VkDeviceAddress vertex_address;
     uint32_t drawdata_slot;
 };
 
@@ -96,8 +103,25 @@ class GeometryPass final : public String::Pass
     // there's one per frame-in-flight to avoid a frame N+1 compute clobbering the buffer frame N's
     // draw is still reading on the GPU.
     string::gpu::resource_id cull_draw_buffer_;
+    // Host-visible mapped view of cull_draw_buffer_: the geometry streamer flips each draw's
+    // index_count here (0 = not resident / not drawn, real = resident) as geometry streams in.
+    CullDraw* cull_draw_mapped_ = nullptr;
     std::vector<string::gpu::resource_id> culled_indirect_buffers_;
     uint32_t frames_in_flight_ = 1;
+
+    // Geometry residency streaming: per-draw vertex/index ranges suballocate into heaps SMALLER than
+    // the whole model as draws enter the view frustum, and are freed (reclaimed) on eviction. A
+    // not-yet-resident draw stays hidden (index_count 0). Capping resident geometry below the full
+    // model is what exercises reclaim; raise toward 100 for a VRAM-fitting scene with no pop-in.
+    static constexpr std::uint64_t kGeometryResidentPercent = 100;
+    static constexpr VkDeviceSize kGeometryStreamPerFrame = 32ull * 1024 * 1024;
+    // Per-model budget (heap capacity), so this is a unique_ptr built once sizes are known.
+    std::unique_ptr<string::gpu::residency_manager> geometry_residency_;
+    std::unique_ptr<GeometryStreamer> geometry_streamer_;
+    // Only stream per-frame when the model doesn't fit the budget (< 100%). When it fits, all
+    // geometry is uploaded up front (no per-frame streaming/eviction cost) — streaming a scene that
+    // fits in VRAM just adds startup lag for no benefit.
+    bool geometry_streaming_ = false;
 
     // Per glTF-image backing resource + its bindless slot (index-aligned with the loaded
     // model's textures, so a material's texture index maps straight to a slot).
@@ -107,6 +131,36 @@ class GeometryPass final : public String::Pass
     // base-color factor still tints it).
     string::gpu::resource_id white_image_;
     uint32_t white_slot_ = 0;
+
+    // Texture residency streaming: the streamer (a residency_provider) owns each texture's mip
+    // levels and adjustable-minLod sampler; the manager drives what streams in per frame. Only
+    // cooked KTX2 textures stream — stb-decoded fallbacks upload whole as before. Budget is large
+    // (no physical VRAM reclaim yet — see TextureStreamer), so all wanted detail streams in.
+    static constexpr VkDeviceSize kTextureBudget = 6ull * 1024 * 1024 * 1024;
+    // Cap new streaming per frame so the coarse scene appears instantly and sharpens over ~a second,
+    // rather than stalling frame 0 on the whole fine-mip upload.
+    static constexpr VkDeviceSize kTextureStreamPerFrame = 64ull * 1024 * 1024;
+    // Coarse-mip LOD floor: the coarsest resident mip every streamed texture is pinned to is roughly
+    // this wide, so the whole scene renders blurry-but-real up front and only visible surfaces pull
+    // finer mips (screen-coverage feedback in update()).
+    static constexpr std::uint32_t kCoarseFloorPixels = 64;
+    string::gpu::residency_manager residency_;
+    std::unique_ptr<TextureStreamer> texture_streamer_;
+    std::vector<string::gpu::resource_id> streamed_textures_;
+    // Per glTF texture (index-aligned with texture_images_): the info the coverage heuristic needs
+    // to pick a desired mip. levels == 0 marks a non-streamed (stb) texture the feedback skips.
+    struct TextureLod
+    {
+        std::uint32_t levels = 0;         // total mip levels
+        std::uint32_t base_extent = 0;    // max(width, height) of mip 0
+        std::uint32_t coarse_detail = 0;  // pinned coarse-tail detail (never wanted below this)
+    };
+    std::vector<TextureLod> texture_lod_;
+    // Scratch reused each frame: the finest detail any visible draw wants per texture (starts at the
+    // coarse floor, raised by coverage), issued as one want() per texture after the draw loop.
+    std::vector<std::uint32_t> frame_desired_detail_;
+    uint64_t stream_frame_ = 0;
+    bool logged_full_resident_ = false;
 
     std::vector<GltfMaterial> materials_;
     std::vector<GltfDraw> draws_;

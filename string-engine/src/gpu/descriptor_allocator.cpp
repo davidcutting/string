@@ -239,6 +239,28 @@ void descriptor_table::bind_buffer(resource_id handle, VkDescriptorType type, ui
     vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 }
 
+void descriptor_table::update_texture(std::uint32_t slot, VkImageView view, VkSampler sampler)
+{
+    const VkDescriptorImageInfo image_info = {
+        .sampler = sampler,
+        .imageView = view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    const VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .pNext = nullptr,
+        .dstSet = descriptor_set_,
+        .dstBinding = 1,  // combined image samplers (textures)
+        .dstArrayElement = slot,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &image_info,
+        .pBufferInfo = nullptr,
+        .pTexelBufferView = nullptr,
+    };
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+}
+
 void descriptor_table::bind_image(resource_id handle, VkDescriptorType type, uint32_t slot)
 {
     const auto& image = allocator_.get_image(handle);

@@ -42,6 +42,8 @@ executable(
         'gltf_loader.cpp',
         'passes/grid_2d_pass.cpp',
         'passes/geometry_pass.cpp',
+        'passes/texture_streamer.cpp',
+        'passes/geometry_streamer.cpp',
         'passes/ui_pass.cpp',
     ],
     include_directories : sandbox_inc,

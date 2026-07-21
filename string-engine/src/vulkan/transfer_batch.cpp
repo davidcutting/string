@@ -130,16 +130,21 @@ void TransferBatch::submit_current()
     current_ = (current_ + 1) % RING;
 }
 
-void TransferBatch::upload_buffer(const void* data, VkDeviceSize size, string::gpu::resource_id dst_buffer)
+TransferBatch::upload_ticket TransferBatch::upload_buffer(const void* data, VkDeviceSize size,
+    string::gpu::resource_id dst_buffer, VkDeviceSize dst_offset)
 {
     VkCommandBuffer command_buffer = begin_if_needed();
+    // The value the current (still-recording) slot will signal when submitted: submit_current
+    // assigns signal = next_signal_ (then increments), so this slot's eventual signal is exactly
+    // next_signal_ regardless of whether the budget triggers a submit at the end of this call.
+    const upload_ticket ticket = next_signal_;
 
     const string::gpu::resource_id staging = allocator_.create_staging(size);
     allocator_.copy_data_to_buffer(data, staging);
     ring_[current_].staging.push_back(staging);
     pending_bytes_ += size;
 
-    const VkBufferCopy region = { .srcOffset = 0, .dstOffset = 0, .size = size };
+    const VkBufferCopy region = { .srcOffset = 0, .dstOffset = dst_offset, .size = size };
     vkCmdCopyBuffer(command_buffer, allocator_.get_buffer(staging).buffer,
         allocator_.get_buffer(dst_buffer).buffer, 1, &region);
 
@@ -147,11 +152,13 @@ void TransferBatch::upload_buffer(const void* data, VkDeviceSize size, string::g
     {
         submit_current();
     }
+    return ticket;
 }
 
-void TransferBatch::upload_image(const void* pixels, VkDeviceSize size, string::gpu::resource_id dst_image)
+TransferBatch::upload_ticket TransferBatch::upload_image(const void* pixels, VkDeviceSize size, string::gpu::resource_id dst_image)
 {
     VkCommandBuffer command_buffer = begin_if_needed();
+    const upload_ticket ticket = next_signal_;
     const string::gpu::allocated_image& image = allocator_.get_image(dst_image);
     const uint32_t mip_levels = image.mip_levels;
 
@@ -249,16 +256,21 @@ void TransferBatch::upload_image(const void* pixels, VkDeviceSize size, string::
     {
         submit_current();
     }
+    return ticket;
 }
 
-void TransferBatch::upload_image_levels(const void* data, VkDeviceSize total_size,
-    std::span<const level_copy> levels, string::gpu::resource_id dst_image)
+TransferBatch::upload_ticket TransferBatch::upload_image_levels(const void* data, VkDeviceSize total_size,
+    std::span<const level_copy> levels, string::gpu::resource_id dst_image, uint32_t base_mip)
 {
     VkCommandBuffer command_buffer = begin_if_needed();
+    const upload_ticket ticket = next_signal_;
     const string::gpu::allocated_image& image = allocator_.get_image(dst_image);
-    const uint32_t mip_levels = static_cast<uint32_t>(levels.size());
+    const uint32_t level_count = static_cast<uint32_t>(levels.size());
 
-    // All mip levels UNDEFINED -> TRANSFER_DST.
+    // Only the touched subrange [base_mip, base_mip + level_count) is transitioned; for the whole-
+    // image case (base_mip == 0, level_count == image.mip_levels) this covers every level, and for
+    // a streamed subrange the other (already-resident) mips are left in SHADER_READ untouched.
+    // old_layout UNDEFINED discards prior contents of these levels — fine, we overwrite them whole.
     vku::transition_image(command_buffer, {
         .image = image.image,
         .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -267,7 +279,8 @@ void TransferBatch::upload_image_levels(const void* data, VkDeviceSize total_siz
         .src_access = 0,
         .dst_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
         .dst_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .level_count = mip_levels,
+        .base_mip = base_mip,
+        .level_count = level_count,
     });
 
     // Stage the whole blob once, then copy each precomputed level into its mip. Tightly packed
@@ -278,14 +291,14 @@ void TransferBatch::upload_image_levels(const void* data, VkDeviceSize total_siz
     pending_bytes_ += total_size;
 
     std::vector<VkBufferImageCopy> regions;
-    regions.reserve(mip_levels);
-    for (uint32_t level = 0; level < mip_levels; ++level)
+    regions.reserve(level_count);
+    for (uint32_t level = 0; level < level_count; ++level)
     {
         regions.push_back(VkBufferImageCopy{
             .bufferOffset = levels[level].offset,
             .bufferRowLength = 0,
             .bufferImageHeight = 0,
-            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1 },
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, base_mip + level, 0, 1 },
             .imageOffset = { 0, 0, 0 },
             .imageExtent = levels[level].extent,
         });
@@ -294,7 +307,7 @@ void TransferBatch::upload_image_levels(const void* data, VkDeviceSize total_siz
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         static_cast<uint32_t>(regions.size()), regions.data());
 
-    // All mip levels TRANSFER_DST -> SHADER_READ.
+    // The touched subrange TRANSFER_DST -> SHADER_READ.
     vku::transition_image(command_buffer, {
         .image = image.image,
         .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -303,13 +316,27 @@ void TransferBatch::upload_image_levels(const void* data, VkDeviceSize total_siz
         .src_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
         .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
         .dst_access = VK_ACCESS_2_SHADER_READ_BIT,
-        .level_count = mip_levels,
+        .base_mip = base_mip,
+        .level_count = level_count,
     });
 
     if (pending_bytes_ >= STAGING_BUDGET)
     {
         submit_current();
     }
+    return ticket;
+}
+
+uint64_t TransferBatch::completed_value() const
+{
+    uint64_t value = 0;
+    vkGetSemaphoreCounterValue(device_.get_device(), timeline_, &value);
+    return value;
+}
+
+bool TransferBatch::is_complete(upload_ticket ticket) const
+{
+    return ticket == 0 || completed_value() >= ticket;
 }
 
 void TransferBatch::flush()

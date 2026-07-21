@@ -82,6 +82,12 @@ public:
     void bind(resource_id handle, descriptor_type type);
     void unbind(resource_id handle, descriptor_type type);
 
+    // Rewrite an already-allocated texture slot's combined-image-sampler (binding 1) with a new
+    // view/sampler. Used by streaming to swap a texture's sampler as its resident mip range grows
+    // or shrinks (an adjustable minLod), without reallocating the bindless slot. The set is
+    // UPDATE_AFTER_BIND, so this is safe to call between frames while the slot stays bound.
+    void update_texture(std::uint32_t slot, VkImageView view, VkSampler sampler);
+
     auto get_binding_slot(resource_id handle, descriptor_type type) -> std::uint32_t;
     auto get_layout() const -> VkDescriptorSetLayout { return descriptor_set_layout_; }
     auto get_set() const -> VkDescriptorSet { return descriptor_set_; }

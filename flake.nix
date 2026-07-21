@@ -111,12 +111,14 @@
 
           nativeBuildInputs = with pkgs; [
             meson ninja pkg-config cmake makeWrapper glslang
+            ktx-tools     # `ktx` CLI, for cooking textures to KTX2 (tools/cook_textures.sh)
           ];
 
           buildInputs = with pkgs; [
             spdlog glm entt sdl3
             vulkan-headers vulkan-memory-allocator vulkan-volk
             shader-slang fastgltf simdjson
+            ktx-tools     # libktx: the sandbox loader reads/transcodes .ktx2 (KTX::ktx cmake config)
           ];
 
           # WSI is an option of the engine subproject, so it is namespaced.
@@ -159,6 +161,7 @@
               spdlog glm entt sdl3
               vulkan-headers vulkan-memory-allocator vulkan-volk
               fastgltf simdjson
+              ktx-tools                   # libktx + `ktx` CLI (texture cook + runtime load)
               gtest                       # for -Dtests=true in-shell
               # Profiler: the tracy client links into the engine (-Dtracy=true); this is also
               # the standalone Tracy viewer so you don't have to build it manually.

@@ -34,6 +34,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 , compute_queue_(device_.get_queue(string::gpu::queue_type::COMPUTE))
 , presenter_(device_, window_, frames_in_flight_)
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
+, transfer_batch_(device_, allocator_, graphics_queue_)
 , global_descriptor_table_(device_.get_device(), allocator_)
 , composite_pass_(device_, std::filesystem::path(application_info.resources_directory), global_descriptor_table_.get_layout(), presenter_.get_format())
 {
@@ -90,14 +91,13 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     // context and executes. Passes that upload (e.g. geometry) record into the transfer batch
     // and bind into the bindless table during construction. The batch streams uploads
     // asynchronously (a ring of command buffers on a timeline), so building passes doesn't
-    // stall per upload; wait_idle() below drains it once before the first frame.
-    TransferBatch transfer_batch{ device_, allocator_, graphics_queue_ };
-
+    // stall per upload; wait_idle() below drains it once before the first frame. transfer_batch_
+    // is a persistent member (it keeps streaming after init), flushed per frame in begin_frame.
     PassContext pass_context{
         device_,
         allocator_,
         global_descriptor_table_,
-        transfer_batch,
+        transfer_batch_,
         window_->get_input(),
         input_map_,
         string::gpu::COLOR_TARGET,
@@ -128,7 +128,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 
     // Drain the async upload ring: submit any pending batch and wait for every in-flight batch
     // to finish (freeing all staging) before the first frame draws the uploaded resources.
-    transfer_batch.wait_idle();
+    transfer_batch_.wait_idle();
 
     for (auto& pass : scene_passes_)
     {
@@ -218,6 +218,11 @@ void Renderer::begin_frame()
     frame.recorder.reset();
 
     update();
+
+    // Push any streamed uploads recorded during update() onto the graphics queue (submit, don't
+    // wait). A no-op until a streamer records into the batch; the trailing transfer barrier makes
+    // the writes visible to this frame's draws via submission order on the shared queue.
+    transfer_batch_.flush();
 
     // Acquire now, before recording, so end_rendering has a valid blit target. Copy the
     // handles out of string::gpu::acquired_image (which holds references into vectors resize() reallocates).
