@@ -10,7 +10,6 @@
 
 #include <string/core/font.hpp>
 #include <string/core/layout.hpp>
-#include "passes/grid_2d_pass.hpp"
 #include "passes/geometry_pass.hpp"
 #include "passes/ui_pass.hpp"
 
@@ -112,8 +111,8 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
     auto atlas = std::make_shared<string::font_atlas>(string::build_font_atlas(ttf, 32.0f));
 
     String::RenderPlan plan;
-    // Grid (background), the Sponza scene, then the single UI overlay (shapes + text) last.
-    plan.add<Grid2DPass>();
+    // The Sponza scene (which now draws its own procedural sky background), then the single UI
+    // overlay (shapes + text) last. The debug grid is gone — the sky fills the background.
     plan.add<GeometryPass>(
         std::filesystem::path{ "assets/sponza/main/NewSponza_Main_glTF_003.gltf" });
     plan.add<UIPass>(atlas, make_ui_author());

@@ -588,6 +588,30 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         .build_graphics_pipeline(pipeline_.pipeline_layout);
     pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
 
+    // --- Procedural sky background ------------------------------------------------------------
+    // A fullscreen pass drawn (in record()) before the geometry, into the same HDR target; no depth
+    // test/write so opaque geometry overwrites it. Fills the void and drives the IBL ambient.
+    const VkPushConstantRange sky_push_range = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(SkyPush),
+    };
+    sky_pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
+        .set_descriptor_set_layout({})   // procedural: no bindings, only the push constant
+        .set_push_constant_ranges({ sky_push_range })
+        .build(device_);
+    sky_pipeline_.pipeline = string::gpu::pipeline_builder(device_)
+        .add_vertex_shader(context.resources_path / "shaders/sky.vert.spv")
+        .add_fragment_shader(context.resources_path / "shaders/sky.frag.spv")
+        .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+        .set_tessellation()
+        .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
+        .set_multisampling(context.sample_count)
+        .enable_depth_stencil(false, false)   // background: declare the depth format but don't test/write
+        .enable_color_blending()
+        .build_graphics_pipeline(sky_pipeline_.pipeline_layout);
+    sky_pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+
     // --- Directional shadow map ---------------------------------------------------------------
     if (draw_count_ > 0)
     {
@@ -725,6 +749,8 @@ GeometryPass::~GeometryPass()
 {
     vkDestroyPipeline(device_.get_device(), pipeline_.pipeline, nullptr);
     vkDestroyPipelineLayout(device_.get_device(), pipeline_.pipeline_layout, nullptr);
+    vkDestroyPipeline(device_.get_device(), sky_pipeline_.pipeline, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), sky_pipeline_.pipeline_layout, nullptr);
 
     if (!shadow_images_.empty())
     {
@@ -993,6 +1019,24 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
         return;
     }
 
+    // Procedural sky first (fullscreen, no depth) so opaque geometry overwrites it where it exists;
+    // the shared sky colours also drive the lit shader's ambient below.
+    {
+        const glm::mat4 vp = camera_.view_proj();
+        const SkyPush sky_push{
+            .inv_view_proj = glm::inverse(vp),
+            .camera_pos = camera_.position(),
+            .sun_dir = sun_dir_,
+            .sky_zenith = sky_zenith_,
+            .sky_ground = sky_ground_,
+            .sun_color = sun_color_,
+        };
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_pipeline_.pipeline);
+        vkCmdPushConstants(command_buffer, sky_pipeline_.pipeline_layout,
+                           VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(SkyPush), &sky_push);
+        vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    }
+
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.pipeline);
 
     const auto& vertex_buffer = allocator_.get_buffer(vertex_buffer_);
@@ -1016,10 +1060,12 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
         .drawdata_slot = draw_data_slot_,
         .camera_pos = camera_.position(),
         .sun_dir = sun_dir_,
-        .sun_intensity = 3.0f,
-        .sun_color = glm::vec3(1.0f, 0.96f, 0.9f),
-        .ambient_sky = glm::vec3(0.10f, 0.13f, 0.20f),
-        .ambient_ground = glm::vec3(0.10f, 0.08f, 0.06f),
+        .sun_intensity = sun_intensity_,
+        .sun_color = sun_color_,
+        // The lit shader reuses these as the sky zenith/ground for its image-based ambient, so the
+        // ambient matches the visible sky exactly.
+        .ambient_sky = sky_zenith_,
+        .ambient_ground = sky_ground_,
         .light_view_proj = light_view_proj_,
         .shadow_slot = shadow_slots_.empty() ? 0u : shadow_slots_[current_frame],
         .shadow_texel = 1.0f / static_cast<float>(kShadowResolution),

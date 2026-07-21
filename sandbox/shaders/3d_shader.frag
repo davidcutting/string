@@ -1,9 +1,13 @@
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : require
 
-// Forward metallic-roughness PBR: one directional sun + hemispheric ambient, normal-mapped. All
-// textures live in the bindless combined-image-sampler array (set 0, binding 1); the per-draw slots
-// arrive from the vertex stage. Output is linear HDR — tonemapping happens in the composite pass.
+#include "sky.glsl"
+
+// Forward metallic-roughness PBR: one directional sun (shadow-mapped) + image-based ambient from the
+// procedural sky, normal-mapped. All textures live in the bindless combined-image-sampler array
+// (set 0, binding 1); the per-draw slots arrive from the vertex stage. Output is linear HDR —
+// tonemapping happens in the composite pass.
 layout(set = 0, binding = 1) uniform sampler2D textures[];
 
 layout(push_constant) uniform Push {
@@ -137,8 +141,22 @@ void main() {
     float shadow = shadow_factor(fragWorldPos, normalize(fragWorldNormal), NdotL);
     vec3 direct = (diffuse + specular) * pc.sun_color * pc.sun_intensity * NdotL * (1.0 - shadow);
 
-    // Hemispheric ambient (cheap sky/ground fill; ao = 1 until an occlusion map is added).
-    vec3 ambient = mix(pc.ambient_ground, pc.ambient_sky, N.y * 0.5 + 0.5) * albedo;
+    // Image-based ambient from the same procedural sky the background draws (ambient_sky/ground are
+    // reused as the sky zenith/ground). Analytic, no prefiltered cubemap: diffuse ~ sky in the
+    // normal direction; specular ~ sky in the reflection direction, blurred toward the diffuse term
+    // by roughness, weighted by an ambient Fresnel. ao = 1 until an occlusion map is added.
+    vec3 irradiance = sky_gradient(N, pc.ambient_sky, pc.ambient_ground);   // no sun (avoids double-count)
+    vec3 diffuse_ibl = irradiance * albedo * (1.0 - metallic);
+
+    vec3 R = reflect(-V, N);
+    vec3 env = mix(sky(R, pc.sun_dir, pc.ambient_sky, pc.ambient_ground, pc.sun_color), irradiance, roughness);
+    vec3 F_amb = F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(1.0 - NdotV, 5.0);
+    vec3 specular_ibl = env * F_amb;
+
+    // Scale the analytic IBL down: sampling sky radiance as if it were pre-integrated irradiance
+    // (no cosine-hemisphere integral, no /PI) over-brightens, so this restores sun-vs-sky contrast.
+    const float kIblStrength = 0.5;
+    vec3 ambient = (diffuse_ibl + specular_ibl) * kIblStrength;
 
     outColor = vec4(direct + ambient, base.a);
 }

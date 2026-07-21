@@ -65,6 +65,19 @@ struct ShadowPush
     uint32_t drawdata_slot;
 };
 
+// Push constant for the procedural sky background (sky.vert/frag): the inverse view-projection (to
+// turn NDC into a world ray), the camera position, and the sky/sun colours shared with the lit
+// shader's image-based ambient. Matches the Push block in sky.frag (vec3s on 16-byte boundaries).
+struct SkyPush
+{
+    glm::mat4 inv_view_proj;
+    glm::vec3 camera_pos;  float _sp0;
+    glm::vec3 sun_dir;     float _sp1;
+    glm::vec3 sky_zenith;  float _sp2;
+    glm::vec3 sky_ground;  float _sp3;
+    glm::vec3 sun_color;   float _sp4;
+};
+
 // Per-draw record read by the vertex shader (indexed by gl_InstanceIndex). Baked at load: the
 // node transform, the material's base-color factor, and the bindless slot of its base-color
 // texture. Padded to a 16-byte-aligned stride to match the shader's std430 DrawData[] layout.
@@ -172,6 +185,14 @@ class GeometryPass final : public String::Pass
     glm::vec3 sun_dir_ = glm::normalize(glm::vec3(0.5f, 0.72f, 0.45f));  // direction TO the light
     glm::mat4 light_view_proj_{ 1.0f };                                 // computed once from bounds
     float shadow_world_texel_ = 0.0f;  // world units per shadow texel (for normal-offset bias)
+
+    // Environment (procedural sky + image-based ambient). The sky colours drive BOTH the visible sky
+    // background and the lit shader's ambient, so shaded surfaces read as lit by the same sky.
+    glm::vec3 sky_zenith_ = glm::vec3(0.14f, 0.30f, 0.62f);  // clear-day zenith blue (linear)
+    glm::vec3 sky_ground_ = glm::vec3(0.22f, 0.19f, 0.15f);  // warm ground/bounce
+    glm::vec3 sun_color_ = glm::vec3(1.0f, 0.96f, 0.9f);
+    float sun_intensity_ = 3.0f;
+    string::gpu::pipeline sky_pipeline_;  // fullscreen procedural sky, drawn before geometry
     string::gpu::pipeline shadow_pipeline_;
     std::vector<string::gpu::resource_id> shadow_images_;   // one per frame in flight
     std::vector<uint32_t> shadow_slots_;
