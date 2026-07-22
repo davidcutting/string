@@ -261,6 +261,44 @@ void descriptor_table::update_texture(std::uint32_t slot, VkImageView view, VkSa
     vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 }
 
+auto descriptor_table::bind_storage_view(VkImageView view) -> std::uint32_t
+{
+    // Synthetic keys above the real resource-id range so the storage-image slot allocator can track
+    // per-mip HiZ views (one image, several slots) without colliding with resource-backed binds.
+    static resource_id synthetic_key = 0xF0000000u;
+    const resource_id key = synthetic_key++;
+    const uint32_t slot = st_image_descriptor_allocator_.allocate(key);
+
+    const VkDescriptorImageInfo image_info = {
+        .sampler = VK_NULL_HANDLE,
+        .imageView = view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    const VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .pNext = nullptr,
+        .dstSet = descriptor_set_,
+        .dstBinding = 2,  // storage images
+        .dstArrayElement = slot,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .pImageInfo = &image_info,
+        .pBufferInfo = nullptr,
+        .pTexelBufferView = nullptr,
+    };
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    slot_to_synthetic_[slot] = key;
+    return slot;
+}
+
+void descriptor_table::unbind_storage_view(std::uint32_t slot)
+{
+    auto it = slot_to_synthetic_.find(slot);
+    if (it == slot_to_synthetic_.end()) return;
+    st_image_descriptor_allocator_.release(it->second);
+    slot_to_synthetic_.erase(it);
+}
+
 void descriptor_table::bind_image(resource_id handle, VkDescriptorType type, uint32_t slot)
 {
     const auto& image = allocator_.get_image(handle);

@@ -30,21 +30,36 @@ public:
     void update(const InputMap& input, float delta_time, float aspect);
 
     glm::mat4 view_proj() const { return view_proj_; }
+    glm::mat4 view() const { return view_; }
     glm::vec3 position() const { return position_; }
+    glm::vec3 forward() const { return forward_; }
+    // Perspective parameters (needed to fit cascaded shadow frusta to view-space depth slices).
+    float near_plane() const { return near_; }
+    float far_plane() const { return far_; }
+    float fov_degrees() const { return fov_degrees_; }
+    float aspect() const { return aspect_; }
 
     void set_fov_degrees(float fov) { fov_degrees_ = fov; }
     void set_move_speed(float speed) { move_speed_ = speed; }
+    // Debug/tooling: place the camera exactly (used by the STRING_CAM headless-capture override).
+    void set_pose(const glm::vec3& position, float yaw, float pitch)
+    {
+        position_ = position; yaw_ = yaw; pitch_ = pitch;
+    }
 
 private:
     glm::vec3 position_{ 0.0f };
+    glm::vec3 forward_{ 0.0f, 0.0f, -1.0f };
     float yaw_ = 0.0f;     // radians about +Y
     float pitch_ = 0.0f;   // radians, clamped to +/-89 deg
     float move_speed_ = 1.0f;
     float near_ = 0.1f;
     float far_ = 100.0f;
     float fov_degrees_ = 60.0f;
+    float aspect_ = 1.0f;
     float look_sensitivity_ = 0.0025f;
     float sprint_multiplier_ = 4.0f;
+    glm::mat4 view_{ 1.0f };
     glm::mat4 view_proj_{ 1.0f };
 };
 

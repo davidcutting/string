@@ -112,6 +112,27 @@ inline VkShaderModule load_shader_from_disk(VkDevice device, const std::filesyst
     return create_shader_module(device, binary);
 }
 
+// Create a shader module from SPIR-V words already in memory (the in-process Slang compile path,
+// vs. load_shader_from_disk's precompiled .spv files).
+inline VkShaderModule create_shader_module_spirv(VkDevice device, const std::vector<uint32_t>& code)
+{
+    VkShaderModuleCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .codeSize = code.size() * sizeof(uint32_t),
+        .pCode = code.data()
+    };
+
+    VkShaderModule shader_module;
+    if (vkCreateShaderModule(device, &create_info, nullptr, &shader_module) != VK_SUCCESS)
+    {
+        throw std::runtime_error("failed to create shader module!");
+    }
+
+    return shader_module;
+}
+
 inline VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
                                              const VkAllocationCallbacks* pAllocator,
                                              VkDebugUtilsMessengerEXT* pDebugMessenger) {

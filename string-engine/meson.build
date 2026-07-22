@@ -146,6 +146,7 @@ core_src = [
     'src/application.cpp',
     'src/scene.cpp',
     'src/core/job_system.cpp',
+    'src/core/file_watch_service.cpp',
     'src/core/font.cpp',
     'src/platform/input_map.cpp',
     'src/scene/camera.cpp',
@@ -161,6 +162,8 @@ core_src = [
     'src/vulkan/resource_state.cpp',
     'src/vulkan/vulkan_utils.cpp',
     'src/gpu/pipeline_builder.cpp',
+    'src/gpu/shader_compiler.cpp',
+    'src/gpu/shader_program_registry.cpp',
     # The offscreen->swapchain resolve is the only built-in pass; concrete scene passes
     # (grid/geometry/ui) and their pipelines live in the application (sandbox/).
     'src/vulkan/passes/composite_pass.cpp',

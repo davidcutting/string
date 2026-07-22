@@ -1,19 +1,27 @@
-# Shaders for the application's passes (grid/geometry/ui). Compiled to SPIR-V and installed
-# alongside the engine's composite shader under include/string/shaders, so the pass pipelines
-# resolve them via STRING_RESOURCES_DIR exactly as before.
-shaders = [
-    '3d_shader.frag',
-    '3d_shader.vert',
-    'shadow.vert',
-    'sky.vert',
-    'sky.frag',
-    'cull.comp',
+# Shaders for the application's passes, compiled in-process from Slang (brief 01): the engine
+# compiles them at startup and recompiles on save for hot-reload (via string::gpu::shader_compiler).
+# The scene geometry front-end is the task/mesh meshlet pipeline (brief 03). The only remaining
+# build-time-glslang GLSL shaders are the (out-of-scope) 2D grid pass.
+
+# --- Slang sources (in-process compile + hot-reload) -------------------------------------------
+slang_shaders = files(
+    'ui_shader.slang',
+    'text_shader.slang',
+    'sky_shader.slang',
+    'sky.slang',        # imported by sky_shader.slang and lighting.slang (image-based ambient)
+    'froxel_cull.slang', # clustered light-binning compute (brief 02)
+    'meshlet.slang',     # shared meshlet data model (imported by the mesh pipeline; brief 03)
+    'meshlet_mesh.slang',   # task + mesh + fragment meshlet draw path (brief 03)
+    'meshlet_shadow.slang', # task + mesh depth-only meshlet shadow path (brief 03)
+    'hiz_build.slang',      # HiZ depth-pyramid downsample compute (brief 03)
+    'meshlet_reset.slang',  # per-frame stats/visibility reset compute (brief 03)
+)
+install_data(slang_shaders, install_dir : 'include/string/shaders')
+
+# --- Remaining GLSL shaders (build-time glslang) -----------------------------------------------
+glsl_shaders = [
     'grid_2d_shader.vert',
     'grid_2d_shader.frag',
-    'ui_shader.frag',
-    'ui_shader.vert',
-    'text_shader.frag',
-    'text_shader.vert',
 ]
 
 # Shared shader includes (#include "sky.glsl"). -I resolves them; listed as depend_files so a change
@@ -21,7 +29,7 @@ shaders = [
 shader_includes = files('sky.glsl')
 
 shader_targets = []
-foreach s : shaders
+foreach s : glsl_shaders
     shader_targets += custom_target(
         s.split('.')[0] + '_' + s.split('.')[1] + '_shader',
         input : s,

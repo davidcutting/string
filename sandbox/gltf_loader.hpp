@@ -35,6 +35,7 @@ struct GltfMaterial
     int32_t base_color_texture = -1;
     int32_t metallic_roughness_texture = -1;
     int32_t normal_texture = -1;
+    int32_t occlusion_texture = -1;   // glTF occlusion (baked AO); attenuates ambient
 };
 
 // One draw call: a contiguous range of the model's shared index buffer, the material to bind,

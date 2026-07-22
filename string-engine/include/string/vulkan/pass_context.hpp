@@ -6,6 +6,7 @@
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
+#include <string/gpu/shader_program_registry.hpp>
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/platform/input.hpp>
 #include <string/platform/input_map.hpp>
@@ -23,6 +24,10 @@ struct PassContext
     string::gpu::device& device;
     string::gpu::resource_allocator& allocator;
     string::gpu::descriptor_table& descriptor_table;
+    // Registry for hot-reloadable Slang pipelines: a pass calls create(source.slang, builder) to
+    // get a shader_program whose pipeline recompiles + swaps on save (brief 01). The overlay pass
+    // also reads its current_errors() to render compile diagnostics.
+    string::gpu::shader_program_registry& shader_registry;
     // Batches a pass's one-time uploads (mesh/texture staging copies); flushed once by the
     // renderer after all passes are built, so uploads cost a single submit, not one per copy.
     TransferBatch& transfer;

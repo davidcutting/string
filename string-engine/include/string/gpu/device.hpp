@@ -64,7 +64,10 @@ private:
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME,
         VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
-        VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME};
+        VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+        // Task/mesh shader meshlet pipeline (brief 03). Locked requirement (RDNA3+), no fallback:
+        // the geometry path draws through vkCmdDrawMeshTasksEXT.
+        VK_EXT_MESH_SHADER_EXTENSION_NAME};
 };
 
 }

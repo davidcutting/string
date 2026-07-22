@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -36,6 +37,9 @@ class presenter
     VkExtent2D extent_;
     // I'm only holding on to this so that resizing can use the same info as creation
     VkSwapchainCreateInfoKHR swapchain_create_info_;
+    // Backing storage for swapchain_create_info_.pQueueFamilyIndices — the create info is saved
+    // and reused by resize(), so the indices must outlive the constructor's stack frame.
+    std::array<uint32_t, 2> shared_queue_family_indices_{};
 
     uint32_t current_frame_id_ = std::numeric_limits<uint32_t>::max();
     uint32_t next_frame_id_ = 0;

@@ -88,6 +88,13 @@ public:
     // UPDATE_AFTER_BIND, so this is safe to call between frames while the slot stays bound.
     void update_texture(std::uint32_t slot, VkImageView view, VkSampler sampler);
 
+    // Bind an arbitrary (caller-owned) image view into a fresh storage-image slot (binding 2), with
+    // no backing resource_id. Used for per-mip views of a HiZ pyramid where one image needs several
+    // storage slots (the resource-keyed bind() can't give more than one slot per handle). The view's
+    // lifetime is the caller's; unbind_storage_view() frees the slot. Returns the slot.
+    auto bind_storage_view(VkImageView view) -> std::uint32_t;
+    void unbind_storage_view(std::uint32_t slot);
+
     auto get_binding_slot(resource_id handle, descriptor_type type) -> std::uint32_t;
     auto get_layout() const -> VkDescriptorSetLayout { return descriptor_set_layout_; }
     auto get_set() const -> VkDescriptorSet { return descriptor_set_; }
@@ -95,6 +102,10 @@ public:
 private:
     void bind_buffer(resource_id handle, VkDescriptorType type, uint32_t slot);
     void bind_image(resource_id handle, VkDescriptorType type, uint32_t slot);
+
+    // Maps a storage-image slot from bind_storage_view() back to its synthetic allocator key, so
+    // unbind_storage_view() can release it (these slots have no resource_id).
+    std::unordered_map<std::uint32_t, resource_id> slot_to_synthetic_;
 };
 
 } // namespace string::gpu

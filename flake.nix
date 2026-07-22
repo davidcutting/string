@@ -118,7 +118,8 @@
             spdlog glm entt sdl3
             vulkan-headers vulkan-memory-allocator vulkan-volk
             shader-slang fastgltf simdjson
-            ktx-tools     # libktx: the sandbox loader reads/transcodes .ktx2 (KTX::ktx cmake config)
+            ktx-tools       # libktx: the sandbox loader reads/transcodes .ktx2 (KTX::ktx cmake config)
+            meshoptimizer   # meshlet build + LOD simplify (brief 03; meshoptimizer::meshoptimizer)
           ];
 
           # WSI is an option of the engine subproject, so it is namespaced.
@@ -162,6 +163,7 @@
               vulkan-headers vulkan-memory-allocator vulkan-volk
               fastgltf simdjson
               ktx-tools                   # libktx + `ktx` CLI (texture cook + runtime load)
+              meshoptimizer               # meshlet build + LOD simplify (brief 03)
               gtest                       # for -Dtests=true in-shell
               # Profiler: the tracy client links into the engine (-Dtracy=true); this is also
               # the standalone Tracy viewer so you don't have to build it manually.

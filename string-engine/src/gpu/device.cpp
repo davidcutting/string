@@ -62,9 +62,14 @@ bool device::is_device_suitable(const VkPhysicalDevice& device) {
     dynamic_rendering_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
     dynamic_rendering_features.pNext = nullptr;
 
+    // Task + mesh shader stages (brief 03 meshlet pipeline). Queried here, required below.
+    VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader_features{};
+    mesh_shader_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+    mesh_shader_features.pNext = &dynamic_rendering_features;
+
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT extended_dynamic_state2_features{};
     extended_dynamic_state2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
-    extended_dynamic_state2_features.pNext = &dynamic_rendering_features;
+    extended_dynamic_state2_features.pNext = &mesh_shader_features;
 
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT extended_dynamic_state3_features{};
     extended_dynamic_state3_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT;
@@ -125,7 +130,13 @@ bool device::is_device_suitable(const VkPhysicalDevice& device) {
         && vulkan13_features.shaderDemoteToHelperInvocation == VK_TRUE
         && vulkan12_features.timelineSemaphore == VK_TRUE
         && vulkan12_features.bufferDeviceAddress == VK_TRUE
+        // GPU-driven draw generation (brief 03b): vkCmdDrawMeshTasksIndirectCountEXT reads the
+        // draw count from a GPU buffer the cull compute writes.
+        && vulkan12_features.drawIndirectCount == VK_TRUE
         && extended_dynamic_state2_features.extendedDynamicState2 == VK_TRUE
+        // Meshlet pipeline (brief 03): both stages required, no fallback path.
+        && mesh_shader_features.taskShader == VK_TRUE
+        && mesh_shader_features.meshShader == VK_TRUE
         && has_bindless_features
         && has_bindless_capacity;
 
@@ -214,11 +225,29 @@ void device::create_logical_device()
     extended_dynamic_state2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
     extended_dynamic_state2_features.extendedDynamicState2 = VK_TRUE;
 
+    // Task + mesh shader stages (brief 03 meshlet pipeline). vkCmdDrawMeshTasksEXT + the
+    // [shader("amplification")]/[shader("mesh")] Slang stages need both enabled.
+    VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader_features{};
+    mesh_shader_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+    mesh_shader_features.pNext = &extended_dynamic_state2_features;
+    mesh_shader_features.taskShader = VK_TRUE;
+    mesh_shader_features.meshShader = VK_TRUE;
+
+    VkPhysicalDeviceVulkan11Features vulkan11_features{};
+    vulkan11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    vulkan11_features.pNext = &mesh_shader_features;
+    // Slang lowers SV_VertexID/SV_InstanceID relative to gl_BaseVertex/gl_BaseInstance,
+    // which declares the SPIR-V DrawParameters capability.
+    vulkan11_features.shaderDrawParameters = VK_TRUE;
+
     VkPhysicalDeviceVulkan12Features vulkan12_features{};
     vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    vulkan12_features.pNext = &extended_dynamic_state2_features;
+    vulkan12_features.pNext = &vulkan11_features;
     vulkan12_features.timelineSemaphore = VK_TRUE;
     vulkan12_features.bufferDeviceAddress = VK_TRUE;
+    // GPU-driven draw generation (brief 03b): vkCmdDrawMeshTasksIndirectCountEXT reads its draw
+    // count from a GPU buffer written by the draw-cull compute.
+    vulkan12_features.drawIndirectCount = VK_TRUE;
     // Scalar block layout: lets the 3D vertex shader's buffer_reference Vertex struct pack to match
     // the tightly-packed C++ String::Vertex (vec3/vec2 mix) instead of std430's vec3->vec4 padding.
     vulkan12_features.scalarBlockLayout = VK_TRUE;

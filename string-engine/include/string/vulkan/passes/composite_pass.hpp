@@ -5,6 +5,7 @@
 #include <string/vulkan/render_pass.hpp>
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/device.hpp>
+#include <string/gpu/shader_program_registry.hpp>
 
 #include <volk.h>
 
@@ -17,13 +18,15 @@ namespace String
 class CompositePass final : public Pass
 {
     string::gpu::device& device_;
-    string::gpu::pipeline pipeline_;
+    // The pipeline is owned by the shader_program (hot-reloadable); the pass binds program_->current().
+    string::gpu::shader_program* program_ = nullptr;
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
     uint32_t source_slot_ = 0;
 
 public:
     CompositePass(string::gpu::device& device, const std::filesystem::path& resources_path,
-                  VkDescriptorSetLayout global_layout, VkFormat color_format);
+                  VkDescriptorSetLayout global_layout, VkFormat color_format,
+                  string::gpu::shader_program_registry& registry);
     virtual ~CompositePass() override;
 
     // The renderer supplies the global set and the slot the HDR target is bound at

@@ -277,6 +277,11 @@ void Window::update(entt::dispatcher& dispatcher)
 
                 properties_.extent.width = static_cast<uint32_t>(width);
                 properties_.extent.height = static_cast<uint32_t>(height);
+
+                for (const auto& callback : resize_callbacks_)
+                {
+                    callback(properties_.extent);
+                }
                 break;
             }
             case SDL_EVENT_WINDOW_MINIMIZED:

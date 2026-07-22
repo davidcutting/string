@@ -33,9 +33,10 @@ std::vector<std::uint8_t> read_file(const std::filesystem::path& path)
 // only mutates the field while it is focused. Modal: mouse-look capture = game (WASD/look to the
 // camera); Esc frees the cursor for UI (hover, click-to-focus, type); a click on empty space
 // re-captures. All dynamic strings live in the closure UIPass holds, so their views stay valid.
-UIPass::Author make_ui_author()
+UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats)
 {
-    return [frame = 0ull, counter = std::string{}, field = std::string{}, edit = std::string{}](
+    return [frame = 0ull, counter = std::string{}, field = std::string{}, edit = std::string{},
+            mesh_stats, stat_lines = std::vector<std::string>{}](
                string::layout_builder& b, const UIPass::UiContext& ctx) mutable {
         using namespace string;
         ++frame;
@@ -98,6 +99,51 @@ UIPass::Author make_ui_author()
              .add_text(button, hot ? "hovering!" : "hover me", 32)
              .add_text(field_el, edit, 32)
          .end();
+
+        // --- Brief 03: meshlet culling-stats overlay (GPU counters, read back one frame late) ---
+        if (mesh_stats)
+        {
+            const MeshOverlayStats& m = *mesh_stats;
+            const GpuMeshStats& s = m.stats;
+            static const char* view_names[] = { "off", "meshlet-id", "LOD", "occlusion" };
+            auto pct = [](uint32_t num, uint32_t den) {
+                return den == 0 ? std::string("--") : std::to_string(num * 100 / den) + "%";
+            };
+            stat_lines.clear();
+            stat_lines.push_back("HiZ: " + std::string(m.hiz_enabled ? "on" : "off") +
+                                 "   view: " + view_names[m.debug_view & 3] +
+                                 (m.crowd_enabled ? "   [CROWD]" : ""));
+            stat_lines.push_back("meshlets: " + std::to_string(s.meshlets_total) +
+                                 " / " + std::to_string(m.total_meshlets));
+            stat_lines.push_back("frustum: " + std::to_string(s.after_frustum) +
+                                 " (" + pct(s.after_frustum, s.meshlets_total) + ")");
+            stat_lines.push_back("cone:    " + std::to_string(s.after_cone) +
+                                 " (" + pct(s.after_cone, s.meshlets_total) + ")");
+            stat_lines.push_back("hiz/drawn: " + std::to_string(s.after_hiz) +
+                                 " (" + pct(s.after_hiz, s.meshlets_total) + ")");
+            stat_lines.push_back("LOD draws: " + std::to_string(s.draws_per_lod[0]) + "/" +
+                                 std::to_string(s.draws_per_lod[1]) + "/" +
+                                 std::to_string(s.draws_per_lod[2]) + "/" +
+                                 std::to_string(s.draws_per_lod[3]));
+
+            element stats_panel{};
+            stats_panel.color = { 20, 22, 34, 235 };
+            stats_panel.stroke_color = { 88, 91, 112, 255 };
+            stats_panel.stroke_width = 2;
+            stats_panel.radius = 12;
+            stats_panel.shape = shape::ROUNDED_RECTANGLE;
+            stats_panel.sizing = size_fit();
+
+            b.begin(stats_panel, format{ .padding = { 10, 10, 10, 10 }, .gap = 4, .direction = direction::VERTICAL });
+            for (const std::string& line : stat_lines)
+            {
+                element row{};
+                row.color = { 205, 214, 244, 255 };
+                row.sizing = size_fit();
+                b.add_text(row, line, 20);
+            }
+            b.end();
+        }
     };
 }
 
@@ -110,12 +156,16 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
     const std::vector<std::uint8_t> ttf = read_file(resources_dir / "assets/fonts/DejaVuSans.ttf");
     auto atlas = std::make_shared<string::font_atlas>(string::build_font_atlas(ttf, 32.0f));
 
+    // Shared meshlet culling stats: the GeometryPass fills it each frame, the UI author reads it
+    // (both run on the render thread; the shared_ptr is just the plumbing seam between passes).
+    auto mesh_stats = std::make_shared<MeshOverlayStats>();
+
     String::RenderPlan plan;
     // The Sponza scene (which now draws its own procedural sky background), then the single UI
     // overlay (shapes + text) last. The debug grid is gone — the sky fills the background.
     plan.add<GeometryPass>(
-        std::filesystem::path{ "assets/sponza/main/NewSponza_Main_glTF_003.gltf" });
-    plan.add<UIPass>(atlas, make_ui_author());
+        std::filesystem::path{ "assets/sponza/main/NewSponza_Main_glTF_003.gltf" }, mesh_stats);
+    plan.add<UIPass>(atlas, make_ui_author(mesh_stats));
     return plan;
 }
 

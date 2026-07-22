@@ -1,20 +1,9 @@
+# Slang shader sources are installed as-is; the engine compiles them in-process at startup (and
+# recompiles on save for hot-reload) via string::gpu::shader_compiler, replacing the build-time
+# glslang path. Only the composite resolve is a built-in engine shader; the scene passes' shaders
+# live with those passes in the application (sandbox/shaders).
+slang_shaders = files(
+    'composite.slang',
+)
 
-glsl_compiler = find_program('glslangValidator')
-# Only the composite resolve is a built-in engine shader; the scene passes' shaders
-# (2d/3d/grid/ui) live with those passes in the application (sandbox/shaders).
-shaders = [
-    'composite.vert',
-    'composite.frag'
-]
-
-shader_targets = []
-foreach s : shaders
-    shader_targets += custom_target(
-        s.split('.')[0] + '_' + s.split('.')[1] + '_shader',
-        input : s,
-        output : '@PLAINNAME@.spv',
-        command : ['glslangValidator', '--target-env', 'vulkan1.3', '-o', '@OUTPUT@', '@INPUT@'],
-        install : true,
-        install_dir : 'include/string/shaders'
-    )
-endforeach
+install_data(slang_shaders, install_dir : 'include/string/shaders')

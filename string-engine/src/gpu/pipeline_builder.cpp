@@ -100,6 +100,10 @@ pipeline_builder::~pipeline_builder()
         vkDestroyShaderModule(device_.get_device(), vertex_shader_module_, nullptr);
     if (fragment_shader_module_ != VK_NULL_HANDLE)
         vkDestroyShaderModule(device_.get_device(), fragment_shader_module_, nullptr);
+    if (task_shader_module_ != VK_NULL_HANDLE)
+        vkDestroyShaderModule(device_.get_device(), task_shader_module_, nullptr);
+    if (mesh_shader_module_ != VK_NULL_HANDLE)
+        vkDestroyShaderModule(device_.get_device(), mesh_shader_module_, nullptr);
 }
 
 pipeline_builder& pipeline_builder::add_compute_shader(const std::filesystem::path& resource_path)
@@ -156,6 +160,96 @@ pipeline_builder& pipeline_builder::add_fragment_shader(const std::filesystem::p
     };
     fragment_shader_stage_info_ = fragment_shader_stage_info;
     // clang-format on
+    return *this;
+}
+
+pipeline_builder& pipeline_builder::add_compute_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
+{
+    compute_entry_point_ = entry_point;
+    compute_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+
+    VkPipelineShaderStageCreateInfo compute_shader_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = compute_shader_module_,
+        .pName = compute_entry_point_.c_str(),
+        .pSpecializationInfo = nullptr
+    };
+    compute_shader_stage_info_ = compute_shader_stage_info;
+    return *this;
+}
+
+pipeline_builder& pipeline_builder::add_vertex_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
+{
+    vertex_entry_point_ = entry_point;
+    vertex_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+
+    VkPipelineShaderStageCreateInfo vertex_shader_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+        .module = vertex_shader_module_,
+        .pName = vertex_entry_point_.c_str(),
+        .pSpecializationInfo = nullptr
+    };
+    vertex_shader_stage_info_ = vertex_shader_stage_info;
+    return *this;
+}
+
+pipeline_builder& pipeline_builder::add_fragment_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
+{
+    fragment_entry_point_ = entry_point;
+    fragment_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+
+    VkPipelineShaderStageCreateInfo fragment_shader_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .module = fragment_shader_module_,
+        .pName = fragment_entry_point_.c_str(),
+        .pSpecializationInfo = nullptr
+    };
+    fragment_shader_stage_info_ = fragment_shader_stage_info;
+    return *this;
+}
+
+pipeline_builder& pipeline_builder::add_task_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
+{
+    task_entry_point_ = entry_point;
+    task_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+
+    VkPipelineShaderStageCreateInfo task_shader_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage = VK_SHADER_STAGE_TASK_BIT_EXT,
+        .module = task_shader_module_,
+        .pName = task_entry_point_.c_str(),
+        .pSpecializationInfo = nullptr
+    };
+    task_shader_stage_info_ = task_shader_stage_info;
+    return *this;
+}
+
+pipeline_builder& pipeline_builder::add_mesh_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
+{
+    mesh_entry_point_ = entry_point;
+    mesh_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+
+    VkPipelineShaderStageCreateInfo mesh_shader_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage = VK_SHADER_STAGE_MESH_BIT_EXT,
+        .module = mesh_shader_module_,
+        .pName = mesh_entry_point_.c_str(),
+        .pSpecializationInfo = nullptr
+    };
+    mesh_shader_stage_info_ = mesh_shader_stage_info;
     return *this;
 }
 
@@ -425,6 +519,86 @@ VkPipeline pipeline_builder::build_graphics_pipeline(const VkPipelineLayout& pip
     vkDestroyShaderModule(device_.get_device(), fragment_shader_module_, nullptr);
 
     vertex_shader_module_ = VK_NULL_HANDLE;
+    fragment_shader_module_ = VK_NULL_HANDLE;
+
+    return pipeline;
+}
+
+VkPipeline pipeline_builder::build_mesh_pipeline(const VkPipelineLayout& pipeline_layout)
+{
+    VkPipelineViewportStateCreateInfo viewport_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .viewportCount = 1,
+        .pViewports = nullptr,
+        .scissorCount = 1,
+        .pScissors = nullptr,
+    };
+
+    std::vector<VkDynamicState> dynamic_states = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamic_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .dynamicStateCount = static_cast<uint32_t>(dynamic_states.size()),
+        .pDynamicStates = dynamic_states.data()
+    };
+
+    // TASK?+MESH+FRAG? stages. Task and fragment are optional (a depth-only shadow pipeline drops
+    // the fragment; a small draw could drop the task). Mesh is required.
+    std::vector<VkPipelineShaderStageCreateInfo> stages;
+    if (task_shader_module_ != VK_NULL_HANDLE) stages.push_back(task_shader_stage_info_);
+    stages.push_back(mesh_shader_stage_info_);
+    const bool has_fragment = fragment_shader_module_ != VK_NULL_HANDLE;
+    if (has_fragment) stages.push_back(fragment_shader_stage_info_);
+
+    VkFormat color_format = color_format_;
+    VkPipelineRenderingCreateInfo pipeline_render_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .pNext = nullptr,
+        .viewMask = 0,
+        .colorAttachmentCount = color_enabled_ ? 1u : 0u,
+        .pColorAttachmentFormats = color_enabled_ ? &color_format : nullptr,
+        .depthAttachmentFormat = depth_format_,
+        .stencilAttachmentFormat = {}
+    };
+
+    // No pVertexInputState / pInputAssemblyState — the mesh shader emits primitives directly.
+    VkGraphicsPipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &pipeline_render_info,
+        .flags = 0,
+        .stageCount = static_cast<uint32_t>(stages.size()),
+        .pStages = stages.data(),
+        .pVertexInputState = nullptr,
+        .pInputAssemblyState = nullptr,
+        .pTessellationState = nullptr,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterizer_state_info_,
+        .pMultisampleState = &multisampling_state_info_,
+        .pDepthStencilState = (depth_format_ == VK_FORMAT_UNDEFINED) ? nullptr : &depth_stencil_info_,
+        .pColorBlendState = color_enabled_ ? &color_blending_info_ : nullptr,
+        .pDynamicState = &dynamic_state,
+        .layout = pipeline_layout,
+        .renderPass = 0,
+        .subpass = 0,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = 0
+    };
+
+    VkPipeline pipeline;
+    if (vkCreateGraphicsPipelines(device_.get_device(), VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create mesh-shader pipeline!");
+    }
+
+    if (task_shader_module_ != VK_NULL_HANDLE)
+        vkDestroyShaderModule(device_.get_device(), task_shader_module_, nullptr);
+    vkDestroyShaderModule(device_.get_device(), mesh_shader_module_, nullptr);
+    if (fragment_shader_module_ != VK_NULL_HANDLE)
+        vkDestroyShaderModule(device_.get_device(), fragment_shader_module_, nullptr);
+    task_shader_module_ = VK_NULL_HANDLE;
+    mesh_shader_module_ = VK_NULL_HANDLE;
     fragment_shader_module_ = VK_NULL_HANDLE;
 
     return pipeline;

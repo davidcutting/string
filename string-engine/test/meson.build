@@ -3,7 +3,9 @@ test_files = [
     'layout_test.cpp',
     'resource_usage_test.cpp',
     'residency_manager_test.cpp',
-    'font_test.cpp'
+    'font_test.cpp',
+    'file_watch_service_test.cpp',
+    'shader_compiler_test.cpp'
 ]
 
 test_dep = [

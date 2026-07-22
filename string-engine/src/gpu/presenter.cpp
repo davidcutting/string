@@ -72,13 +72,13 @@ presenter::presenter(device& device, const std::shared_ptr<String::Window>& wind
 
     // Make sure that graphics and present queues are not different queues
     queue_family_indices indices = device_.get_queue_families();
-    uint32_t queue_family_indices[] = {indices.graphics_family.value(), indices.present_family.value()};
+    shared_queue_family_indices_ = {indices.graphics_family.value(), indices.present_family.value()};
 
     if (indices.graphics_family != indices.present_family)
     {
         create_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
         create_info.queueFamilyIndexCount = 2;
-        create_info.pQueueFamilyIndices = queue_family_indices;
+        create_info.pQueueFamilyIndices = shared_queue_family_indices_.data();
     }
 
     // Save this for later...

@@ -1,10 +1,15 @@
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 #include <string/gpu/driver.hpp>
 #include <string/vulkan/renderer.hpp>
@@ -36,10 +41,28 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
 , transfer_batch_(device_, allocator_, graphics_queue_)
 , global_descriptor_table_(device_.get_device(), allocator_)
-, composite_pass_(device_, std::filesystem::path(application_info.resources_directory), global_descriptor_table_.get_layout(), presenter_.get_format())
+// Shader hot-reload: a 1-thread pool (mtime scans + recompiles are light and serial), the watcher
+// polled each frame, and the Slang compiler with a content-hash cache under the shaders dir. The
+// shaders/ tree is the include/import search root.
+, shader_jobs_(1)
+, file_watcher_(shader_jobs_)
+// Cache lives under the OS temp dir (the resources/shaders tree may be read-only, e.g. the Nix
+// store); it is content-hash keyed so a stale entry is simply never hit.
+, shader_compiler_(
+    std::filesystem::temp_directory_path() / "string-shader-cache",
+    { std::filesystem::path(application_info.resources_directory) / "shaders" })
+, shader_registry_(device_, shader_compiler_, file_watcher_, shader_jobs_)
+, composite_pass_(device_, std::filesystem::path(application_info.resources_directory), global_descriptor_table_.get_layout(), presenter_.get_format(), shader_registry_)
 {
     STRING_LOG_DEBUG("Initializing renderer...");
     const auto resources_path = std::filesystem::path(application_info_.resources_directory);
+
+    if (const char* cap = std::getenv("STRING_CAPTURE_FRAME"))
+    {
+        capture_frame_ = std::strtoull(cap, nullptr, 10);
+        const char* path = std::getenv("STRING_CAPTURE_PATH");
+        capture_path_ = path ? path : "/tmp/string_capture.bmp";
+    }
 
     window_->register_resize_event_callback(std::bind(&Renderer::handle_resize, this, std::placeholders::_1));
 
@@ -97,6 +120,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         device_,
         allocator_,
         global_descriptor_table_,
+        shader_registry_,
         transfer_batch_,
         window_->get_input(),
         input_map_,
@@ -194,6 +218,17 @@ void Renderer::update()
         std::chrono::duration<float, std::chrono::seconds::period>(current_time - last_time).count();
     last_time = current_time;
 
+    // Rolling frame-time log (until Tracy is wired): avg/max ms per 600 frames.
+    static float acc = 0.0f, worst = 0.0f;
+    static uint32_t n = 0;
+    acc += delta_time; worst = std::max(worst, delta_time); ++n;
+    if (n == 600)
+    {
+        STRING_LOG_INFO("[frametime] avg {:.2f} ms ({:.0f} fps), worst {:.2f} ms",
+                        acc / n * 1000.0f, n / acc, worst * 1000.0f);
+        acc = 0.0f; worst = 0.0f; n = 0;
+    }
+
     for (auto& pass : scene_passes_)
     {
         pass->update(delta_time, static_cast<uint16_t>(current_frame_));
@@ -216,6 +251,18 @@ void Renderer::begin_frame()
 
     frame.garbage_collector.flush();
     frame.recorder.reset();
+
+    // Shader hot-reload, at the frame boundary (GPU work for this slot has completed — see the
+    // semaphore wait above). Poll the file watcher for edits, then apply any completed recompiles:
+    // swap the rebuilt pipeline in and retire the old one through THIS frame's garbage collector,
+    // so it is destroyed only after the ring cycles back (past all in-flight frames).
+    file_watcher_.poll_main_thread();
+    shader_registry_.apply_pending_swaps([&frame, this](string::gpu::pipeline old) {
+        frame.garbage_collector.push_function([this, old] {
+            vkDestroyPipeline(device_.get_device(), old.pipeline, nullptr);
+            vkDestroyPipelineLayout(device_.get_device(), old.pipeline_layout, nullptr);
+        });
+    });
 
     update();
 
@@ -260,7 +307,10 @@ void Renderer::record_frame()
             .pNext = nullptr,
             .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+            // Compute output feeds indirect draws, vertex pulling, AND fragment reads (froxel light
+            // lists from the Forward+ binning compute are consumed in the fragment stage).
+            .dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                          | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
             .dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
         };
         const VkDependencyInfo dependency = {
@@ -483,9 +533,100 @@ void Renderer::end_frame()
 
     presenter_.present();
 
+    if (capture_frame_ != 0 && frame_count_ >= capture_frame_)
+    {
+        capture_color_target();
+        capture_frame_ = 0;
+    }
+
     // Increment frame
     frame_count_++;
     current_frame_ = frame_count_ % frames_in_flight_;
+}
+
+// Debug capture: drain the GPU, copy color_attachment_ (single-sample resolved HDR) to a host
+// buffer, tonemap to 8-bit, write a bottom-up 24-bit BMP. Transitions go through
+// resource_states_ so the tracker stays consistent for the next frame.
+void Renderer::capture_color_target()
+{
+    vkDeviceWaitIdle(device_.get_device());
+
+    const VkExtent2D extent = presenter_.get_extent();
+    const VkDeviceSize bytes = VkDeviceSize(extent.width) * extent.height * 8;  // RGBA16F
+    const string::gpu::resource_id staging = allocator_.create_resource(string::gpu::buffer_info{
+        .size = bytes,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
+        .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
+                          | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+    });
+
+    string::gpu::command_recorder recorder;
+    recorder.init(device_.get_device(), graphics_queue_);
+    VkCommandBuffer cb = recorder.begin();
+    const string::gpu::allocated_image& src = allocator_.get_image(color_attachment_);
+    resource_states_.transition(cb, src.image, VK_IMAGE_ASPECT_COLOR_BIT,
+                                Access::TransferRead, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+    const VkBufferImageCopy region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { extent.width, extent.height, 1 },
+    };
+    vkCmdCopyImageToBuffer(cb, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           allocator_.get_buffer(staging).buffer, 1, &region);
+    recorder.end().immediate_submit();
+    recorder.destroy();
+
+    const auto half_to_float = [](uint16_t h) -> float {
+        const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+        float v;
+        if (exp == 0) v = man / 1024.0f / 16384.0f;
+        else if (exp == 31) v = 65504.0f;
+        else v = (1.0f + man / 1024.0f) * std::pow(2.0f, int(exp) - 15);
+        return sign ? -v : v;
+    };
+    const auto encode = [&](uint16_t h) -> uint8_t {
+        float v = std::max(half_to_float(h), 0.0f);
+        v = v / (1.0f + v);                      // simple tonemap
+        v = std::pow(v, 1.0f / 2.2f);            // gamma
+        return uint8_t(std::min(v, 1.0f) * 255.0f + 0.5f);
+    };
+
+    const uint16_t* pixels =
+        static_cast<const uint16_t*>(allocator_.get_buffer(staging).allocation_info.pMappedData);
+    const uint32_t row_bytes = (extent.width * 3 + 3) & ~3u;  // BMP rows pad to 4 bytes
+    const uint32_t image_bytes = row_bytes * extent.height;
+    std::vector<uint8_t> bmp(54 + image_bytes, 0);
+    const uint32_t file_size = uint32_t(bmp.size());
+    // BITMAPFILEHEADER + BITMAPINFOHEADER (24-bit, bottom-up)
+    bmp[0]='B'; bmp[1]='M';
+    std::memcpy(&bmp[2], &file_size, 4);
+    const uint32_t data_offset = 54; std::memcpy(&bmp[10], &data_offset, 4);
+    const uint32_t hdr_size = 40;    std::memcpy(&bmp[14], &hdr_size, 4);
+    const int32_t w = int32_t(extent.width), h = int32_t(extent.height);
+    std::memcpy(&bmp[18], &w, 4); std::memcpy(&bmp[22], &h, 4);
+    const uint16_t planes = 1, bpp = 24;
+    std::memcpy(&bmp[26], &planes, 2); std::memcpy(&bmp[28], &bpp, 2);
+    std::memcpy(&bmp[34], &image_bytes, 4);
+    for (uint32_t y = 0; y < extent.height; ++y)
+    {
+        uint8_t* row = bmp.data() + 54 + row_bytes * (extent.height - 1 - y);  // bottom-up
+        const uint16_t* src_row = pixels + VkDeviceSize(y) * extent.width * 4;
+        for (uint32_t x = 0; x < extent.width; ++x)
+        {
+            row[x * 3 + 0] = encode(src_row[x * 4 + 2]);  // B
+            row[x * 3 + 1] = encode(src_row[x * 4 + 1]);  // G
+            row[x * 3 + 2] = encode(src_row[x * 4 + 0]);  // R
+        }
+    }
+    std::ofstream out(capture_path_, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(bmp.data()), std::streamsize(bmp.size()));
+    out.close();
+    allocator_.destroy_resource(staging);
+    STRING_LOG_INFO("[capture] frame {} -> {}", frame_count_, capture_path_);
 }
 
 // The whole-frame entry point, called once per frame from Application::run.

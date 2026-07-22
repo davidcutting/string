@@ -156,6 +156,7 @@ UIPass::UIPass(PassContext& context, std::shared_ptr<const string::font_atlas> a
 , atlas_(std::move(atlas))
 , author_(std::move(author))
 , input_(context.input)
+, shader_registry_(context.shader_registry)
 {
     const std::filesystem::path& resources_path = context.resources_path;
 
@@ -199,54 +200,55 @@ UIPass::UIPass(PassContext& context, std::shared_ptr<const string::font_atlas> a
         { context.color_target, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
     };
 
-    // --- Shape pipeline (ui_shader): push = { screen, shape_slot }, vertex stage only ---
-    const VkPushConstantRange shape_push = {
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = sizeof(ShapePush),
-    };
-    shape_pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
-        .set_descriptor_set_layout({ descriptor_table_.get_layout() })
-        .set_push_constant_ranges({ shape_push })
-        .build(device_);
-    shape_pipeline_.pipeline = string::gpu::pipeline_builder(device_)
-        .add_vertex_shader(resources_path / "shaders/ui_shader.vert.spv")
-        .add_fragment_shader(resources_path / "shaders/ui_shader.frag.spv")
-        .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-        .set_tessellation()
-        .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
-        .set_multisampling(context.sample_count)
-        .enable_depth_stencil(false, false)
-        .enable_color_blending()
-        .build_graphics_pipeline(shape_pipeline_.pipeline_layout);
-    shape_pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+    // Both overlay pipelines share the same fixed state (instanced quads, no cull, MSAA, no depth,
+    // alpha blend); only the shaders + reflected push-constant range differ. Build them via the
+    // hot-reload registry so a save recompiles + swaps them. Set 0 stays the bindless table layout;
+    // reflection drives the push-constant range.
+    VkDescriptorSetLayout global_layout = descriptor_table_.get_layout();
+    VkSampleCountFlagBits samples = context.sample_count;
+    auto overlay_builder = [global_layout, samples](string::gpu::device& dev,
+                                                    const string::gpu::compiled_program& compiled) {
+        string::gpu::pipeline p{};
+        p.push_constants = compiled.layout.push_constant;
+        p.pipeline_layout = string::gpu::pipeline_layout_builder()
+            .set_descriptor_set_layout({ global_layout })
+            .set_push_constant_ranges({ compiled.layout.push_constant })
+            .build(dev);
 
-    // --- Text pipeline (text_shader): push = { screen, glyph_slot, atlas_slot }, both stages ---
-    const VkPushConstantRange text_push = {
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        .offset = 0, .size = sizeof(TextPush),
+        string::gpu::pipeline_builder builder(dev);
+        for (const auto& stage : compiled.stages)
+        {
+            if (stage.stage == VK_SHADER_STAGE_VERTEX_BIT)
+                builder.add_vertex_shader_spirv(stage.spirv, stage.entry_point);
+            else if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                builder.add_fragment_shader_spirv(stage.spirv, stage.entry_point);
+        }
+        p.pipeline = builder
+            .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+            .set_tessellation()
+            .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
+            .set_multisampling(samples)
+            .enable_depth_stencil(false, false)
+            .enable_color_blending()
+            .build_graphics_pipeline(p.pipeline_layout);
+        p.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+        return p;
     };
-    text_pipeline_.pipeline_layout = string::gpu::pipeline_layout_builder()
-        .set_descriptor_set_layout({ descriptor_table_.get_layout() })
-        .set_push_constant_ranges({ text_push })
-        .build(device_);
-    text_pipeline_.pipeline = string::gpu::pipeline_builder(device_)
-        .add_vertex_shader(resources_path / "shaders/text_shader.vert.spv")
-        .add_fragment_shader(resources_path / "shaders/text_shader.frag.spv")
-        .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-        .set_tessellation()
-        .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
-        .set_multisampling(context.sample_count)
-        .enable_depth_stencil(false, false)
-        .enable_color_blending()
-        .build_graphics_pipeline(text_pipeline_.pipeline_layout);
-    text_pipeline_.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+
+    shape_program_ = context.shader_registry.create(resources_path / "shaders" / "ui_shader.slang",
+                                                    overlay_builder);
+    text_program_ = context.shader_registry.create(resources_path / "shaders" / "text_shader.slang",
+                                                   overlay_builder);
 }
 
 UIPass::~UIPass()
 {
-    vkDestroyPipeline(device_.get_device(), shape_pipeline_.pipeline, nullptr);
-    vkDestroyPipelineLayout(device_.get_device(), shape_pipeline_.pipeline_layout, nullptr);
-    vkDestroyPipeline(device_.get_device(), text_pipeline_.pipeline, nullptr);
-    vkDestroyPipelineLayout(device_.get_device(), text_pipeline_.pipeline_layout, nullptr);
+    const string::gpu::pipeline& shape_p = shape_program_->current();
+    vkDestroyPipeline(device_.get_device(), shape_p.pipeline, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), shape_p.pipeline_layout, nullptr);
+    const string::gpu::pipeline& text_p = text_program_->current();
+    vkDestroyPipeline(device_.get_device(), text_p.pipeline, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), text_p.pipeline_layout, nullptr);
     for (Ring& r : shape_ring_)
     {
         descriptor_table_.unbind(r.buffer, string::gpu::descriptor_type::STORAGE_BUFFER);
@@ -262,6 +264,55 @@ UIPass::~UIPass()
     vkDestroySampler(device_.get_device(), atlas_sampler_, nullptr);
 }
 
+void UIPass::author_error_overlay()
+{
+    const std::vector<string::gpu::compile_error> errors = shader_registry_.current_errors();
+    if (errors.empty())
+    {
+        error_lines_.clear();
+        return;  // last compile succeeded — overlay clears
+    }
+
+    // Flatten the diagnostics into individual lines (Slang messages already carry file:line:col).
+    error_lines_.clear();
+    for (const string::gpu::compile_error& e : errors)
+    {
+        error_lines_.push_back("shader error: " + e.file.filename().string());
+        std::string msg = e.message;
+        std::size_t start = 0;
+        while (start < msg.size())
+        {
+            const std::size_t nl = msg.find('\n', start);
+            const std::size_t end = (nl == std::string::npos) ? msg.size() : nl;
+            if (end > start)
+            {
+                error_lines_.push_back(msg.substr(start, end - start));
+            }
+            start = end + 1;
+        }
+    }
+
+    using namespace string;
+    element panel{};
+    panel.color = { 40, 8, 8, 240 };          // dark red, near-opaque
+    panel.stroke_color = { 243, 139, 168, 255 };
+    panel.stroke_width = 2;
+    panel.radius = 8;
+    panel.shape = shape::ROUNDED_RECTANGLE;
+    panel.sizing = size_fit();
+
+    builder_.begin(panel, format{ .padding = { 10, 10, 10, 10 }, .gap = 2,
+                                  .direction = direction::VERTICAL });
+    for (const std::string& line : error_lines_)
+    {
+        element text_el{};
+        text_el.color = { 243, 139, 168, 255 };  // readable red-pink
+        text_el.sizing = size_fit();
+        builder_.add_text(text_el, line, 20);
+    }
+    builder_.end();
+}
+
 void UIPass::update(float /*delta_time*/, uint16_t current_frame)
 {
     if (screen_size.width == 0 || screen_size.height == 0 || current_frame >= shape_ring_.size())
@@ -275,6 +326,7 @@ void UIPass::update(float /*delta_time*/, uint16_t current_frame)
     builder_.begin(string::format{ .padding = { 12, 12, 12, 12 }, .gap = 8,
                                    .direction = string::direction::VERTICAL });
     author_(builder_, UiContext{ input_, hovered_id_, focused_id_ });
+    author_error_overlay();
     const string::dimension available{
         static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.width, 0xFFFF)),
         static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.height, 0xFFFF)) };
@@ -332,30 +384,32 @@ void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_fr
     VkCommandBuffer command_buffer = recorder.get_command_buffer();
 
     // Shapes first (under), then glyphs (over).
+    const string::gpu::pipeline& shape_p = shape_program_->current();
     const Ring& sr = shape_ring_[current_frame];
     if (sr.count > 0)
     {
-        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shape_pipeline_.pipeline);
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shape_p.pipeline);
         vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            shape_pipeline_.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
+            shape_p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
         const ShapePush push{
             { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) }, sr.slot };
-        vkCmdPushConstants(command_buffer, shape_pipeline_.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+        vkCmdPushConstants(command_buffer, shape_p.pipeline_layout, shape_p.push_constants.stageFlags,
             0, sizeof(ShapePush), &push);
         vkCmdDraw(command_buffer, 6, sr.count, 0, 0);
     }
 
+    const string::gpu::pipeline& text_p = text_program_->current();
     const Ring& gr = glyph_ring_[current_frame];
     if (gr.count > 0)
     {
-        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, text_pipeline_.pipeline);
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, text_p.pipeline);
         vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            text_pipeline_.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
+            text_p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
         const TextPush push{
             { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
             gr.slot, atlas_slot_ };
-        vkCmdPushConstants(command_buffer, text_pipeline_.pipeline_layout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(TextPush), &push);
+        vkCmdPushConstants(command_buffer, text_p.pipeline_layout,
+            text_p.push_constants.stageFlags, 0, sizeof(TextPush), &push);
         vkCmdDraw(command_buffer, 6, gr.count, 0, 0);
     }
 }

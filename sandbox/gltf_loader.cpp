@@ -19,10 +19,72 @@
 #include <fastgltf/types.hpp>
 #include <fastgltf/glm_element_traits.hpp>   // ElementTraits for glm::vec2/3/4 accessor reads
 
+#include "third_party/mikktspace/mikktspace.h"
+
 namespace sandbox
 {
 namespace
 {
+
+// Pack a normalized tangent + handedness sign into the vertex's 10:10:10:2 field (matching
+// VK_FORMAT_A2B10G10R10_SNORM_PACK32 / the shader unpack): xyz as 10-bit snorm, w=sign in 2 bits.
+uint32_t pack_tangent(const glm::vec3& t, float sign)
+{
+    auto snorm10 = [](float v) -> uint32_t {
+        v = glm::clamp(v, -1.0f, 1.0f);
+        const int32_t q = static_cast<int32_t>(std::lround(v * 511.0f));
+        return static_cast<uint32_t>(q & 0x3FF);
+    };
+    // A2B10G10R10: bits [0..9]=x, [10..19]=y, [20..29]=z, [30..31]=w. A 2-bit snorm stores +1 as 01
+    // and -1 as 11 (== -1 in 2-bit two's complement); the shader reads .w and does sign(w) or w<0.
+    const uint32_t w2 = sign < 0.0f ? 0x3u : 0x1u;
+    return snorm10(t.x) | (snorm10(t.y) << 10) | (snorm10(t.z) << 20) | (w2 << 30);
+}
+
+// MikkTSpace generation context: runs over a de-indexed triangle list for one primitive's vertex
+// range, then writes packed tangents back to the (indexed) shared vertex array. glTF winds CCW.
+struct MikktMesh
+{
+    String::Vertex* verts;          // base of this primitive's vertex range in model.vertices
+    const uint32_t* indices;        // global index values for this primitive (already vertex-rebased)
+    uint32_t base_vertex;           // subtract to map a global index back to a local vertex slot
+    uint32_t face_count;
+};
+
+int mikkt_num_faces(const SMikkTSpaceContext* c)
+{
+    return static_cast<const MikktMesh*>(c->m_pUserData)->face_count;
+}
+int mikkt_num_verts_of_face(const SMikkTSpaceContext*, int) { return 3; }
+
+const String::Vertex& mikkt_vertex(const SMikkTSpaceContext* c, int face, int vert)
+{
+    const MikktMesh* m = static_cast<const MikktMesh*>(c->m_pUserData);
+    const uint32_t idx = m->indices[face * 3 + vert] - m->base_vertex;
+    return m->verts[idx];
+}
+void mikkt_get_position(const SMikkTSpaceContext* c, float out[], int face, int vert)
+{
+    const glm::vec3& p = mikkt_vertex(c, face, vert).pos;
+    out[0] = p.x; out[1] = p.y; out[2] = p.z;
+}
+void mikkt_get_normal(const SMikkTSpaceContext* c, float out[], int face, int vert)
+{
+    const glm::vec3& n = mikkt_vertex(c, face, vert).normal;
+    out[0] = n.x; out[1] = n.y; out[2] = n.z;
+}
+void mikkt_get_texcoord(const SMikkTSpaceContext* c, float out[], int face, int vert)
+{
+    const glm::vec2& uv = mikkt_vertex(c, face, vert).texCoord;
+    out[0] = uv.x; out[1] = uv.y;
+}
+void mikkt_set_tspace_basic(const SMikkTSpaceContext* c, const float t[], float sign, int face, int vert)
+{
+    const MikktMesh* m = static_cast<const MikktMesh*>(c->m_pUserData);
+    const uint32_t idx = m->indices[face * 3 + vert] - m->base_vertex;
+    // MikkTSpace's sign is the bitangent handedness (B = sign * cross(N, T)); pass it through.
+    m->verts[idx].tangent = pack_tangent(glm::vec3(t[0], t[1], t[2]), sign);
+}
 
 // Copy a slice of encoded image bytes into a texture source (no decode — the pass decodes it).
 GltfTexture encoded_source(const std::byte* bytes, std::size_t size)
@@ -161,6 +223,7 @@ GltfParsed parse_gltf(const std::filesystem::path& path)
         out.base_color_texture = image_index_of(asset, material.pbrData.baseColorTexture);
         out.metallic_roughness_texture = image_index_of(asset, material.pbrData.metallicRoughnessTexture);
         out.normal_texture = image_index_of(asset, material.normalTexture);
+        out.occlusion_texture = image_index_of(asset, material.occlusionTexture);
 
         // Base-color maps carry sRGB-encoded color; data maps stay linear. (Left at the default
         // linear for normal / metallic-roughness.)
@@ -197,6 +260,7 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
         uint32_t index_count;
         glm::vec3 local_min{ 0.0f };   // primitive's local-space AABB, filled by the parallel pass
         glm::vec3 local_max{ 0.0f };
+        bool has_tangent = false;      // glTF supplied TANGENT (else MikkTSpace generates it)
     };
 
     std::vector<PrimitivePlan> plans;
@@ -279,6 +343,19 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
                         });
                 }
 
+                // glTF TANGENT is a vec4 (xyz tangent + w handedness). When present, pack it directly;
+                // otherwise MikkTSpace fills these vertices after the parallel pass (needs the full
+                // primitive at once). plan.has_tangent gates that.
+                if (const auto* tan = primitive.findAttribute("TANGENT"); tan != primitive.attributes.end())
+                {
+                    plan.has_tangent = true;
+                    fastgltf::iterateAccessorWithIndex<glm::vec4>(
+                        casset, casset.accessors[tan->accessorIndex], [&](glm::vec4 value, std::size_t i) {
+                            model.vertices[plan.base_vertex + i].tangent =
+                                pack_tangent(glm::vec3(value), value.w);
+                        });
+                }
+
                 if (primitive.indicesAccessor.has_value())
                 {
                     const auto& index_accessor = casset.accessors[primitive.indicesAccessor.value()];
@@ -304,6 +381,53 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
         {
             job.get();   // sync + rethrow any decode error
         }
+    }
+
+    // --- Tangents: generate via MikkTSpace for primitives the glTF didn't ship TANGENT for ------
+    // MikkTSpace needs the whole primitive (it welds/averages across shared vertices), so it runs
+    // after the parallel fill. Parallelised across primitives (each writes only its own vertex
+    // range). Generates the standard per-vertex tangent basis the fragment shader expects.
+    {
+        std::vector<PrimitivePlan*> to_generate;
+        for (PrimitivePlan& plan : plans)
+        {
+            if (!plan.has_tangent && plan.index_count > 0)
+            {
+                to_generate.push_back(&plan);
+            }
+        }
+        if (!to_generate.empty())
+        {
+            string::core::job_system pool;
+            std::vector<std::future<void>> jobs;
+            jobs.reserve(to_generate.size());
+            for (PrimitivePlan* plan : to_generate)
+            {
+                jobs.push_back(pool.enqueue([&model, plan]() {
+                    MikktMesh mesh{
+                        .verts = model.vertices.data() + plan->base_vertex,
+                        .indices = model.indices.data() + plan->index_offset,
+                        .base_vertex = plan->base_vertex,
+                        .face_count = plan->index_count / 3,
+                    };
+                    SMikkTSpaceInterface iface{};
+                    iface.m_getNumFaces = mikkt_num_faces;
+                    iface.m_getNumVerticesOfFace = mikkt_num_verts_of_face;
+                    iface.m_getPosition = mikkt_get_position;
+                    iface.m_getNormal = mikkt_get_normal;
+                    iface.m_getTexCoord = mikkt_get_texcoord;
+                    iface.m_setTSpaceBasic = mikkt_set_tspace_basic;
+                    SMikkTSpaceContext ctx{ &iface, &mesh };
+                    genTangSpaceDefault(&ctx);
+                }));
+            }
+            for (auto& job : jobs)
+            {
+                job.get();
+            }
+        }
+        STRING_LOG_INFO("[load]   tangents: {} of {} primitives generated via MikkTSpace (rest from glTF TANGENT)",
+                        to_generate.size(), plans.size());
     }
 
     // Regroup the filled primitives by mesh (preserving order) for the instance pass below.

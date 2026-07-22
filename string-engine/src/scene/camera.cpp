@@ -75,7 +75,10 @@ void Camera::update(const InputMap& input, float delta_time, float aspect)
     }
 
     const float safe_aspect = aspect <= 0.0f ? 1.0f : aspect;
+    aspect_ = safe_aspect;
+    forward_ = forward;
     const glm::mat4 view = glm::lookAt(position_, position_ + forward, world_up);
+    view_ = view;
     glm::mat4 proj = glm::perspective(glm::radians(fov_degrees_), safe_aspect, near_, far_);
     proj[1][1] *= -1;   // GLM is OpenGL-handed; flip Y for Vulkan.
 

@@ -90,10 +90,10 @@ private:
 // Streams a model's geometry per draw, as a residency_provider driving the residency_manager, with
 // real VRAM reclaim: the vertices/indices live in two heaps SMALLER than the whole model, and each
 // draw's geometry is suballocated on demand (when the draw enters the view frustum) and freed on
-// eviction so its space is reused. Because indices stay global, a draw's indirect command uses
-// vertexOffset = (heap vertex offset - the draw's min vertex) so gl_VertexIndex lands in the draw's
-// heap slot — no index rebasing. Gating is free: a not-resident draw keeps index_count 0 (cull.comp
-// emits an empty command); the streamer writes the real command fields on residency.
+// eviction so its space is reused. Because indices stay global, meshlet vertices hold ORIGINAL global
+// indices and the mesh shader rebases them by vertex_offset = (heap vertex offset - the draw's min
+// vertex). Gating is free: a not-resident draw stays hidden via DrawInfo.resident 0; the streamer
+// flips the resident flag + vertex_offset on residency (and back to 0 on eviction).
 //
 // Frees are deferred by frames-in-flight: a range evicted at frame N is only reusable at frame
 // N + frames_in_flight, after every in-flight frame that could still read it has finished on the GPU.
@@ -114,9 +114,9 @@ public:
     // Reclaim ranges whose deferred-free window has elapsed (call once per frame before tick()).
     void begin_frame(std::uint64_t frame);
 
-    // Called when a draw's residency changes, to write its indirect-command fields into the mapped
-    // cull buffer: (draw, vertex_offset, first_index, index_count). All zero = hidden (not drawn).
-    void set_residency_callback(std::function<void(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t)> cb)
+    // Called when a draw's residency changes, to flip its DrawInfo gate: (draw, vertex_offset,
+    // resident). resident == 0 hides the draw (evicted / not yet streamed).
+    void set_residency_callback(std::function<void(std::uint32_t, std::uint32_t, std::uint32_t)> cb)
     {
         set_cull_ = std::move(cb);
     }
@@ -153,6 +153,11 @@ private:
         std::uint64_t vheap, vcount, iheap, icount, safe_frame;
     };
 
+public:
+    // Debug: read a vertex from the CPU-side copy (headless meshlet diagnostics).
+    const String::Vertex& cpu_vertex(std::uint32_t i) const { return vertices_[i]; }
+
+private:
     string::gpu::resource_allocator& allocator_;
     String::TransferBatch& transfer_;
     string::gpu::resource_id vertex_buffer_;
@@ -167,7 +172,7 @@ private:
     std::uint32_t frames_in_flight_;
     std::uint64_t current_frame_ = 0;
 
-    std::function<void(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t)> set_cull_;
+    std::function<void(std::uint32_t, std::uint32_t, std::uint32_t)> set_cull_;
     std::uint32_t resident_draws_ = 0;
     std::uint32_t evicted_draws_ = 0;
     VkDeviceSize streamed_bytes_ = 0;

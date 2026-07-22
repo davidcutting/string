@@ -113,12 +113,11 @@ void GeometryStreamer::on_resident(string::gpu::resource_id id, std::uint32_t de
     }
     const DrawRange& r = ranges_[id];
     const Alloc& a = allocs_[id];
-    // Indices are global; vertexOffset shifts gl_VertexIndex from the source vertex numbering to the
-    // draw's heap slot: heap_vertex = index_value + (a.vheap - r.vertex_offset). Stored as uint bits
-    // of a signed int32 (cull.comp reinterprets it with int()).
+    // Indices are global; vertex_offset rebases meshlet vertices from the source vertex numbering to
+    // the draw's heap slot: heap_vertex = index_value + (a.vheap - r.vertex_offset). Stored as uint
+    // bits of a signed int32 (the mesh shader reinterprets it with int()).
     const std::int32_t vertex_offset = static_cast<std::int32_t>(a.vheap) - static_cast<std::int32_t>(r.vertex_offset);
-    set_cull_(static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(vertex_offset),
-              static_cast<std::uint32_t>(a.iheap), r.index_count);
+    set_cull_(static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(vertex_offset), /*resident=*/1u);
     ++resident_draws_;
     streamed_bytes_ += cost(id, detail);
 }
@@ -134,9 +133,9 @@ void GeometryStreamer::evict(string::gpu::resource_id id, std::uint32_t /*from_d
     {
         return;
     }
-    // Hide the draw now (index_count 0), but defer freeing its heap ranges until every in-flight
+    // Hide the draw now (resident 0), but defer freeing its heap ranges until every in-flight
     // frame that might still be drawing it has finished — then begin_frame() reclaims them.
-    if (set_cull_) set_cull_(static_cast<std::uint32_t>(id), 0, 0, 0);
+    if (set_cull_) set_cull_(static_cast<std::uint32_t>(id), 0, /*resident=*/0u);
     const DrawRange& r = ranges_[id];
     pending_free_.push_back(PendingFree{ a.vheap, r.vertex_count, a.iheap, r.index_count,
                                          current_frame_ + frames_in_flight_ });

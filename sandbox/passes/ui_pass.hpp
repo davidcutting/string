@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <string/core/font.hpp>
@@ -10,6 +11,7 @@
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/gpu/device.hpp>
 #include <string/gpu/pipeline.hpp>
+#include <string/gpu/shader_program_registry.hpp>
 #include <string/gpu/resource.hpp>
 #include <string/gpu/resource_allocator.hpp>
 #include <string/platform/input.hpp>
@@ -82,6 +84,9 @@ private:
     std::shared_ptr<const string::font_atlas> atlas_;
     Author author_;
     String::Input& input_;  // non-const: the pass requests game/UI capture mode
+    // Read each frame for the shader-compile error overlay (brief 01, M4): when a hot-reload fails,
+    // the registry holds the diagnostics; the pass draws them over the UI until the next success.
+    string::gpu::shader_program_registry& shader_registry_;
     string::layout_builder builder_;
     std::uint64_t hovered_id_ = 0;
     std::uint64_t focused_id_ = 0;
@@ -89,18 +94,25 @@ private:
 
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
 
-    // Shape overlay (rounded-rect SDF): ui_shader.*
-    string::gpu::pipeline shape_pipeline_;
+    // Shape overlay (rounded-rect SDF): ui_shader.slang. Pipeline owned by the hot-reloadable
+    // shader_program (recompiles + swaps on save); the pass binds shape_program_->current().
+    string::gpu::shader_program* shape_program_ = nullptr;
     std::vector<Ring> shape_ring_;
 
-    // Text overlay (glyph SDF sampling the atlas): text_shader.*
-    string::gpu::pipeline text_pipeline_;
+    // Text overlay (glyph SDF sampling the atlas): text_shader.slang.
+    string::gpu::shader_program* text_program_ = nullptr;
     std::vector<Ring> glyph_ring_;
     string::gpu::resource_id atlas_image_ = 0;
     VkSampler atlas_sampler_ = VK_NULL_HANDLE;
     std::uint32_t atlas_slot_ = 0;
 
     bool warned_overflow_ = false;
+
+    // Persistent backing for the compile-error overlay's text (add_text takes non-owning views, so
+    // the strings must outlive layout + record). Rebuilt each frame from the registry's diagnostics.
+    std::vector<std::string> error_lines_;
+    // Appends the shader-compile error overlay to the current layout tree, if any errors are live.
+    void author_error_overlay();
 };
 
 }  // namespace sandbox

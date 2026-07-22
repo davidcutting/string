@@ -18,6 +18,10 @@
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/vulkan/passes/composite_pass.hpp>
 #include <string/platform/input_map.hpp>
+#include <string/core/job_system.hpp>
+#include <string/core/file_watch_service.hpp>
+#include <string/gpu/shader_compiler.hpp>
+#include <string/gpu/shader_program_registry.hpp>
 
 #include <volk.h>
 
@@ -56,6 +60,15 @@ class Renderer
     // borrows, so its constructor sees them initialized.
     TransferBatch transfer_batch_;
     string::gpu::descriptor_table global_descriptor_table_;
+    // Shader hot-reload plumbing (brief 01). shader_jobs_ is a small pool for off-thread mtime
+    // scans + Slang recompiles; the watcher polls it each frame; the compiler is the in-process
+    // Slang session (SPIR-V + reflection with a content-hash disk cache); the registry owns every
+    // reloadable pipeline and swaps rebuilt ones at the frame boundary. Declared before the passes
+    // (composite + scene) so they can register their pipelines during construction.
+    string::core::job_system shader_jobs_;
+    string::core::file_watch_service file_watcher_;
+    string::gpu::shader_compiler shader_compiler_;
+    string::gpu::shader_program_registry shader_registry_;
     // Derives the frame's image-layout barriers from tracked state (see begin/end_rendering).
     ResourceStateTracker resource_states_;
     CompositePass composite_pass_;
@@ -81,6 +94,13 @@ class Renderer
     uint64_t frame_count_ = 1;
     uint64_t current_frame_ = 0;
     std::array<Frame, frames_in_flight_> frames_;
+
+    // Debug frame capture (env STRING_CAPTURE_FRAME=N [+ STRING_CAPTURE_PATH]): after frame N is
+    // submitted, waits idle and writes the resolved HDR color target to a BMP so a headless
+    // agent/tool can inspect real output. 0 = disabled.
+    uint64_t capture_frame_ = 0;
+    std::string capture_path_;
+    void capture_color_target();
 public:
     Renderer(const ApplicationInfo& application_info, std::shared_ptr<Window> window,
              const RenderPlan& plan);

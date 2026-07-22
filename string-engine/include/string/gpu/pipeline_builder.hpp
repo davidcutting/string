@@ -3,6 +3,10 @@
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/device.hpp>
 
+#include <filesystem>
+#include <string>
+#include <vector>
+
 #include <volk.h>
 
 namespace string::gpu
@@ -29,10 +33,22 @@ public:
     pipeline_builder(const pipeline_builder&) = delete;
     pipeline_builder& operator=(const pipeline_builder&) = delete;
 
-    // shader stages
+    // shader stages (SPIR-V from disk — the legacy glslang path)
     pipeline_builder& add_compute_shader(const std::filesystem::path& resource_path);
     pipeline_builder& add_vertex_shader(const std::filesystem::path& resource_path);
     pipeline_builder& add_fragment_shader(const std::filesystem::path& resource_path);
+
+    // shader stages (SPIR-V words already in memory — the in-process Slang path). `entry_point`
+    // is the Slang entry-point name; Vulkan's pName must match the SPIR-V's entry point.
+    pipeline_builder& add_compute_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point);
+    pipeline_builder& add_vertex_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point);
+    pipeline_builder& add_fragment_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point);
+
+    // Mesh-shader stages (VK_EXT_mesh_shader). A task (amplification) shader is optional; a mesh
+    // pipeline is TASK?+MESH+FRAG?. build_mesh_pipeline() omits the vertex-input + input-assembly
+    // state entirely (the mesh shader emits primitives directly).
+    pipeline_builder& add_task_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point);
+    pipeline_builder& add_mesh_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point);
 
     // pipeline config
     pipeline_builder& set_vertex_binding(
@@ -64,6 +80,10 @@ public:
 
     VkPipeline build_graphics_pipeline(const VkPipelineLayout& pipeline_layout);
     VkPipeline build_compute_pipeline(const VkPipelineLayout& pipeline_layout);
+    // Task/mesh graphics pipeline: TASK?+MESH+FRAG? stages, NO vertex-input / input-assembly state
+    // (the mesh shader emits primitives). Everything else (raster/depth/blend/MSAA/formats) is the
+    // same fixed state the graphics builder consumes.
+    VkPipeline build_mesh_pipeline(const VkPipelineLayout& pipeline_layout);
 
 private:
     [[maybe_unused]] pipeline_type type_;
@@ -71,11 +91,23 @@ private:
     VkShaderModule compute_shader_module_{VK_NULL_HANDLE};
     VkShaderModule vertex_shader_module_{VK_NULL_HANDLE};
     VkShaderModule fragment_shader_module_{VK_NULL_HANDLE};
+    VkShaderModule task_shader_module_{VK_NULL_HANDLE};
+    VkShaderModule mesh_shader_module_{VK_NULL_HANDLE};
+
+    // Entry-point names for the SPIR-V (Slang) path. Held so the VkPipelineShaderStageCreateInfo
+    // pName pointers stay valid until build(). GLSL modules default their entry point to "main".
+    std::string compute_entry_point_{"main"};
+    std::string vertex_entry_point_{"main"};
+    std::string fragment_entry_point_{"main"};
+    std::string task_entry_point_{"main"};
+    std::string mesh_entry_point_{"main"};
 
     // Config
     VkPipelineShaderStageCreateInfo compute_shader_stage_info_{};
     VkPipelineShaderStageCreateInfo vertex_shader_stage_info_{};
     VkPipelineShaderStageCreateInfo fragment_shader_stage_info_{};
+    VkPipelineShaderStageCreateInfo task_shader_stage_info_{};
+    VkPipelineShaderStageCreateInfo mesh_shader_stage_info_{};
     VkPipelineVertexInputStateCreateInfo vertex_input_info_{};
     VkPipelineInputAssemblyStateCreateInfo input_assembly_{};
     VkPipelineTessellationStateCreateInfo tessellation_state_info_{};

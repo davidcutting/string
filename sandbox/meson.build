@@ -1,6 +1,6 @@
 project(
     'string-demo',
-    'cpp',
+    ['cpp', 'c'],   # c: the vendored MikkTSpace reference lib (third_party/mikktspace/mikktspace.c)
     version : '0.0.1',
     license : 'MIT',
     default_options : [
@@ -30,7 +30,22 @@ string_dep = dependency('string-engine', fallback : ['string-engine', 'project_d
 # system KTX-Software install (there's no meson wrap — its CMake build isn't wired as a subproject).
 ktx_dep = dependency('Ktx', method : 'cmake', modules : ['KTX::ktx'])
 
+# meshoptimizer: meshlet build (meshopt_buildMeshlets) + the LOD simplify chain (brief 03). Like
+# ktx, the engine stays generic — meshletization is an app-side asset step. Resolved from its CMake
+# config (meshoptimizer::meshoptimizer): on nix from nixpkgs; off-nix from the meson wrap.
+meshopt_dep = dependency('meshoptimizer',
+                         method : 'cmake', modules : ['meshoptimizer::meshoptimizer'],
+                         fallback : ['meshoptimizer', 'meshoptimizer_dep'])
+
 sandbox_inc = include_directories('.')
+
+# Vendored MikkTSpace reference lib (tangent generation for meshes without glTF TANGENT). Built as
+# its own static lib so the project's -Wall/-Wextra don't drown in this third-party C file.
+mikktspace_lib = static_library(
+    'mikktspace',
+    'third_party/mikktspace/mikktspace.c',
+    c_args : ['-w'],
+)
 
 subdir('shaders')
 
@@ -42,11 +57,13 @@ executable(
         'gltf_loader.cpp',
         'passes/grid_2d_pass.cpp',
         'passes/geometry_pass.cpp',
+        'passes/meshlet_builder.cpp',
         'passes/texture_streamer.cpp',
         'passes/geometry_streamer.cpp',
         'passes/ui_pass.cpp',
     ],
     include_directories : sandbox_inc,
-    dependencies : [ string_dep, ktx_dep ],
+    link_with : [ mikktspace_lib ],
+    dependencies : [ string_dep, ktx_dep, meshopt_dep ],
     install : true,
 )
