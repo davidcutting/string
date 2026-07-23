@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string_view>
 #include <vector>
 #include <string/platform/window.hpp>
 #include <string/gpu/driver.hpp>
@@ -37,6 +38,17 @@ public:
     auto get_device() -> VkDevice&;
     auto get_queue(queue_type type) -> queue;
 
+    // Brief 04e M1: the selected device's queue-family capability table (families, per-family
+    // queue counts, capability flags, present support, timestamp validity). Enumerated once at
+    // physical-device selection; the lane set and the graph's placement policy read it.
+    const std::vector<queue_family_caps>& queue_capabilities() const { return family_caps_; }
+    // The full useful queue set, created once at init and exposed as named submission lanes
+    // ("main", "async-compute-N", "transfer"). 1:1 lane->queue; on hardware with fewer queues,
+    // fewer lanes exist (no transparent multiplexing — locked guardrail).
+    const std::vector<submission_lane>& submission_lanes() const { return lanes_; }
+    // Lookup by name; nullptr when the hardware doesn't expose that lane.
+    const submission_lane* lane(std::string_view name) const;
+
     // True if VK_EXT_calibrated_timestamps was available and enabled at device creation. The
     // Tracy GPU context uses this to build a calibrated (host<->device correlated) context;
     // otherwise it falls back to an uncalibrated one. Optional feature — never a hard requirement.
@@ -53,6 +65,13 @@ private:
     // re-probing queue families (2 property queries + a per-family surface-support query) on
     // every get_queue()/create_logical_device(), and re-querying properties for limits.
     queue_family_indices queue_family_indices_{};
+    // Brief 04e M1: full per-family capability table + the created submission-lane set.
+    std::vector<queue_family_caps> family_caps_;
+    std::vector<submission_lane> lanes_;
+    // How many queues create_logical_device requested per family (indexed by family), so lane
+    // construction retrieves exactly the queues that exist.
+    void build_capability_table();
+    void build_submission_lanes();
     VkPhysicalDeviceProperties properties_{};
     // Whether VK_EXT_calibrated_timestamps was present and enabled (optional; profiler-only).
     bool calibrated_timestamps_enabled_ = false;

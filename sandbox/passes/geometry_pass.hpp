@@ -243,6 +243,10 @@ class GeometryPass final : public String::Pass
     string::gpu::resource_id vertex_buffer_;
     uint32_t draw_count_ = 0;
     uint32_t frames_in_flight_ = 1;
+    // Brief 04e M2: number of fixed usages declared at construction; update() truncates back to
+    // this count and re-appends the current frame slot's buffer usages (worklists, froxels,
+    // visibility bitfield) so the frame graph sees per-frame-true declarations.
+    std::size_t static_usage_count_ = 0;
 
     // Geometry residency streaming: per-draw vertex/index ranges suballocate into heaps SMALLER than
     // the whole model as draws enter the view frustum, and are freed (reclaimed) on eviction. A
@@ -419,7 +423,12 @@ class GeometryPass final : public String::Pass
     // (12B VkDrawMeshTasksIndirectCommandEXT), records[max_draws] (8B {draw_index, lod}), and the
     // surviving-draw count word (for vkCmdDrawMeshTasksIndirectCountEXT). One command per surviving
     // draw (empty slots compacted out): removes the fan-out cost while keeping command ordering.
-    struct Worklist { string::gpu::resource_id buffer = 0; };
+    // Brief 04e M3: worklists are SCRATCH regions now — `offset` into the renderer's per-frame-
+    // slot scratch arena, reserved once at load (same offset in every slot's buffer); `buffer`
+    // is the slot's scratch buffer, bound lazily in update() once the arena is materialized.
+    struct Worklist { string::gpu::resource_id buffer = 0; VkDeviceSize offset = 0; };
+    String::FrameScratch* scratch_ = nullptr;
+    bool scratch_bound_ = false;
     // Per-frame-in-flight (the GPU may still read last frame's list). Camera lists: opaque one-sided +
     // two-sided (brief 04d: shared by phase 1 and phase 2; the task shader partitions per phase — the
     // old forced-LOD0 depth-prepass lists are deleted along with the prepass itself).
@@ -429,7 +438,12 @@ class GeometryPass final : public String::Pass
     // reject in the draw phase — off-camera casters that reach the cascade still cast in).
     std::vector<std::array<Worklist, kMaxCascades>> wl_shadow_;
     // Shared per-draw selected LOD (one per frame; every camera-derived list + shadows read it).
-    std::vector<string::gpu::resource_id> draw_lod_buffers_;
+    // Shared per-draw selected LOD: a scratch region (offset into each slot's arena buffer).
+    VkDeviceSize draw_lod_off_ = 0;
+    VkDeviceAddress draw_lod_address(uint16_t frame) const
+    {
+        return scratch_->address(frame) + draw_lod_off_;
+    }
     uint32_t cull_max_draws_ = 0;
     uint32_t cull_max_blocks_ = 0;      // ceil(max_draws / kScanBlock)
     VkDeviceSize wl_offsets_off_ = 0;   // byte offset of offsets[] within a worklist buffer
@@ -570,6 +584,11 @@ public:
     virtual void update(float delta_time, uint16_t current_frame) override;
     virtual bool record_compute(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
     virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+
+    // Brief 04e M4: froxel light binning is the pass's dependency-free async-compute chain
+    // (declared via async_usages; the renderer picks the lane or records inline).
+    virtual bool has_async_compute() const override;
+    virtual void record_async_compute(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 
     // Brief 04d two-phase occlusion. record() draws PHASE 1 (sky + last-frame-visible opaque, into the
     // MSAA targets). The renderer then MIN-resolves the MSAA depth into hz.depth, calls record_between()

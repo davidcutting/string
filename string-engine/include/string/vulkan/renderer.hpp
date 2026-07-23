@@ -8,10 +8,12 @@
 #include <string/gpu/driver.hpp>
 #include <string/gpu/presenter.hpp>
 #include <string/gpu/queue.hpp>
+#include <string/gpu/submission.hpp>
 #include <string/gpu/resource.hpp>
 #include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/vulkan/resource_state.hpp>
+#include <string/vulkan/frame_scratch.hpp>
 #include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/render_plan.hpp>
 #include <string/vulkan/pass_context.hpp>
@@ -53,7 +55,18 @@ class Renderer
     string::gpu::driver driver_;
     string::gpu::device device_;
     string::gpu::queue graphics_queue_;
-    string::gpu::queue compute_queue_;
+    // Brief 04e M1: per-lane command + timeline infrastructure over the device's capability-derived
+    // submission lanes ("main", "async-compute-N", "transfer"). Frame recording acquires recorders
+    // by (lane, frame slot); the lane timelines are the ONLY per-queue timelines (frame pacing =
+    // the main lane's timeline; cross-lane edges will use the others). Initialized in the ctor body.
+    string::gpu::submission_set submissions_;
+    uint32_t main_lane_ = 0;   // index of the "main" (graphics) lane in submissions_
+    // Brief 04e M4: the async compute lane the scheduler places dependency-free compute chains
+    // on (UINT32_MAX when the hardware exposes none -> inline placement, zero special cases).
+    uint32_t async_lane_ = UINT32_MAX;
+    // Cross-lane timeline waits the main submit must honour this frame (built in record_frame
+    // when async chains were submitted, consumed by end_frame's submit).
+    std::vector<VkSemaphoreSubmitInfo> async_waits_;
     string::gpu::presenter presenter_;
     string::gpu::resource_allocator allocator_;
     // Persistent upload ring on the graphics queue. Passes record their initial uploads into it
@@ -73,6 +86,9 @@ class Renderer
     string::gpu::shader_program_registry shader_registry_;
     // Derives the frame's image-layout barriers from tracked state (see begin/end_rendering).
     ResourceStateTracker resource_states_;
+    // Brief 04e M3: per-frame-slot transient scratch arena (passes reserve during construction,
+    // materialized after plan.build). Also the transient-aliasing arena — see frame_scratch.hpp.
+    FrameScratch frame_scratch_;
     CompositePass composite_pass_;
     // Ordered passes that draw into the offscreen HDR target (color_attachment_), recorded
     // between begin_rendering() and end_rendering(). composite_pass_ is the fixed resolve
@@ -85,7 +101,9 @@ class Renderer
     // re-transitioned.
     std::vector<Pass*> frame_passes_;
     std::unordered_set<string::gpu::resource_id> written_resources_;
-    VkSemaphore frame_semaphore_;
+    // Frame pacing timeline = the main lane's timeline semaphore (submissions_ owns it). Cached
+    // here because every begin/end_frame touches it.
+    VkSemaphore frame_semaphore_ = VK_NULL_HANDLE;
 
     // Swapchain image acquired at the start of the frame (in begin_frame), so that
     // end_rendering has a valid blit target and end_frame can submit/present against it.
@@ -106,11 +124,20 @@ class Renderer
     // single-shot r.capture.frame and the r.capture.every_n sequence (with a numbered path).
     void capture_color_target(const std::string& path);
 
-    // Tracy GPU profiling context on the graphics queue (calibrated when the device supports
-    // VK_EXT_calibrated_timestamps). Null / no-op when -Dtracy is off. Created after the frame
-    // ring is up (needs a command buffer to probe the timestamp period) and destroyed in the dtor.
+    // Tracy GPU profiling contexts, ONE PER SUBMISSION LANE (brief 04e M1: multi-queue overlap
+    // must be visible in traces), indexed like submissions_' lanes and named after them.
+    // gpu_profiler_ctx_ aliases the main lane's context (the one passes receive via PassContext).
+    // Null / no-op when -Dtracy is off. Created after the lane recorders are up (each context
+    // needs a probe command buffer on ITS queue) and destroyed in the dtor.
+    std::vector<STRING_PROFILE_GPU_CONTEXT_TYPE> lane_profiler_ctxs_;
     STRING_PROFILE_GPU_CONTEXT_TYPE gpu_profiler_ctx_ = nullptr;
     void init_gpu_profiler();
+
+    // The main lane's recorder for a frame slot (the frame loop's command stream).
+    string::gpu::command_recorder& main_recorder(uint64_t frame_slot)
+    {
+        return submissions_.recorder(main_lane_, static_cast<uint32_t>(frame_slot));
+    }
 
     // Brief 06: always-on per-pass GPU timing (vkCmdWriteTimestamp2 pairs around each pass's
     // record()/record_compute()). Independent of Tracy — feeds the in-game profiler HUD and the

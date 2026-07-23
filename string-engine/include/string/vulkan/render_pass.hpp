@@ -40,6 +40,18 @@ struct Pass
     virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) = 0;
     void resize(VkExtent2D extent) { screen_size = extent; }
 
+    // --- Brief 04e M4: async-compute lane work --------------------------------------------------
+    // A DEPENDENCY-FREE compute chain (inputs host-written or persistent; nothing produced by
+    // this frame's other GPU work) that the renderer places onto an async compute lane when the
+    // capability table exposes one. On 1-lane hardware it records inline on the main queue —
+    // same graph, serialized placement, zero special cases. `async_usages` declares what the
+    // chain WRITES (on the async queue) and where the main-queue frame READS it; the renderer
+    // derives the cross-lane timeline edge + queue-family ownership transfer (async placement)
+    // or the plain tracker barriers (inline) from those declarations.
+    std::vector<ResourceUsage> async_usages;
+    virtual bool has_async_compute() const { return false; }
+    virtual void record_async_compute(string::gpu::command_recorder& /*recorder*/, uint16_t /*current_frame*/) {}
+
     // --- Brief 04d: two-phase occlusion support -------------------------------------------------
     // A pass that must interleave a COMPUTE step between two sets of draws into the SAME MSAA scene
     // targets (phase-1 opaque -> build HiZ pyramid -> phase-2 opaque) cannot dispatch that compute

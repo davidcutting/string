@@ -16,6 +16,7 @@ static_assert(!is_write(Access::StorageRead));
 static_assert(!is_write(Access::VertexRead));
 static_assert(!is_write(Access::IndexRead));
 static_assert(!is_write(Access::TransferRead));
+static_assert(!is_write(Access::IndirectRead));
 
 static_assert(access_scope(Access::ColorWrite).layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 static_assert(access_scope(Access::SampledRead).layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -32,8 +33,11 @@ TEST(ResourceUsage, WriteClassification)
 
 TEST(ResourceUsage, AccessScopeMapping)
 {
-    EXPECT_EQ(access_scope(Access::ColorWrite).access, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    // Brief 04e M2: attachment writes also cover the load/blend/resolve READs of the same stage.
+    EXPECT_EQ(access_scope(Access::ColorWrite).access,
+              VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
     EXPECT_EQ(access_scope(Access::ColorWrite).layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    EXPECT_EQ(access_scope(Access::IndirectRead).access, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
 
     EXPECT_EQ(access_scope(Access::SampledRead).access, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     EXPECT_EQ(access_scope(Access::SampledRead).layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

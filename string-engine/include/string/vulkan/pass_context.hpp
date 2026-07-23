@@ -7,6 +7,7 @@
 #include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/gpu/shader_program_registry.hpp>
+#include <string/vulkan/frame_scratch.hpp>
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/platform/input.hpp>
 #include <string/platform/input_map.hpp>
@@ -57,6 +58,11 @@ struct PassContext
     // -Dtracy the context type is void*, so the value is always a valid null-holding slot; the GPU
     // zone macros are no-ops. May be null if the renderer chooses not to expose one.
     STRING_PROFILE_GPU_CONTEXT_TYPE* gpu_profiler_ctx;
+    // Brief 04e M3: the per-frame-slot scratch arena. Passes RESERVE per-frame transient bytes
+    // during construction (returns a byte offset); the renderer materializes one buffer per
+    // frame slot after all passes are built. Address at record time: scratch.buffer(slot) /
+    // scratch.address(slot) + offset.
+    FrameScratch& scratch;
 };
 
 }  // namespace String

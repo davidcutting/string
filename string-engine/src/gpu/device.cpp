@@ -1,6 +1,8 @@
+#include <algorithm>
 #include <memory>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <string/gpu/device.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
@@ -183,7 +185,98 @@ void device::select_physical_device()
     // Cache the selected device's immutable data once; every later query reuses these.
     vkGetPhysicalDeviceProperties(physical_device_, &properties_);
     queue_family_indices_ = get_queue_families(physical_device_);
+    build_capability_table();
     STRING_LOG_INFO("device name: {}", properties_.deviceName);
+}
+
+// Brief 04e M1: enumerate what the selected device's queue families ACTUALLY offer — family
+// flags, per-family queue counts, present support, timestamp validity. This is the single source
+// the lane set (and later the graph's placement policy) is derived from; nothing downstream
+// re-probes or assumes a hardware shape.
+void device::build_capability_table()
+{
+    uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &family_count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &family_count, families.data());
+
+    family_caps_.clear();
+    for (uint32_t i = 0; i < family_count; ++i)
+    {
+        VkBool32 present = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(physical_device_, i, surface_, &present);
+        family_caps_.push_back(queue_family_caps{
+            .index = i,
+            .flags = families[i].queueFlags,
+            .queue_count = families[i].queueCount,
+            .present_support = present == VK_TRUE,
+            .timestamps = families[i].timestampValidBits > 0,
+        });
+        STRING_LOG_INFO(
+            "queue family {}: count={} flags={:#x} present={} timestamps={}",
+            i, families[i].queueCount, families[i].queueFlags,
+            present == VK_TRUE, families[i].timestampValidBits > 0);
+    }
+}
+
+// How many queues the lane plan wants from a family. Graphics/present/transfer families carry one
+// lane each; a DEDICATED compute family carries up to four async-compute lanes (RDNA3 shape). The
+// count is clamped to what the family exposes — fewer queues means fewer lanes exist.
+static uint32_t desired_queue_count(const queue_family_caps& caps)
+{
+    const bool graphics = caps.flags & VK_QUEUE_GRAPHICS_BIT;
+    const bool compute = caps.flags & VK_QUEUE_COMPUTE_BIT;
+    if (!graphics && compute)
+        return std::min(caps.queue_count, 4u);
+    return std::min(caps.queue_count, 1u);
+}
+
+// Brief 04e M1: retrieve every created queue and name it as a submission lane. Lane existence is
+// capability-derived: "main" always (graphics is required), "async-compute-N" per dedicated
+// compute queue, "transfer" only when a dedicated transfer family exists.
+void device::build_submission_lanes()
+{
+    lanes_.clear();
+    const queue_family_indices& indices = queue_family_indices_;
+
+    const auto caps_of = [&](uint32_t family) -> const queue_family_caps& {
+        return family_caps_[family];
+    };
+    const auto add_lane = [&](std::string name, queue_type type, uint32_t family, uint32_t index) {
+        submission_lane lane{
+            .name = std::move(name),
+            .type = type,
+            .queue_family_index = family,
+            .queue_index = index,
+            .vk_queue = VK_NULL_HANDLE,
+            .timestamps = caps_of(family).timestamps,
+        };
+        vkGetDeviceQueue(device_, family, index, &lane.vk_queue);
+        lanes_.push_back(std::move(lane));
+    };
+
+    add_lane("main", queue_type::GRAPHICS, indices.graphics_family.value(), 0);
+    if (indices.compute_family.has_value())
+    {
+        const uint32_t count = desired_queue_count(caps_of(indices.compute_family.value()));
+        for (uint32_t i = 0; i < count; ++i)
+            add_lane("async-compute-" + std::to_string(i), queue_type::COMPUTE,
+                     indices.compute_family.value(), i);
+    }
+    if (indices.transfer_family.has_value())
+        add_lane("transfer", queue_type::TRANSFER, indices.transfer_family.value(), 0);
+
+    std::string lane_names;
+    for (const submission_lane& lane : lanes_)
+        lane_names += (lane_names.empty() ? "" : ", ") + lane.name;
+    STRING_LOG_INFO("submission lanes: {}", lane_names);
+}
+
+const submission_lane* device::lane(std::string_view name) const
+{
+    for (const submission_lane& lane : lanes_)
+        if (lane.name == name) return &lane;
+    return nullptr;
 }
 
 void device::create_logical_device()
@@ -205,7 +298,10 @@ void device::create_logical_device()
             uniqueQueueFamilies.insert(family.value());
     }
 
-    float queuePriority = 1.0f;
+    // Brief 04e M1: create the FULL useful queue set once, per the capability table — one queue
+    // for graphics/present/transfer families, up to four for a dedicated compute family. Equal
+    // priorities: relative queue priority is a scheduler hint we deliberately don't play with.
+    static constexpr float queue_priorities[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     for (uint32_t queueFamily : uniqueQueueFamilies) {
         // clang-format off
         VkDeviceQueueCreateInfo queue_create_info = {
@@ -213,8 +309,8 @@ void device::create_logical_device()
             .pNext = nullptr,
             .flags = 0,
             .queueFamilyIndex = queueFamily,
-            .queueCount = 1,
-            .pQueuePriorities = &queuePriority,
+            .queueCount = desired_queue_count(family_caps_[queueFamily]),
+            .pQueuePriorities = queue_priorities,
         };
         // clang-format on
         queueCreateInfos.push_back(queue_create_info);
@@ -335,6 +431,9 @@ void device::create_logical_device()
     }
 
     volkLoadDevice(device_);
+
+    // The queue set now exists; expose it as named lanes (1:1, capability-derived).
+    build_submission_lanes();
 }
 
 swap_chain_support_details device::get_swap_chain_support(const VkPhysicalDevice& physical_device)

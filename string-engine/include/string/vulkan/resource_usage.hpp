@@ -27,6 +27,7 @@ enum class Access : std::uint8_t
     StorageWrite,   // storage buffer / image write
     VertexRead,     // vertex buffer (attribute fetch)
     IndexRead,      // index buffer
+    IndirectRead,   // indirect draw/dispatch parameter read (brief 04e M2)
     TransferRead,   // copy source
     TransferWrite,  // copy destination
     Present,        // ready for the presentation engine
@@ -60,7 +61,12 @@ constexpr AccessScope access_scope(Access access)
     switch (access)
     {
         case Access::ColorWrite:
-            return { VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+            // WRITE|READ: color attachment use also READS — LOAD_OP_LOAD, blending, and the
+            // MSAA resolve's source read all happen in the attachment-output stage. The 04d
+            // ghosting bug class is exactly a missed store->load/resolve dependency; the write
+            // scope must cover both directions (brief 04e M2).
+            return { VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
         case Access::DepthWrite:
             // DEPTH_STENCIL_* (not the separate DEPTH_* layouts, which need the
             // separateDepthStencilLayouts feature we don't enable).
@@ -73,11 +79,17 @@ constexpr AccessScope access_scope(Access access)
         case Access::StorageRead:
             return { VK_ACCESS_2_SHADER_STORAGE_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED };
         case Access::StorageWrite:
-            return { VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED };
+            // WRITE|READ: storage writes are commonly read-modify-write (atomics — the
+            // visibility bitfield, stats counters), so a write use must order against BOTH
+            // directions of the previous access (brief 04e M2).
+            return { VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                     VK_IMAGE_LAYOUT_UNDEFINED };
         case Access::VertexRead:
             return { VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED };
         case Access::IndexRead:
             return { VK_ACCESS_2_INDEX_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED };
+        case Access::IndirectRead:
+            return { VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED };
         case Access::TransferRead:
             return { VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL };
         case Access::TransferWrite:

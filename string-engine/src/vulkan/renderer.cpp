@@ -21,6 +21,7 @@
 #include <string/debug_draw.hpp>
 #include <string/gpu/driver.hpp>
 #include <string/vulkan/renderer.hpp>
+#include <string/vulkan/render_graph.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource.hpp>
@@ -84,6 +85,18 @@ std::string numbered_capture_path(const std::string& base, uint64_t frame)
     if (has_ext) return base.substr(0, dot) + idx + base.substr(dot);
     return base + idx;
 }
+
+// Brief 04e M4: async-compute placement lever (alias STRING_ASYNC). Default on; off = the same
+// graph records the async chains inline on the main queue (the 1-lane degrade path) — the A/B
+// lever agents use to isolate cross-queue sync from placement.
+string::core::CVar<bool>& async_enabled_cvar()
+{
+    static string::core::CVar<bool> v{"r.async.enabled", true,
+        "place dependency-free compute chains on the async compute lane (0 = record inline)"};
+    static const bool aliased = [] { v.add_alias("async"); return true; }();
+    (void)aliased;
+    return v;
+}
 }  // namespace
 
 Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Window> window,
@@ -93,7 +106,6 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 , driver_(application_info, window_)
 , device_(driver_, window_)
 , graphics_queue_(device_.get_queue(string::gpu::queue_type::GRAPHICS))
-, compute_queue_(device_.get_queue(string::gpu::queue_type::COMPUTE))
 , presenter_(device_, window_, frames_in_flight_)
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
 , transfer_batch_(device_, allocator_, graphics_queue_)
@@ -114,6 +126,15 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     STRING_LOG_DEBUG("Initializing renderer...");
     const auto resources_path = std::filesystem::path(application_info_.resources_directory);
 
+    // Brief 04e M1: stand up the per-lane command/timeline infrastructure over the device's
+    // capability-derived submission lanes. The main lane's timeline IS the frame-pacing
+    // semaphore (one central timeline per queue; no ad-hoc semaphores for queue work).
+    submissions_.init(device_.get_device(), device_.submission_lanes(), frames_in_flight_);
+    main_lane_ = submissions_.lane_index("main");
+    frame_semaphore_ = submissions_.timeline(main_lane_);
+    // Brief 04e M4: async placement targets the first async compute lane when it exists.
+    async_lane_ = submissions_.lane_index("async-compute-0");
+
     // Frame-capture config via CVars. Touch the accessors so both are registered, apply the env
     // bridge (honours STRING_R_CAPTURE_FRAME and legacy STRING_CAPTURE_FRAME/PATH aliases), then
     // read. apply_env() is idempotent and cheap; calling it here initialises these levers.
@@ -123,6 +144,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     // / STRING_R_CAPTURE_EVERY_N) is never registered and headless capture sequences are silently
     // ignored (the accessor is otherwise first touched at frame end, long after apply_env ran).
     capture_every_n_cvar();
+    async_enabled_cvar();   // register before apply_env so STRING_ASYNC works headlessly
     string::core::CVarRegistry::instance().apply_env();
     capture_frame_ = static_cast<uint64_t>(std::max(0, capture_frame_cvar().get()));
     capture_path_ = capture_path_cvar().get();
@@ -198,8 +220,13 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         // Address of the Tracy GPU ctx member (created later in init_gpu_profiler); passes store the
         // pointer and read it live at record time. Brief 06.
         &gpu_profiler_ctx_,
+        frame_scratch_,
     };
     scene_passes_ = plan.build(pass_context);
+
+    // Brief 04e M3: all passes have declared their per-frame scratch needs; back them with one
+    // device-local arena per frame slot (logged as the VRAM consolidation number).
+    frame_scratch_.materialize(allocator_, frames_in_flight_);
 
     // Composite resolves the offscreen HDR target to the swapchain: reads color_attachment_,
     // writes the screen. Declared here (composite_pass_ is renderer-built, not in the plan).
@@ -214,10 +241,8 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     for (auto& pass : scene_passes_)
         frame_passes_.push_back(pass.get());
     frame_passes_.push_back(&composite_pass_);
-    for (const Pass* pass : frame_passes_)
-        for (const ResourceUsage& usage : pass->usages)
-            if (is_write(usage.access))
-                written_resources_.insert(usage.resource);
+    // written_resources_ is recomputed per frame in record_frame (brief 04e M2): usages may name
+    // per-frame-slot resources, so the written set is frame state, not init state.
 
     // Drain the async upload ring: submit any pending batch and wait for every in-flight batch
     // to finish (freeing all staging) before the first frame draws the uploaded resources.
@@ -231,28 +256,6 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     for (auto& frame : frames_)
     {
         frame.frame_id = 0;
-        frame.recorder.init(device_.get_device(), graphics_queue_);
-    }
-
-    VkSemaphoreTypeCreateInfo timeline_create_info = {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-        .pNext = nullptr,
-        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-        // Start at 0: the first submit signals frame_count_ (== 1), which must be strictly
-        // greater than the timeline's current value. Starting at frame_count_ (1) made the
-        // first signal illegal, which broke per-frame gating (stale command-buffer reuse).
-        .initialValue = 0,
-    };
-
-    VkSemaphoreCreateInfo semaphore_info = {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        .pNext = &timeline_create_info,
-        .flags = 0,
-    };
-
-    if (vkCreateSemaphore(device_.get_device(), &semaphore_info, nullptr, &frame_semaphore_) != VK_SUCCESS)
-    {
-        throw std::runtime_error("Failed to create timeline semaphore for resource allocator!");
     }
 
     init_gpu_profiler();
@@ -271,20 +274,31 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 void Renderer::init_gpu_profiler()
 {
 #if defined(STRING_PROFILE) && !defined(STRING_RELEASE)
-    VkCommandBuffer probe = frames_[0].recorder.get_command_buffer();
-    if (device_.supports_calibrated_timestamps())
+    // Brief 04e M1: one Tracy GPU context PER LANE, named after it, so multi-queue overlap is
+    // visible in traces. Each context probes with a command buffer from ITS lane's pool (Tracy
+    // records/submits/waits on the probe itself — hand it an INITIAL-state buffer). Lanes whose
+    // family has no valid timestamps get no context (Tracy timestamps would be meaningless).
+    lane_profiler_ctxs_.assign(submissions_.lane_count(), nullptr);
+    for (uint32_t i = 0; i < submissions_.lane_count(); ++i)
     {
-        STRING_PROFILE_GPU_CONTEXT_CREATE(gpu_profiler_ctx_, device_.get_physical_device(),
-            device_.get_device(), graphics_queue_.queue, probe);
+        const string::gpu::submission_lane& lane = submissions_.lane(i);
+        if (!lane.timestamps) continue;
+        VkCommandBuffer probe = submissions_.recorder(i, 0).get_command_buffer();
+        if (device_.supports_calibrated_timestamps())
+        {
+            STRING_PROFILE_GPU_CONTEXT_CREATE(lane_profiler_ctxs_[i], device_.get_physical_device(),
+                device_.get_device(), lane.vk_queue, probe);
+        }
+        else
+        {
+            STRING_PROFILE_GPU_CONTEXT_CREATE_BASIC(lane_profiler_ctxs_[i],
+                device_.get_physical_device(), device_.get_device(), lane.vk_queue, probe);
+        }
+        STRING_PROFILE_GPU_CONTEXT_NAME(lane_profiler_ctxs_[i], lane.name.c_str(),
+            lane.name.size());
+        submissions_.recorder(i, 0).reset();
     }
-    else
-    {
-        STRING_PROFILE_GPU_CONTEXT_CREATE_BASIC(gpu_profiler_ctx_, device_.get_physical_device(),
-            device_.get_device(), graphics_queue_.queue, probe);
-    }
-    static constexpr char kGpuCtxName[] = "graphics";
-    STRING_PROFILE_GPU_CONTEXT_NAME(gpu_profiler_ctx_, kGpuCtxName, sizeof(kGpuCtxName) - 1);
-    frames_[0].recorder.reset();
+    gpu_profiler_ctx_ = lane_profiler_ctxs_[main_lane_];
 #endif
 }
 
@@ -293,25 +307,29 @@ Renderer::~Renderer()
     STRING_LOG_DEBUG("Waiting for device to be idle...");
     vkDeviceWaitIdle(device_.get_device());
 
-    // Tear down the Tracy GPU context (no-op when profiling is off) before the device goes away.
-    STRING_PROFILE_GPU_CONTEXT_DESTROY(gpu_profiler_ctx_);
+    // Tear down the per-lane Tracy GPU contexts (no-op when profiling is off) before the device
+    // goes away. gpu_profiler_ctx_ aliases the main lane's context — don't double-destroy it.
+    for (STRING_PROFILE_GPU_CONTEXT_TYPE& ctx : lane_profiler_ctxs_)
+        STRING_PROFILE_GPU_CONTEXT_DESTROY(ctx)
+    lane_profiler_ctxs_.clear();
+    gpu_profiler_ctx_ = nullptr;
     GpuProfiler::set_global(nullptr);
     gpu_timing_.destroy(device_.get_device());
 
     // Destroy the passes while the allocator, table, and device are still alive.
     scene_passes_.clear();
 
-    vkDestroySemaphore(device_.get_device(), frame_semaphore_, nullptr);
-
     for (auto& frame : frames_)
     {
         frame.garbage_collector.flush();
-        frame.recorder.destroy();
     }
+    // Destroys every lane's recorders + timelines (frame_semaphore_ aliases the main timeline).
+    submissions_.destroy();
 
     allocator_.destroy_resource(msaa_depth_);
     allocator_.destroy_resource(msaa_color_);
     allocator_.destroy_resource(color_attachment_);
+    frame_scratch_.destroy(allocator_);
 }
 
 void Renderer::update()
@@ -386,7 +404,7 @@ void Renderer::begin_frame()
     vkWaitSemaphores(device_.get_device(), &wait_info, UINT64_MAX);
 
     frame.garbage_collector.flush();
-    frame.recorder.reset();
+    main_recorder(current_frame_).reset();
 
     // Shader hot-reload, at the frame boundary (GPU work for this slot has completed — see the
     // semaphore wait above). Poll the file watcher for edits, then apply any completed recompiles:
@@ -425,8 +443,8 @@ void Renderer::begin_frame()
 void Renderer::record_frame()
 {
     STRING_PROFILE_SCOPE("record_frame")
-    auto& frame = frames_[current_frame_];
-    VkCommandBuffer command_buffer = frame.recorder.begin();
+    string::gpu::command_recorder& recorder = main_recorder(current_frame_);
+    VkCommandBuffer command_buffer = recorder.begin();
     const VkExtent2D extent = presenter_.get_extent();
 
     // Brief 06: reset this frame index's GPU-timestamp pool (and read back its previous cycle's
@@ -442,44 +460,246 @@ void Renderer::record_frame()
     };
     const VkRect2D scissor = { .offset = { 0, 0 }, .extent = extent };
 
-    // Compute prepass: passes may dispatch GPU work (e.g. frustum culling that fills an indirect
-    // buffer) outside dynamic rendering, before any graphics group. If any did, one barrier makes
-    // those storage writes visible to the indirect draws / vertex-stage reads that follow.
-    bool recorded_compute = false;
+    // Brief 04e M2: the frame graph. Every frame the passes' declared ResourceUsages feed the
+    // planner; execution follows its (stable, authored-order-preserving) toposort, and ALL
+    // inter-pass barriers below derive from the same declarations through resource_states_ —
+    // pass-declared usage is the single source of truth for scheduling AND sync.
+    GraphBuilder graph_builder;
     for (Pass* pass : frame_passes_)
     {
+        PassBuilder pass_builder = graph_builder.add_pass(std::string(pass->debug_name()));
+        for (const ResourceUsage& usage : pass->usages)
+            pass_builder.use(usage.resource, usage.access, usage.stage);
+        pass_builder.end_pass();
+    }
+    const RenderGraph graph = graph_builder.build();
+    // Brief 04e M3: one-shot lifetime report — the planner's per-resource [first, last] topo
+    // positions are the transient-aliasing input. Two transients may share memory iff their
+    // spans are disjoint (plus the aliasing rules: acquire-from-UNDEFINED vs the previous
+    // tenant's scope, and never across frames-in-flight slots).
+    static bool logged_lifetimes = false;
+    if (!logged_lifetimes)
+    {
+        logged_lifetimes = true;
+        for (const auto& [id, lifetime] : graph.resource_lifetimes)
+            STRING_LOG_INFO("[graph] resource {}: passes [{}..{}] first_writer={}",
+                            id, lifetime.first.value_or(0), lifetime.last.value_or(0),
+                            lifetime.first_writer.has_value()
+                                ? static_cast<int64_t>(*lifetime.first_writer) : -1);
+    }
+    std::vector<Pass*> execution_order;
+    execution_order.reserve(frame_passes_.size());
+    for (uint32_t index : graph.toposorted)
+        execution_order.push_back(frame_passes_[index]);
+
+    // The set of resources the graph itself writes this frame (usages may change per frame —
+    // per-frame-slot buffers). Static uploaded inputs are never re-transitioned.
+    written_resources_.clear();
+    for (const Pass* pass : frame_passes_)
+        for (const ResourceUsage& usage : pass->usages)
+            if (is_write(usage.access))
+                written_resources_.insert(usage.resource);
+
+    // A usage recorded during the compute prepass (record_compute) vs during the graphics groups
+    // (record). The stage mask says which side of the frame it belongs to.
+    const auto is_compute_stage = [](VkPipelineStageFlags2 stage) {
+        return (stage & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) != 0;
+    };
+    // Buffer usages carry no image layout; they go through the tracker's merged memory barrier.
+    const auto is_buffer_usage = [](const ResourceUsage& usage) {
+        return access_scope(usage.access).layout == VK_IMAGE_LAYOUT_UNDEFINED;
+    };
+
+    // Brief 04e M4: place the frame's dependency-free async-compute chains. With an async lane
+    // (and r.async.enabled): record ALL chains into ONE command buffer on that lane, submit it
+    // now signalling the lane timeline at frame_count_, register the cross-lane wait for the
+    // main submit (at the union of the declared read stages), and queue-family-transfer the
+    // written buffers — release recorded on the async queue, acquire recorded here on main
+    // (explicit transfers by default, per the locked decision). Without a lane the SAME chains
+    // record inline on the main queue with tracker-derived barriers — zero special cases.
+    // async_usages semantics: write usages = produced by the chain ON the async queue; read
+    // usages = consumed by the main-queue frame. Async-queue INPUTS that are host-written (the
+    // light ring) need no declaration — their contents come from the host domain, which is not
+    // queue-family scoped.
+    async_waits_.clear();
+    {
+        std::vector<Pass*> async_passes;
+        for (Pass* pass : execution_order)
+            if (pass->has_async_compute()) async_passes.push_back(pass);
+        const bool place_async = !async_passes.empty() && async_lane_ != UINT32_MAX
+                              && async_enabled_cvar().get();
+        if (place_async)
+        {
+            const string::gpu::submission_lane& lane = submissions_.lane(async_lane_);
+            STRING_PROFILE_GPU_CONTEXT_TYPE async_ctx =
+                async_lane_ < lane_profiler_ctxs_.size() ? lane_profiler_ctxs_[async_lane_] : nullptr;
+            string::gpu::command_recorder& async_recorder =
+                submissions_.recorder(async_lane_, static_cast<uint32_t>(current_frame_));
+            async_recorder.reset();
+            VkCommandBuffer async_cb = async_recorder.begin();
+            std::vector<VkBufferMemoryBarrier2> releases;
+            std::vector<VkBufferMemoryBarrier2> acquires;
+            VkPipelineStageFlags2 wait_stages = 0;
+            for (Pass* pass : async_passes)
+            {
+                {
+                    STRING_PROFILE_GPU_ZONE_DYNAMIC(async_ctx, async_cb, "froxel-cull")
+                    pass->record_async_compute(async_recorder, static_cast<uint16_t>(current_frame_));
+                }
+                for (const ResourceUsage& usage : pass->async_usages)
+                {
+                    const AccessScope scope = access_scope(usage.access);
+                    const VkBuffer buffer = allocator_.get_buffer(usage.resource).buffer;
+                    if (is_write(usage.access))
+                    {
+                        // Release half of the QFOT (the written contents must survive the
+                        // family transfer for the main-queue reads).
+                        releases.push_back(VkBufferMemoryBarrier2{
+                            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+                            .pNext = nullptr,
+                            .srcStageMask = usage.stage,
+                            .srcAccessMask = scope.access,
+                            .dstStageMask = VK_PIPELINE_STAGE_2_NONE,
+                            .dstAccessMask = 0,
+                            .srcQueueFamilyIndex = lane.queue_family_index,
+                            .dstQueueFamilyIndex = graphics_queue_.queue_family_index,
+                            .buffer = buffer,
+                            .offset = 0,
+                            .size = VK_WHOLE_SIZE,
+                        });
+                    }
+                    else
+                    {
+                        wait_stages |= usage.stage;
+                        acquires.push_back(VkBufferMemoryBarrier2{
+                            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+                            .pNext = nullptr,
+                            .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+                            .srcAccessMask = 0,
+                            .dstStageMask = usage.stage,
+                            .dstAccessMask = scope.access,
+                            .srcQueueFamilyIndex = lane.queue_family_index,
+                            .dstQueueFamilyIndex = graphics_queue_.queue_family_index,
+                            .buffer = buffer,
+                            .offset = 0,
+                            .size = VK_WHOLE_SIZE,
+                        });
+                    }
+                }
+            }
+            if (!releases.empty())
+            {
+                const VkDependencyInfo release_dep = {
+                    .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                    .pNext = nullptr,
+                    .dependencyFlags = 0,
+                    .memoryBarrierCount = 0,
+                    .pMemoryBarriers = nullptr,
+                    .bufferMemoryBarrierCount = static_cast<uint32_t>(releases.size()),
+                    .pBufferMemoryBarriers = releases.data(),
+                    .imageMemoryBarrierCount = 0,
+                    .pImageMemoryBarriers = nullptr,
+                };
+                vkCmdPipelineBarrier2(async_cb, &release_dep);
+            }
+            STRING_PROFILE_GPU_COLLECT(async_ctx, async_cb)
+            async_recorder.end();
+
+            const VkSemaphoreSubmitInfo async_signal = {
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .pNext = nullptr,
+                .semaphore = submissions_.timeline(async_lane_),
+                .value = frame_count_,
+                .stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .deviceIndex = 0,
+            };
+            const VkCommandBufferSubmitInfo async_cb_info = {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                .pNext = nullptr,
+                .commandBuffer = async_cb,
+                .deviceMask = 0,
+            };
+            const VkSubmitInfo2 async_submit = {
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                .pNext = nullptr,
+                .flags = 0,
+                .waitSemaphoreInfoCount = 0,
+                .pWaitSemaphoreInfos = nullptr,
+                .commandBufferInfoCount = 1,
+                .pCommandBufferInfos = &async_cb_info,
+                .signalSemaphoreInfoCount = 1,
+                .pSignalSemaphoreInfos = &async_signal,
+            };
+            if (vkQueueSubmit2(lane.vk_queue, 1, &async_submit, nullptr) != VK_SUCCESS)
+                throw std::runtime_error("failed to submit async compute command buffer");
+            submissions_.mark_signaled(async_lane_, frame_count_);
+
+            // Acquire half of the QFOT on main + the cross-lane timeline wait for end_frame.
+            if (!acquires.empty())
+            {
+                const VkDependencyInfo acquire_dep = {
+                    .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                    .pNext = nullptr,
+                    .dependencyFlags = 0,
+                    .memoryBarrierCount = 0,
+                    .pMemoryBarriers = nullptr,
+                    .bufferMemoryBarrierCount = static_cast<uint32_t>(acquires.size()),
+                    .pBufferMemoryBarriers = acquires.data(),
+                    .imageMemoryBarrierCount = 0,
+                    .pImageMemoryBarriers = nullptr,
+                };
+                vkCmdPipelineBarrier2(command_buffer, &acquire_dep);
+            }
+            async_waits_.push_back(VkSemaphoreSubmitInfo{
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .pNext = nullptr,
+                .semaphore = submissions_.timeline(async_lane_),
+                .value = frame_count_,
+                .stageMask = wait_stages != 0 ? wait_stages : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                .deviceIndex = 0,
+            });
+        }
+        else
+        {
+            // Inline degrade path: same chains, main queue, tracker-derived barriers.
+            for (Pass* pass : async_passes)
+            {
+                for (const ResourceUsage& usage : pass->async_usages)
+                    if (is_write(usage.access))
+                        resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+                resource_states_.flush_buffers(command_buffer);
+                {
+                    STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, "froxel-cull")
+                    gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_),
+                                            std::string(pass->debug_name()) + " (async-inline)");
+                    pass->record_async_compute(recorder, static_cast<uint16_t>(current_frame_));
+                    gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
+                }
+                // The main-queue reads: noted now, flushed with the next barrier point (before
+                // any graphics group begins).
+                for (const ResourceUsage& usage : pass->async_usages)
+                    if (!is_write(usage.access))
+                        resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+            }
+        }
+    }
+
+    // Compute prepass: passes may dispatch GPU work (e.g. GPU culling that fills indirect
+    // worklists) outside dynamic rendering, before any graphics group. Each pass's declared
+    // compute-stage buffer usages derive the barriers it needs (vs prior tracked accesses).
+    for (Pass* pass : execution_order)
+    {
+        for (const ResourceUsage& usage : pass->usages)
+            if (is_buffer_usage(usage) && is_compute_stage(usage.stage))
+                resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+        resource_states_.flush_buffers(command_buffer);
+
         const std::string pass_name(pass->debug_name());
         STRING_PROFILE_SCOPE_DYNAMIC(pass_name.data(), pass_name.size())
         STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, pass_name.c_str())
         gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), pass_name + " (cs)");
-        recorded_compute |= pass->record_compute(frame.recorder, static_cast<uint16_t>(current_frame_));
+        pass->record_compute(recorder, static_cast<uint16_t>(current_frame_));
         gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
-    }
-    if (recorded_compute)
-    {
-        const VkMemoryBarrier2 compute_to_draw = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-            .pNext = nullptr,
-            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            // Compute output feeds indirect draws, vertex pulling, AND fragment reads (froxel light
-            // lists from the Forward+ binning compute are consumed in the fragment stage).
-            .dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
-                          | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            .dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-        };
-        const VkDependencyInfo dependency = {
-            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .pNext = nullptr,
-            .dependencyFlags = 0,
-            .memoryBarrierCount = 1,
-            .pMemoryBarriers = &compute_to_draw,
-            .bufferMemoryBarrierCount = 0,
-            .pBufferMemoryBarriers = nullptr,
-            .imageMemoryBarrierCount = 0,
-            .pImageMemoryBarriers = nullptr,
-        };
-        vkCmdPipelineBarrier2(command_buffer, &dependency);
     }
 
     // The color / depth target a pass renders into (every frame pass writes exactly one color
@@ -515,16 +735,16 @@ void Renderer::record_frame()
     size_t start = 0;
     bool seen_msaa_group = false;   // has a COLOR_TARGET group already cleared the MSAA targets?
     Pass* pending_after_between = nullptr;   // breaker whose phase-2 runs in the next (reopened) group
-    while (start < frame_passes_.size())
+    while (start < execution_order.size())
     {
-        const string::gpu::resource_id group_color = color_target_of(frame_passes_[start]);
+        const string::gpu::resource_id group_color = color_target_of(execution_order[start]);
         std::optional<string::gpu::resource_id> group_depth;
         size_t end = start;
         bool break_after = false;
-        while (end < frame_passes_.size() && color_target_of(frame_passes_[end]) == group_color)
+        while (end < execution_order.size() && color_target_of(execution_order[end]) == group_color)
         {
-            if (auto depth = depth_target_of(frame_passes_[end])) group_depth = depth;
-            const bool breaks = frame_passes_[end]->breaks_scene_group();
+            if (auto depth = depth_target_of(execution_order[end])) group_depth = depth;
+            const bool breaks = execution_order[end]->breaks_scene_group();
             ++end;
             if (breaks) { break_after = true; break; }   // end this group right after the breaker
         }
@@ -533,8 +753,8 @@ void Renderer::record_frame()
         // rest STORE their MSAA samples for the following group to LOAD. A group is the last MSAA
         // group iff it writes COLOR_TARGET and the pass immediately after `end` does NOT.
         const bool this_is_msaa = (group_color == string::gpu::COLOR_TARGET);
-        const bool next_is_msaa = this_is_msaa && end < frame_passes_.size()
-            && color_target_of(frame_passes_[end]) == string::gpu::COLOR_TARGET;
+        const bool next_is_msaa = this_is_msaa && end < execution_order.size()
+            && color_target_of(execution_order[end]) == string::gpu::COLOR_TARGET;
         const bool msaa_is_first = this_is_msaa && !seen_msaa_group;   // clears vs loads
         const bool msaa_is_last = this_is_msaa && !next_is_msaa;       // resolves vs stores
         if (this_is_msaa) seen_msaa_group = true;
@@ -543,7 +763,7 @@ void Renderer::record_frame()
         // depth-resolve target (reverse-Z: min = farthest = conservative HiZ occluder), so
         // record_between() can build the pyramid from a normally-samplable depth. 0 = no resolve.
         const string::gpu::resource_id depth_resolve = break_after
-            ? frame_passes_[end - 1]->depth_resolve_target(static_cast<uint16_t>(current_frame_)) : 0;
+            ? execution_order[end - 1]->depth_resolve_target(static_cast<uint16_t>(current_frame_)) : 0;
 
         // Barriers: transition each graph-written image the group touches to the state its usage
         // needs (deduped per resource). Static uploaded inputs are skipped — they aren't in
@@ -552,10 +772,19 @@ void Renderer::record_frame()
         // from the tracker; writes discard the previous contents.
         std::unordered_map<string::gpu::resource_id, ResourceUsage> group_transitions;
         for (size_t i = start; i < end; ++i)
-            for (const ResourceUsage& usage : frame_passes_[i]->usages)
+            for (const ResourceUsage& usage : execution_order[i]->usages)
             {
+                // Graphics-phase BUFFER usages (indirect worklists, task/fragment storage reads,
+                // the visibility bitfield's task-stage RMW): note them with the tracker so their
+                // barriers — vs this frame's compute writes AND the previous frame's draws —
+                // derive from the declaration. Flushed as one merged barrier before rendering.
+                if (is_buffer_usage(usage))
+                {
+                    if (!is_compute_stage(usage.stage))
+                        resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+                    continue;
+                }
                 if (!written_resources_.contains(usage.resource)) continue;
-                if (access_scope(usage.access).layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
                 // Writes take precedence: a group that both writes and reads a resource as an
                 // attachment must sit in the WRITE layout for the whole rendering (the group's
                 // attachment info uses ATTACHMENT_OPTIMAL; attachment reads are legal there). A
@@ -597,91 +826,28 @@ void Renderer::record_frame()
         // resolved into color_attachment_ (which the group_transitions loop already moved to
         // COLOR_ATTACHMENT_OPTIMAL as the resolve dest). The composite group (SWAPCHAIN) is
         // single-sample and renders straight into the swapchain image.
+        //
+        // Brief 04e M2: msaa_color_ is a FIRST-CLASS tracked resource now. The logical
+        // COLOR_TARGET the passes declare expands here to the physical MSAA image; the
+        // hazard-complete tracker derives every barrier it needs:
+        //   - first MSAA group (discard): synchronizes the clear+writes against the PREVIOUS
+        //     frame's still-in-flight resolve read/writes (the 04d cross-frame semi-transparency
+        //     race — ColorWrite's scope includes the resolve READ);
+        //   - later MSAA groups (no discard): a WAW/store->load self-barrier orders this group's
+        //     load + writes + resolve against the previous group's store (the 04d motion-ghosting
+        //     bug). Both former hand-rolled vkCmdPipelineBarrier2 blocks are DELETED — this is
+        //     exactly the class of sync that must derive from declarations, not accrete by hand.
         const bool msaa_group = this_is_msaa;
-        if (msaa_group && msaa_is_first)
+        if (msaa_group)
         {
-            // msaa_color_ isn't a graph resource; transition it here. The FIRST MSAA group clears
-            // (discard); later groups LOAD it (below), so they must NOT discard — the resource
-            // tracker already holds it in COLOR_ATTACHMENT_OPTIMAL from the previous group's store.
             resource_states_.transition(command_buffer, allocator_.get_image(msaa_color_).image,
                 VK_IMAGE_ASPECT_COLOR_BIT, Access::ColorWrite,
-                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, /*discard=*/true);
-
-            // CROSS-FRAME (frames-in-flight) hazard fix. msaa_color_ is a SINGLE shared image, not
-            // ringed per frame. This frame's phase-1 LOAD_OP_CLEAR + writes race the PREVIOUS frame's
-            // still-in-flight AVERAGE resolve READ of the same image (both COLOR_ATTACHMENT_OUTPUT).
-            // The transition() above is a no-op across the frame boundary (the tracker already holds
-            // COLOR_ATTACHMENT_OPTIMAL from the prior frame's store), so it emits NO dependency — and
-            // the existing self-barrier below only fires INTRA-frame (!msaa_is_first). Without this,
-            // the prior frame's resolve averages half-clobbered samples -> large surfaces render
-            // SEMI-TRANSPARENT (roofline visible THROUGH the ceiling/curtains) under camera motion.
-            // Same-queue submission order makes this barrier's COLOR_ATTACHMENT_OUTPUT src scope wait
-            // on the prior frame's resolve read. (Headless captures vkDeviceWaitIdle before copy, so
-            // the prior frame has fully drained and the race is serialized away — which is exactly why
-            // captures looked clean while the live 3-deep pipeline ghosted.)
-            const VkImageMemoryBarrier2 msaa_color_frame_barrier = {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = allocator_.get_image(msaa_color_).image,
-                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-            };
-            const VkDependencyInfo msaa_color_frame_dep = {
-                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                .imageMemoryBarrierCount = 1,
-                .pImageMemoryBarriers = &msaa_color_frame_barrier,
-            };
-            vkCmdPipelineBarrier2(command_buffer, &msaa_color_frame_dep);
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, /*discard=*/msaa_is_first);
         }
-        else if (msaa_group && !msaa_is_first)
-        {
-            // Brief 04d motion-ghosting fix: a later MSAA group LOADs msaa_color_ that the previous
-            // group STORED, but msaa_color_ is NOT a graph resource, so the tracker never emits a
-            // barrier for it — its layout is already COLOR_ATTACHMENT_OPTIMAL from the store, making
-            // resource_states_.transition() a silent no-op. Without an execution+memory dependency
-            // between the previous group's color STORE (COLOR_ATTACHMENT_WRITE) and this group's LOAD
-            // + resolve read (COLOR_ATTACHMENT_WRITE|READ), phase-1's stored samples are not
-            // guaranteed visible to phase-2's load, and phase-2's writes race the store. On a static
-            // frame phase 2 draws nothing so the resolve happened to read intact phase-1 samples and
-            // the hazard never bit — but under camera motion phase 2 writes into the shared MSAA
-            // image and the AVERAGE resolve mixes stale + fresh samples, rendering large surfaces
-            // (e.g. the interior ceiling vault) SEMI-TRANSPARENT with a previous-frame ghost. The
-            // same class of dependency (depth STORE->LOAD) IS covered because msaa_depth_ is a graph
-            // resource; msaa_color_ needs this explicit self-barrier. (Both stages/accesses are
-            // COLOR_ATTACHMENT_OUTPUT; a memory barrier makes the store both available and visible.)
-            const VkImageMemoryBarrier2 msaa_color_barrier = {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                .pNext = nullptr,
-                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = allocator_.get_image(msaa_color_).image,
-                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-            };
-            const VkDependencyInfo msaa_color_dep = {
-                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                .pNext = nullptr,
-                .dependencyFlags = 0,
-                .memoryBarrierCount = 0,
-                .pMemoryBarriers = nullptr,
-                .bufferMemoryBarrierCount = 0,
-                .pBufferMemoryBarriers = nullptr,
-                .imageMemoryBarrierCount = 1,
-                .pImageMemoryBarriers = &msaa_color_barrier,
-            };
-            vkCmdPipelineBarrier2(command_buffer, &msaa_color_dep);
-        }
+        // Emit the merged buffer barrier for this group's declared buffer usages (outside
+        // rendering — task/indirect/fragment reads of the compute-built worklists, the visibility
+        // bitfield's cross-frame task RMW).
+        resource_states_.flush_buffers(command_buffer);
 
         // Brief 04d MSAA chain: first group clears, later groups load; only the last resolves.
         const VkAttachmentLoadOp msaa_color_load =
@@ -765,18 +931,18 @@ void Renderer::record_frame()
             const std::string an(pending_after_between->debug_name());
             STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, "phase2")
             gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), an + " (phase2)");
-            pending_after_between->record_after_between(frame.recorder, static_cast<uint16_t>(current_frame_));
+            pending_after_between->record_after_between(recorder, static_cast<uint16_t>(current_frame_));
             gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
             pending_after_between = nullptr;
         }
 
         for (size_t i = start; i < end; ++i)
         {
-            const std::string pass_name(frame_passes_[i]->debug_name());
+            const std::string pass_name(execution_order[i]->debug_name());
             STRING_PROFILE_SCOPE_DYNAMIC(pass_name.data(), pass_name.size())
             STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, pass_name.c_str())
             gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), pass_name);
-            frame_passes_[i]->record(frame.recorder, static_cast<uint16_t>(current_frame_));
+            execution_order[i]->record(recorder, static_cast<uint16_t>(current_frame_));
             gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
         }
 
@@ -786,11 +952,11 @@ void Renderer::record_frame()
         // rendering, after phase-1's depth is stored, before phase-2's group reopens.
         if (break_after)
         {
-            Pass* breaker = frame_passes_[end - 1];
+            Pass* breaker = execution_order[end - 1];
             const std::string bn(breaker->debug_name());
             STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, "hiz-build")
             gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), bn + " (between)");
-            breaker->record_between(frame.recorder, static_cast<uint16_t>(current_frame_));
+            breaker->record_between(recorder, static_cast<uint16_t>(current_frame_));
             gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
             pending_after_between = breaker;   // its phase-2 runs in the next group
         }
@@ -806,7 +972,7 @@ void Renderer::record_frame()
     // across the frames-in-flight ring. No-op without -Dtracy.
     STRING_PROFILE_GPU_COLLECT(gpu_profiler_ctx_, command_buffer)
 
-    frame.recorder.end();
+    recorder.end();
 }
 
 VkImage Renderer::image_of(string::gpu::resource_id target) const
@@ -837,7 +1003,9 @@ void Renderer::end_frame()
 
     // The swapchain image was acquired in begin_frame; wait on image-availability at the
     // COLOR_ATTACHMENT_OUTPUT stage since the first thing we do to it is the composite draw.
-    const VkSemaphoreSubmitInfo wait_semaphore_infos[] = {
+    // Brief 04e M4: plus any cross-lane timeline waits the async placement registered this
+    // frame (each at the union of its declared read stages).
+    std::vector<VkSemaphoreSubmitInfo> wait_semaphore_infos = {
         {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .pNext = nullptr,
@@ -847,6 +1015,7 @@ void Renderer::end_frame()
             .deviceIndex = 0
         }
     };
+    wait_semaphore_infos.insert(wait_semaphore_infos.end(), async_waits_.begin(), async_waits_.end());
 
     const VkSemaphoreSubmitInfo signal_semaphore_infos[] = {
         {   // Render semaphore for present synchronization
@@ -870,7 +1039,7 @@ void Renderer::end_frame()
     VkCommandBufferSubmitInfo command_buffer_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
         .pNext = nullptr,
-        .commandBuffer = frame.recorder.get_command_buffer(),
+        .commandBuffer = main_recorder(current_frame_).get_command_buffer(),
         .deviceMask = 0
     };
 
@@ -878,20 +1047,21 @@ void Renderer::end_frame()
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
         .pNext = nullptr,
         .flags = 0,
-        .waitSemaphoreInfoCount = 1,
-        .pWaitSemaphoreInfos = wait_semaphore_infos,
+        .waitSemaphoreInfoCount = static_cast<uint32_t>(wait_semaphore_infos.size()),
+        .pWaitSemaphoreInfos = wait_semaphore_infos.data(),
         .commandBufferInfoCount = 1,
         .pCommandBufferInfos = &command_buffer_info,
         .signalSemaphoreInfoCount = 2,
         .pSignalSemaphoreInfos = signal_semaphore_infos
     };
 
-    if (vkQueueSubmit2(frame.recorder.get_queue().queue, 1, &submit_info, nullptr) != VK_SUCCESS)
+    if (vkQueueSubmit2(graphics_queue_.queue, 1, &submit_info, nullptr) != VK_SUCCESS)
     {
         throw std::runtime_error("failed to submit draw command buffer!");
     }
 
     frame.frame_id = frame_count_;
+    submissions_.mark_signaled(main_lane_, frame_count_);
 
     presenter_.present();
 

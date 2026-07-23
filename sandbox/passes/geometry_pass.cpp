@@ -220,6 +220,9 @@ GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::pa
 , overlay_stats_(std::move(overlay_stats))
 , gpu_profiler_ctx_(context.gpu_profiler_ctx)
 {
+    // Brief 04e M3: per-frame transient buffers (worklists, draw_lod) reserve into the
+    // renderer's scratch arena; buffers bind lazily in update() after materialization.
+    scratch_ = &context.scratch;
     // Brief 04b: load the COOKED scenes (bake library did the parse/flatten/MikkTSpace/meshletize
     // offline). Per source glTF: read a fresh cooked file, or cook in-process via the library when
     // missing/stale (WARN + CLI hint), then merge N cooked scenes into one draw set (vertex/index/
@@ -607,8 +610,11 @@ GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::pa
         { context.depth_target, Access::DepthWrite,
           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT },
     };
-    // The indirect buffer's DRAW_INDIRECT read is covered by the transfer batch's global barrier
-    // (like the static textures); once buffer state is graph-tracked it can be declared here too.
+    // Brief 04e M2: buffer state IS graph-tracked now. The static usages above are the fixed
+    // prefix; update() re-appends the per-frame-slot buffer usages (worklists, froxel lists, the
+    // visibility bitfield) each frame, and the renderer derives the compute->draw and cross-frame
+    // barriers from them (the old renderer-side broad barrier is deleted).
+    static_usage_count_ = usages.size();
 
     // --- Procedural sky background ------------------------------------------------------------
     // A fullscreen pass drawn (in record()) before the geometry, into the same HDR target; no depth
@@ -922,30 +928,29 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
     wl_count_off_     = align16(wl_records_off_ + records_bytes);
     const VkDeviceSize worklist_size = wl_count_off_ + 16;   // count word (16B-padded)
 
-    const auto make_worklist = [&]() -> Worklist {
-        return Worklist{ allocator_.create_resource(string::gpu::buffer_info{
-            .size = worklist_size,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                   | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            .allocation_flags = {},
-        }) };
+    // Brief 04e M3: worklists + the shared draw_lod are per-frame TRANSIENTS (fully rebuilt by
+    // the draw/expand computes every frame), so they live in the renderer's per-frame-slot
+    // scratch arena instead of 21 dedicated allocations (6 worklists + draw_lod, x3 slots).
+    // reserve() returns the region's offset (identical in every slot's buffer); the slot buffer
+    // ids are bound lazily in update() once the renderer materializes the arena.
+    const auto reserve_worklist = [&]() -> Worklist {
+        return Worklist{ 0, scratch_->reserve(worklist_size) };
     };
     wl_opaque_.resize(frames_in_flight_);
     wl_twosided_.resize(frames_in_flight_);
     wl_shadow_.resize(frames_in_flight_);
-    draw_lod_buffers_.resize(frames_in_flight_);
-    for (uint32_t f = 0; f < frames_in_flight_; ++f)
     {
-        wl_opaque_[f] = make_worklist();
-        wl_twosided_[f] = make_worklist();
-        for (uint32_t c = 0; c < kMaxCascades; ++c) wl_shadow_[f][c] = make_worklist();
-        draw_lod_buffers_[f] = allocator_.create_resource(string::gpu::buffer_info{
-            .size = u32 * max_draws,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            .allocation_flags = {},
-        });
+        const Worklist opaque = reserve_worklist();
+        const Worklist twosided = reserve_worklist();
+        std::array<Worklist, kMaxCascades> shadow{};
+        for (uint32_t c = 0; c < kMaxCascades; ++c) shadow[c] = reserve_worklist();
+        draw_lod_off_ = scratch_->reserve(u32 * max_draws);
+        for (uint32_t f = 0; f < frames_in_flight_; ++f)
+        {
+            wl_opaque_[f] = opaque;
+            wl_twosided_[f] = twosided;
+            wl_shadow_[f] = shadow;
+        }
     }
 
     // Brief 04d: persistent per-meshlet visibility bitfield (1 bit per GLOBAL meshlet id). Sized to
@@ -1284,11 +1289,11 @@ void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, 
     // depth-only HiZ camera prepass, so there is no forced-LOD0 prepass variant here anymore.)
     const bool shadow = cascade >= 0;
     const VkDeviceAddress opaque_base =
-        allocator_.get_buffer(wl_opaque_[current_frame].buffer).device_address;
+        allocator_.get_buffer(wl_opaque_[current_frame].buffer).device_address + wl_opaque_[current_frame].offset;
     const VkDeviceAddress twosided_base =
-        allocator_.get_buffer(wl_twosided_[current_frame].buffer).device_address;
+        allocator_.get_buffer(wl_twosided_[current_frame].buffer).device_address + wl_twosided_[current_frame].offset;
     const VkDeviceAddress shadow_base =
-        shadow ? allocator_.get_buffer(wl_shadow_[current_frame][cascade].buffer).device_address : 0;
+        shadow ? allocator_.get_buffer(wl_shadow_[current_frame][cascade].buffer).device_address + wl_shadow_[current_frame][cascade].offset : 0;
 
     const float lod_error_px = cv_lod_error_px().get();   // CVar r.lod.error_px (STRING_LOD_PX alias)
     const float half_h = screen_size.height * 0.5f;
@@ -1320,7 +1325,7 @@ void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, 
     // commands[] area, overwritten by its own fill before use) instead.
     cull.draw_lod = shadow
         ? shadow_base + wl_commands_off_   // shadow throwaway -> commands (fill overwrites)
-        : allocator_.get_buffer(draw_lod_buffers_[current_frame]).device_address;
+        : draw_lod_address(current_frame);
     cull.stats = allocator_.get_buffer(stats_buffers_[current_frame]).device_address;
     cull.draw_count = active_draw_count_;
     cull.lod_enabled = lod_enabled_ ? 1u : 0u;
@@ -1361,7 +1366,7 @@ void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, 
 // per-draw selected LOD from `draw_lod` into each surviving draw's record.
 void GeometryPass::record_expand(VkCommandBuffer cb, const Worklist& wl, VkDeviceAddress draw_lod)
 {
-    const VkDeviceAddress base = allocator_.get_buffer(wl.buffer).device_address;
+    const VkDeviceAddress base = allocator_.get_buffer(wl.buffer).device_address + wl.offset;
     ExpandPush push{};
     push.counts     = base;
     push.offsets    = base + wl_offsets_off_;
@@ -1527,7 +1532,7 @@ void GeometryPass::record_meshlet_draws(VkCommandBuffer cb, const string::gpu::p
     const glm::mat4 cull_vp = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : vp;
     const HizPyramid& hz = hiz_[current_frame];
     const bool hiz_ready = hiz_enabled_ && hz.image != 0;
-    const VkDeviceAddress base = allocator_.get_buffer(wl.buffer).device_address;
+    const VkDeviceAddress base = allocator_.get_buffer(wl.buffer).device_address + wl.offset;
 
     MeshletPush push{};
     push.view_proj = vp;
@@ -1558,8 +1563,52 @@ void GeometryPass::record_meshlet_draws(VkCommandBuffer cb, const string::gpu::p
     const VkBuffer buf = allocator_.get_buffer(wl.buffer).buffer;
 
     vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletPush), &push);
-    vkCmdDrawMeshTasksIndirectCountEXT(cb, buf, wl_commands_off_, buf, wl_count_off_,
+    vkCmdDrawMeshTasksIndirectCountEXT(cb, buf, wl.offset + wl_commands_off_, buf, wl.offset + wl_count_off_,
                                        cull_max_draws_, sizeof(uint32_t) * 3);
+}
+
+// Brief 04e M4: froxel light binning — one thread per froxel bins the local lights into
+// per-froxel index lists the lit fragment shader reads. DEPENDENCY-FREE within the frame (reads
+// only the host-written light SSBO ring), so the renderer places it on an async compute lane
+// when the hardware exposes one (timeline edge + queue-family ownership transfer derived from
+// async_usages), or records it inline on the main queue otherwise. No Tracy zone here: the
+// renderer wraps the whole async chain in the LANE's own GPU context (a pass-side zone would
+// use the main-queue context and produce bogus timestamps on the async queue).
+bool GeometryPass::has_async_compute() const
+{
+    return froxel_program_ != nullptr && froxel_count_ > 0 && !froxel_buffers_.empty();
+}
+
+void GeometryPass::record_async_compute(string::gpu::command_recorder& recorder, uint16_t current_frame)
+{
+    if (froxel_program_ == nullptr || froxel_count_ == 0 || current_frame >= froxel_buffers_.size()
+        || froxel_buffers_[current_frame] == 0)
+        return;
+    VkCommandBuffer command_buffer = recorder.get_command_buffer();
+    const uint32_t light_count = lights_enabled_ ? static_cast<uint32_t>(lights_.size()) : 0u;
+    const string::gpu::pipeline& fp = froxel_program_->current();
+    glm::mat4 proj = camera_.view_proj() * glm::inverse(camera_.view());  // == projection
+    const FroxelPush fpush{
+        .view = camera_.view(),
+        .inv_proj = glm::inverse(proj),
+        .screen = glm::uvec2(screen_size.width, screen_size.height),
+        .grid = glm::uvec2(froxel_tiles_x_, froxel_tiles_y_),
+        .slices = kFroxelDepthSlices,
+        .tile_size = kFroxelTileSize,
+        .near_plane = camera_.near_plane(),
+        .far_plane = std::min(settings_.shadow_depth_range, camera_.far_plane()),
+        .light_count = light_count,
+        .max_per_froxel = kMaxLightsPerFroxel,
+        ._pad0 = 0, ._pad1 = 0,
+        .lights = light_count > 0
+                ? allocator_.get_buffer(light_buffers_[current_frame]).device_address : 0,
+        .froxels = allocator_.get_buffer(froxel_buffers_[current_frame]).device_address,
+    };
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, fp.pipeline);
+    vkCmdPushConstants(command_buffer, fp.pipeline_layout, fp.push_constants.stageFlags,
+                       0, sizeof(FroxelPush), &fpush);
+    vkCmdDispatch(command_buffer, (froxel_tiles_x_ + 3) / 4, (froxel_tiles_y_ + 3) / 4,
+                  (kFroxelDepthSlices + 3) / 4);
 }
 
 void GeometryPass::compute_cascades()
@@ -1810,14 +1859,8 @@ GeometryPass::~GeometryPass()
         }
         if (hiz_sampler_ != VK_NULL_HANDLE) vkDestroySampler(device_.get_device(), hiz_sampler_, nullptr);
         for (const string::gpu::resource_id b : stats_buffers_) allocator_.destroy_resource(b);
-        // Brief 04c worklist buffers.
-        const auto destroy_wl = [&](std::vector<Worklist>& v) {
-            for (const Worklist& w : v) if (w.buffer) allocator_.destroy_resource(w.buffer);
-        };
-        destroy_wl(wl_opaque_); destroy_wl(wl_twosided_);
-        for (const auto& per_frame : wl_shadow_)
-            for (const Worklist& w : per_frame) if (w.buffer) allocator_.destroy_resource(w.buffer);
-        for (const string::gpu::resource_id b : draw_lod_buffers_) if (b) allocator_.destroy_resource(b);
+        // Brief 04e M3: worklists + draw_lod live in the renderer-owned scratch arena — nothing
+        // to free here.
         for (const string::gpu::resource_id b : transp_buffers_) if (b) allocator_.destroy_resource(b);
         allocator_.destroy_resource(draw_info_buffer_);
         allocator_.destroy_resource(meshlet_triangles_);
@@ -1857,6 +1900,19 @@ GeometryPass::~GeometryPass()
 
 void GeometryPass::update(float delta_time, uint16_t current_frame)
 {
+    // Brief 04e M3: bind each frame slot's scratch buffer into the worklist handles once the
+    // renderer has materialized the arena (post-construction, pre-first-frame).
+    if (!scratch_bound_ && scratch_ != nullptr && scratch_->materialized())
+    {
+        for (uint32_t f = 0; f < wl_opaque_.size(); ++f)
+        {
+            const string::gpu::resource_id buf = scratch_->buffer(f);
+            wl_opaque_[f].buffer = buf;
+            wl_twosided_[f].buffer = buf;
+            for (Worklist& wl : wl_shadow_[f]) wl.buffer = buf;
+        }
+        scratch_bound_ = true;
+    }
     const float aspect = screen_size.height == 0
         ? 1.0f
         : screen_size.width / static_cast<float>(screen_size.height);
@@ -2254,6 +2310,55 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
     }
 
     ++stream_frame_;
+
+    // --- Brief 04e M2: declare this frame's inter-phase buffer usages -------------------------
+    // The frame-level graph derives the compute->draw barriers (worklists, froxel lists) and the
+    // cross-frame visibility-bitfield ordering from THESE declarations; hand-rolled equivalents
+    // are deleted. Shadow worklists + scan scratch are intra-pass (written AND consumed inside
+    // record_compute, local barriers) so they are not frame-graph state.
+    usages.resize(static_usage_count_);
+    const auto declare_worklist = [this](const Worklist& wl) {
+        if (wl.buffer == 0) return;
+        usages.push_back({ wl.buffer, String::Access::StorageWrite,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT });
+        usages.push_back({ wl.buffer, String::Access::IndirectRead,
+                           VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT });
+        usages.push_back({ wl.buffer, String::Access::StorageRead,
+                           VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT });
+    };
+    if (current_frame < wl_opaque_.size()) declare_worklist(wl_opaque_[current_frame]);
+    if (current_frame < wl_twosided_.size()) declare_worklist(wl_twosided_[current_frame]);
+    // Brief 04e M4: the froxel list is written by the pass's ASYNC compute chain and read by the
+    // main-queue fragment stage — declared in async_usages so the renderer derives the timeline
+    // edge + ownership transfer (async lane) or the plain barriers (inline fallback).
+    async_usages.clear();
+    if (current_frame < froxel_buffers_.size() && froxel_buffers_[current_frame] != 0)
+    {
+        async_usages.push_back({ froxel_buffers_[current_frame], String::Access::StorageWrite,
+                                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT });
+        async_usages.push_back({ froxel_buffers_[current_frame], String::Access::StorageRead,
+                                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT });
+    }
+    // Per-frame stats: reset + histogram in compute, then atomic tallies from the task/mesh/
+    // fragment stages of the draws. Declaring the draw-stage RMW gives it a derived
+    // compute->draw-stages WAW barrier (the old broad hand barrier never covered the TASK/MESH
+    // stats atomics — a latent narrowness this closes).
+    if (current_frame < stats_buffers_.size() && stats_buffers_[current_frame] != 0)
+    {
+        usages.push_back({ stats_buffers_[current_frame], String::Access::StorageWrite,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT });
+        usages.push_back({ stats_buffers_[current_frame], String::Access::StorageWrite,
+                           VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT
+                               | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT
+                               | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT });
+    }
+    // The persistent visibility bitfield: task-stage read-modify-write every two-phase frame.
+    // StorageWrite's scope is READ|WRITE, so the derived TASK->TASK barrier orders the previous
+    // frame's phase-2 writes before BOTH this frame's phase-1 reads (RAW) and phase-2 writes
+    // (WAW) — the 04d cross-frame flicker fix, now declaration-driven.
+    if (hiz_enabled_ && hiz_program_ && visbits_buffer_ != 0)
+        usages.push_back({ visbits_buffer_, String::Access::StorageWrite,
+                           VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT });
 }
 
 bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint16_t current_frame)
@@ -2265,32 +2370,10 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
 
     VkCommandBuffer& command_buffer = recorder.get_command_buffer();
 
-    // Cross-frame serialization of the persistent visibility bitfield. The bitfield is a SINGLE
-    // (non-ring) buffer by design — its temporal state accumulates across frames — so this frame's
-    // phase-1 task shader reads exactly the bits the PREVIOUS frame's phase-2 task shader wrote. With
-    // frames-in-flight, the prior frame's phase-2 TASK-stage writes can still be executing when this
-    // frame begins; without a barrier, phase-1's read races them and a meshlet's bit flips between
-    // consecutive frames -> its phase-2 draw appears/disappears (the flicker/popping the user saw even
-    // on a STATIC camera). This barrier sits OUTSIDE any dynamic-rendering instance (record() opens
-    // rendering later), where TASK_SHADER is a legal stage; same-queue submission order makes its src
-    // scope cover the prior frame's phase-2 writes. (Intra-frame phase-1->phase-2 is handled in
-    // record_between via its own task-stage barrier.)
-    if (hiz_enabled_ && hiz_program_ && visbits_buffer_)
-    {
-        const VkMemoryBarrier2 vbf = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-            .srcStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
-            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
-            // READ | WRITE: phase-1 READs the bits and phase-2 READ-MODIFY-WRITEs them, so the prior
-            // frame's phase-2 write must be ordered before BOTH this frame's phase-1 read (RAW) and
-            // this frame's phase-2 write (WAW).
-            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        };
-        const VkDependencyInfo vdep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .memoryBarrierCount = 1, .pMemoryBarriers = &vbf };
-        vkCmdPipelineBarrier2(command_buffer, &vdep);
-    }
+    // (Brief 04e M2: the cross-frame visibility-bitfield barrier that lived here is now DERIVED
+    // by the renderer from this pass's declared {visbits, StorageWrite, TASK} usage — see the
+    // usage declarations at the end of update(). Intra-frame phase-1 -> phase-2 ordering is still
+    // handled locally in record_between.)
 
     // --- Brief 03: meshlet-path per-frame prep (stats reset, HiZ pyramid) --------------------------
     // Builds the GPU work lists, the HiZ pyramid, and the shadow cascades that record() then draws.
@@ -2345,7 +2428,7 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
             {
                 STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "expand")
                 const VkDeviceAddress cam_lod =
-                    allocator_.get_buffer(draw_lod_buffers_[current_frame]).device_address;
+                    draw_lod_address(current_frame);
                 record_expand(command_buffer, wl_opaque_[current_frame], cam_lod);
                 record_expand(command_buffer, wl_twosided_[current_frame], cam_lod);
                 if (do_shadow)
@@ -2388,39 +2471,9 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
         }
     }
 
-    // --- Froxel light binning: one thread per froxel bins the local lights into per-froxel index
-    // lists that the lit fragment shader reads. Independent of the meshlet cull dispatch (different
-    // buffers), so no barrier between them; the renderer's compute->draw barrier covers the read.
-    if (froxel_program_ && froxel_count_ > 0 && current_frame < froxel_buffers_.size()
-        && froxel_buffers_[current_frame] != 0)
-    {
-        STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "froxel-cull")
-        const uint32_t light_count = lights_enabled_ ? static_cast<uint32_t>(lights_.size()) : 0u;
-        const string::gpu::pipeline& fp = froxel_program_->current();
-        glm::mat4 proj = camera_.view_proj() * glm::inverse(camera_.view());  // == projection
-        const FroxelPush fpush{
-            .view = camera_.view(),
-            .inv_proj = glm::inverse(proj),
-            .screen = glm::uvec2(screen_size.width, screen_size.height),
-            .grid = glm::uvec2(froxel_tiles_x_, froxel_tiles_y_),
-            .slices = kFroxelDepthSlices,
-            .tile_size = kFroxelTileSize,
-            .near_plane = camera_.near_plane(),
-            .far_plane = std::min(settings_.shadow_depth_range, camera_.far_plane()),
-            .light_count = light_count,
-            .max_per_froxel = kMaxLightsPerFroxel,
-            ._pad0 = 0, ._pad1 = 0,
-            .lights = light_count > 0
-                    ? allocator_.get_buffer(light_buffers_[current_frame]).device_address : 0,
-            .froxels = allocator_.get_buffer(froxel_buffers_[current_frame]).device_address,
-        };
-        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, fp.pipeline);
-        vkCmdPushConstants(command_buffer, fp.pipeline_layout, fp.push_constants.stageFlags,
-                           0, sizeof(FroxelPush), &fpush);
-        vkCmdDispatch(command_buffer, (froxel_tiles_x_ + 3) / 4, (froxel_tiles_y_ + 3) / 4,
-                      (kFroxelDepthSlices + 3) / 4);
-    }
-
+    // (Brief 04e M4: the froxel light-binning dispatch moved to record_async_compute — it is
+    // dependency-free within the frame, so the renderer places it on an async compute lane when
+    // one exists, or records it inline on the main queue otherwise.)
     // --- Cascaded shadow maps: render scene depth from the sun into each cascade's image, then
     // transition each to SHADER_READ for the lit pass. Draws the resident set via the meshlet shadow
     // path (off-screen casters included — cascades read the resident-only work list, NOT camera-culled).
@@ -2485,12 +2538,12 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
             // Brief 04c: each cascade draws its OWN worklist (resident-only, draw-culled vs THIS
             // cascade's light sphere; camera-selected LOD via the shared draw_lod). One indirect draw.
             const Worklist& sh_wl = wl_shadow_[current_frame][c];
-            const VkDeviceAddress sh_base = allocator_.get_buffer(sh_wl.buffer).device_address;
+            const VkDeviceAddress sh_base = allocator_.get_buffer(sh_wl.buffer).device_address + sh_wl.offset;
             mspush.records = sh_base + wl_records_off_;   // compacted {draw_index, camera-selected LOD}
             const VkBuffer sh_buf = allocator_.get_buffer(sh_wl.buffer).buffer;
             vkCmdPushConstants(command_buffer, msh.pipeline_layout, VK_SHADER_STAGE_ALL,
                                0, sizeof(MeshletShadowPush), &mspush);
-            vkCmdDrawMeshTasksIndirectCountEXT(command_buffer, sh_buf, wl_commands_off_, sh_buf, wl_count_off_,
+            vkCmdDrawMeshTasksIndirectCountEXT(command_buffer, sh_buf, sh_wl.offset + wl_commands_off_, sh_buf, sh_wl.offset + wl_count_off_,
                                                cull_max_draws_, sizeof(uint32_t) * 3);
 
             vkCmdEndRendering(command_buffer);
