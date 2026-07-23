@@ -1,11 +1,13 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <string/core/dynamic_font.hpp>
 #include <string/core/font.hpp>
 #include <string/core/layout.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
@@ -41,29 +43,40 @@ public:
     // State handed to the authoring callback each frame so it can style/route by interaction.
     struct UiContext
     {
-        const String::Input& input;
+        // Non-const so a modal surface (the debug console) can set Input::text_capture to suppress
+        // gameplay input while it is open. Read-only for every other author.
+        String::Input& input;
         std::uint64_t hovered;  // id.hash under the cursor (as of last frame's layout); 0 = none
         std::uint64_t focused;  // id.hash of the focused element; 0 = none
+        float delta_time = 0.0f;  // seconds since last frame, for the author's motion/animation table
+        std::uint64_t pressed = 0;  // id.hash clicked (pressed edge) this frame in UI mode; 0 = none
     };
     // Authors the frame's UI into a builder already opened at a screen-filling root container.
     using Author = std::function<void(string::layout_builder&, const UiContext&)>;
 
-    // `atlas` is the SDF font atlas (baked once, shared with nothing else). `author` declares the
-    // whole UI (shapes + text) each frame.
-    UIPass(String::PassContext& context, std::shared_ptr<const string::font_atlas> atlas,
+    // `atlas` is the dynamic (grow-on-demand, Unicode) SDF glyph atlas — shared, mutated as new
+    // glyphs are seen. `author` declares the whole UI (shapes + text) each frame.
+    UIPass(String::PassContext& context, std::shared_ptr<string::dynamic_font_atlas> atlas,
            Author author);
     ~UIPass() override;
 
     UIPass(const UIPass&) = delete;
     UIPass& operator=(const UIPass&) = delete;
 
+    // Stable identity for tooling (Tracy zones, inspector). Brief 06.
+    std::string_view debug_name() const override { return "ui"; }
+
     void update(float delta_time, uint16_t current_frame) override;
+    // Uploads the dynamic atlas's dirty region (glyphs added this frame) before the color pass draws.
+    bool record_compute(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
     void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 
 private:
-    // Per-frame ring capacities. Content beyond these is dropped (with a one-time warn).
-    static constexpr std::uint32_t kMaxShapes = 4096;
-    static constexpr std::uint32_t kMaxGlyphs = 8192;
+    // Per-frame ring capacities. Raised for the brief-05 500-nameplate synthetic stress (each
+    // nameplate is a name run + 1-2 bars; 500 of them plus screens fit comfortably here). Content
+    // beyond these is dropped (with a one-time warn).
+    static constexpr std::uint32_t kMaxShapes = 16384;
+    static constexpr std::uint32_t kMaxGlyphs = 65536;
 
     // A persistent-mapped storage buffer per frame in flight (the geometry_streamer pattern).
     struct Ring
@@ -72,6 +85,7 @@ private:
         std::uint32_t slot = 0;
         void* mapped = nullptr;
         std::uint32_t count = 0;
+        std::uint32_t split = 0;  // count of MAIN-layer entries; [split, count) is the overlay layer
     };
     // Create `frames_in_flight` mapped storage buffers of `capacity * stride` bytes, bound bindless.
     void make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight, std::uint32_t capacity,
@@ -81,7 +95,7 @@ private:
     string::gpu::resource_allocator& allocator_;
     string::gpu::descriptor_table& descriptor_table_;
 
-    std::shared_ptr<const string::font_atlas> atlas_;
+    std::shared_ptr<string::dynamic_font_atlas> atlas_;
     Author author_;
     String::Input& input_;  // non-const: the pass requests game/UI capture mode
     // Read each frame for the shader-compile error overlay (brief 01, M4): when a hot-reload fails,
@@ -91,6 +105,16 @@ private:
     std::uint64_t hovered_id_ = 0;
     std::uint64_t focused_id_ = 0;
     bool prev_click_ = false;  // for left-button edge detection in UI mode
+    bool stick_armed_ = true;  // gamepad left-stick recentred since last focus-nav flick
+    // Feel instrumentation (brief 05 M5): timestamp a UI click in update() and, in record() of the
+    // SAME frame (the immediate-mode author reflects the click that frame), log the click->record
+    // latency. Reports the numbers the brief asks for; gated so it's quiet unless a click happened.
+    std::chrono::steady_clock::time_point click_time_{};
+    bool click_pending_ = false;
+    // Rolling UI CPU-cost instrumentation (author + layout + pack), logged every 300 frames.
+    std::int64_t ui_cpu_us_accum_ = 0;
+    std::int64_t ui_cpu_us_peak_ = 0;
+    int ui_cpu_samples_ = 0;
 
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
 
@@ -105,6 +129,13 @@ private:
     string::gpu::resource_id atlas_image_ = 0;
     VkSampler atlas_sampler_ = VK_NULL_HANDLE;
     std::uint32_t atlas_slot_ = 0;
+    // Dynamic-atlas re-upload: a host-visible staging buffer per frame in flight (the atlas grows as
+    // new glyphs appear). record_compute copies the whole CPU atlas into this frame's staging and
+    // vkCmdCopyBufferToImage's it when the atlas reports dirty, wrapped in the SHADER_READ<->TRANSFER
+    // barriers. atlas_uploaded_ gates the very first transition (UNDEFINED -> SHADER_READ).
+    std::vector<string::gpu::resource_id> atlas_staging_;
+    std::uint32_t atlas_upload_bytes_ = 0;
+    bool atlas_uploaded_ = false;
 
     bool warned_overflow_ = false;
 

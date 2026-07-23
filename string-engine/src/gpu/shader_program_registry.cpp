@@ -45,28 +45,25 @@ shader_program* shader_program_registry::create(const std::filesystem::path& sou
 
 void shader_program_registry::on_file_changed(const std::filesystem::path& path)
 {
-    // Find the program(s) for this source and recompile asynchronously on the job pool.
-    shader_program* program = nullptr;
+    // A single source may back MULTIPLE programs (e.g. one .slang built into two pipeline variants
+    // that differ only in fixed state, like a one-sided and a two-sided cull-mode variant). Reload
+    // ALL of them, or an edit would silently leave the extra variants running stale SPIR-V.
+    std::vector<shader_program*> matches;
     for (const auto& p : programs_)
-    {
-        if (p->source_path_ == path)
-        {
-            program = p.get();
-            break;
-        }
-    }
-    if (program == nullptr)
-    {
+        if (p->source_path_ == path) matches.push_back(p.get());
+    if (matches.empty())
         return;
-    }
 
     STRING_LOG_INFO("shader hot-reload: recompiling '{}'", path.string());
 
-    in_flight_.push_back(jobs_.enqueue([this, program, path] {
+    // Compile once (the compiler's disk cache makes repeat compiles cheap, but a single compile here
+    // also guarantees every variant swaps from identical SPIR-V) and stage the result for each variant.
+    in_flight_.push_back(jobs_.enqueue([this, matches, path] {
         compile_error err;
         std::optional<compiled_program> compiled = compiler_.compile(path, err);
         std::lock_guard<std::mutex> lock(staged_mutex_);
-        staged_.push_back({ program, std::move(compiled), err });
+        for (shader_program* program : matches)
+            staged_.push_back({ program, compiled, err });
     }));
 }
 

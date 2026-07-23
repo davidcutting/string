@@ -75,6 +75,9 @@ private:
     std::vector<ResizeEventCallbackFn> resize_callbacks_;
     bool closing = false;
     Input input_;
+    // Opaque SDL_Gamepad* for the first connected pad (brief 05); null when none. void* so the
+    // header stays SDL-free (only the SDL backend .cpp touches it).
+    void* gamepad_ = nullptr;
 };
 
 }  // namespace String

@@ -2,6 +2,7 @@
 
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
+#include <string/core/profiler.hpp>
 
 namespace String
 {
@@ -91,6 +92,7 @@ VkCommandBuffer TransferBatch::begin_if_needed()
 
 void TransferBatch::submit_current()
 {
+    STRING_PROFILE_SCOPE("transfer submit")
     Batch& batch = ring_[current_];
     if (!batch.recording)
     {
@@ -157,6 +159,7 @@ TransferBatch::upload_ticket TransferBatch::upload_buffer(const void* data, VkDe
 
 TransferBatch::upload_ticket TransferBatch::upload_image(const void* pixels, VkDeviceSize size, string::gpu::resource_id dst_image)
 {
+    STRING_PROFILE_SCOPE("upload image")
     VkCommandBuffer command_buffer = begin_if_needed();
     const upload_ticket ticket = next_signal_;
     const string::gpu::allocated_image& image = allocator_.get_image(dst_image);

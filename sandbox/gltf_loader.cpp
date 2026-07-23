@@ -225,6 +225,15 @@ GltfParsed parse_gltf(const std::filesystem::path& path)
         out.normal_texture = image_index_of(asset, material.normalTexture);
         out.occlusion_texture = image_index_of(asset, material.occlusionTexture);
 
+        switch (material.alphaMode)
+        {
+        case fastgltf::AlphaMode::Mask:  out.alpha_mode = GltfAlphaMode::Mask;  break;
+        case fastgltf::AlphaMode::Blend: out.alpha_mode = GltfAlphaMode::Blend; break;
+        default:                         out.alpha_mode = GltfAlphaMode::Opaque; break;
+        }
+        out.alpha_cutoff = material.alphaCutoff;
+        out.double_sided = material.doubleSided;
+
         // Base-color maps carry sRGB-encoded color; data maps stay linear. (Left at the default
         // linear for normal / metallic-roughness.)
         if (out.base_color_texture >= 0)

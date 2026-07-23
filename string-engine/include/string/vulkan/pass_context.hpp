@@ -10,6 +10,7 @@
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/platform/input.hpp>
 #include <string/platform/input_map.hpp>
+#include <string/core/profiler.hpp>
 
 namespace String
 {
@@ -48,6 +49,14 @@ struct PassContext
     // MSAA sample count of the scene color/depth targets. Scene-pass pipelines must set their
     // rasterizationSamples to this (via set_multisampling) to be compatible with the render pass.
     VkSampleCountFlagBits sample_count;
+    // Brief 06: address of the renderer's Tracy GPU context so a pass can open finer per-STAGE GPU
+    // zones INSIDE its record()/record_compute() (the renderer only wraps the whole pass in one
+    // zone named by debug_name()). It is a POINTER because the context is created after the passes
+    // are built (init_gpu_profiler runs post plan.build) — the pass stores this address at
+    // construction and dereferences it at record time, by which point the context is live. Without
+    // -Dtracy the context type is void*, so the value is always a valid null-holding slot; the GPU
+    // zone macros are no-ops. May be null if the renderer chooses not to expose one.
+    STRING_PROFILE_GPU_CONTEXT_TYPE* gpu_profiler_ctx;
 };
 
 }  // namespace String

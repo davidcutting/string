@@ -7,12 +7,16 @@
 slang_shaders = files(
     'ui_shader.slang',
     'text_shader.slang',
+    'ui_background.slang',  # ui-dev sandbox flat gradient background (brief 05, milestone 0)
     'sky_shader.slang',
     'sky.slang',        # imported by sky_shader.slang and lighting.slang (image-based ambient)
     'froxel_cull.slang', # clustered light-binning compute (brief 02)
     'meshlet.slang',     # shared meshlet data model (imported by the mesh pipeline; brief 03)
+    'meshlet_cull.slang',   # brief 04d M1: shared pure per-meshlet cull primitives (frustum/cone/HiZ/LOD)
     'meshlet_mesh.slang',   # task + mesh + fragment meshlet draw path (brief 03)
     'meshlet_shadow.slang', # task + mesh depth-only meshlet shadow path (brief 03)
+    'meshlet_draw_cull.slang', # brief 04c draw phase: per-draw meshlet counts + LOD select
+    'meshlet_expand.slang',    # brief 04c expansion: order-stable prefix scan + worklist fill
     'hiz_build.slang',      # HiZ depth-pyramid downsample compute (brief 03)
     'meshlet_reset.slang',  # per-frame stats/visibility reset compute (brief 03)
 )
@@ -22,6 +26,8 @@ install_data(slang_shaders, install_dir : 'include/string/shaders')
 glsl_shaders = [
     'grid_2d_shader.vert',
     'grid_2d_shader.frag',
+    'debug_line.vert',   # brief 06 immediate-mode debug lines (world-space line list)
+    'debug_line.frag',
 ]
 
 # Shared shader includes (#include "sky.glsl"). -I resolves them; listed as depend_files so a change

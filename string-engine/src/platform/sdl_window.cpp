@@ -242,10 +242,35 @@ Window::Window(const Properties& properties)
 
     // Enable Unicode text input so SDL_EVENT_TEXT_INPUT flows to text fields (see update()).
     SDL_StartTextInput(window_handle);
+
+    // Gamepad (brief 05: controller-first UI). Init the subsystem and open any already-connected
+    // pad; hotplug is handled by ADDED/REMOVED events in update(). Non-fatal if it fails.
+    if (SDL_InitSubSystem(SDL_INIT_GAMEPAD))
+    {
+        int count = 0;
+        SDL_JoystickID* ids = SDL_GetGamepads(&count);
+        if (ids != nullptr)
+        {
+            if (count > 0)
+            {
+                gamepad_ = SDL_OpenGamepad(ids[0]);
+                input_.set_gamepad_connected(gamepad_ != nullptr);
+                if (gamepad_)
+                    STRING_LOG_INFO("Gamepad connected: {}", SDL_GetGamepadName((SDL_Gamepad*)gamepad_));
+            }
+            SDL_free(ids);
+        }
+    }
+    else
+    {
+        STRING_LOG_DEBUG("Gamepad subsystem unavailable: {}", SDL_GetError());
+    }
 };
 
 Window::~Window()
 {
+    if (gamepad_ != nullptr)
+        SDL_CloseGamepad((SDL_Gamepad*)gamepad_);
     SDL_DestroyWindow((SDL_Window*)window_handle_);
 }
 
@@ -337,7 +362,55 @@ void Window::update(entt::dispatcher& dispatcher)
                 // focuses UI or requests game mode. See the reconcile at the end of update().
                 break;
             }
+            case SDL_EVENT_GAMEPAD_ADDED:
+            {
+                if (gamepad_ == nullptr)
+                {
+                    gamepad_ = SDL_OpenGamepad(event.gdevice.which);
+                    input_.set_gamepad_connected(gamepad_ != nullptr);
+                    if (gamepad_)
+                        STRING_LOG_INFO("Gamepad connected: {}",
+                                        SDL_GetGamepadName((SDL_Gamepad*)gamepad_));
+                }
+                break;
+            }
+            case SDL_EVENT_GAMEPAD_REMOVED:
+            {
+                if (gamepad_ != nullptr &&
+                    event.gdevice.which == SDL_GetGamepadID((SDL_Gamepad*)gamepad_))
+                {
+                    SDL_CloseGamepad((SDL_Gamepad*)gamepad_);
+                    gamepad_ = nullptr;
+                    input_.set_gamepad_connected(false);
+                }
+                break;
+            }
         }
+    }
+
+    // Poll the connected gamepad's current state each frame (buttons + axes). Polling (vs per-event)
+    // keeps edge detection in Input::new_frame consistent with the keyboard/mouse path.
+    if (gamepad_ != nullptr)
+    {
+        SDL_Gamepad* gp = (SDL_Gamepad*)gamepad_;
+        static const SDL_GamepadButton kButtons[] = {
+            SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST,
+            SDL_GAMEPAD_BUTTON_NORTH, SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_GUIDE,
+            SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK,
+            SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
+            SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+            SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
+        };
+        for (int i = 0; i < static_cast<int>(GamepadButton::COUNT); ++i)
+            input_.set_gamepad_button(static_cast<GamepadButton>(i),
+                                      SDL_GetGamepadButton(gp, kButtons[i]));
+        auto axis = [&](SDL_GamepadAxis a) { return SDL_GetGamepadAxis(gp, a) / 32767.0f; };
+        input_.set_gamepad_axis(GamepadAxis::LEFT_X, axis(SDL_GAMEPAD_AXIS_LEFTX));
+        input_.set_gamepad_axis(GamepadAxis::LEFT_Y, axis(SDL_GAMEPAD_AXIS_LEFTY));
+        input_.set_gamepad_axis(GamepadAxis::RIGHT_X, axis(SDL_GAMEPAD_AXIS_RIGHTX));
+        input_.set_gamepad_axis(GamepadAxis::RIGHT_Y, axis(SDL_GAMEPAD_AXIS_RIGHTY));
+        input_.set_gamepad_axis(GamepadAxis::LEFT_TRIGGER, axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
+        input_.set_gamepad_axis(GamepadAxis::RIGHT_TRIGGER, axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
     }
 
     // Reconcile the actual cursor mode to what the app requested this frame (Esc / a UI click set

@@ -41,7 +41,10 @@ public:
 
     void set_fov_degrees(float fov) { fov_degrees_ = fov; }
     void set_move_speed(float speed) { move_speed_ = speed; }
-    // Debug/tooling: place the camera exactly (used by the STRING_CAM headless-capture override).
+    // Debug/tooling: read/place the exact pose. yaw()/pitch() expose the internal look angles so a
+    // motion lever (dbg.orbit headless capture) can sway them without re-deriving from forward().
+    float yaw() const { return yaw_; }
+    float pitch() const { return pitch_; }
     void set_pose(const glm::vec3& position, float yaw, float pitch)
     {
         position_ = position; yaw_ = yaw; pitch_ = pitch;

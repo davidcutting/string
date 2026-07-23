@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include <volk.h>
 
@@ -83,7 +85,14 @@ struct GpuDrawInfo
     // shaders MUST apply this — meshlet-vertices hold ORIGINAL global indices, but the vertex
     // heap is suballocated (the old path carried this in the indirect draw's vertexOffset).
     uint32_t vertex_offset;        // 204
+    // Material rendering flags (brief 04): bit 0 = cutout (alpha-test), bit 1 = double-sided.
+    uint32_t flags;                // 208
+    float alpha_cutoff;            // 212 (MASK threshold; base-color alpha < this => clip())
 };
+// Brief 04 material flag bits (must match meshlet.slang kDrawFlag*).
+inline constexpr uint32_t kDrawFlagCutout = 1u;
+inline constexpr uint32_t kDrawFlagDoubleSided = 2u;
+inline constexpr uint32_t kDrawFlagBlend = 4u;
 static_assert(offsetof(GpuDrawInfo, model) == 0);
 static_assert(offsetof(GpuDrawInfo, base_color) == 64);
 static_assert(offsetof(GpuDrawInfo, base_slot) == 80);
@@ -96,7 +105,13 @@ static_assert(offsetof(GpuDrawInfo, lods) == 128);
 static_assert(offsetof(GpuDrawInfo, lod_count) == 192);
 static_assert(offsetof(GpuDrawInfo, first_meshlet) == 196);
 static_assert(offsetof(GpuDrawInfo, total_meshlets) == 200);
-static_assert(sizeof(GpuDrawInfo) == 208);
+static_assert(offsetof(GpuDrawInfo, vertex_offset) == 204);
+static_assert(offsetof(GpuDrawInfo, flags) == 208);
+static_assert(offsetof(GpuDrawInfo, alpha_cutoff) == 212);
+static_assert(sizeof(GpuDrawInfo) == 216);
+
+// Scan block size — must match kScanBlock in meshlet.slang (the compaction two-pass block scan).
+inline constexpr uint32_t kScanBlock = 256;
 
 // GPU-written per-frame culling stats (read back for the UI overlay + log line). One uint per stage
 // counter; the task/mesh shaders atomically increment. draws_per_lod is indexed by LOD level.
@@ -108,9 +123,36 @@ struct GpuMeshStats
     uint32_t after_hiz;         // survived HiZ occlusion (== drawn)
     uint32_t draws_per_lod[kMaxLods];
     uint32_t triangles;         // emitted triangles (approx: sum of drawn meshlet tri counts)
-    uint32_t _pad[3];
+    uint32_t shadow_draws;      // brief 04 M4: draws surviving per-cascade shadow draw-cull (summed)
+    uint32_t phase2_drawn;      // brief 04d: meshlets drawn in phase 2 (the disocclusion set). == stats[10]
+    uint32_t _pad;
 };
 static_assert(sizeof(GpuMeshStats) == 48);
+static_assert(offsetof(GpuMeshStats, shadow_draws) == 36);   // == stats[9] written by the cull compute
+static_assert(offsetof(GpuMeshStats, phase2_drawn) == 40);   // == stats[10] written by the phase-2 task shader
+
+// Brief 06 inspector: a per-draw snapshot the GeometryPass publishes each frame for the scene/draw
+// inspector (read-only v1). Names come from the cooked scene if present, else "draw N".
+struct InspectorDraw
+{
+    std::string name;
+    uint32_t index = 0;
+    int32_t material = -1;
+    uint32_t meshlet_count = 0;
+    uint32_t lod_count = 0;
+    bool resident = false;
+    glm::vec3 aabb_min{ 0.0f };
+    glm::vec3 aabb_max{ 0.0f };
+};
+
+// Brief 06 inspector: a light snapshot (world position + range + colour).
+struct InspectorLight
+{
+    glm::vec3 position{ 0.0f };
+    float range = 0.0f;
+    glm::vec3 color{ 1.0f };
+    bool spot = false;
+};
 
 // Shared, CPU-side overlay state the GeometryPass fills each frame and the UI author reads (they are
 // built separately in the RenderPlan, so a shared_ptr is the seam). Plain data, single-threaded
@@ -123,6 +165,12 @@ struct MeshOverlayStats
     int debug_view = 0;         // 0 none, 1 meshlet, 2 LOD, 3 occlusion-reject
     uint32_t total_meshlets = 0;
     uint32_t draw_count = 0;
+
+    // Brief 06: camera + scene snapshot for the debug-line pass and the scene/draw inspector.
+    glm::mat4 view_proj{ 1.0f };
+    glm::vec3 camera_pos{ 0.0f };
+    std::vector<InspectorDraw> draws;   // rebuilt when the draw set changes (load / crowd toggle)
+    std::vector<InspectorLight> lights; // refreshed each frame (lights animate)
 };
 
 }  // namespace sandbox

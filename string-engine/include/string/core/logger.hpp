@@ -2,10 +2,14 @@
 
 #include <print>
 #include <format>
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <source_location>
+#include <string>
 #include <string_view>
 #include <mutex>
+#include <vector>
 #include <string/core/platform_detection.hpp>
 
 namespace String
@@ -19,6 +23,74 @@ enum class LogLevel : int
     WARN = 3,
     ERROR = 4,
     CRITICAL = 5
+};
+
+// A small thread-safe ring buffer that mirrors the most recent log lines so an in-engine console
+// (brief 06) can render a live log tail without owning the logger. Every Logger::log_impl call
+// pushes its formatted line (with severity) here in addition to stdout; the console snapshots the
+// tail each frame. Fixed capacity, lock-guarded, no allocation on the hot path beyond the line
+// string itself. Process-global (the logger is a singleton, so its sink is too).
+class LogRingBuffer
+{
+public:
+    struct Line
+    {
+        LogLevel level;
+        std::string text;   // "[HH:MM:SS] [LEVEL] message"
+    };
+
+    static LogRingBuffer& instance()
+    {
+        static LogRingBuffer buf;
+        return buf;
+    }
+
+    void push(LogLevel level, std::string text)
+    {
+        std::lock_guard lock(mutex_);
+        if (lines_.size() < capacity_)
+        {
+            lines_.push_back(Line{ level, std::move(text) });
+        }
+        else
+        {
+            lines_[head_] = Line{ level, std::move(text) };
+            head_ = (head_ + 1) % capacity_;
+        }
+        ++total_;
+    }
+
+    // Snapshot the last `count` lines in chronological order (oldest first). Cheap enough for a
+    // per-frame console (small N, short strings); copies under the lock so the caller is decoupled.
+    std::vector<Line> tail(std::size_t count) const
+    {
+        std::lock_guard lock(mutex_);
+        const std::size_t n = std::min(count, lines_.size());
+        std::vector<Line> out;
+        out.reserve(n);
+        const std::size_t start = lines_.size() < capacity_ ? lines_.size() - n
+                                                            : (head_ + (capacity_ - n)) % capacity_;
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            out.push_back(lines_[(start + i) % lines_.size()]);
+        }
+        return out;
+    }
+
+    // Monotonic count of lines ever pushed — lets the console detect new lines to auto-scroll.
+    std::size_t total() const
+    {
+        std::lock_guard lock(mutex_);
+        return total_;
+    }
+
+private:
+    LogRingBuffer() = default;
+    static constexpr std::size_t capacity_ = 512;
+    mutable std::mutex mutex_;
+    std::vector<Line> lines_;
+    std::size_t head_ = 0;    // next write slot once full
+    std::size_t total_ = 0;
 };
 
 class Logger
@@ -74,8 +146,15 @@ private:
             message = fmt.get();
         }
 
-        std::println("[{}] [{}] {}", 
+        std::println("[{}] [{}] {}",
                     timestamp, level_str, message);
+
+        // Mirror into the in-engine console ring (brief 06). Timestamp trimmed to HH:MM:SS to keep
+        // the console line short; severity is carried structurally for colouring.
+        std::string_view ts = timestamp;
+        if (ts.size() > 11) ts = ts.substr(11);  // drop "YYYY-MM-DD "
+        LogRingBuffer::instance().push(
+            level, std::format("[{}] [{}] {}", ts, level_str, message));
     }
 
 public:

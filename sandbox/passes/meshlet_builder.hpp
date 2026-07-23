@@ -36,14 +36,9 @@ struct MeshletModel
     bool from_cache = false;
 };
 
-// Meshletize every draw of a flattened model. `cache_dir` holds the content-hash-keyed cache (created
-// if missing); `cache_key_seed` folds the source path so different models don't collide. The returned
-// draws carry bounds + per-LOD ranges but NOT material/transform (the caller fills those from its
-// GltfDraw/GltfMaterial data — meshletization is geometry-only).
-MeshletModel build_meshlets(const std::vector<String::Vertex>& vertices,
-                            const std::vector<uint32_t>& indices,
-                            const std::vector<GltfDraw>& draws,
-                            const std::filesystem::path& cache_dir,
-                            uint64_t cache_key_seed);
+// NOTE (brief 04c M3): the runtime meshletizer (build_meshlets) and its disk cache moved to the cook
+// path (assetbake/bake.cpp — bake_scene) when the asset pipeline landed; meshlet_builder.cpp was dead
+// (uncompiled, uncalled) and is deleted. This header now only defines MeshletModel, the in-memory form
+// the scene loader fills and GeometryPass uploads.
 
 }  // namespace sandbox

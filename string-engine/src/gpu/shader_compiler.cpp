@@ -10,6 +10,7 @@
 #include <slang-com-helper.h>
 
 #include <string/core/logger.hpp>
+#include <string/core/profiler.hpp>
 
 namespace string::gpu
 {
@@ -161,6 +162,7 @@ shader_compiler::~shader_compiler() = default;
 std::optional<compiled_program> shader_compiler::compile(const std::filesystem::path& source_path,
                                                          compile_error& out_error)
 {
+    STRING_PROFILE_SCOPE("shader compile")
     const std::optional<std::string> source = read_text_file(source_path);
     if (!source)
     {

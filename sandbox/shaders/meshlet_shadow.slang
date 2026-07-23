@@ -1,7 +1,16 @@
-// Depth-only meshlet shadow path (brief 03): task + mesh, one cascade per dispatch. Frustum + cone
-// cull per cascade (no HiZ for light views in v1). Replaces the interim indirect shadow draw list.
-// Alpha-cutout is out of scope until brief 04 (no cutout materials yet).
+// Depth-only meshlet shadow path (brief 03 / 04c resolution b): task + mesh, one cascade per dispatch.
+// Frustum + cone cull per cascade (no HiZ for light views in v1). ONE indirect draw command per
+// surviving draw (vkCmdDrawMeshTasksIndirectCountEXT over the compacted commands[]/records[] the
+// expand compute built for this cascade); the task reads its draw via SV_DrawIndex -> records[].
+// Brief 04: a fragment stage now applies alpha-tested cutout (clip on base-color alpha) so foliage/
+// curtains cast and self-shadow correctly. This same module drives the HiZ depth prepass, so the
+// prepass writes cutout depth too (HiZ would over-cull behind a cutout otherwise). Opaque draws
+// carry a negative threshold and never discard, so their depth is bit-identical to the pre-04 path.
 import meshlet;
+import meshlet_cull;   // brief 04d M1: shared frustum primitives (was inlined here)
+
+// Bindless base-color textures (same set/binding as lighting.slang; the pipeline layout is shared).
+[[vk::binding(1, 0)]] Sampler2D shadow_textures[];
 
 static const uint kTaskGroup = 32;
 
@@ -13,7 +22,7 @@ struct Push
     MeshletVertexBuffer *mverts;
     MeshletTriangleBuffer *mtris;
     DrawInfoBuffer *draws;
-    DrawRecordBuffer *records;   // brief 03b: {draw_index, lod} per indirect draw (SV_DrawIndex)
+    DrawRecordBuffer *records;   // brief 04c: compacted {draw_index, lod} per indirect draw (SV_DrawIndex)
     uint _pad0;
     uint _pad1;
 };
@@ -21,28 +30,6 @@ struct Push
 
 struct Payload { uint meshlet_ids[kTaskGroup]; uint draw_index; };
 groupshared Payload payload;
-
-void frustum_planes(float4x4 vp, out float4 planes[6])
-{
-    // Slang/HLSL: vp[i] IS row i (unlike GLSL, where m[i] is a column). See meshlet_mesh.slang.
-    float4 r0 = vp[0];
-    float4 r1 = vp[1];
-    float4 r2 = vp[2];
-    float4 r3 = vp[3];
-    planes[0] = r3 + r0; planes[1] = r3 - r0;
-    planes[2] = r3 + r1; planes[3] = r3 - r1;
-    planes[4] = r2;      planes[5] = r3 - r2;
-}
-bool sphere_in_frustum(float4 planes[6], float3 c, float r)
-{
-    [unroll] for (int i = 0; i < 6; ++i)
-    {
-        float3 n = planes[i].xyz; float len = length(n);
-        if (len < 1e-6) continue;
-        if ((dot(n, c) + planes[i].w) / len < -r) return false;
-    }
-    return true;
-}
 
 [shader("amplification")]
 [numthreads(kTaskGroup)]
@@ -79,7 +66,14 @@ void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint draw : 
     DispatchMesh(total, 1, 1, payload);
 }
 
-struct MeshOut { float4 position : SV_Position; };
+struct MeshOut
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+    nointerpolation uint base_slot : TEXCOORD1;
+    nointerpolation float base_alpha : TEXCOORD2;    // base_color factor alpha
+    nointerpolation float cutout_alpha : TEXCOORD3;  // >=0 alpha-test threshold, <0 = opaque (no clip)
+};
 
 [shader("mesh")]
 [outputtopology("triangle")]
@@ -101,11 +95,27 @@ void mesh_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID,
         Vertex v = pc.vertices.verts[gv];
         MeshOut o;
         o.position = mul(pc.light_view_proj, mul(di.model, float4(v.pos, 1.0)));
+        o.uv = v.texCoord;
+        o.base_slot = di.base_slot;
+        o.base_alpha = di.base_color.w;
+        o.cutout_alpha = (di.flags & kDrawFlagCutout) != 0u ? di.alpha_cutoff : -1.0;
         verts[tid] = o;
     }
     for (uint t = tid; t < ml.triangle_count; t += kMeshletMaxVertices)
     {
         uint packed = pc.mtris.packed[ml.triangle_offset + t];
         tris[t] = uint3(packed & 0xffu, (packed >> 8) & 0xffu, (packed >> 16) & 0xffu);
+    }
+}
+
+// Depth-only fragment: opaque draws (cutout_alpha < 0) fall straight through and write depth exactly
+// as before; cutout draws sample base-color alpha and discard below the threshold (foliage/curtains).
+[shader("fragment")]
+void fragment_main(MeshOut i)
+{
+    if (i.cutout_alpha >= 0.0)
+    {
+        float a = shadow_textures[i.base_slot].Sample(i.uv).a * i.base_alpha;
+        if (a < i.cutout_alpha) discard;
     }
 }

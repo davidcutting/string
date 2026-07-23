@@ -27,6 +27,10 @@ struct GltfTexture
 // A glTF PBR material. Only the fields the renderer consumes today are kept flat here; texture
 // members index into GltfModel::textures (-1 = none). Enough for unlit base-color now, with the
 // metallic-roughness / normal slots already carried for when lighting lands.
+// glTF alpha rendering mode (KHR core). MASK => alpha-tested cutout (clip on base-color alpha vs
+// alpha_cutoff); BLEND => routed to the sorted transparency pass; OPAQUE => alpha ignored.
+enum class GltfAlphaMode : uint8_t { Opaque = 0, Mask = 1, Blend = 2 };
+
 struct GltfMaterial
 {
     glm::vec4 base_color_factor{ 1.0f };
@@ -36,6 +40,9 @@ struct GltfMaterial
     int32_t metallic_roughness_texture = -1;
     int32_t normal_texture = -1;
     int32_t occlusion_texture = -1;   // glTF occlusion (baked AO); attenuates ambient
+    GltfAlphaMode alpha_mode = GltfAlphaMode::Opaque;
+    float alpha_cutoff = 0.5f;        // MASK threshold (glTF default 0.5)
+    bool double_sided = false;        // disable backface cull + cone cull; flip normal to viewer
 };
 
 // One draw call: a contiguous range of the model's shared index buffer, the material to bind,

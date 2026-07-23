@@ -75,7 +75,15 @@ struct DrawInfo
     // Signed heap delta (int32 as uint bits): meshlet-vertices hold ORIGINAL global vertex
     // indices; the vertex heap is suballocated. heap_vertex = uint(int(global) + int(this)).
     uint vertex_offset;
+    // Material rendering flags (brief 04): bit 0 = cutout (alpha-test), bit 1 = double-sided
+    // (bypass cone cull, rasterizer CULL_NONE via a separate command list, flip normal to viewer).
+    uint flags;
+    float alpha_cutoff;    // MASK threshold, sampled base-color alpha < this => clip()
 };
+// Brief 04 material flag bits (shared C++/Slang meaning).
+static const uint kDrawFlagCutout = 1u;
+static const uint kDrawFlagDoubleSided = 2u;
+static const uint kDrawFlagBlend = 4u;    // alpha-blend: excluded from opaque lists, drawn sorted in the transparency pass
 struct DrawInfoBuffer { DrawInfo draws[]; };
 
 // --- Brief 03b: GPU-driven draw generation --------------------------------------------------------
@@ -93,3 +101,45 @@ struct DrawRecord { uint draw_index; uint lod; };
 struct DrawRecordBuffer { DrawRecord records[]; };
 
 struct CountBuffer { uint count; };
+
+// --- Brief 04c (resolution b): per-view scan-compacted per-draw command lists -------------------
+// The per-draw dispatch fan-out (one indirect command per draw, empty for skipped draws — the 03b
+// stable-slot scheme) is replaced by a two-phase cull that COMPACTS surviving draws: (1) a DRAW phase
+// writes, at stable slot == draw index, each draw's surviving meshlet COUNT for this list + its
+// selected LOD; (2) a COMPACTION phase runs an order-stable exclusive prefix scan over the survival
+// predicate and a fill dispatch that writes, per SURVIVING draw at a dense contiguous slot in
+// ascending draw order, one VkDrawMeshTasksIndirectCommandEXT (commands[]) + one {draw_index, lod}
+// record (records[]), plus the surviving-draw count. One vkCmdDrawMeshTasksIndirectCountEXT then
+// draws the whole list — draw count no longer drives dispatch cost, and command-index ordering pins
+// coplanar depth-tie winners run-to-run (the 03b/RADV determinism constraint). The scan preserves
+// input (draw) order, so submission order is deterministic (no atomics in the ordering path).
+
+// Per-draw scratch the draw phase writes and the compaction consumes (stable slot == draw index).
+struct UintBuffer { uint v[]; };
+
+// Scan block size — one workgroup scans this many per-draw survival predicates in pass A.
+static const uint kScanBlock = 256;
+
+// --- Brief 04d: persistent per-meshlet visibility bitfield -----------------------------------------
+// One bit per GLOBAL meshlet id (draw's lods[lod].meshlet_offset + local). Sized to total meshlet
+// capacity, zero-initialized on creation (a cleared bit => the meshlet takes phase 2 for one frame:
+// warmup = fallback = streaming/LOD-change path, all correct). Persists across frames (NOT ringed).
+// Phase 1 reads a bit (visible last frame). Phase 2 sets it when the meshlet is HiZ-visible now, or
+// clears it when HiZ-hidden. Set/clear are atomic (distinct meshlets may share a 32-bit word, and
+// many task workgroups touch the same word in the same frame).
+struct VisBitfield { uint words[]; };
+
+bool vis_get(VisBitfield *bf, uint id)
+{
+    return (bf.words[id >> 5u] & (1u << (id & 31u))) != 0u;
+}
+void vis_set(VisBitfield *bf, uint id)
+{
+    uint prev;
+    InterlockedOr(bf.words[id >> 5u], (1u << (id & 31u)), prev);
+}
+void vis_clear(VisBitfield *bf, uint id)
+{
+    uint prev;
+    InterlockedAnd(bf.words[id >> 5u], ~(1u << (id & 31u)), prev);
+}

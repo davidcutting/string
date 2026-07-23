@@ -72,6 +72,26 @@ enum class MouseButton : std::uint8_t
     BUTTON_8 = 7
 };
 
+// Gamepad face/d-pad/shoulder buttons + stick clicks (brief 05: controller-first UI). Values follow
+// SDL3's SDL_GamepadButton ordering so the backend maps 1:1. LEFT/RIGHT/UP/DOWN are the d-pad.
+enum class GamepadButton : std::uint8_t
+{
+    A = 0, B = 1, X = 2, Y = 3,
+    BACK = 4, GUIDE = 5, START = 6,
+    LEFT_STICK = 7, RIGHT_STICK = 8,
+    LEFT_SHOULDER = 9, RIGHT_SHOULDER = 10,
+    UP = 11, DOWN = 12, LEFT = 13, RIGHT = 14,
+    COUNT = 15
+};
+
+// Gamepad analog axes (SDL3 order): sticks (normalized -1..1) + triggers (0..1).
+enum class GamepadAxis : std::uint8_t
+{
+    LEFT_X = 0, LEFT_Y = 1, RIGHT_X = 2, RIGHT_Y = 3,
+    LEFT_TRIGGER = 4, RIGHT_TRIGGER = 5,
+    COUNT = 6
+};
+
 enum class KeyAction : std::uint8_t
 {
     RELEASE = 0,
@@ -180,6 +200,12 @@ public:
     // frees/grabs the cursor (it gets first dibs on a click) rather than the window guessing.
     bool capture_requested() const { return capture_requested_; }
     void set_capture_requested(bool requested) { capture_requested_ = requested; }
+    // Brief 06: while a modal text surface (the debug console) is open it sets this so gameplay
+    // input routed through InputMap (camera, debug keys) is suppressed — the console reads raw
+    // Input::key_*/typed_text() directly, so it still receives keys. Reconciled each frame by the
+    // surface: it must clear this when it closes.
+    bool text_capture() const { return text_capture_; }
+    void set_text_capture(bool capture) { text_capture_ = capture; }
     // Absolute cursor position in window pixels (top-left origin), for UI hit-testing. Unlike the
     // delta this persists across frames (last known position), and is tracked even while captured.
     glm::vec2 mouse_position() const { return mouse_position_; }
@@ -188,7 +214,31 @@ public:
     // new_frame(). Backspace/enter/etc. are not here — read those via key_pressed().
     std::string_view typed_text() const { return typed_text_; }
 
+    // --- Gamepad (brief 05: controller-first UI) ---
+    bool gamepad_connected() const { return gamepad_connected_; }
+    bool gamepad_down(GamepadButton b) const { return pad_buttons_[static_cast<std::size_t>(b)]; }
+    bool gamepad_pressed(GamepadButton b) const
+    {
+        const std::size_t i = static_cast<std::size_t>(b);
+        return pad_buttons_[i] && !prev_pad_buttons_[i];
+    }
+    bool gamepad_released(GamepadButton b) const
+    {
+        const std::size_t i = static_cast<std::size_t>(b);
+        return !pad_buttons_[i] && prev_pad_buttons_[i];
+    }
+    float gamepad_axis(GamepadAxis a) const { return pad_axes_[static_cast<std::size_t>(a)]; }
+
     // --- Filled by the WSI backend ---
+    void set_gamepad_connected(bool connected) { gamepad_connected_ = connected; }
+    void set_gamepad_button(GamepadButton b, bool down)
+    {
+        pad_buttons_[static_cast<std::size_t>(b)] = down;
+    }
+    void set_gamepad_axis(GamepadAxis a, float value)
+    {
+        pad_axes_[static_cast<std::size_t>(a)] = value;
+    }
     void set_key(KeyCode key, bool down) { keys_[static_cast<std::size_t>(key)] = down; }
     void set_mouse_button(MouseButton button, bool down)
     {
@@ -205,6 +255,7 @@ public:
     {
         prev_keys_ = keys_;
         prev_buttons_ = buttons_;
+        prev_pad_buttons_ = pad_buttons_;
         mouse_delta_ = glm::vec2(0.0f);
         typed_text_.clear();
     }
@@ -220,7 +271,15 @@ private:
     glm::vec2 mouse_position_{ 0.0f };
     bool mouse_captured_ = false;
     bool capture_requested_ = true;   // start in game mode (mouse-look)
+    bool text_capture_ = false;       // brief 06: modal console open -> suppress InputMap actions
     std::string typed_text_;
+
+    static constexpr std::size_t PAD_BUTTONS = static_cast<std::size_t>(GamepadButton::COUNT);
+    static constexpr std::size_t PAD_AXES = static_cast<std::size_t>(GamepadAxis::COUNT);
+    std::array<bool, PAD_BUTTONS> pad_buttons_{};
+    std::array<bool, PAD_BUTTONS> prev_pad_buttons_{};
+    std::array<float, PAD_AXES> pad_axes_{};
+    bool gamepad_connected_ = false;
 };
 
 }

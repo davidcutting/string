@@ -1,5 +1,7 @@
 #include <string/application.hpp>
 #include <string/core/signals.hpp>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 namespace String {
@@ -7,7 +9,17 @@ namespace String {
 void Application::initialize(const ApplicationInfo& info, const RenderPlan& plan)
 {
     event_handler_.sink<WindowEvent>().connect<&Application::on_window_event>(*this);
-    window_ = std::make_shared<Window>(Window::Properties{.title = info.application_name, .extent = {800, 800}});
+    // STRING_WINDOW_SIZE=WxH overrides the initial window size — headless repro tooling: bugs can
+    // be resolution/timing dependent (window managers also resize real sessions at map time), so
+    // captures must be able to match a user's actual resolution, not just the 800x800 default.
+    View::Extent extent = { 800, 800 };
+    if (const char* ws = std::getenv("STRING_WINDOW_SIZE"))
+    {
+        unsigned w = 0, h = 0;
+        if (std::sscanf(ws, "%ux%u", &w, &h) == 2 && w >= 64 && h >= 64 && w <= 16384 && h <= 16384)
+            extent = { w, h };
+    }
+    window_ = std::make_shared<Window>(Window::Properties{.title = info.application_name, .extent = extent});
     init_signal_handling();
     renderer_ = std::make_unique<Renderer>(info, window_, plan);
 }

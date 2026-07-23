@@ -47,6 +47,29 @@
           mesonFlags = [ "-Dwsi=sdl" "-Dtests=true" ];
         });
 
+        # `nix flake check` also builds the sandbox with the asset-bake tests enabled and runs them
+        # (brief 04b). This proves the cook LIBRARY builds + its cooked-format round-trip and
+        # cook-twice-byte-identical determinism gates pass, and that the `.#cook` CLI compiles.
+        # Mirrors packages.demo's build inputs (sandbox pulls the engine in as a subproject) plus
+        # gtest for -Dtests=true.
+        checks.cook = self'.packages.demo.overrideAttrs (old: {
+          pname = "string-cook-tests";
+          doCheck = true;
+          buildInputs = old.buildInputs ++ [ pkgs.gtest ];
+          mesonFlags = old.mesonFlags ++ [ "-Dtests=true" ];
+        });
+
+        # `.#cook` (brief 04b M3): the offline asset-cook CLI. packages.demo installs the
+        # `string_cook` binary alongside the demo (same assetbake_lib), so the app just points at
+        # it. Usage: `nix run .#cook -- [--chunk N | --no-chunk] <file.gltf> ...` — cooks each
+        # source glTF to a `.c<budget>.cooked` blob next to it and maintains the `.cook_manifest`
+        # sidecar (incremental: fresh entries are skipped). This is the pre-cook path the engine's
+        # in-process-cook WARN hint tells the user to run.
+        apps.cook = {
+          type = "app";
+          program = "${self'.packages.demo}/bin/string_cook";
+        };
+
         # packages.default builds ONLY the engine library (String, as intended). Its meson
         # project is self-contained under string-engine/ (own meson.build, meson_options.txt,
         # and subprojects/). Off-nix the deps come from the meson wraps; here they come from
@@ -147,6 +170,19 @@
 
           meta.mainProgram = "string_demo";
         };
+
+        # packages.demo-tracy is packages.demo built with the Tracy profiler client compiled in
+        # (-Dstring-engine:tracy=true, which defines STRING_PROFILE and links the tracy wrap). The
+        # normal .#demo stays Tracy-free. Run with `nix run .#demo-tracy` then attach the Tracy
+        # viewer (`tracy` in the devShell / nixpkgs) — Connect to localhost, the client broadcasts
+        # on the LAN and streams zones live. Build/run: `nix run .#demo-tracy`.
+        packages.demo-tracy = self'.packages.demo.overrideAttrs (old: {
+          pname = "string-demo-tracy";
+          # The Tracy client comes from nixpkgs (CMake config Tracy::TracyClient); the engine's
+          # meson.build probes that before the (undownloadable-in-nix) wrap.
+          buildInputs = old.buildInputs ++ [ pkgs.tracy ];
+          mesonFlags = (old.mesonFlags or []) ++ [ "-Dstring-engine:tracy=true" ];
+        });
 
         # devShells.default describes the default shell with C++, cmake, boost,
         # and catch2

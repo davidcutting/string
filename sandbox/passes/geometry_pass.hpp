@@ -25,6 +25,7 @@
 #include "lighting_data.hpp"
 #include "meshlet_data.hpp"
 #include "meshlet_builder.hpp"
+#include "assetbake/scene_loader.hpp"
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -82,7 +83,9 @@ struct SkyPush
 
 // Push constant for the task/mesh meshlet draw path (matches Push in shaders/meshlet_mesh.slang;
 // std430 push-constant layout — offsets verified against %Push_std430 OpMemberDecorate). 240B; fits
-// RDNA3's 256B push budget. Two mat4 (view_proj + cull source), eight device addresses, then scalars.
+// RDNA3's 256B push budget. Two mat4 (view_proj + cull source), device addresses, then scalars.
+// Brief 04c (resolution b): the task shader reads its draw via SV_DrawIndex -> records[] (compacted
+// per-surviving-draw {draw_index, lod}), so this carries `records` (not the dead entry worklist).
 struct MeshletPush
 {
     glm::mat4 view_proj;         // 0
@@ -94,7 +97,7 @@ struct MeshletPush
     VkDeviceAddress draws;       // 160
     VkDeviceAddress scene;       // 168
     VkDeviceAddress stats;       // 176
-    VkDeviceAddress records;     // 184 (brief 03b: {draw_index, lod} per indirect draw, SV_DrawIndex)
+    VkDeviceAddress records;     // 184 (brief 04c: compacted {draw_index, lod} per indirect draw)
     glm::vec3 camera_pos;        // 192
     float _pad_cp;               // 204
     uint32_t debug_view;         // 208
@@ -102,14 +105,29 @@ struct MeshletPush
     uint32_t hiz_mips;           // 216
     uint32_t _pad_hiz;           // 220 (std430: uvec2 hiz_size is 8-aligned -> pad to 224)
     glm::uvec2 hiz_size;         // 224
+    uint32_t blend_pass;         // 232 (brief 04: 1 = transparency pass -> fragment returns base.a)
+    // Brief 04d two-phase occlusion. phase: 0 = single-pass (legacy, HiZ-off / transparency), 1 =
+    // phase-1 (render meshlets whose bit is SET — visible last frame; no HiZ), 2 = phase-2 (render
+    // the complement whose bit is CLEAR + HiZ-visible, and update bits). `bitfield` is the persistent
+    // per-meshlet visibility bitfield (1 bit per global meshlet). freeze_bits: 1 = do NOT mutate bits
+    // (freeze). The bit index is the meshlet's GLOBAL meshlet id (draw's lod meshlet_offset + local).
+    uint32_t phase;              // 236
+    VkDeviceAddress bitfield;    // 240 (8-aligned; persistent visibility bits)
+    uint32_t freeze_bits;        // 248
+    uint32_t _pad_end2;          // 252 (pad to 256)
 };
-static_assert(sizeof(MeshletPush) == 232);
 static_assert(offsetof(MeshletPush, records) == 184);
 static_assert(offsetof(MeshletPush, camera_pos) == 192);
 static_assert(offsetof(MeshletPush, debug_view) == 208);
 static_assert(offsetof(MeshletPush, hiz_size) == 224);
+static_assert(offsetof(MeshletPush, blend_pass) == 232);
+static_assert(offsetof(MeshletPush, phase) == 236);
+static_assert(offsetof(MeshletPush, bitfield) == 240);
+static_assert(offsetof(MeshletPush, freeze_bits) == 248);
+static_assert(sizeof(MeshletPush) == 256);
 
 // Push for the depth-only meshlet shadow path (matches Push in shaders/meshlet_shadow.slang).
+// Brief 04c (resolution b): reads its draw via SV_DrawIndex -> records[] (compacted per-cascade).
 struct MeshletShadowPush
 {
     glm::mat4 light_view_proj;   // 0
@@ -118,7 +136,7 @@ struct MeshletShadowPush
     VkDeviceAddress mverts;      // 80
     VkDeviceAddress mtris;       // 88
     VkDeviceAddress draws;       // 96
-    VkDeviceAddress records;     // 104 (brief 03b: {draw_index, lod} per indirect draw, SV_DrawIndex)
+    VkDeviceAddress records;     // 104 (brief 04c: compacted {draw_index, lod} per indirect draw)
     uint32_t _pad0;              // 112
     uint32_t _pad1;              // 116
 };
@@ -128,28 +146,66 @@ static_assert(sizeof(MeshletShadowPush) == 120);
 // Push for the GPU draw-cull compute (matches Push in shaders/meshlet_draw_cull.slang; std430).
 struct DrawCullPush
 {
-    glm::mat4 cull_view_proj;        // 0   draw-level frustum source (frozen-aware; C disables)
-    VkDeviceAddress draws;           // 64
-    VkDeviceAddress commands;        // 72  frustum-culled list (main pass / HiZ prepass)
-    VkDeviceAddress shadow_commands; // 80  resident-only list (cascades: casters may be off-camera)
-    VkDeviceAddress records;         // 88
-    VkDeviceAddress count;           // 96
-    VkDeviceAddress stats;           // 104
-    uint32_t draw_count;             // 112
-    uint32_t lod_enabled;            // 116
-    uint32_t frustum_cull;           // 120 (0 = C toggle off -> pass everything)
-    uint32_t stats_lod;              // 124 (1 = write the LOD histogram; camera pass only)
-    glm::vec3 camera_pos;            // 128 (16-aligned; frozen-aware — drives LOD select)
-    float lod_error_px;              // 140
-    float focal;                     // 144
-    uint32_t _pad0;                  // 148
-    uint32_t _pad1;                  // 152
-    uint32_t _pad2;                  // 156
+    glm::mat4 cull_view_proj;          // 0   draw-level frustum source (frozen-aware; C disables)
+    VkDeviceAddress draws;             // 64
+    VkDeviceAddress counts;            // 72  brief 04c: per-draw one-sided meshlet count
+    VkDeviceAddress counts_twosided;   // 80  brief 04c: per-draw two-sided meshlet count
+    VkDeviceAddress counts_shadow;     // 88  brief 04c: per-draw resident-only shadow count
+    VkDeviceAddress draw_lod;          // 96  brief 04c: per-draw selected LOD (shared by lists)
+    VkDeviceAddress stats;             // 104
+    uint32_t draw_count;               // 112
+    uint32_t lod_enabled;              // 116
+    uint32_t frustum_cull;             // 120 (0 = C toggle off -> pass everything)
+    uint32_t stats_lod;                // 124 (1 = write the LOD histogram; camera pass only)
+    glm::vec3 camera_pos;              // 128 (16-aligned; frozen-aware — drives LOD select)
+    float lod_error_px;                // 140
+    float focal;                       // 144
+    uint32_t shadow_mode;              // 148 (brief 04 M4: 1 -> draw-cull shadow list vs cascade sphere)
+    float shadow_radius;               // 152 (cascade bounding-sphere radius, world units)
+    uint32_t force_lod0;               // 156 (DEAD since brief 04d deleted the LOD0 HiZ prepass; always
+                                       //      written 0 — kept as a padding slot to preserve push offsets)
+    int32_t isolate_draw;              // 160 (brief 06: >=0 -> only this draw survives; -1 = off).
+                                       //     Repurposes a former pad slot, so all offsets/size hold.
+    uint32_t _pad3b;                   // 164
+    uint32_t _pad3c;                   // 168
+    uint32_t _pad3d;                   // 172
+    glm::vec3 shadow_center;           // 176 (cascade bounding-sphere centre, world; 16-aligned)
+    float _pad4;                       // 188
 };
 static_assert(offsetof(DrawCullPush, draws) == 64);
+static_assert(offsetof(DrawCullPush, counts_twosided) == 80);
+static_assert(offsetof(DrawCullPush, counts_shadow) == 88);
+static_assert(offsetof(DrawCullPush, draw_lod) == 96);
 static_assert(offsetof(DrawCullPush, camera_pos) == 128);
 static_assert(offsetof(DrawCullPush, lod_error_px) == 140);
-static_assert(sizeof(DrawCullPush) == 160);
+static_assert(offsetof(DrawCullPush, shadow_mode) == 148);
+static_assert(offsetof(DrawCullPush, force_lod0) == 156);
+static_assert(offsetof(DrawCullPush, shadow_center) == 176);
+static_assert(sizeof(DrawCullPush) == 192);
+
+// Push for the brief-04c compaction/expansion compute (matches Push in shaders/meshlet_expand.slang).
+// The scan compacts SURVIVING draws (counts[d] != 0) into a dense array of per-draw indirect commands
+// + parallel records, in ascending draw-index order, and writes the surviving-draw count.
+struct ExpandPush
+{
+    VkDeviceAddress counts;      // 0   in : per-draw meshlet count (stable slot d), 0 = culled
+    VkDeviceAddress offsets;     // 8   scratch: per-draw block-local compact index
+    VkDeviceAddress block_sums;  // 16  scratch: per-block surviving total -> block base
+    VkDeviceAddress draw_lod;    // 24  in : per-draw selected LOD (fill copies it into records[])
+    VkDeviceAddress commands;    // 32  out: dense VkDrawMeshTasksIndirectCommandEXT {ceil(mcount/32),1,1}
+    VkDeviceAddress records;     // 40  out: dense parallel {draw_index, lod}
+    VkDeviceAddress count;       // 48  out: surviving-draw count (indirect draw count)
+    uint32_t draw_count;         // 56
+    uint32_t block_count;        // 60  ceil(draw_count / kScanBlock)
+    uint32_t max_draws;          // 64  commands[]/records[] capacity (overflow guard)
+    uint32_t _pad;               // 68
+};
+static_assert(offsetof(ExpandPush, commands) == 32);
+static_assert(offsetof(ExpandPush, records) == 40);
+static_assert(offsetof(ExpandPush, count) == 48);
+static_assert(offsetof(ExpandPush, draw_count) == 56);
+static_assert(offsetof(ExpandPush, max_draws) == 64);
+static_assert(sizeof(ExpandPush) == 72);
 
 // Push for the HiZ pyramid downsample (matches Push in shaders/hiz_build.slang).
 struct HizPush
@@ -159,7 +215,7 @@ struct HizPush
     glm::uvec2 dst_size;
     glm::uvec2 src_size;
     uint32_t copy_depth;
-    uint32_t _pad;
+    uint32_t src_level;   // mip level of `src_slot` to sample (pyramid->pyramid: the level being reduced)
 };
 
 // Push for the per-frame stats reset (matches Push in shaders/meshlet_reset.slang).
@@ -185,7 +241,6 @@ class GeometryPass final : public String::Pass
     string::gpu::shader_program* froxel_program_ = nullptr;
 
     string::gpu::resource_id vertex_buffer_;
-    string::gpu::resource_id index_buffer_;
     uint32_t draw_count_ = 0;
     uint32_t frames_in_flight_ = 1;
 
@@ -227,6 +282,10 @@ class GeometryPass final : public String::Pass
     std::array<glm::mat4, kMaxCascades> cascade_view_proj_{};
     std::array<float, kMaxCascades> cascade_split_{};       // view-space far distance per cascade
     std::array<float, kMaxCascades> cascade_world_texel_{}; // world units per texel per cascade
+    // Brief 04 M4: each cascade's world-space bounding sphere (centre + depth-inflated radius) for the
+    // conservative draw-level shadow cull in the draw-cull compute.
+    std::array<glm::vec3, kMaxCascades> cascade_center_{};
+    std::array<float, kMaxCascades> cascade_cull_radius_{};
     // Time-of-day: an angle animated (or scrubbed) that drives sun_dir_ + the sky colours.
     float time_of_day_ = 0.30f;   // 0..1 across the day arc (0.30 ~= mid-morning)
     bool sun_animate_ = false;    // T toggles continuous time-of-day advance
@@ -321,6 +380,13 @@ class GeometryPass final : public String::Pass
     // Built at load from the flattened geometry: the GPU-side meshlet/vertex/triangle heaps + the
     // per-draw DrawInfo table. Metadata buffers are small and always resident; only the vertex/index
     // heaps stream (DrawInfo.resident is the streaming gate).
+    // Brief 04b spatial-chunking budget: draws whose LOD0 meshlet count exceeds this are split into
+    // tight-bounds chunks at COOK time (the loader selects the cooked variant baked with this budget).
+    // Brief 04c M4: chunking FINALIZED OFF by default (r.chunk.budget default 0) — under resolution
+    // (b)'s per-draw command boundaries the chunk fan-out is not free (measured +~1.8 ms interior).
+    // This constant is the CHUNKED variant's budget, used only when r.chunk.budget is set non-zero for
+    // A/B; kept here so the loader + cooked-file naming agree.
+    static constexpr uint32_t kChunkMaxMeshlets = 1024;
     MeshletModel meshlet_model_;
     string::gpu::resource_id meshlet_buffer_ = 0;      // GpuMeshlet[]
     string::gpu::resource_id meshlet_vertices_ = 0;    // uint[] global vertex remap
@@ -334,26 +400,65 @@ class GeometryPass final : public String::Pass
     GpuMeshStats stats_latest_{};                       // most recent, for the UI accessor
     // Mesh pipelines (hot-reloadable via the registry).
     string::gpu::shader_program* meshlet_program_ = nullptr;
+    string::gpu::shader_program* meshlet_twosided_program_ = nullptr;  // brief 04: CULL_NONE variant
+    string::gpu::shader_program* meshlet_transparent_program_ = nullptr; // brief 04: blend, no depth write
     string::gpu::shader_program* meshlet_shadow_program_ = nullptr;
     string::gpu::shader_program* hiz_program_ = nullptr;
     string::gpu::shader_program* reset_program_ = nullptr;
-    // Brief 03b: GPU draw-cull compute. One thread per draw appends an indirect mesh-task command +
-    // a {draw_index, lod} record to a per-frame work list the CPU issues with a single
-    // vkCmdDrawMeshTasksIndirectCountEXT (main pass + prepass + 3 shadow cascades).
+    // Brief 04c: two-phase GPU cull for the global meshlet worklists. (1) draw-cull compute writes each
+    // draw's surviving meshlet COUNT + selected LOD at a stable slot; (2) expand compute prefix-scans
+    // the counts (order-stable, no atomics) into a compacted {draw_index, meshlet_local} worklist +
+    // the indirect groupCount for a SINGLE vkCmdDrawMeshTasksIndirectEXT per list. Draw count no
+    // longer drives dispatch cost.
     string::gpu::shader_program* draw_cull_program_ = nullptr;
-    // Per-frame-in-flight work lists (the GPU may still read last frame's list). Each buffer packs:
-    // commands[max_draws] (VkDrawMeshTasksIndirectCommandEXT, 12B) at offset 0, records[max_draws]
-    // ({draw_index,lod}, 8B) at offset kRecordsOffset, then a single uint count at kCountOffset.
-    // Two lists per frame: the camera list (selected LOD; main pass + shadow cascades reuse it) and
-    // the prepass list (forced LOD0; the HiZ depth prepass draws the fullest silhouette).
-    std::vector<string::gpu::resource_id> cull_cmd_buffers_;         // camera list
-    std::vector<string::gpu::resource_id> cull_prepass_buffers_;     // LOD0 prepass list
+    string::gpu::shader_program* expand_scan_blocks_program_ = nullptr;
+    string::gpu::shader_program* expand_scan_carry_program_ = nullptr;
+    string::gpu::shader_program* expand_fill_program_ = nullptr;
+    // A worklist buffer packs, at 16B-aligned regions: counts[max_draws], offsets[max_draws],
+    // block_sums[max_blocks] (scan scratch), then the COMPACTED draw list — commands[max_draws]
+    // (12B VkDrawMeshTasksIndirectCommandEXT), records[max_draws] (8B {draw_index, lod}), and the
+    // surviving-draw count word (for vkCmdDrawMeshTasksIndirectCountEXT). One command per surviving
+    // draw (empty slots compacted out): removes the fan-out cost while keeping command ordering.
+    struct Worklist { string::gpu::resource_id buffer = 0; };
+    // Per-frame-in-flight (the GPU may still read last frame's list). Camera lists: opaque one-sided +
+    // two-sided (brief 04d: shared by phase 1 and phase 2; the task shader partitions per phase — the
+    // old forced-LOD0 depth-prepass lists are deleted along with the prepass itself).
+    std::vector<Worklist> wl_opaque_;
+    std::vector<Worklist> wl_twosided_;
+    // Brief 04 M4: one shadow worklist PER CASCADE per frame (resident-only; per-cascade light-sphere
+    // reject in the draw phase — off-camera casters that reach the cascade still cast in).
+    std::vector<std::array<Worklist, kMaxCascades>> wl_shadow_;
+    // Shared per-draw selected LOD (one per frame; every camera-derived list + shadows read it).
+    std::vector<string::gpu::resource_id> draw_lod_buffers_;
     uint32_t cull_max_draws_ = 0;
-    VkDeviceSize cull_shadow_cmds_offset_ = 0; // byte offset of the resident-only shadow_cmds[]
-    VkDeviceSize cull_records_offset_ = 0;   // byte offset of records[] within a work-list buffer
-    VkDeviceSize cull_count_offset_ = 0;     // byte offset of the count uint
-    // Dispatch the draw-cull compute for one work list (mode chooses LOD-forcing + histogram write).
-    void record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, bool prepass);
+    uint32_t cull_max_blocks_ = 0;      // ceil(max_draws / kScanBlock)
+    VkDeviceSize wl_offsets_off_ = 0;   // byte offset of offsets[] within a worklist buffer
+    VkDeviceSize wl_blocksums_off_ = 0; // byte offset of block_sums[]
+    VkDeviceSize wl_commands_off_ = 0;  // byte offset of the compacted indirect commands[] (12B each)
+    VkDeviceSize wl_records_off_ = 0;   // byte offset of the parallel records[] (8B each)
+    VkDeviceSize wl_count_off_ = 0;     // byte offset of the surviving-draw count word
+    // Draw phase for one camera frame (writes opaque+twosided counts + draw_lod), or a shadow cascade
+    // (cascade>=0: resident-only counts vs the cascade sphere).
+    void record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, int cascade = -1);
+    // Compaction phase for one worklist (scan + fill): compacts surviving draws into commands[]+records[]
+    // + count, ready for one vkCmdDrawMeshTasksIndirectCountEXT. `draw_lod` is the per-draw selected-LOD
+    // buffer the records[] inherit (camera-selected for camera+shadow lists, zeroed for the LOD0 prepass).
+    void record_expand(VkCommandBuffer cb, const Worklist& wl, VkDeviceAddress draw_lod);
+
+    // Brief 04 sorted transparency pass. BLEND draws are excluded from the opaque lists (GPU compute)
+    // and rendered here after opaque + sky: depth-tested vs opaque depth, NO depth write, alpha-blended,
+    // one CPU back-to-front-sorted COMPACTED per-draw command list (commands[] then records[] then
+    // count in a single host-visible buffer per frame — same shape as the GPU-compacted lists, so the
+    // same task/mesh consumer + vkCmdDrawMeshTasksIndirectCountEXT draws it). Draw-order (back-to-front)
+    // is preserved because the CPU writes commands/records in sorted order. Counts are small (no OIT).
+    std::vector<string::gpu::resource_id> transp_buffers_;   // per-frame host-visible {commands[], records[], count}
+    std::vector<uint32_t*> transp_mapped_;
+    VkDeviceSize transp_commands_off_ = 0;
+    VkDeviceSize transp_records_off_ = 0;
+    VkDeviceSize transp_count_off_ = 0;
+    std::vector<uint32_t> blend_draw_indices_;               // draw indices flagged BLEND (built at load)
+    uint32_t build_transparency_list(uint16_t current_frame);  // sorts + fills the list; returns count
+    void record_transparency(VkCommandBuffer cb, uint16_t current_frame, uint32_t count);
 
     // HiZ depth pyramid (R32F mip chain), one per frame in flight. Built each frame from the scene
     // depth via a MIN reduce (reverse-Z: min = farthest). Sampled by the pass-2 task shader.
@@ -365,16 +470,28 @@ class GeometryPass final : public String::Pass
         std::vector<uint32_t> mip_storage_slots;       // per-mip STORAGE_IMAGE bindless slots
         uint32_t mips = 0;
         glm::uvec2 size{ 0, 0 };
-        // Single-sample depth the pyramid's mip 0 reduces from. The renderer's shared depth target is
-        // 4x MSAA (can't be sampled with a plain Sampler2D), so the meshlet path renders its own
-        // single-sample depth-only camera prepass here each frame, then builds the pyramid from it.
+        // Single-sample depth the pyramid's mip 0 reduces from. The scene's shared depth target is
+        // 4x MSAA (can't be sampled with a plain Sampler2D), so brief 04d MIN-resolves the phase-1
+        // MSAA depth into this single-sample image (the renderer's depth-resolve target, filled at
+        // phase-1's EndRendering), and record_between() builds the pyramid from it.
         string::gpu::resource_id depth = 0;
-        uint32_t depth_slot = 0;                       // sampled slot of the prepass depth
+        uint32_t depth_slot = 0;                       // sampled slot of the min-resolved phase-1 depth
     };
     std::vector<HizPyramid> hiz_;
     VkSampler hiz_sampler_ = VK_NULL_HANDLE;
     uint32_t hiz_screen_w_ = 0, hiz_screen_h_ = 0;
     void ensure_hiz(uint16_t current_frame);
+
+    // Brief 06: address of the renderer's Tracy GPU context (from PassContext), for finer per-stage
+    // GPU zones inside record_compute/record. Null when the renderer exposes none; the zone macros
+    // are no-ops without -Dtracy regardless. Read live at record time (the ctx is created after the
+    // pass is built). Helper below turns the double-indirection into the value the macros want.
+    STRING_PROFILE_GPU_CONTEXT_TYPE* gpu_profiler_ctx_ = nullptr;
+    STRING_PROFILE_GPU_CONTEXT_TYPE gpu_ctx() const
+    {
+        STRING_PROFILE_GPU_CONTEXT_TYPE none{};
+        return gpu_profiler_ctx_ ? *gpu_profiler_ctx_ : none;
+    }
 
     // Runtime state.
     bool meshlet_readback_pending_ = false;  // STRING_MESHLET_READBACK: GPU-vs-CPU memcmp at frame 50
@@ -383,6 +500,14 @@ class GeometryPass final : public String::Pass
     int debug_view_ = 0;             // 0 none, 1 meshlet colour, 2 LOD colour, 3 occlusion reject (V cycles)
     bool mesh_cull_frozen_ = false;  // meshlet freeze-cull (F keybind)
     glm::mat4 mesh_frozen_view_proj_{ 1.0f };
+    // dbg.orbit motion lever: continuously sways the camera around a captured base pose so headless
+    // captures exercise per-frame disocclusion (the two-phase interleaved phase-1/phase-2 path).
+    // Base pose is latched on the first orbiting frame; the sway is applied AFTER camera_.update.
+    bool orbit_base_latched_ = false;
+    glm::vec3 orbit_base_pos_{ 0.0f };
+    float orbit_base_yaw_ = 0.0f;
+    float orbit_base_pitch_ = 0.0f;
+    float orbit_phase_ = 0.0f;       // accumulated angle (rad)
     // Freeze-cull must freeze EVERY camera-dependent cull input, not just the frustum planes:
     // cone culling + the HiZ nearest-point test + LOD select all use the eye position, and the
     // HiZ prepass/test use the view-projection. A partial freeze mixes frozen and live inputs
@@ -398,8 +523,29 @@ class GeometryPass final : public String::Pass
     uint32_t active_draw_count_ = 0; // base, or base + crowd when the crowd is on
     void build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_max);
     void build_meshlet_gpu(String::PassContext& context);
+    // Brief 04d: `phase` (0 legacy/transparency, 1 = bit-set only, 2 = bit-clear+HiZ+update) is pushed
+    // into MeshletPush so the task shader partitions the worklist's meshlets across the two phases.
     void record_meshlet_draws(VkCommandBuffer cb, const string::gpu::pipeline& p,
-                              uint16_t current_frame);
+                              uint16_t current_frame, const Worklist& wl, uint32_t phase = 0);
+
+    // --- Brief 04d two-phase occlusion state ---------------------------------------------------
+    // Persistent per-meshlet visibility bitfield (1 bit per GLOBAL meshlet id, ceil(total/32) words),
+    // device-local, zero-initialized on creation. NOT ring-buffered — the temporal visibility state
+    // must accumulate across frames. Phase 1 reads it; phase 2 sets/clears it (atomics). A cleared bit
+    // => the meshlet takes phase 2 for one frame (warmup = fallback = streaming/LOD-change path).
+    string::gpu::resource_id visbits_buffer_ = 0;
+    uint32_t visbits_words_ = 0;
+    // Per-draw LOD selected LAST frame (device-local, one word per draw). The draw-cull compute
+    // compares it to this frame's selected LOD; a switch clears that draw's bitfield range (its
+    // meshlets become "new" -> phase 2), because bits are keyed to the CURRENT LOD's meshlet ids.
+    string::gpu::resource_id prev_draw_lod_buffer_ = 0;
+    // True when the two-phase path is active this frame (HiZ enabled + warmup done). Gates
+    // breaks_scene_group(): when false the pass renders single-pass (phase 0) in one group.
+    bool two_phase_active_ = false;
+    // Records phase-1 or phase-2 opaque+two-sided draws into the (already-open) MSAA render pass.
+    void record_opaque_phase(VkCommandBuffer cb, uint16_t current_frame, uint32_t phase);
+    // Zeroes visbits_buffer_ + prev_draw_lod_buffer_ (teleport/first-frame/streaming full clear).
+    bool visbits_clear_pending_ = true;
 
     // Shared overlay state written each frame for the UI (stats + which path is active), so the UI
     // author (built separately in the RenderPlan) can display it without a direct pass pointer.
@@ -408,15 +554,32 @@ class GeometryPass final : public String::Pass
 public:
     // Latest GPU culling stats (read back one frame late) for the UI overlay.
     const GpuMeshStats& mesh_stats() const { return stats_latest_; }
-    // model_path is a .gltf/.glb resolved relative to context.resources_path. `overlay_stats` (may be
-    // null) receives the meshlet culling stats + path/HiZ/view flags each frame for the UI overlay.
-    GeometryPass(String::PassContext& context, const std::filesystem::path& model_path,
+    // model_paths are .gltf/.glb files resolved relative to context.resources_path, flattened and
+    // merged into one draw set (shared vertex/index/material/texture tables — the NewSponza packs
+    // overlay the same world space). `overlay_stats` (may be null) receives the meshlet culling
+    // stats + path/HiZ/view flags each frame for the UI overlay.
+    GeometryPass(String::PassContext& context, std::vector<std::filesystem::path> model_paths,
                  std::shared_ptr<MeshOverlayStats> overlay_stats = nullptr);
     virtual ~GeometryPass() override;
+
+    // Stable identity for tooling (Tracy zones, inspector). Brief 06. The renderer names the
+    // pass-level GPU/CPU zones from this; finer per-stage zones (draw-cull, HiZ, shadows, sky,
+    // transparency) are scoped inside record_compute/record via STRING_PROFILE_GPU_ZONE.
+    std::string_view debug_name() const override { return "geometry"; }
 
     virtual void update(float delta_time, uint16_t current_frame) override;
     virtual bool record_compute(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
     virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+
+    // Brief 04d two-phase occlusion. record() draws PHASE 1 (sky + last-frame-visible opaque, into the
+    // MSAA targets). The renderer then MIN-resolves the MSAA depth into hz.depth, calls record_between()
+    // to build the HiZ pyramid, and record_after_between() draws PHASE 2 (the disocclusion complement +
+    // transparency) into the reloaded MSAA targets. When HiZ is disabled the pass does NOT break the
+    // group: record() renders everything single-pass (phase 0) as before.
+    virtual bool breaks_scene_group() const override { return two_phase_active_; }
+    virtual string::gpu::resource_id depth_resolve_target(uint16_t current_frame) const override;
+    virtual void record_between(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+    virtual void record_after_between(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 };
 
 }  // namespace sandbox

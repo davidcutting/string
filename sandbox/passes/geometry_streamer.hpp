@@ -103,12 +103,24 @@ class GeometryStreamer final : public string::gpu::residency_provider
 {
 public:
     GeometryStreamer(string::gpu::resource_allocator& allocator, String::TransferBatch& transfer,
-                     string::gpu::resource_id vertex_buffer, string::gpu::resource_id index_buffer,
+                     string::gpu::resource_id vertex_buffer,
                      std::vector<String::Vertex> vertices, std::vector<std::uint32_t> indices,
-                     std::uint64_t vertex_capacity, std::uint64_t index_capacity,
+                     std::uint64_t vertex_capacity,
+                     std::uint32_t frames_in_flight);
+
+    // Cooked-scene ctor (brief 04b): no CPU index buffer exists (the cook consumed indices into
+    // meshlets); per-draw vertex windows come from set_windows() instead of an index scan.
+    GeometryStreamer(string::gpu::resource_allocator& allocator, String::TransferBatch& transfer,
+                     string::gpu::resource_id vertex_buffer,
+                     std::vector<String::Vertex> vertices,
+                     std::uint64_t vertex_capacity,
                      std::uint32_t frames_in_flight);
 
     void set_draws(const std::vector<GltfDraw>& draws);
+    // Cooked path: set per-draw vertex windows directly (offset = min global vertex, count = span).
+    // Equivalent to what set_draws() derives from indices, but baked at cook (no runtime index scan).
+    struct Window { std::uint32_t offset; std::uint32_t count; };
+    void set_windows(const std::vector<Window>& windows);
     std::size_t draw_count() const { return ranges_.size(); }
 
     // Reclaim ranges whose deferred-free window has elapsed (call once per frame before tick()).
@@ -139,18 +151,17 @@ private:
     {
         std::uint32_t vertex_offset = 0;  // min index (first vertex) in the source arrays
         std::uint32_t vertex_count = 0;
-        std::uint32_t index_offset = 0;   // first index in the source arrays
-        std::uint32_t index_count = 0;
+        std::uint32_t index_offset = 0;   // first index in the CPU source arrays (meshlet_builder read)
+        std::uint32_t index_count = 0;    // (CPU-only; the GPU index heap was removed in brief 04 M3)
     };
     struct Alloc
     {
         std::uint64_t vheap = 0;  // heap vertex offset (valid while resident)
-        std::uint64_t iheap = 0;  // heap index offset
         bool resident = false;
     };
     struct PendingFree
     {
-        std::uint64_t vheap, vcount, iheap, icount, safe_frame;
+        std::uint64_t vheap, vcount, safe_frame;
     };
 
 public:
@@ -161,13 +172,11 @@ private:
     string::gpu::resource_allocator& allocator_;
     String::TransferBatch& transfer_;
     string::gpu::resource_id vertex_buffer_;
-    string::gpu::resource_id index_buffer_;
     std::vector<String::Vertex> vertices_;
-    std::vector<std::uint32_t> indices_;
+    std::vector<std::uint32_t> indices_;  // CPU-side, kept for meshlet_builder (no GPU index heap)
     std::vector<DrawRange> ranges_;  // indexed by draw
     std::vector<Alloc> allocs_;      // indexed by draw
     HeapSuballocator vheap_;
-    HeapSuballocator iheap_;
     std::vector<PendingFree> pending_free_;
     std::uint32_t frames_in_flight_;
     std::uint64_t current_frame_ = 0;

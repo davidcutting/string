@@ -24,6 +24,7 @@ struct Push
     float2 screen_size;
     uint glyph_slot;
     uint atlas_slot;
+    uint first;   // base index of this sub-draw's range (the overlay layer draws a tail range)
 };
 [[vk::push_constant]]
 Push pc;
@@ -43,7 +44,7 @@ static const float2 corners[6] = {
 [shader("vertex")]
 VSOut vertex_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID)
 {
-    Glyph g = glyph_buffers[pc.glyph_slot][instance_id];
+    Glyph g = glyph_buffers[pc.glyph_slot][pc.first + instance_id];
 
     float2 corner = corners[vertex_id];
     float2 pixel = g.rect.xy + corner * g.rect.zw;

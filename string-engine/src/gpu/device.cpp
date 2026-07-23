@@ -290,6 +290,26 @@ void device::create_logical_device()
     };
     // clang-format on
 
+    // Optional (profiler-only) extension: VK_EXT_calibrated_timestamps lets the Tracy GPU context
+    // correlate host and device clocks. It is NOT in the hard-required device_extensions list — we
+    // probe for it and append only if the driver offers it, so a device without it still creates.
+    std::vector<const char*> enabled_extensions(device_extensions.begin(), device_extensions.end());
+    {
+        uint32_t ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &ext_count, nullptr);
+        std::vector<VkExtensionProperties> available(ext_count);
+        vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &ext_count, available.data());
+        for (const auto& ext : available)
+        {
+            if (std::string(ext.extensionName) == VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)
+            {
+                enabled_extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+                calibrated_timestamps_enabled_ = true;
+                break;
+            }
+        }
+    }
+
     // clang-format off
     VkDeviceCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -299,8 +319,8 @@ void device::create_logical_device()
         .pQueueCreateInfos = queueCreateInfos.data(),
         .enabledLayerCount = 0,
         .ppEnabledLayerNames = nullptr,
-        .enabledExtensionCount = static_cast<uint32_t>(device_extensions.size()),
-        .ppEnabledExtensionNames = device_extensions.data(),
+        .enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size()),
+        .ppEnabledExtensionNames = enabled_extensions.data(),
         .pEnabledFeatures = nullptr // Data is passed through pNext instead
     };
     // clang-format on

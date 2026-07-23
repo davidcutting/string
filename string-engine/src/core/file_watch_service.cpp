@@ -1,6 +1,7 @@
 #include <string/core/file_watch_service.hpp>
 
 #include <string/core/logger.hpp>
+#include <string/core/profiler.hpp>
 
 namespace string::core
 {
@@ -33,6 +34,7 @@ void file_watch_service::watch(const std::filesystem::path& path, callback cb)
 
 std::vector<std::size_t> file_watch_service::scan_for_changes()
 {
+    STRING_PROFILE_SCOPE("file watch scan")
     std::vector<std::size_t> changed;
     std::lock_guard<std::mutex> lock(mutex_);
     for (std::size_t i = 0; i < entries_.size(); ++i)

@@ -1,5 +1,9 @@
 #include <string/core/job_system.hpp>
 
+#include <string>
+
+#include <string/core/profiler.hpp>
+
 namespace string::core
 {
 
@@ -17,7 +21,10 @@ job_system::job_system(std::size_t thread_count)
     workers_.reserve(thread_count);
     for (std::size_t i = 0; i < thread_count; ++i)
     {
-        workers_.emplace_back([this]() {
+        workers_.emplace_back([this, i]() {
+            // Name the worker on the Tracy timeline (no-op without -Dtracy). Built once per thread.
+            const std::string thread_name = "job worker " + std::to_string(i);
+            STRING_PROFILE_THREAD(thread_name.c_str())
             for (;;)
             {
                 std::function<void()> task;
@@ -31,7 +38,10 @@ job_system::job_system(std::size_t thread_count)
                     task = std::move(tasks_.front());
                     tasks_.pop();
                 }
-                task();
+                {
+                    STRING_PROFILE_SCOPE("job execute")
+                    task();
+                }
             }
         });
     }

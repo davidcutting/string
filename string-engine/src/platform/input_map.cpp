@@ -34,6 +34,9 @@ void InputMap::clear(std::string_view action)
 
 bool InputMap::held(std::string_view action) const
 {
+    // Brief 06: a modal text surface (console) suppresses ALL gameplay actions routed through the
+    // map, so typing/toggling in the console never drives the camera or debug keys.
+    if (input_->text_capture()) return false;
     const auto it = buttons_.find(action);
     if (it == buttons_.end())
     {
@@ -48,6 +51,7 @@ bool InputMap::held(std::string_view action) const
 
 bool InputMap::pressed(std::string_view action) const
 {
+    if (input_->text_capture()) return false;
     const auto it = buttons_.find(action);
     if (it == buttons_.end())
     {
@@ -62,6 +66,7 @@ bool InputMap::pressed(std::string_view action) const
 
 bool InputMap::released(std::string_view action) const
 {
+    if (input_->text_capture()) return false;
     const auto it = buttons_.find(action);
     if (it == buttons_.end())
     {
@@ -76,6 +81,7 @@ bool InputMap::released(std::string_view action) const
 
 float InputMap::axis(std::string_view action) const
 {
+    if (input_->text_capture()) return 0.0f;
     const auto it = axes_.find(action);
     if (it == axes_.end())
     {

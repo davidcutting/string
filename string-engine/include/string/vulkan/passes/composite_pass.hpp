@@ -33,6 +33,7 @@ public:
     // (re-supplied on resize, when the target is re-created and re-bound).
     void set_source(VkDescriptorSet descriptor_set, uint32_t source_slot);
 
+    std::string_view debug_name() const override { return "composite"; }
     virtual void update(float delta_time, uint16_t current_frame) override;
     virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 };

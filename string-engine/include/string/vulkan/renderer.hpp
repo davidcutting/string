@@ -17,11 +17,13 @@
 #include <string/vulkan/pass_context.hpp>
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/vulkan/passes/composite_pass.hpp>
+#include <string/vulkan/gpu_profiler.hpp>
 #include <string/platform/input_map.hpp>
 #include <string/core/job_system.hpp>
 #include <string/core/file_watch_service.hpp>
 #include <string/gpu/shader_compiler.hpp>
 #include <string/gpu/shader_program_registry.hpp>
+#include <string/core/profiler.hpp>
 
 #include <volk.h>
 
@@ -100,11 +102,27 @@ class Renderer
     // agent/tool can inspect real output. 0 = disabled.
     uint64_t capture_frame_ = 0;
     std::string capture_path_;
-    void capture_color_target();
+    // Writes the resolved HDR target to `path` (PNG when it ends .png, else BMP). Used by the
+    // single-shot r.capture.frame and the r.capture.every_n sequence (with a numbered path).
+    void capture_color_target(const std::string& path);
+
+    // Tracy GPU profiling context on the graphics queue (calibrated when the device supports
+    // VK_EXT_calibrated_timestamps). Null / no-op when -Dtracy is off. Created after the frame
+    // ring is up (needs a command buffer to probe the timestamp period) and destroyed in the dtor.
+    STRING_PROFILE_GPU_CONTEXT_TYPE gpu_profiler_ctx_ = nullptr;
+    void init_gpu_profiler();
+
+    // Brief 06: always-on per-pass GPU timing (vkCmdWriteTimestamp2 pairs around each pass's
+    // record()/record_compute()). Independent of Tracy — feeds the in-game profiler HUD and the
+    // periodic [frametime] per-pass log line. Cheap; runs even when the HUD is off.
+    GpuProfiler gpu_timing_;
 public:
     Renderer(const ApplicationInfo& application_info, std::shared_ptr<Window> window,
              const RenderPlan& plan);
     ~Renderer();
+
+    // Read-only handle to the per-pass GPU timing so a HUD/tooling layer can render it.
+    const GpuProfiler& gpu_timing() const { return gpu_timing_; }
 
     void update();
 

@@ -49,21 +49,73 @@ mikktspace_lib = static_library(
 
 subdir('shaders')
 
+# Asset-bake library (brief 04b): the cook logic (meshletize + LOD chain + spatial chunking) +
+# cooked-scene format writer/reader + glTF front-end. Shared by the demo's in-process cook fallback,
+# the `.#cook` CLI, and the bake tests. Depends on meshopt (meshletize) + the engine (String::Vertex)
+# + the sandbox glTF loader (front-end). Built as its own static lib so the demo, CLI, and tests link
+# the SAME cook code (the procgen/server contract requires one bake implementation).
+assetbake_lib = static_library(
+    'assetbake',
+    [
+        'assetbake/bake.cpp',
+        'assetbake/bake_gltf.cpp',
+        'assetbake/cooked_io.cpp',
+        'assetbake/manifest.cpp',
+        'assetbake/scene_loader.cpp',
+        'gltf_loader.cpp',
+    ],
+    include_directories : sandbox_inc,
+    link_with : [ mikktspace_lib ],
+    dependencies : [ string_dep, meshopt_dep ],
+)
+
 executable(
     'string_demo',
     [
         'main.cpp',
+        'debug_cvars.cpp',
         'demo_scene.cpp',
-        'gltf_loader.cpp',
         'passes/grid_2d_pass.cpp',
         'passes/geometry_pass.cpp',
-        'passes/meshlet_builder.cpp',
         'passes/texture_streamer.cpp',
         'passes/geometry_streamer.cpp',
         'passes/ui_pass.cpp',
+        'passes/ui_background_pass.cpp',
+        'passes/debug_line_pass.cpp',
+        'ui/motion.cpp',
+        'ui/widgets.cpp',
+        'ui/screens.cpp',
+        'ui/debug_console.cpp',
+        'ui/debug_panels.cpp',
     ],
     include_directories : sandbox_inc,
-    link_with : [ mikktspace_lib ],
+    link_with : [ mikktspace_lib, assetbake_lib ],
     dependencies : [ string_dep, ktx_dep, meshopt_dep ],
     install : true,
 )
+
+# Thin CLI (brief 04b): cooks source glTFs to `.cooked` blobs + maintains the sidecar manifest.
+# The cook logic lives entirely in assetbake_lib; this is just an argv front-end. Installed so the
+# `.#cook` nix app can invoke it.
+executable(
+    'string_cook',
+    [ 'assetbake/cook_main.cpp' ],
+    include_directories : sandbox_inc,
+    link_with : [ mikktspace_lib, assetbake_lib ],
+    dependencies : [ string_dep, meshopt_dep ],
+    install : true,
+)
+
+if get_option('tests')
+    gtest_dep = dependency('gtest', main : true)
+    test('bake_tests',
+        executable(
+            'bake_tests',
+            [ 'assetbake/bake_test.cpp' ],
+            include_directories : sandbox_inc,
+            link_with : [ mikktspace_lib, assetbake_lib ],
+            dependencies : [ string_dep, meshopt_dep, gtest_dep ],
+            install : false,
+        )
+    )
+endif

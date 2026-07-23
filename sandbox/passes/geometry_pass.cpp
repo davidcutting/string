@@ -12,12 +12,15 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <string/core/cache_dir.hpp>
 #include <string/core/job_system.hpp>
 #include <string/core/logger.hpp>
 #include <string/gpu/command_recorder.hpp>
 #include "geometry_pass.hpp"
+#include "../debug_cvars.hpp"
 #include <glm/gtc/constants.hpp>
 #include <string/gpu/pipeline_builder.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
@@ -206,7 +209,7 @@ bool aabb_in_frustum(const glm::mat4& vp, const glm::vec3& mn, const glm::vec3& 
 
 }  // namespace
 
-GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& model_path,
+GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::path> model_paths,
                            std::shared_ptr<MeshOverlayStats> overlay_stats)
 : device_(context.device)
 , allocator_(context.allocator)
@@ -215,40 +218,143 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
 , frames_in_flight_(context.frames_in_flight)
 , residency_(kTextureBudget, kTextureStreamPerFrame)
 , overlay_stats_(std::move(overlay_stats))
+, gpu_profiler_ctx_(context.gpu_profiler_ctx)
 {
-    // Parse the glTF (fast: buffers + resolved texture sources + materials), then overlap the
-    // two expensive stages: texture decode runs on the worker pool while this thread flattens
-    // the geometry. Texture decode dominates load, so hiding the flatten (and the vertex/index
-    // upload) under it is effectively free.
+    // Brief 04b: load the COOKED scenes (bake library did the parse/flatten/MikkTSpace/meshletize
+    // offline). Per source glTF: read a fresh cooked file, or cook in-process via the library when
+    // missing/stale (WARN + CLI hint), then merge N cooked scenes into one draw set (vertex/index/
+    // material/texture/meshlet-heap rebasing). No fastgltf/MikkTSpace/meshopt runs here when the
+    // cooked files are present — this is the whole point of the brief.
     const auto load_start = std::chrono::steady_clock::now();
-    GltfParsed parsed = parse_gltf(context.resources_path / model_path);
+    // Brief 04b M4: chunking budget defaults to kChunkMaxMeshlets (on). STRING_CHUNK overrides it for
+    // A/B measurement (STRING_CHUNK=0 selects the unchunked .c0 cooked variant); the value also picks
+    // the .c<budget>.cooked file, so both variants must be pre-cooked.
+    // Brief 06: CVar-backed (r.chunk.budget; legacy STRING_CHUNK alias). Default = kChunkMaxMeshlets.
+    uint32_t chunk_budget = static_cast<uint32_t>(std::max(0, cv_chunk_budget().get()));
+    assetbake::LoadedScene loaded =
+        assetbake::load_cooked_scenes(context.resources_path, model_paths, chunk_budget);
 
-    // Kick off the uncooked (stb) texture decodes now, before flattening — they run on the pool
-    // while the main thread flattens geometry. Cooked .ktx2 textures are NOT touched here: their
-    // UASTC->BC7 transcode is deferred to the streamer's background workers on first use (it's the
-    // dominant cost), so at load they only get a header read + a placeholder slot.
-    string::core::job_system decode_pool;
-    std::vector<std::optional<std::filesystem::path>> ktx_paths(parsed.textures.size());
-    std::vector<std::future<DecodedTexture>> decode_jobs(parsed.textures.size());
-    for (std::size_t i = 0; i < parsed.textures.size(); ++i)
+    // Adopt the merged geometry-only tables into the runtime containers (the rest of the pass is
+    // unchanged: build_meshlet_gpu fills material/transform onto meshlet_model_.draws, the streamer
+    // takes the vertex heap + per-draw windows).
+    GltfGeometry geometry;
+    geometry.vertices = std::move(loaded.vertices);
+    // No CPU index buffer in the cooked path (indices were consumed at cook into meshlets).
+    geometry.draws = loaded.draws_meta;
+    materials_ = std::move(loaded.materials);
+    std::vector<GltfTexture> textures = std::move(loaded.textures);
+    meshlet_model_.meshlets = std::move(loaded.meshlets);
+    meshlet_model_.meshlet_vertices = std::move(loaded.meshlet_vertices);
+    meshlet_model_.meshlet_triangles = std::move(loaded.meshlet_triangles);
+    meshlet_model_.draws = std::move(loaded.draws);
+    meshlet_model_.total_meshlets = loaded.total_meshlets;
+    std::vector<GeometryStreamer::Window> draw_windows;
+    draw_windows.reserve(loaded.draw_windows.size());
+    for (const auto& w : loaded.draw_windows) draw_windows.push_back({ w.offset, w.count });
+
+    STRING_LOG_INFO("[load] cooked scenes: {} files ({} fresh, {} cooked in-process) in {:.1f} ms",
+                    model_paths.size(), loaded.cooked_hits, loaded.cooked_misses, loaded.load_ms);
+
+    // Brief 04 (STRING_TRANSP_TEST=1): inject a synthetic set of alpha-blended quads at STAGGERED
+    // depths + lateral offsets so the sorted transparency pass can be verified visually. The quads
+    // are baked through the SAME library (bake_scene over a tiny synthetic vertex/index/draw set),
+    // then merged into the loaded tables so meshlets/windows/DrawInfo all come from one path.
+    if (cv_transp_test().get())
     {
-        ktx_paths[i] = ktx_sibling(parsed.textures[i]);
-        if (!ktx_paths[i])
+        const int base_mat = static_cast<int>(materials_.size());
+        const uint32_t meshlet_base = static_cast<uint32_t>(meshlet_model_.meshlets.size());
+        const uint32_t mvert_base = static_cast<uint32_t>(meshlet_model_.meshlet_vertices.size());
+        const uint32_t mtri_base = static_cast<uint32_t>(meshlet_model_.meshlet_triangles.size());
+        const uint32_t vertex_base = static_cast<uint32_t>(geometry.vertices.size());
+
+        const glm::vec4 colors[5] = {
+            { 1.0f, 0.2f, 0.2f, 0.5f }, { 0.2f, 1.0f, 0.2f, 0.5f }, { 0.2f, 0.2f, 1.0f, 0.5f },
+            { 1.0f, 1.0f, 0.2f, 0.5f }, { 1.0f, 0.2f, 1.0f, 0.5f },
+        };
+        std::vector<String::Vertex> qv;
+        std::vector<uint32_t> qi;
+        std::vector<GltfDraw> qd;
+        for (int q = 0; q < 5; ++q)
         {
-            const GltfTexture* source = &parsed.textures[i];
-            decode_jobs[i] = decode_pool.enqueue([source]() { return decode_texture(*source); });
+            GltfMaterial m;
+            m.base_color_factor = colors[q];
+            m.alpha_mode = GltfAlphaMode::Blend;
+            m.double_sided = true;
+            materials_.push_back(m);
+
+            const float x = 6.0f - static_cast<float>(q) * 1.0f;
+            const float cy = 4.5f;
+            const float lateral = (static_cast<float>(q) - 2.0f) * 0.4f;
+            const float s = 1.6f;
+            const uint32_t v0 = static_cast<uint32_t>(qv.size());
+            const glm::vec3 nrm{ 1.0f, 0.0f, 0.0f };
+            const glm::vec3 col = glm::vec3(colors[q]);
+            const glm::vec3 corners[4] = {
+                { x, cy - s, lateral - s }, { x, cy - s, lateral + s },
+                { x, cy + s, lateral + s }, { x, cy + s, lateral - s },
+            };
+            for (const glm::vec3& c : corners)
+                qv.push_back(String::Vertex{ c, col, { 0.0f, 0.0f }, nrm, 0u });
+            const uint32_t idx0 = static_cast<uint32_t>(qi.size());
+            const uint32_t quad[6] = { v0, v0 + 1, v0 + 2, v0, v0 + 2, v0 + 3 };
+            for (uint32_t k : quad) qi.push_back(k);
+
+            GltfDraw d;
+            d.index_offset = idx0;
+            d.index_count = 6;
+            d.material = q;   // file-local; the merge below rebases by base_mat (as the loader does)
+            d.transform = glm::mat4(1.0f);
+            d.aabb_min = { x - 0.01f, cy - s, lateral - s };
+            d.aabb_max = { x + 0.01f, cy + s, lateral + s };
+            qd.push_back(d);
         }
+        // Bake the quads (chunking off) and merge into the loaded tables, rebasing meshlet heaps +
+        // vertex windows by the current bases.
+        assetbake::CookedScene qs = assetbake::bake_scene(qv, qi, qd, assetbake::BakeParams{});
+        geometry.vertices.insert(geometry.vertices.end(), qs.vertices.begin(), qs.vertices.end());
+        for (uint32_t v : qs.meshlet_vertices) meshlet_model_.meshlet_vertices.push_back(v + vertex_base);
+        meshlet_model_.meshlet_triangles.insert(meshlet_model_.meshlet_triangles.end(),
+                                                qs.meshlet_triangles.begin(), qs.meshlet_triangles.end());
+        for (GpuMeshlet ml : qs.meshlets)
+        {
+            ml.vertex_offset += mvert_base;
+            ml.triangle_offset += mtri_base;
+            meshlet_model_.meshlets.push_back(ml);
+        }
+        for (const assetbake::CookedDraw& cd : qs.draws)
+        {
+            GpuDrawInfo info{};
+            info.center = cd.center;
+            info.radius = cd.radius;
+            info.lod_count = cd.lod_count;
+            info.first_meshlet = cd.first_meshlet + meshlet_base;
+            info.total_meshlets = cd.total_meshlets;
+            for (uint32_t l = 0; l < kMaxLods; ++l)
+            {
+                info.lods[l] = cd.lods[l];
+                if (l < cd.lod_count) info.lods[l].meshlet_offset += meshlet_base;
+            }
+            meshlet_model_.draws.push_back(info);
+            draw_windows.push_back({ cd.vertex_count == 0 ? 0u : cd.vertex_offset + vertex_base,
+                                     cd.vertex_count });
+            GltfDraw meta;
+            meta.index_offset = cd.index_offset;
+            meta.index_count = cd.index_count;
+            meta.material = cd.material >= 0 ? cd.material + base_mat : -1;
+            meta.transform = cd.transform;
+            meta.aabb_min = cd.aabb_min;
+            meta.aabb_max = cd.aabb_max;
+            geometry.draws.push_back(meta);
+        }
+        meshlet_model_.total_meshlets = static_cast<uint32_t>(meshlet_model_.meshlets.size());
+        STRING_LOG_INFO("[brief04] STRING_TRANSP_TEST: injected 5 blended quads (baked)");
     }
 
-    // Flatten geometry on this thread (overlaps the decode jobs above). Non-const so its vertex /
-    // index arrays can be moved into the geometry streamer (which uploads them on demand).
-    GltfGeometry geometry = flatten_geometry(parsed);
-    materials_ = parsed.materials;
     draws_ = geometry.draws;
 
-    STRING_LOG_INFO("glTF loaded: {} vertices, {} indices, {} draws, {} materials, {} textures",
-                    geometry.vertices.size(), geometry.indices.size(), geometry.draws.size(),
-                    parsed.materials.size(), parsed.textures.size());
+    STRING_LOG_INFO("scene loaded: {} files, {} vertices, {} draws, {} materials, {} textures, {} meshlets",
+                    model_paths.size(), geometry.vertices.size(),
+                    geometry.draws.size(), materials_.size(), textures.size(), meshlet_model_.total_meshlets);
 
     // Heap capacities (in elements). The streamer suballocates a SEPARATE range per draw, so shared
     // vertices (instanced primitives) are duplicated — size to the sum of per-draw ranges, not the
@@ -256,25 +362,15 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     // caps below that to exercise reclaim (with pop-in / possible thrash when the visible set exceeds
     // the budget); 100 keeps everything resident (reclaim still happens for geometry left behind as
     // you look around, freeing ranges — visible in the [geo] logs — but no artifacts).
+    // Sum the per-draw vertex windows (the streamer suballocates one range per draw, so shared
+    // instanced vertices are duplicated — size to the window sum, not the deduplicated vertex count).
+    // Windows are baked at cook, so no runtime index scan is needed.
     uint64_t vertex_units = 0;
-    for (const GltfDraw& d : draws_)
-    {
-        if (d.index_count == 0) continue;
-        uint32_t vmin = std::numeric_limits<uint32_t>::max();
-        uint32_t vmax = 0;
-        for (uint32_t k = 0; k < d.index_count; ++k)
-        {
-            const uint32_t v = geometry.indices[d.index_offset + k];
-            vmin = std::min(vmin, v);
-            vmax = std::max(vmax, v);
-        }
-        vertex_units += (vmax - vmin + 1);
-    }
-    const uint64_t index_units = geometry.indices.size();  // indices aren't shared across draws
+    for (const GeometryStreamer::Window& w : draw_windows) vertex_units += w.count;
     const uint64_t vertex_capacity = std::max<uint64_t>(1, vertex_units * kGeometryResidentPercent / 100);
-    const uint64_t index_capacity = std::max<uint64_t>(1, index_units * kGeometryResidentPercent / 100);
-    const uint32_t vertex_size = static_cast<uint32_t>(sizeof(String::Vertex) * vertex_capacity);
-    const uint32_t index_size = static_cast<uint32_t>(sizeof(uint32_t) * index_capacity);
+    const VkDeviceSize vertex_size = VkDeviceSize(sizeof(String::Vertex)) * vertex_capacity;
+    // Brief 04 M3/04b: no GPU index heap AND no CPU index buffer — the task/mesh shaders pull vertices
+    // via the meshlet-vertex remap heap (baked at cook); the streamer uploads per-draw vertex windows.
 
     // Model AABB, computed now (before the geometry arrays are moved into the streamer below) for
     // framing the camera.
@@ -299,13 +395,6 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         .size = vertex_size,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-    });
-
-    index_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
-        .size = index_size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
     });
@@ -344,20 +433,36 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     descriptor_table_.bind(flat_normal_image_, string::gpu::descriptor_type::TEXTURE);
     flat_normal_slot_ = descriptor_table_.get_binding_slot(flat_normal_image_, string::gpu::descriptor_type::TEXTURE);
 
+    // Texture sources come from the cooked scenes (path + srgb). Cooked .ktx2 siblings register with
+    // the streamer; the rest decode via stb on a worker pool. (Textures are unchanged this brief; the
+    // cooked format just carries the paths, so the decode/upload path below is the same as before.)
+    string::core::job_system decode_pool;
+    std::vector<std::optional<std::filesystem::path>> ktx_paths(textures.size());
+    std::vector<std::future<DecodedTexture>> decode_jobs(textures.size());
+    for (std::size_t i = 0; i < textures.size(); ++i)
+    {
+        ktx_paths[i] = ktx_sibling(textures[i]);
+        if (!ktx_paths[i])
+        {
+            const GltfTexture* source = &textures[i];
+            decode_jobs[i] = decode_pool.enqueue([source]() { return decode_texture(*source); });
+        }
+    }
+
     // Collect textures: cooked KTX2 register with the streamer (BC7 image + placeholder slot now,
     // mips streamed in on demand from the coarse tail up); stb fallbacks upload whole here.
     texture_streamer_ = std::make_unique<TextureStreamer>(
         device_, allocator_, descriptor_table_, context.transfer, white.view, white.sampler);
-    texture_images_.resize(parsed.textures.size());
-    texture_slots_.resize(parsed.textures.size());
-    texture_lod_.resize(parsed.textures.size());
-    frame_desired_detail_.resize(parsed.textures.size(), 0);
-    for (std::size_t i = 0; i < parsed.textures.size(); ++i)
+    texture_images_.resize(textures.size());
+    texture_slots_.resize(textures.size());
+    texture_lod_.resize(textures.size());
+    frame_desired_detail_.resize(textures.size(), 0);
+    for (std::size_t i = 0; i < textures.size(); ++i)
     {
         if (ktx_paths[i])
         {
             const TextureStreamer::Registered reg =
-                texture_streamer_->add(*ktx_paths[i], parsed.textures[i].srgb);
+                texture_streamer_->add(*ktx_paths[i], textures[i].srgb);
             texture_images_[i] = reg.image;
             texture_slots_[i] = reg.slot;
             residency_.register_resource(reg.image, *texture_streamer_, reg.min_detail,
@@ -379,9 +484,9 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - load_start).count();
     STRING_LOG_INFO("[load] total ({} textures, {} decode workers): {} ms",
-                    parsed.textures.size(), decode_pool.worker_count(), load_ms);
+                    textures.size(), decode_pool.worker_count(), load_ms);
     STRING_LOG_INFO("[stream] {} of {} textures streamed (BC7, coarse tail first); rest stb",
-                    texture_streamer_->count(), parsed.textures.size());
+                    texture_streamer_->count(), textures.size());
     // The renderer drains the transfer batch (wait_idle) once after all passes are built; no
     // per-pass flush needed here.
 
@@ -389,32 +494,22 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     draw_count_ = static_cast<uint32_t>(draws_.size());
     if (draw_count_ > 0)
     {
-        // Brief 03: meshletize the model (per-draw LOD chain + meshlets) BEFORE the streamer takes
-        // the geometry arrays. Content-hash disk-cached. The GPU meshlet buffers are uploaded in
-        // build_meshlet_gpu() below; the DrawInfo table's material/transform fields are filled there
-        // too (the builder produces geometry-only draw records).
-        {
-            const std::filesystem::path meshlet_cache =
-                std::filesystem::temp_directory_path() / "string-meshlet-cache";
-            const uint64_t seed = std::hash<std::string>{}(model_path.string());
-            meshlet_model_ = build_meshlets(geometry.vertices, geometry.indices, draws_,
-                                            meshlet_cache, seed);
-            STRING_LOG_INFO("[meshlet] {} draws -> {} meshlets, {} vtx-remap, {} tri-words ({:.1f} ms, {})",
-                            meshlet_model_.draws.size(), meshlet_model_.total_meshlets,
-                            meshlet_model_.meshlet_vertices.size(), meshlet_model_.meshlet_triangles.size(),
-                            meshlet_model_.build_ms, meshlet_model_.from_cache ? "cache hit" : "built");
-        }
+        // Brief 04b: meshlets + LOD chain were baked offline (loaded above into meshlet_model_).
+        // The GPU meshlet buffers are uploaded in build_meshlet_gpu() below; the DrawInfo table's
+        // material/transform fields are filled there too (the cooked draws are geometry-only records).
+        STRING_LOG_INFO("[meshlet] {} draws -> {} meshlets, {} vtx-remap, {} tri-words (cooked)",
+                        meshlet_model_.draws.size(), meshlet_model_.total_meshlets,
+                        meshlet_model_.meshlet_vertices.size(), meshlet_model_.meshlet_triangles.size());
 
-        // Geometry streaming: hand the CPU geometry to the streamer (suballocates + uploads per-draw
-        // ranges on demand, frees on eviction) and register every draw with the geometry residency
-        // manager. The manager's byte budget matches the heap capacity so it evicts (reclaims) once
-        // the heaps are full. On residency the streamer flips the draw's DrawInfo gate (resident +
-        // vertex_offset), revealing it; on eviction it clears the resident flag.
+        // Geometry streaming: hand the shared vertex heap to the streamer (suballocates + uploads
+        // per-draw windows on demand, frees on eviction) and register every draw with the geometry
+        // residency manager. The manager's byte budget matches the heap capacity so it evicts once
+        // full. On residency the streamer flips the draw's DrawInfo gate (resident + vertex_offset).
+        // No CPU index buffer now (cooked path): windows come from the baked per-draw vertex ranges.
         geometry_streamer_ = std::make_unique<GeometryStreamer>(
-            allocator_, context.transfer, vertex_buffer_, index_buffer_,
-            std::move(geometry.vertices), std::move(geometry.indices),
-            vertex_capacity, index_capacity, frames_in_flight_);
-        geometry_streamer_->set_draws(draws_);
+            allocator_, context.transfer, vertex_buffer_,
+            std::move(geometry.vertices), vertex_capacity, frames_in_flight_);
+        geometry_streamer_->set_windows(draw_windows);
         geometry_streamer_->set_residency_callback(
             [this](std::uint32_t draw, std::uint32_t vertex_offset, std::uint32_t resident) {
                 // Streaming seam: DrawInfo.resident is the ONLY draw gate. vertex_offset (heap delta)
@@ -424,6 +519,12 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
                 {
                     draw_info_mapped_[draw].resident = resident;
                     draw_info_mapped_[draw].vertex_offset = vertex_offset;
+                    // Brief 04d: a residency change makes this draw's meshlets "new" — their persistent
+                    // visibility bits are stale. Flag a bitfield clear so every meshlet re-validates via
+                    // phase 2 next frame (a cleared bit is correct: one phase-2 frame, no popping). The
+                    // clear is a cheap fill of a small buffer; flagging (not clearing per-range here from
+                    // the CPU — the bitfield is device-local) keeps the streaming callback trivial.
+                    visbits_clear_pending_ = true;
                 }
             });
 
@@ -435,8 +536,9 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
         if (geometry_streaming_)
         {
             // Doesn't fit: register with the manager and stream per-frame by visibility (update()).
-            const VkDeviceSize geometry_budget = VkDeviceSize(vertex_capacity) * sizeof(String::Vertex)
-                                               + VkDeviceSize(index_capacity) * sizeof(uint32_t);
+            // Brief 04 M3: the budget is vertex-heap only now (the GPU index heap is gone), matching
+            // the streamer's vertex-only cost() so eviction decisions stay coherent with what's uploaded.
+            const VkDeviceSize geometry_budget = VkDeviceSize(vertex_capacity) * sizeof(String::Vertex);
             geometry_residency_ = std::make_unique<string::gpu::residency_manager>(
                 geometry_budget, kGeometryStreamPerFrame);
             for (std::uint32_t d = 0; d < draw_count_; ++d)
@@ -472,22 +574,24 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     input_map_.bind_button("toggle_lod", String::KeyCode::G);
     camera_.frame_bounds(aabb_min, aabb_max);
 
-    // Headless-debug env overrides (used with STRING_CAPTURE_FRAME for agent-driven A/B runs):
-    // STRING_HIZ=0, STRING_LOD=0, STRING_CULL=0, STRING_CAM="px,py,pz,yaw,pitch" (radians).
-    if (const char* p = std::getenv("STRING_HIZ"); p && p[0] == '0') hiz_enabled_ = false;
-    if (const char* p = std::getenv("STRING_LOD"); p && p[0] == '0') lod_enabled_ = false;
-    if (const char* p = std::getenv("STRING_CULL"); p && p[0] == '0') cull_enabled_ = false;
-    if (const char* p = std::getenv("STRING_LIGHTS"); p && p[0] == '0') lights_enabled_ = false;
-    if (const char* c = std::getenv("STRING_CAM"))
+    // Brief 06: the improvised STRING_* levers are now CVar-backed (legacy env names kept as aliases,
+    // see debug_cvars.*). Seed the runtime-mutable toggles from the CVars; the F/C/O/L/V/G/K keys
+    // still flip the members live in update(). Recipes like STRING_HIZ=0 / STRING_CAM=... work verbatim.
+    hiz_enabled_ = cv_hiz_enabled().get();
+    lod_enabled_ = cv_lod_enabled().get();
+    cull_enabled_ = cv_cull_enabled().get();
+    lights_enabled_ = cv_lights_enabled().get();
+    debug_view_ = cv_debug_view().get();
+    // STRING_CAM="px,py,pz,yaw,pitch" (radians); empty CVar = keep the scene-framed default pose.
+    if (const std::string cam = cv_camera_pose().get(); !cam.empty())
     {
         glm::vec3 pos{}; float yaw = 0.0f, pitch = 0.0f;
-        if (std::sscanf(c, "%f,%f,%f,%f,%f", &pos.x, &pos.y, &pos.z, &yaw, &pitch) == 5)
+        if (std::sscanf(cam.c_str(), "%f,%f,%f,%f,%f", &pos.x, &pos.y, &pos.z, &yaw, &pitch) == 5)
             camera_.set_pose(pos, yaw, pitch);
     }
-    if (const char* p = std::getenv("STRING_VIEW")) debug_view_ = std::atoi(p);
-    // STRING_CROWD=1 triggers the K-toggle crowd stress path at first update (headless benchmark).
-    // The build is deferred to update() (needs residency known); update()'s lazy-build handles it.
-    if (const char* p = std::getenv("STRING_CROWD"); p && p[0] == '1') crowd_enabled_ = true;
+    // r.crowd.enabled (STRING_CROWD) triggers the K-toggle crowd stress path at first update
+    // (headless benchmark). The build is deferred to update() (needs residency known).
+    crowd_enabled_ = cv_crowd_enabled().get();
     // (STRING_DRAW_MIN/MAX bisection removed with brief 03b: draws are now GPU-generated into one
     //  indirect list, so a CPU draw-index window no longer maps to the dispatch loop.)
 
@@ -496,9 +600,12 @@ GeometryPass::GeometryPass(PassContext& context, const std::filesystem::path& mo
     // graph-tracked and don't need declaring here.
     usages = {
         { vertex_buffer_,       Access::VertexRead,  VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT },
-        { index_buffer_,        Access::IndexRead,   VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT },
         { context.color_target, Access::ColorWrite,  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
-        { context.depth_target, Access::DepthWrite,  VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT },
+        // EARLY|LATE: the MSAA depth STORE (brief 04d two-phase chain: phase-1 group stores depth for
+        // phase-2 to reload) completes at LATE_FRAGMENT_TESTS, so the tracker must record that stage —
+        // else the phase-2 group's reload transition's src scope misses it (sync-validation WAW).
+        { context.depth_target, Access::DepthWrite,
+          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT },
     };
     // The indirect buffer's DRAW_INDIRECT read is covered by the transfer batch's global barrier
     // (like the static textures); once buffer state is graph-tracked it can be declared here too.
@@ -687,13 +794,13 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
 
     // Debug (STRING_MESHLET_READBACK=1): after the transfer batch drains, read each buffer back and
     // memcmp against the CPU arrays — catches upload corruption that CPU-side validation can't see.
-    if (const char* env = std::getenv("STRING_MESHLET_READBACK"); env && env[0] == '1')
+    if (cv_meshlet_readback().get())
     {
         meshlet_readback_pending_ = true;
     }
-    if (const char* env = std::getenv("STRING_MESHLET_DUMP"))
+    if (const int32_t dump_start = cv_meshlet_dump().get(); dump_start >= 0)
     {
-        const uint32_t d0 = uint32_t(std::atoi(env));
+        const uint32_t d0 = uint32_t(dump_start);
         for (uint32_t d = d0; d < std::min<uint32_t>(d0 + 6, uint32_t(meshlet_model_.draws.size())); ++d)
         {
             // Compare the CPU model against what the GPU actually reads (mapped DrawInfo).
@@ -730,6 +837,8 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
         info.model = draw.transform;
         info.resident = 0;       // flipped on residency (up-front loop / streaming)
         info.skinned = 0;        // Phase B reserves this (bounds inflation + cone-cull bypass)
+        info.flags = 0;
+        info.alpha_cutoff = 0.5f;
         if (draw.material >= 0)
         {
             const GltfMaterial& m = materials_[draw.material];
@@ -740,6 +849,12 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
             info.metallic = m.metallic_factor;
             info.roughness = m.roughness_factor;
             info.occlusion_slot = m.occlusion_texture >= 0 ? texture_slots_[m.occlusion_texture] : white_slot_;
+            // Brief 04: MASK => alpha-tested cutout; BLEND => routed to the sorted transparency pass
+            // (excluded from the opaque lists); doubleSided => two-sided (bypass cull both places).
+            if (m.alpha_mode == GltfAlphaMode::Mask)  info.flags |= kDrawFlagCutout;
+            if (m.alpha_mode == GltfAlphaMode::Blend) info.flags |= kDrawFlagBlend;
+            if (m.double_sided)                       info.flags |= kDrawFlagDoubleSided;
+            info.alpha_cutoff = m.alpha_cutoff;
         }
         else
         {
@@ -751,6 +866,7 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
             info.roughness = 1.0f;
             info.occlusion_slot = white_slot_;
         }
+        if (info.flags & kDrawFlagBlend) blend_draw_indices_.push_back(static_cast<uint32_t>(i));
     }
 
     // Size the DrawInfo table for base + the full crowd grid (extra copies referencing the same
@@ -782,31 +898,97 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
         });
     }
 
-    // --- Brief 03b: GPU draw-cull work lists (per frame in flight). Each buffer packs commands[]
-    // (12B stride), then records[] (8B), then a count uint. records[] aligned to 16B for a clean
-    // device-address SSBO base. INDIRECT_BUFFER usage lets the driver read commands[] + count.
+    // --- Brief 04c (resolution b): GPU meshlet worklist buffers (per frame in flight). Each worklist
+    // packs, at 16B-aligned regions: counts[max_draws] (uint), offsets[max_draws] (uint, scratch),
+    // block_sums[max_blocks] (uint, scratch), commands[max_draws] (12B VkDrawMeshTasksIndirectCommandEXT),
+    // records[max_draws] (8B {draw_index, lod}), then the surviving-draw count word. The draw phase
+    // writes counts (+ the shared draw_lod buffer); the compaction phase scans the survival predicate
+    // and fills the DENSE commands[]+records[]+count in ascending draw order; one
+    // vkCmdDrawMeshTasksIndirectCountEXT consumes it (command ordering pins coplanar winners).
     cull_max_draws_ = max_draws;
-    const VkDeviceSize cmd_bytes = VkDeviceSize(sizeof(uint32_t) * 3) * max_draws;   // 12B/cmd
-    cull_shadow_cmds_offset_ = (cmd_bytes + 15) & ~VkDeviceSize(15);
-    cull_records_offset_ = (cull_shadow_cmds_offset_ + cmd_bytes + 15) & ~VkDeviceSize(15);
-    const VkDeviceSize rec_bytes = VkDeviceSize(sizeof(uint32_t) * 2) * max_draws;   // 8B/record
-    cull_count_offset_ = (cull_records_offset_ + rec_bytes + 15) & ~VkDeviceSize(15);
-    const VkDeviceSize worklist_size = cull_count_offset_ + 16;
-    cull_cmd_buffers_.resize(frames_in_flight_);
-    cull_prepass_buffers_.resize(frames_in_flight_);
+    cull_max_blocks_ = (max_draws + kScanBlock - 1) / kScanBlock;
+
+    const VkDeviceSize u32 = sizeof(uint32_t);
+    const auto align16 = [](VkDeviceSize v) { return (v + 15) & ~VkDeviceSize(15); };
+    const VkDeviceSize counts_bytes    = u32 * max_draws;
+    const VkDeviceSize offsets_bytes   = u32 * max_draws;
+    const VkDeviceSize blocksums_bytes = u32 * cull_max_blocks_;
+    const VkDeviceSize commands_bytes  = VkDeviceSize(sizeof(uint32_t) * 3) * max_draws;   // 12B/cmd
+    const VkDeviceSize records_bytes   = VkDeviceSize(sizeof(uint32_t) * 2) * max_draws;   // 8B/record
+    wl_offsets_off_   = align16(counts_bytes);
+    wl_blocksums_off_ = align16(wl_offsets_off_ + offsets_bytes);
+    wl_commands_off_  = align16(wl_blocksums_off_ + blocksums_bytes);
+    wl_records_off_   = align16(wl_commands_off_ + commands_bytes);
+    wl_count_off_     = align16(wl_records_off_ + records_bytes);
+    const VkDeviceSize worklist_size = wl_count_off_ + 16;   // count word (16B-padded)
+
+    const auto make_worklist = [&]() -> Worklist {
+        return Worklist{ allocator_.create_resource(string::gpu::buffer_info{
+            .size = worklist_size,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                   | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+            .allocation_flags = {},
+        }) };
+    };
+    wl_opaque_.resize(frames_in_flight_);
+    wl_twosided_.resize(frames_in_flight_);
+    wl_shadow_.resize(frames_in_flight_);
+    draw_lod_buffers_.resize(frames_in_flight_);
     for (uint32_t f = 0; f < frames_in_flight_; ++f)
     {
-        const auto make_worklist = [&]() {
-            return allocator_.create_resource(string::gpu::buffer_info{
-                .size = worklist_size,
-                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                       | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-                .allocation_flags = {},
-            });
-        };
-        cull_cmd_buffers_[f] = make_worklist();
-        cull_prepass_buffers_[f] = make_worklist();
+        wl_opaque_[f] = make_worklist();
+        wl_twosided_[f] = make_worklist();
+        for (uint32_t c = 0; c < kMaxCascades; ++c) wl_shadow_[f][c] = make_worklist();
+        draw_lod_buffers_[f] = allocator_.create_resource(string::gpu::buffer_info{
+            .size = u32 * max_draws,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+            .allocation_flags = {},
+        });
+    }
+
+    // Brief 04d: persistent per-meshlet visibility bitfield (1 bit per GLOBAL meshlet id). Sized to
+    // total meshlet capacity, zero-initialized (a cleared bit -> that meshlet takes phase 2 for one
+    // frame — the correct warmup/fallback/streaming-change behaviour). Device-local, NOT ring-buffered:
+    // the temporal state accumulates across frames. TRANSFER_DST for the vkCmdFillBuffer clears.
+    visbits_words_ = (meshlet_model_.total_meshlets + 31u) / 32u;
+    visbits_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
+        .size = VkDeviceSize(u32) * std::max(1u, visbits_words_),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+               | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    });
+    // Per-draw LOD selected LAST frame (for the LOD-switch bit invalidation). Zeroed at first clear.
+    prev_draw_lod_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
+        .size = u32 * max_draws,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+               | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    });
+
+    // Brief 04c transparency list: host-visible (CPU sorts + fills each frame) in the SAME compacted
+    // per-draw shape the task shader consumes — commands[] (12B) @0, records[] (8B), then the count
+    // word. Draws written back-to-front (CPU sort preserved), one command+record per surviving draw.
+    transp_commands_off_ = 0;
+    transp_records_off_  = align16(VkDeviceSize(sizeof(uint32_t) * 3) * max_draws);
+    transp_count_off_    = align16(transp_records_off_ + VkDeviceSize(sizeof(uint32_t) * 2) * max_draws);
+    const VkDeviceSize transp_size = transp_count_off_ + 16;
+    transp_buffers_.resize(frames_in_flight_);
+    transp_mapped_.resize(frames_in_flight_);
+    for (uint32_t f = 0; f < frames_in_flight_; ++f)
+    {
+        transp_buffers_[f] = allocator_.create_resource(string::gpu::buffer_info{
+            .size = transp_size,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                   | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+            .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        });
+        transp_mapped_[f] = static_cast<uint32_t*>(
+            allocator_.get_buffer(transp_buffers_[f]).allocation_info.pMappedData);
     }
 
     // --- Pipelines (all through the hot-reload registry) ---
@@ -815,9 +997,14 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
 
     // Task/mesh/fragment lit meshlet pipeline. Same fixed state as the lit vertex pipeline (back-face
     // cull, CCW, MSAA, reverse-Z depth, alpha blend), but built via build_mesh_pipeline (no VI state).
-    meshlet_program_ = context.shader_registry.create(
-        context.resources_path / "shaders" / "meshlet_mesh.slang",
-        [layout, samples](string::gpu::device& dev, const string::gpu::compiled_program& compiled) {
+    // Brief 04: three variants off the same source differ only in fixed state:
+    //   - one-sided opaque: CULL_BACK, depth write ON;
+    //   - two-sided opaque: CULL_NONE, depth write ON;
+    //   - transparency:     CULL_NONE, depth TEST vs opaque depth but NO write (sorted back-to-front
+    //     on the CPU, so the blend order is correct without depth writes). blend_pass push flag makes
+    //     the fragment output base-color alpha.
+    const auto make_lit = [layout, samples](VkCullModeFlags cull_mode, bool depth_write) {
+        return [layout, samples, cull_mode, depth_write](string::gpu::device& dev, const string::gpu::compiled_program& compiled) {
             string::gpu::pipeline p{};
             p.push_constants = compiled.layout.push_constant;
             p.pipeline_layout = string::gpu::pipeline_layout_builder()
@@ -835,14 +1022,21 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
                     builder.add_fragment_shader_spirv(stage.spirv, stage.entry_point);
             }
             p.pipeline = builder
-                .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .set_rasterization(VK_POLYGON_MODE_FILL, cull_mode, VK_FRONT_FACE_COUNTER_CLOCKWISE)
                 .set_multisampling(samples)
-                .enable_depth_stencil()
+                .enable_depth_stencil(/*depth_test*/ true, depth_write, VK_COMPARE_OP_GREATER_OR_EQUAL)
                 .enable_color_blending()
                 .build_mesh_pipeline(p.pipeline_layout);
             p.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
             return p;
-        });
+        };
+    };
+    meshlet_program_ = context.shader_registry.create(
+        context.resources_path / "shaders" / "meshlet_mesh.slang", make_lit(VK_CULL_MODE_BACK_BIT, /*depth_write*/ true));
+    meshlet_twosided_program_ = context.shader_registry.create(
+        context.resources_path / "shaders" / "meshlet_mesh.slang", make_lit(VK_CULL_MODE_NONE, /*depth_write*/ true));
+    meshlet_transparent_program_ = context.shader_registry.create(
+        context.resources_path / "shaders" / "meshlet_mesh.slang", make_lit(VK_CULL_MODE_NONE, /*depth_write*/ false));
 
     // Depth-only meshlet shadow pipeline (no cull; depth bias handles acne, off-frustum casters kept).
     meshlet_shadow_program_ = context.shader_registry.create(
@@ -861,6 +1055,8 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
                     builder.add_task_shader_spirv(stage.spirv, stage.entry_point);
                 else if (stage.stage == VK_SHADER_STAGE_MESH_BIT_EXT)
                     builder.add_mesh_shader_spirv(stage.spirv, stage.entry_point);
+                else if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                    builder.add_fragment_shader_spirv(stage.spirv, stage.entry_point);  // brief 04: cutout clip()
             }
             p.pipeline = builder
                 .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
@@ -892,9 +1088,33 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
                 return p;
             });
     };
+    // Brief 04c: the expansion shader has three compute entry points (scan_blocks / scan_carry /
+    // fill). Select one by name so each becomes its own pipeline through the same hot-reload registry.
+    auto make_compute_entry = [&](const char* file, const char* entry) {
+        return context.shader_registry.create(
+            context.resources_path / "shaders" / file,
+            [layout, entry](string::gpu::device& dev, const string::gpu::compiled_program& compiled) {
+                string::gpu::pipeline p{};
+                p.push_constants = compiled.layout.push_constant;
+                p.pipeline_layout = string::gpu::pipeline_layout_builder()
+                    .set_descriptor_set_layout({ layout })
+                    .set_push_constant_ranges({ compiled.layout.push_constant })
+                    .build(dev);
+                string::gpu::pipeline_builder builder(dev, string::gpu::pipeline_type::COMPUTE);
+                for (const auto& stage : compiled.stages)
+                    if (stage.stage == VK_SHADER_STAGE_COMPUTE_BIT && stage.entry_point == entry)
+                        builder.add_compute_shader_spirv(stage.spirv, stage.entry_point);
+                p.pipeline = builder.build_compute_pipeline(p.pipeline_layout);
+                p.pipeline_type = string::gpu::pipeline_type::COMPUTE;
+                return p;
+            });
+    };
     hiz_program_ = make_compute("hiz_build.slang");
     reset_program_ = make_compute("meshlet_reset.slang");
     draw_cull_program_ = make_compute("meshlet_draw_cull.slang");
+    expand_scan_blocks_program_ = make_compute_entry("meshlet_expand.slang", "scan_blocks");
+    expand_scan_carry_program_ = make_compute_entry("meshlet_expand.slang", "scan_carry");
+    expand_fill_program_ = make_compute_entry("meshlet_expand.slang", "fill");
 
     // HiZ sampler: nearest + clamp (min-reduced pyramid; we sample explicit mips).
     const VkSamplerCreateInfo hiz_sampler_info = {
@@ -1055,44 +1275,131 @@ void GeometryPass::ensure_hiz(uint16_t current_frame)
 // the camera list (prepass=false) selects LODs and writes the histogram, and is reused by the main
 // pass + all 3 shadow cascades. The list buffer's count is zeroed here, then the compute appends.
 // Leaves a barrier making commands[]/records[]/count visible to DRAW_INDIRECT + task-shader reads.
-void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, bool prepass)
+void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, int cascade)
 {
-    const string::gpu::resource_id list = prepass ? cull_prepass_buffers_[current_frame]
-                                                   : cull_cmd_buffers_[current_frame];
-    const VkDeviceAddress base = allocator_.get_buffer(list).device_address;
+    // Brief 04c DRAW PHASE. cascade < 0: camera — writes the opaque + two-sided per-draw meshlet
+    // counts (into wl_opaque/wl_twosided counts@0) + the shared draw_lod. cascade >= 0: that
+    // cascade's shadow list — writes counts_shadow into wl_shadow[c] counts@0, rejecting whole draws
+    // outside the CASCADE's light sphere (never the camera frustum). (Brief 04d deleted the old
+    // depth-only HiZ camera prepass, so there is no forced-LOD0 prepass variant here anymore.)
+    const bool shadow = cascade >= 0;
+    const VkDeviceAddress opaque_base =
+        allocator_.get_buffer(wl_opaque_[current_frame].buffer).device_address;
+    const VkDeviceAddress twosided_base =
+        allocator_.get_buffer(wl_twosided_[current_frame].buffer).device_address;
+    const VkDeviceAddress shadow_base =
+        shadow ? allocator_.get_buffer(wl_shadow_[current_frame][cascade].buffer).device_address : 0;
 
-    // No count pre-clear needed: the compute writes commands[]/records[] at a stable slot per draw
-    // (== draw index) and the last thread publishes count = active_draw_count_ (skipped draws get a
-    // groupCountX=0 command). This keeps the submission order identical to the old per-draw loop.
-    float lod_error_px = 0.02f;
-    if (const char* t = std::getenv("STRING_LOD_PX")) lod_error_px = float(std::atof(t));
+    const float lod_error_px = cv_lod_error_px().get();   // CVar r.lod.error_px (STRING_LOD_PX alias)
     const float half_h = screen_size.height * 0.5f;
     const float focal = half_h / std::tan(glm::radians(camera_.fov_degrees() * 0.5f));
 
     const string::gpu::pipeline& cp = draw_cull_program_->current();
     DrawCullPush cull{};
-    // Freeze-aware inputs: when F is held, EVERY camera-derived cull input comes from the frozen
-    // pose (frustum planes, LOD eye) so flying the free camera reveals exactly what the frozen
-    // camera would draw — no mixed live/frozen artifacts.
+    // Freeze-aware inputs: when F is held EVERY camera-derived cull input comes from the frozen pose.
     cull.cull_view_proj = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : camera_.view_proj();
     cull.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
-    cull.commands = base;
-    cull.shadow_commands = base + cull_shadow_cmds_offset_;
-    cull.records = base + cull_records_offset_;
-    cull.count = base + cull_count_offset_;
+    if (shadow)
+    {
+        // Shadow only consumes counts_shadow (counts@0 of wl_shadow[c]); the opaque/two-sided writes
+        // land in this same buffer's scratch regions (overwritten by its own expand before use).
+        cull.counts_shadow    = shadow_base;                       // counts@0
+        cull.counts           = shadow_base + wl_offsets_off_;     // throwaway (expand recomputes)
+        cull.counts_twosided  = shadow_base + wl_blocksums_off_;   // throwaway
+    }
+    else
+    {
+        cull.counts          = opaque_base;      // counts@0 of the opaque worklist
+        cull.counts_twosided = twosided_base;    // counts@0 of the two-sided worklist
+        cull.counts_shadow   = opaque_base + wl_offsets_off_;   // throwaway (camera pass ignores it)
+    }
+    // Only the CAMERA opaque/two-sided pass writes the shared camera-selected draw_lod (the main pass +
+    // shadow compaction records read it). The shadow passes must NOT re-write it — a redundant second
+    // writer creates a write-after-write hazard on the shared buffer for no benefit (shadow compaction
+    // reuses the camera draw_lod). Shadow writes its throwaway per-draw LODs into a scratch region (the
+    // commands[] area, overwritten by its own fill before use) instead.
+    cull.draw_lod = shadow
+        ? shadow_base + wl_commands_off_   // shadow throwaway -> commands (fill overwrites)
+        : allocator_.get_buffer(draw_lod_buffers_[current_frame]).device_address;
     cull.stats = allocator_.get_buffer(stats_buffers_[current_frame]).device_address;
     cull.draw_count = active_draw_count_;
-    cull.lod_enabled = (!prepass && lod_enabled_) ? 1u : 0u;   // prepass forces LOD0
-    cull.frustum_cull = cull_enabled_ ? 1u : 0u;               // C toggle disables draw-level cull
+    cull.lod_enabled = lod_enabled_ ? 1u : 0u;
+    cull.force_lod0 = 0u;                                       // (dead: brief 04d deleted the LOD0 prepass)
+    cull.isolate_draw = cv_isolate_draw().get();               // brief 06: >=0 keeps only that draw
+    cull.frustum_cull = cull_enabled_ ? 1u : 0u;              // C toggle disables DRAW-level camera cull
     cull.camera_pos = mesh_cull_frozen_ ? mesh_frozen_camera_pos_ : camera_.position();
     cull.lod_error_px = lod_error_px;
     cull.focal = focal;
-    cull.stats_lod = prepass ? 0u : 1u;                        // histogram: camera list only
+    // Histogram only on the camera opaque/twosided pass (not shadow) — matches pre-04c meaning.
+    cull.stats_lod = shadow ? 0u : 1u;
+    cull.shadow_mode = (shadow && cull_enabled_) ? 1u : 0u;
+    if (shadow)
+    {
+        cull.shadow_center = cascade_center_[cascade];
+        cull.shadow_radius = cascade_cull_radius_[cascade];
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
     vkCmdPushConstants(cb, cp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(DrawCullPush), &cull);
     vkCmdDispatch(cb, (active_draw_count_ + 63) / 64, 1, 1);
 
-    // Make the work list visible to the indirect draw (count + commands) and the task shader (records).
+    // Counts + draw_lod must be visible to the expansion compute (storage read).
+    const VkMemoryBarrier2 mb = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+    };
+    const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
+    vkCmdPipelineBarrier2(cb, &dep);
+}
+
+// Brief 04c COMPACTION PHASE for one worklist: scan_blocks -> scan_carry -> fill, then a barrier so the
+// resulting commands[] + records[] + count are visible to the task shader / indirect draw. The three
+// passes are separated by storage barriers (each reads the previous pass's writes). The fill copies the
+// per-draw selected LOD from `draw_lod` into each surviving draw's record.
+void GeometryPass::record_expand(VkCommandBuffer cb, const Worklist& wl, VkDeviceAddress draw_lod)
+{
+    const VkDeviceAddress base = allocator_.get_buffer(wl.buffer).device_address;
+    ExpandPush push{};
+    push.counts     = base;
+    push.offsets    = base + wl_offsets_off_;
+    push.block_sums = base + wl_blocksums_off_;
+    push.draw_lod   = draw_lod;
+    push.commands   = base + wl_commands_off_;
+    push.records    = base + wl_records_off_;
+    push.count      = base + wl_count_off_;
+    push.draw_count = active_draw_count_;
+    push.block_count = (active_draw_count_ + kScanBlock - 1) / kScanBlock;
+    push.max_draws  = cull_max_draws_;
+
+    const auto storage_barrier = [&]() {
+        const VkMemoryBarrier2 mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        };
+        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
+        vkCmdPipelineBarrier2(cb, &dep);
+    };
+
+    const auto dispatch = [&](string::gpu::shader_program* prog, uint32_t groups) {
+        const string::gpu::pipeline& p = prog->current();
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+        vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ExpandPush), &push);
+        vkCmdDispatch(cb, groups, 1, 1);
+    };
+
+    dispatch(expand_scan_blocks_program_, push.block_count);   // one workgroup per block
+    storage_barrier();
+    dispatch(expand_scan_carry_program_, 1);                   // single-workgroup block-carry scan
+    storage_barrier();
+    dispatch(expand_fill_program_, (active_draw_count_ + 63) / 64);
+    // Entries[] + command visible to the indirect draw + task shader.
     const VkMemoryBarrier2 mb = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -1105,22 +1412,75 @@ void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, 
     vkCmdPipelineBarrier2(cb, &dep);
 }
 
-// Brief 03b: the main pass draws the camera work list with ONE vkCmdDrawMeshTasksIndirectCountEXT.
-// The list (commands[] + records[]) was built by record_draw_cull earlier this frame; the task shader
-// reads its {draw_index, lod} via SV_DrawIndex. groupCountX per command = ceil(LOD meshlets / 32).
-void GeometryPass::record_meshlet_draws(VkCommandBuffer cb, const string::gpu::pipeline& p,
-                                        uint16_t current_frame)
+// Brief 04: build the sorted transparency work list on the CPU. BLEND draws (excluded from the opaque
+// GPU lists) are sorted BACK-TO-FRONT by their world-space bounding-sphere distance to the eye, then
+// written as a compacted commands[] + records[] + count into the host-visible per-frame buffer. v1
+// uses LOD0 for every transparent draw (counts are small; per-draw sort only — no per-meshlet/OIT).
+// Returns the number of draws written (indirect count). Runs on the render thread (host-visible write).
+uint32_t GeometryPass::build_transparency_list(uint16_t current_frame)
 {
-    const glm::mat4 vp = camera_.view_proj();
-    const glm::mat4 cull_vp = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : vp;
+    if (blend_draw_indices_.empty() || transp_mapped_.empty()) return 0;
+    const glm::vec3 eye = camera_.position();
+
+    // Sort a scratch copy back-to-front (farthest first) by squared distance eye->draw center.
+    std::vector<std::pair<float, uint32_t>> order;
+    order.reserve(blend_draw_indices_.size());
+    for (uint32_t di : blend_draw_indices_)
+    {
+        if (di >= active_draw_count_) continue;
+        const GpuDrawInfo& info = draw_info_mapped_[di];
+        if (info.resident == 0 || info.lod_count == 0) continue;
+        const glm::vec3 d = info.center - eye;
+        order.emplace_back(glm::dot(d, d), di);
+    }
+    // Brief 06: CVar-backed (dbg.transp_reverse; legacy STRING_TRANSP_REVERSE alias). A/B sort check.
+    if (cv_transp_reverse().get())
+        std::sort(order.begin(), order.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });  // WRONG: nearest first
+    else
+        std::sort(order.begin(), order.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });  // farthest first (correct)
+
+    // Brief 04c (resolution b): fill the COMPACTED per-draw list directly on the CPU in sorted order —
+    // one command {ceil(LOD0 meshlets/32),1,1} + one record {draw_index, lod=0} per surviving draw,
+    // in back-to-front order (the sort order == the submission order, so command-index ordering keeps
+    // the blend order correct). This is the CPU analogue of the GPU compaction's fill.
+    static constexpr uint32_t kTaskGroup = 32;
+    char* buf = reinterpret_cast<char*>(transp_mapped_[current_frame]);
+    auto* commands = reinterpret_cast<uint32_t*>(buf + transp_commands_off_);   // 3 uints/command
+    auto* records  = reinterpret_cast<uint32_t*>(buf + transp_records_off_);    // 2 uints/record
+    uint32_t count = 0;
+    for (const auto& [dist2, di] : order)
+    {
+        if (count >= cull_max_draws_) break;
+        const GpuDrawInfo& info = draw_info_mapped_[di];
+        const uint32_t mcount = info.lods[0].meshlet_count;  // LOD0
+        if (mcount == 0) continue;
+        commands[count * 3 + 0] = (mcount + kTaskGroup - 1) / kTaskGroup;  // groupCountX
+        commands[count * 3 + 1] = 1u;
+        commands[count * 3 + 2] = 1u;
+        records[count * 2 + 0] = di;   // draw_index
+        records[count * 2 + 1] = 0u;   // lod (transparent draws all render at LOD0)
+        ++count;
+    }
+    *reinterpret_cast<uint32_t*>(buf + transp_count_off_) = count;   // surviving-draw count
+    return count;
+}
+
+// Brief 04: draw the sorted transparency list (after opaque + sky). Same push as the main pass but
+// blend_pass=1 (fragment outputs base-color alpha) via the transparency pipeline (blend on, depth
+// test vs opaque depth, no depth write). HiZ stays valid (occlusion vs opaque depth is fine).
+void GeometryPass::record_transparency(VkCommandBuffer cb, uint16_t current_frame, uint32_t count)
+{
+    if (count == 0 || !meshlet_transparent_program_) return;
+    const string::gpu::pipeline& tp = meshlet_transparent_program_->current();
     const HizPyramid& hz = hiz_[current_frame];
     const bool hiz_ready = hiz_enabled_ && hz.image != 0;
-    const string::gpu::resource_id list = cull_cmd_buffers_[current_frame];
-    const VkDeviceAddress base = allocator_.get_buffer(list).device_address;
+    const glm::mat4 vp = camera_.view_proj();
 
     MeshletPush push{};
     push.view_proj = vp;
-    push.cull_view_proj = cull_enabled_ ? cull_vp : vp;   // (frustum planes; C disables via wide test below)
+    push.cull_view_proj = cull_enabled_ ? (mesh_cull_frozen_ ? mesh_frozen_view_proj_ : vp) : vp;
     push.vertices = allocator_.get_buffer(vertex_buffer_).device_address;
     push.meshlets = allocator_.get_buffer(meshlet_buffer_).device_address;
     push.mverts = allocator_.get_buffer(meshlet_vertices_).device_address;
@@ -1128,18 +1488,77 @@ void GeometryPass::record_meshlet_draws(VkCommandBuffer cb, const string::gpu::p
     push.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
     push.scene = allocator_.get_buffer(scene_buffers_[current_frame]).device_address;
     push.stats = allocator_.get_buffer(stats_buffers_[current_frame]).device_address;
-    push.records = base + cull_records_offset_;
+    const VkDeviceAddress tbase = allocator_.get_buffer(transp_buffers_[current_frame]).device_address;
+    push.records = tbase + transp_records_off_;   // compacted {draw_index, lod=0}, back-to-front order
+    push.camera_pos = mesh_cull_frozen_ ? mesh_frozen_camera_pos_ : camera_.position();
+    push.debug_view = static_cast<uint32_t>(debug_view_);
+    // No HiZ occlusion for transparent draws: transparent surfaces are frequently coplanar with (or
+    // just in front of) the opaque geometry that built the pyramid, where the conservative HiZ test
+    // culls them inconsistently at the depth-equality boundary (non-deterministic pop). Transparent
+    // draw counts are tiny, so skipping HiZ here costs nothing. (hiz_mips=0 -> task shader passes all.)
+    push.hiz_slot = 0;
+    push.hiz_mips = 0;
+    push.hiz_size = glm::uvec2(1, 1);
+    push.blend_pass = 1u;
+    push.phase = 0u;   // transparency is single-pass (no bitfield); a valid pointer is still required
+    push.bitfield = allocator_.get_buffer(visbits_buffer_).device_address;
+    push.freeze_bits = 1u;
+    (void)hiz_ready; (void)hz;
+
+    const VkBuffer buf = allocator_.get_buffer(transp_buffers_[current_frame]).buffer;
+    VkDescriptorSet mset = descriptor_table_.get_set();
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline_layout, 0, 1, &mset, 0, nullptr);
+    vkCmdPushConstants(cb, tp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletPush), &push);
+    // Brief 04c (resolution b): one command per surviving transparent draw, in back-to-front order.
+    vkCmdDrawMeshTasksIndirectCountEXT(cb, buf, transp_commands_off_, buf, transp_count_off_,
+                                       cull_max_draws_, sizeof(uint32_t) * 3);
+}
+
+// Brief 04c (resolution b): the main pass draws the compacted camera list with ONE
+// vkCmdDrawMeshTasksIndirectCountEXT. The compaction phase wrote the DENSE commands[] + records[] +
+// count into `wl` (one command per surviving draw, ascending draw order); the task shader reads its
+// {draw_index, lod} via SV_DrawIndex. groupCountX per command = ceil(LOD meshlets / 32). Command-index
+// ordering across the draws is what pins coplanar depth-tie winners run-to-run (AE=0).
+void GeometryPass::record_meshlet_draws(VkCommandBuffer cb, const string::gpu::pipeline& p,
+                                        uint16_t current_frame, const Worklist& wl, uint32_t phase)
+{
+    const glm::mat4 vp = camera_.view_proj();
+    const glm::mat4 cull_vp = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : vp;
+    const HizPyramid& hz = hiz_[current_frame];
+    const bool hiz_ready = hiz_enabled_ && hz.image != 0;
+    const VkDeviceAddress base = allocator_.get_buffer(wl.buffer).device_address;
+
+    MeshletPush push{};
+    push.view_proj = vp;
+    push.cull_view_proj = cull_enabled_ ? cull_vp : vp;   // (frustum planes; C disables via wide test)
+    push.vertices = allocator_.get_buffer(vertex_buffer_).device_address;
+    push.meshlets = allocator_.get_buffer(meshlet_buffer_).device_address;
+    push.mverts = allocator_.get_buffer(meshlet_vertices_).device_address;
+    push.mtris = allocator_.get_buffer(meshlet_triangles_).device_address;
+    push.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
+    push.scene = allocator_.get_buffer(scene_buffers_[current_frame]).device_address;
+    push.stats = allocator_.get_buffer(stats_buffers_[current_frame]).device_address;
+    push.records = base + wl_records_off_;
     // Frozen-aware eye: cone backface + HiZ nearest-point tests must use the SAME eye the frustum
     // froze from, or freeze-cull mixes live/frozen inputs (visible as bogus culling when flying).
     push.camera_pos = mesh_cull_frozen_ ? mesh_frozen_camera_pos_ : camera_.position();
     push.debug_view = static_cast<uint32_t>(debug_view_);
-    push.hiz_slot = hiz_ready ? hz.sample_slot : 0;
-    push.hiz_mips = hiz_ready ? hz.mips : 0;
-    push.hiz_size = hiz_ready ? hz.size : glm::uvec2(1, 1);
-    const VkBuffer buf = allocator_.get_buffer(list).buffer;
+    // Brief 04d: phase 1 renders bit-set (last-frame-visible) meshlets with NO HiZ test (the pyramid
+    // isn't built yet); phase 2 tests the bit-clear complement against the freshly-built pyramid. Phase
+    // 0 is the legacy single-pass (HiZ-off) path. Only phase 2 needs the pyramid slot.
+    const bool use_hiz = hiz_ready && phase != 1u;
+    push.hiz_slot = use_hiz ? hz.sample_slot : 0;
+    push.hiz_mips = use_hiz ? hz.mips : 0;
+    push.hiz_size = use_hiz ? hz.size : glm::uvec2(1, 1);
+    push.blend_pass = 0u;
+    push.phase = phase;
+    push.bitfield = allocator_.get_buffer(visbits_buffer_).device_address;
+    push.freeze_bits = mesh_cull_frozen_ ? 1u : 0u;
+    const VkBuffer buf = allocator_.get_buffer(wl.buffer).buffer;
 
     vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletPush), &push);
-    vkCmdDrawMeshTasksIndirectCountEXT(cb, buf, /*offset*/ 0, buf, cull_count_offset_,
+    vkCmdDrawMeshTasksIndirectCountEXT(cb, buf, wl_commands_off_, buf, wl_count_off_,
                                        cull_max_draws_, sizeof(uint32_t) * 3);
 }
 
@@ -1226,6 +1645,12 @@ void GeometryPass::compute_cascades()
         proj = reverse_z * proj;
 
         cascade_view_proj_[c] = proj * view;
+        // Brief 04 M4: conservative world-space bounding sphere of this cascade for the draw-level
+        // shadow cull. The stabilized fit already bounds XY by `radius`; the ortho depth extends
+        // `radius` (near) .. `2*radius + depth_pad` (far) along -L, so inflate the radius to cover the
+        // full depth slab. Conservative (never under-covers) -> off-cascade draws are safely kept.
+        cascade_center_[c] = center;
+        cascade_cull_radius_[c] = 2.0f * radius + depth_pad;
         last_split = split;
     }
 }
@@ -1355,10 +1780,15 @@ GeometryPass::~GeometryPass()
     destroy_program(sky_program_);
     destroy_program(froxel_program_);
     destroy_program(meshlet_program_);
+    destroy_program(meshlet_twosided_program_);
+    destroy_program(meshlet_transparent_program_);
     destroy_program(meshlet_shadow_program_);
     destroy_program(hiz_program_);
     destroy_program(reset_program_);
     destroy_program(draw_cull_program_);
+    destroy_program(expand_scan_blocks_program_);
+    destroy_program(expand_scan_carry_program_);
+    destroy_program(expand_fill_program_);
 
     // Brief 03 meshlet resources.
     if (meshlet_model_.total_meshlets > 0)
@@ -1380,8 +1810,15 @@ GeometryPass::~GeometryPass()
         }
         if (hiz_sampler_ != VK_NULL_HANDLE) vkDestroySampler(device_.get_device(), hiz_sampler_, nullptr);
         for (const string::gpu::resource_id b : stats_buffers_) allocator_.destroy_resource(b);
-        for (const string::gpu::resource_id b : cull_cmd_buffers_) if (b) allocator_.destroy_resource(b);
-        for (const string::gpu::resource_id b : cull_prepass_buffers_) if (b) allocator_.destroy_resource(b);
+        // Brief 04c worklist buffers.
+        const auto destroy_wl = [&](std::vector<Worklist>& v) {
+            for (const Worklist& w : v) if (w.buffer) allocator_.destroy_resource(w.buffer);
+        };
+        destroy_wl(wl_opaque_); destroy_wl(wl_twosided_);
+        for (const auto& per_frame : wl_shadow_)
+            for (const Worklist& w : per_frame) if (w.buffer) allocator_.destroy_resource(w.buffer);
+        for (const string::gpu::resource_id b : draw_lod_buffers_) if (b) allocator_.destroy_resource(b);
+        for (const string::gpu::resource_id b : transp_buffers_) if (b) allocator_.destroy_resource(b);
         allocator_.destroy_resource(draw_info_buffer_);
         allocator_.destroy_resource(meshlet_triangles_);
         allocator_.destroy_resource(meshlet_vertices_);
@@ -1415,7 +1852,6 @@ GeometryPass::~GeometryPass()
         allocator_.destroy_resource(image);
     }
 
-    allocator_.destroy_resource(index_buffer_);
     allocator_.destroy_resource(vertex_buffer_);
 }
 
@@ -1425,6 +1861,37 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         ? 1.0f
         : screen_size.width / static_cast<float>(screen_size.height);
     camera_.update(input_map_, delta_time, aspect);
+
+    // dbg.orbit (STRING_ORBIT): continuously sway the camera around a latched base pose so headless
+    // captures exercise per-frame disocclusion — the two-phase phase-1/phase-2 interleaved path that
+    // no static capture reaches. Small radius + yaw/pitch sweep = enough new pixels each frame to make
+    // phase 2 non-empty. Applied AFTER camera_.update so it fully overrides the (idle) input path.
+    if (const float orbit_speed = cv_orbit().get(); orbit_speed != 0.0f)
+    {
+        if (!orbit_base_latched_)
+        {
+            orbit_base_pos_ = camera_.position();
+            orbit_base_yaw_ = camera_.yaw();
+            orbit_base_pitch_ = camera_.pitch();
+            orbit_base_latched_ = true;
+        }
+        orbit_phase_ += orbit_speed * delta_time;
+        // Small lateral/vertical circle around the base position + a coupled yaw/pitch sweep so both
+        // the eye point AND the view direction change every frame (maximal disocclusion, no degenerate
+        // pure-roll where the depth buffer barely changes).
+        const float radius = 0.35f;              // world units — small, enough for per-frame reveal
+        const float yaw_amp = 0.06f;             // radians (~3.4 deg) view sweep
+        const float pitch_amp = 0.03f;
+        const glm::vec3 pos = orbit_base_pos_
+            + glm::vec3(std::cos(orbit_phase_) * radius, std::sin(orbit_phase_ * 0.5f) * radius * 0.4f,
+                        std::sin(orbit_phase_) * radius);
+        camera_.set_pose(pos,
+                         orbit_base_yaw_ + std::sin(orbit_phase_) * yaw_amp,
+                         orbit_base_pitch_ + std::sin(orbit_phase_ * 0.7f) * pitch_amp);
+        // Re-run the matrix build with the swayed pose (update() built view_proj from the pre-sway
+        // pose). A zero-delta update with no input just rebuilds the matrices from the members.
+        camera_.update(input_map_, 0.0f, aspect);
+    }
 
     // Debug GPU readback (STRING_MESHLET_READBACK=1): memcmp GPU meshlet buffers vs CPU arrays
     // well after the load-time uploads drained. Reports the first divergent offset per buffer.
@@ -1719,6 +2186,48 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
             overlay_stats_->debug_view = debug_view_;
             overlay_stats_->total_meshlets = meshlet_model_.total_meshlets;
             overlay_stats_->draw_count = draw_count_;
+
+            // Brief 06: publish the camera + scene snapshot for the debug-line pass and the
+            // scene/draw inspector. view_proj/camera + lights refresh every frame; the draw table is
+            // rebuilt only when its size changes (load / crowd toggle) — the per-draw geometry
+            // (bounds, meshlet/LOD counts) is static, only the resident flag is live.
+            overlay_stats_->view_proj = camera_.view_proj();
+            overlay_stats_->camera_pos = camera_.position();
+
+            if (overlay_stats_->draws.size() != meshlet_model_.draws.size())
+            {
+                overlay_stats_->draws.clear();
+                overlay_stats_->draws.reserve(meshlet_model_.draws.size());
+                for (uint32_t d = 0; d < meshlet_model_.draws.size(); ++d)
+                {
+                    const GpuDrawInfo& info = meshlet_model_.draws[d];
+                    InspectorDraw id;
+                    id.name = "draw " + std::to_string(d);
+                    id.index = d;
+                    id.material = -1;
+                    id.meshlet_count = info.total_meshlets;
+                    id.lod_count = info.lod_count;
+                    id.aabb_min = info.center - glm::vec3(info.radius);
+                    id.aabb_max = info.center + glm::vec3(info.radius);
+                    overlay_stats_->draws.push_back(std::move(id));
+                }
+            }
+            // Live residency flag per draw (streamer writes it into draw_info_mapped_).
+            if (draw_info_mapped_)
+                for (uint32_t d = 0; d < overlay_stats_->draws.size(); ++d)
+                    overlay_stats_->draws[d].resident = draw_info_mapped_[d].resident != 0;
+
+            overlay_stats_->lights.clear();
+            overlay_stats_->lights.reserve(lights_.size());
+            for (const GpuLight& L : lights_)
+            {
+                InspectorLight il;
+                il.position = glm::vec3(L.position_radius);
+                il.range = L.position_radius.w;
+                il.color = glm::vec3(L.color_intensity);
+                il.spot = L.direction_type.w > 0.5f;
+                overlay_stats_->lights.push_back(il);
+            }
         }
 
         // Periodic culling-stats log (the numbers the UI overlay also shows). Sampled a few times so
@@ -1726,11 +2235,21 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         if (stream_frame_ == 30 || stream_frame_ == 120 || stream_frame_ == 600)
         {
             const GpuMeshStats& s = stats_latest_;
+            // Brief 04d: with two-phase active, meshlets_total/after_frustum/after_cone DOUBLE-count
+            // (the task shader runs once per phase per meshlet). after_hiz = phase1+phase2 DRAWN
+            // (the union == the visible set); phase2 = the disocclusion complement drawn this frame.
             STRING_LOG_INFO("[mesh-cull] frame {}: meshlets {} -> frustum {} -> cone {} -> hiz {} "
-                            "(LOD draws {}/{}/{}/{}){}",
+                            "(phase2 {}) (LOD draws {}/{}/{}/{}){}",
                             stream_frame_, s.meshlets_total, s.after_frustum, s.after_cone, s.after_hiz,
+                            s.phase2_drawn,
                             s.draws_per_lod[0], s.draws_per_lod[1], s.draws_per_lod[2], s.draws_per_lod[3],
                             crowd_enabled_ ? " [crowd]" : "");
+            // Brief 04 M4: per-cascade shadow draw-cull. "before" = every resident draw dispatched for
+            // every cascade (resident_draws x cascade_count); "after" = draws surviving the per-cascade
+            // light-frustum reject (stats[9], summed across cascades).
+            const uint32_t shadow_before = active_draw_count_ * settings_.cascade_count;
+            STRING_LOG_INFO("[shadow-cull] cascades {}: shadow draws {} -> {} (per-cascade light-sphere reject)",
+                            settings_.cascade_count, shadow_before, s.shadow_draws);
         }
     }
 
@@ -1745,6 +2264,33 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
     }
 
     VkCommandBuffer& command_buffer = recorder.get_command_buffer();
+
+    // Cross-frame serialization of the persistent visibility bitfield. The bitfield is a SINGLE
+    // (non-ring) buffer by design — its temporal state accumulates across frames — so this frame's
+    // phase-1 task shader reads exactly the bits the PREVIOUS frame's phase-2 task shader wrote. With
+    // frames-in-flight, the prior frame's phase-2 TASK-stage writes can still be executing when this
+    // frame begins; without a barrier, phase-1's read races them and a meshlet's bit flips between
+    // consecutive frames -> its phase-2 draw appears/disappears (the flicker/popping the user saw even
+    // on a STATIC camera). This barrier sits OUTSIDE any dynamic-rendering instance (record() opens
+    // rendering later), where TASK_SHADER is a legal stage; same-queue submission order makes its src
+    // scope cover the prior frame's phase-2 writes. (Intra-frame phase-1->phase-2 is handled in
+    // record_between via its own task-stage barrier.)
+    if (hiz_enabled_ && hiz_program_ && visbits_buffer_)
+    {
+        const VkMemoryBarrier2 vbf = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
+            // READ | WRITE: phase-1 READs the bits and phase-2 READ-MODIFY-WRITEs them, so the prior
+            // frame's phase-2 write must be ordered before BOTH this frame's phase-1 read (RAW) and
+            // this frame's phase-2 write (WAW).
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        };
+        const VkDependencyInfo vdep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &vbf };
+        vkCmdPipelineBarrier2(command_buffer, &vdep);
+    }
 
     // --- Brief 03: meshlet-path per-frame prep (stats reset, HiZ pyramid) --------------------------
     // Builds the GPU work lists, the HiZ pyramid, and the shadow cascades that record() then draws.
@@ -1777,147 +2323,68 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
             vkCmdPipelineBarrier2(command_buffer, &sdep);
         }
 
-        // Brief 03b: build the GPU work lists for this frame. The camera list (selected LOD, writes
-        // the LOD histogram) feeds the main pass + all 3 shadow cascades; the prepass list (LOD0)
-        // feeds the HiZ depth prepass. Both are consumed later this frame (record_compute + record).
-        if (draw_cull_program_ && active_draw_count_ > 0)
+        // Brief 04c: build the meshlet worklists for this frame in two phases. DRAW phase writes the
+        // per-draw counts + shared LOD; EXPANSION phase scans them into compacted worklists + indirect
+        // groupCounts. Camera worklists (opaque + two-sided) feed the main pass; prepass worklists
+        // (forced LOD0) feed the HiZ depth prepass; per-cascade shadow worklists feed the cascades.
+        if (draw_cull_program_ && expand_fill_program_ && active_draw_count_ > 0)
         {
-            record_draw_cull(command_buffer, current_frame, /*prepass*/ false);
-            if (hiz_enabled_ && stream_frame_ > 1)
-                record_draw_cull(command_buffer, current_frame, /*prepass*/ true);
+            // Brief 04d: the depth-only HiZ prepass is DELETED. Phase 1 renders last-frame-visible
+            // meshlets directly into the MSAA targets; the pyramid is MIN-resolved from that depth in
+            // record_between(). So there are no prepass worklists — only the camera opaque/two-sided
+            // lists (shared by phase 1 and phase 2 — the task shader partitions them per phase) plus
+            // the per-cascade shadow lists.
+            const bool do_shadow = !shadow_images_.empty();
+            {
+                STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "draw-cull")
+                record_draw_cull(command_buffer, current_frame);
+                if (do_shadow)
+                    for (uint32_t c = 0; c < settings_.cascade_count && c < kMaxCascades; ++c)
+                        record_draw_cull(command_buffer, current_frame, /*cascade*/ int(c));
+            }
+            {
+                STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "expand")
+                const VkDeviceAddress cam_lod =
+                    allocator_.get_buffer(draw_lod_buffers_[current_frame]).device_address;
+                record_expand(command_buffer, wl_opaque_[current_frame], cam_lod);
+                record_expand(command_buffer, wl_twosided_[current_frame], cam_lod);
+                if (do_shadow)
+                    for (uint32_t c = 0; c < settings_.cascade_count && c < kMaxCascades; ++c)
+                        record_expand(command_buffer, wl_shadow_[current_frame][c], cam_lod);
+            }
         }
 
-        // Build the HiZ pyramid. Source: a single-sample depth-only CAMERA prepass of the resident,
-        // frustum+cone-visible meshlets (the renderer's shared depth is 4x MSAA — unsamplable by a
-        // plain Sampler2D — so the meshlet path renders its own 1x depth here). Then a MIN reduce
-        // (reverse-Z: min = farthest) into the R32F pyramid. Skipped the first frames (no geometry
-        // resident yet -> pyramid stays cleared -> HiZ passes everything; correct).
-        if (hiz_enabled_ && hiz_program_ && meshlet_shadow_program_ && stream_frame_ > 1)
+        // Brief 04d: the depth-only HiZ prepass + pyramid build are GONE from here. Phase 1 (record())
+        // renders last-frame-visible meshlets directly into the MSAA targets; the renderer then MIN-
+        // resolves that MSAA depth into hz.depth and calls record_between() to build the pyramid, then
+        // record_after_between() draws phase 2. This method only decides whether the two-phase path is
+        // active this frame and clears the persistent bitfield when required.
+        //
+        // two_phase_active_ gates breaks_scene_group(): active only when HiZ is enabled AND geometry is
+        // resident (warmup done). When inactive (HiZ off, or the first frames) the pass renders in ONE
+        // group, single-pass (phase 0) — everything unconditionally, exactly like HiZ-off before.
+        two_phase_active_ = hiz_enabled_ && hiz_program_ && stream_frame_ > 1;
+
+        // Clear the persistent visibility bitfield + last-LOD on demand (first frame, teleport, a full
+        // streaming reset). A cleared bitfield is CORRECT — every meshlet takes phase 2 for one frame.
+        // Freeze (F) must NOT clear (it would erase the frozen visibility the debug eye is inspecting).
+        if (visbits_clear_pending_ && visbits_buffer_ && !mesh_cull_frozen_)
         {
-            const HizPyramid& hz = hiz_[current_frame];
-            const string::gpu::allocated_image& depth = allocator_.get_image(hz.depth);
-
-            // --- 1x depth-only camera prepass (reuses the depth-only meshlet shadow pipeline, fed
-            // the camera view-proj instead of a light view-proj). Frustum-culled, all resident draws.
-            vku::transition_image(command_buffer, {
-                .image = depth.image, .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                .new_layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
-                .dst_stage = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                .dst_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
-            });
-            const VkRenderingAttachmentInfo pre_depth = {
-                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView = depth.view,
-                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                .resolveMode = VK_RESOLVE_MODE_NONE,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = { .depthStencil = { 0.0f, 0 } },
+            const string::gpu::allocated_buffer& vb = allocator_.get_buffer(visbits_buffer_);
+            vkCmdFillBuffer(command_buffer, vb.buffer, 0, VK_WHOLE_SIZE, 0u);
+            const string::gpu::allocated_buffer& pl = allocator_.get_buffer(prev_draw_lod_buffer_);
+            vkCmdFillBuffer(command_buffer, pl.buffer, 0, VK_WHOLE_SIZE, 0u);
+            const VkMemoryBarrier2 fb = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             };
-            const VkRenderingInfo pre_info = {
-                .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-                .renderArea = { { 0, 0 }, { screen_size.width, screen_size.height } },
-                .layerCount = 1, .colorAttachmentCount = 0, .pDepthAttachment = &pre_depth,
-            };
-            vkCmdBeginRendering(command_buffer, &pre_info);
-            const VkViewport pvp = { 0.0f, 0.0f, (float)screen_size.width, (float)screen_size.height, 0.0f, 1.0f };
-            const VkRect2D psc = { { 0, 0 }, { screen_size.width, screen_size.height } };
-            vkCmdSetViewport(command_buffer, 0, 1, &pvp);
-            vkCmdSetScissor(command_buffer, 0, 1, &psc);
-            const string::gpu::pipeline& pre = meshlet_shadow_program_->current();
-            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pre.pipeline);
-            VkDescriptorSet preset = descriptor_table_.get_set();
-            vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pre.pipeline_layout,
-                                    0, 1, &preset, 0, nullptr);
-            // Prepass draws the LOD0 work list (brief 03b): forced-LOD0 so the pyramid never records a
-            // coarse LOD's receded/holed depth as an occluder the main pass then tests bounds against.
-            MeshletShadowPush pp{};
-            pp.light_view_proj = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : camera_.view_proj();
-            pp.vertices = allocator_.get_buffer(vertex_buffer_).device_address;
-            pp.meshlets = allocator_.get_buffer(meshlet_buffer_).device_address;
-            pp.mverts = allocator_.get_buffer(meshlet_vertices_).device_address;
-            pp.mtris = allocator_.get_buffer(meshlet_triangles_).device_address;
-            pp.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
-            const string::gpu::resource_id pre_list = cull_prepass_buffers_[current_frame];
-            const VkBuffer pre_buf = allocator_.get_buffer(pre_list).buffer;
-            pp.records = allocator_.get_buffer(pre_list).device_address + cull_records_offset_;
-            vkCmdPushConstants(command_buffer, pre.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletShadowPush), &pp);
-            vkCmdDrawMeshTasksIndirectCountEXT(command_buffer, pre_buf, 0, pre_buf, cull_count_offset_,
-                                               cull_max_draws_, sizeof(uint32_t) * 3);
-            vkCmdEndRendering(command_buffer);
-
-            // The prepass depth -> SHADER_READ for the mip-0 reduce.
-            vku::transition_image(command_buffer, {
-                .image = depth.image, .old_layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .src_stage = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                .src_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
-            });
-            // Transition our pyramid to GENERAL for storage writes.
-            const string::gpu::allocated_image& pyr = allocator_.get_image(hz.image);
-            vku::transition_image(command_buffer, {
-                .image = pyr.image, .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-                .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
-                .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-                .level_count = hz.mips,
-            });
-            const string::gpu::pipeline& hp = hiz_program_->current();
-            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, hp.pipeline);
-            VkDescriptorSet set = descriptor_table_.get_set();
-            vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, hp.pipeline_layout,
-                                    0, 1, &set, 0, nullptr);
-            for (uint32_t m = 0; m < hz.mips; ++m)
-            {
-                const uint32_t dw = std::max(1u, hz.size.x >> m);
-                const uint32_t dh = std::max(1u, hz.size.y >> m);
-                HizPush hpush{};
-                if (m == 0)
-                {
-                    hpush.src_slot = hz.depth_slot;
-                    hpush.src_size = glm::uvec2(screen_size.width, screen_size.height);
-                    hpush.copy_depth = 1;
-                }
-                else
-                {
-                    hpush.src_slot = hz.sample_slot;
-                    hpush.src_size = glm::uvec2(std::max(1u, hz.size.x >> (m - 1)), std::max(1u, hz.size.y >> (m - 1)));
-                    hpush.copy_depth = 0;
-                }
-                hpush.dst_slot = hz.mip_storage_slots[m];
-                hpush.dst_size = glm::uvec2(dw, dh);
-                vkCmdPushConstants(command_buffer, hp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(HizPush), &hpush);
-                vkCmdDispatch(command_buffer, (dw + 7) / 8, (dh + 7) / 8, 1);
-                // Barrier: this mip's writes visible to the next mip's sample.
-                const VkMemoryBarrier2 mb = {
-                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                    .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                    .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                    .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                    .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                };
-                const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                    .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-                vkCmdPipelineBarrier2(command_buffer, &dep);
-            }
-            // Move the whole pyramid to SHADER_READ for the task shader's SampleLevel in record().
-            vku::transition_image(command_buffer, {
-                .image = pyr.image, .old_layout = VK_IMAGE_LAYOUT_GENERAL,
-                .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                .dst_stage = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
-                .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-                .level_count = hz.mips,
-            });
+            const VkDependencyInfo fdep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                .memoryBarrierCount = 1, .pMemoryBarriers = &fb };
+            vkCmdPipelineBarrier2(command_buffer, &fdep);
+            visbits_clear_pending_ = false;
         }
     }
 
@@ -1927,6 +2394,7 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
     if (froxel_program_ && froxel_count_ > 0 && current_frame < froxel_buffers_.size()
         && froxel_buffers_[current_frame] != 0)
     {
+        STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "froxel-cull")
         const uint32_t light_count = lights_enabled_ ? static_cast<uint32_t>(lights_.size()) : 0u;
         const string::gpu::pipeline& fp = froxel_program_->current();
         glm::mat4 proj = camera_.view_proj() * glm::inverse(camera_.view());  // == projection
@@ -1958,6 +2426,7 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
     // path (off-screen casters included — cascades read the resident-only work list, NOT camera-culled).
     if (!shadow_images_.empty() && meshlet_shadow_program_ && draw_info_mapped_)
     {
+        STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "shadow-cascades")
         VkDescriptorSet set = descriptor_table_.get_set();
         const uint32_t res = settings_.shadow_resolution;
         for (uint32_t c = 0; c < settings_.cascade_count; ++c)
@@ -2013,15 +2482,15 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
             mspush.mverts = allocator_.get_buffer(meshlet_vertices_).device_address;
             mspush.mtris = allocator_.get_buffer(meshlet_triangles_).device_address;
             mspush.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
-            const string::gpu::resource_id cam_list = cull_cmd_buffers_[current_frame];
-            const VkBuffer cam_buf = allocator_.get_buffer(cam_list).buffer;
-            mspush.records = allocator_.get_buffer(cam_list).device_address + cull_records_offset_;
+            // Brief 04c: each cascade draws its OWN worklist (resident-only, draw-culled vs THIS
+            // cascade's light sphere; camera-selected LOD via the shared draw_lod). One indirect draw.
+            const Worklist& sh_wl = wl_shadow_[current_frame][c];
+            const VkDeviceAddress sh_base = allocator_.get_buffer(sh_wl.buffer).device_address;
+            mspush.records = sh_base + wl_records_off_;   // compacted {draw_index, camera-selected LOD}
+            const VkBuffer sh_buf = allocator_.get_buffer(sh_wl.buffer).buffer;
             vkCmdPushConstants(command_buffer, msh.pipeline_layout, VK_SHADER_STAGE_ALL,
                                0, sizeof(MeshletShadowPush), &mspush);
-            // Cascades read the RESIDENT-ONLY command array (shadow_cmds): the camera-frustum
-            // draw cull must not remove off-screen shadow CASTERS. Records are shared.
-            vkCmdDrawMeshTasksIndirectCountEXT(command_buffer, cam_buf, cull_shadow_cmds_offset_,
-                                               cam_buf, cull_count_offset_,
+            vkCmdDrawMeshTasksIndirectCountEXT(command_buffer, sh_buf, wl_commands_off_, sh_buf, wl_count_off_,
                                                cull_max_draws_, sizeof(uint32_t) * 3);
 
             vkCmdEndRendering(command_buffer);
@@ -2053,6 +2522,7 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
     // Procedural sky first (fullscreen, no depth) so opaque geometry overwrites it where it exists;
     // the shared sky colours also drive the lit shader's ambient below.
     {
+        STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "sky")
         const glm::mat4 vp = camera_.view_proj();
         const SkyPush sky_push{
             .inv_view_proj = glm::inverse(vp),
@@ -2069,20 +2539,187 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
         vkCmdDraw(command_buffer, 3, 1, 0, 0);
     }
 
-    // --- Brief 03: task/mesh meshlet draw path (the scene geometry front-end) -----------------
+    // --- Brief 03/04d: task/mesh meshlet draw path (the scene geometry front-end) ----------------
     if (meshlet_program_ && draw_info_mapped_)
     {
-        const string::gpu::pipeline& mp = meshlet_program_->current();
-        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mp.pipeline);
-        VkDescriptorSet mset = descriptor_table_.get_set();
-        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                mp.pipeline_layout, 0, 1, &mset, 0, nullptr);
-        // Single main pass: every resident meshlet is frustum+cone culled in the task shader and
-        // tested against THIS frame's HiZ pyramid (built from a complete depth prepass). No two-pass
-        // bitfield — the prepass is complete, so one conservative test per meshlet is correct and
-        // deterministic (no dependence on last frame's draw set). HiZ off -> hiz_mips==0 -> all pass.
-        record_meshlet_draws(command_buffer, mp, current_frame);
+        if (two_phase_active_)
+        {
+            // Brief 04d PHASE 1: render meshlets marked visible LAST frame (bit set) directly into the
+            // MSAA color+depth. No HiZ test (the pyramid isn't built yet). The renderer then MIN-resolves
+            // this depth -> hz.depth, record_between() builds the pyramid, record_after_between() draws
+            // phase 2 (the disocclusion complement) + transparency.
+            STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "main-draw")
+            record_opaque_phase(command_buffer, current_frame, /*phase*/ 1u);
+        }
+        else
+        {
+            // Single-pass (HiZ off / warmup): frustum+cone+HiZ in one group, then transparency — the
+            // legacy phase-0 flow. breaks_scene_group() is false so this all lands in one render group.
+            {
+                STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "main-draw")
+                record_opaque_phase(command_buffer, current_frame, /*phase*/ 0u);
+            }
+            {
+                STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "transparency")
+                const uint32_t transp_count = build_transparency_list(current_frame);
+                record_transparency(command_buffer, current_frame, transp_count);
+            }
+        }
     }
+}
+
+// Brief 04d: draw the opaque one-sided + two-sided camera lists at `phase` (0 legacy / 1 bit-set /
+// 2 bit-clear+HiZ+update). Assumes an MSAA scene render pass is already open (record() for phase 1/0,
+// record_after_between() for phase 2). Shared by both phases — the task shader does the partitioning.
+void GeometryPass::record_opaque_phase(VkCommandBuffer command_buffer, uint16_t current_frame, uint32_t phase)
+{
+    const string::gpu::pipeline& mp = meshlet_program_->current();
+    VkDescriptorSet mset = descriptor_table_.get_set();
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mp.pipeline);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            mp.pipeline_layout, 0, 1, &mset, 0, nullptr);
+    record_meshlet_draws(command_buffer, mp, current_frame, wl_opaque_[current_frame], phase);
+    if (meshlet_twosided_program_)
+    {
+        const string::gpu::pipeline& tp = meshlet_twosided_program_->current();
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline);
+        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                tp.pipeline_layout, 0, 1, &mset, 0, nullptr);
+        record_meshlet_draws(command_buffer, tp, current_frame, wl_twosided_[current_frame], phase);
+    }
+}
+
+// Brief 04d: the depth-resolve target the renderer MIN-resolves the phase-1 MSAA depth into (the
+// pyramid's single-sample mip-0 source). Valid only when the two-phase path is active this frame.
+string::gpu::resource_id GeometryPass::depth_resolve_target(uint16_t current_frame) const
+{
+    if (!two_phase_active_ || current_frame >= hiz_.size()) return 0;
+    return hiz_[current_frame].depth;
+}
+
+// Brief 04d: build the HiZ pyramid from the MIN-resolved phase-1 depth (hz.depth), OUTSIDE rendering.
+// The renderer already resolved msaa_depth_ -> hz.depth (reverse-Z MIN = farthest) at phase-1's
+// EndRendering and left it in DEPTH_ATTACHMENT layout. Reuses the exact mip-0 uniform-stretch +
+// 2x2 min chain the old prepass path used; only the depth SOURCE changed (resolve, not a re-draw).
+void GeometryPass::record_between(string::gpu::command_recorder& recorder, uint16_t current_frame)
+{
+    if (!two_phase_active_ || !hiz_program_ || current_frame >= hiz_.size()) return;
+    VkCommandBuffer command_buffer = recorder.get_command_buffer();
+    const HizPyramid& hz = hiz_[current_frame];
+    const string::gpu::allocated_image& depth = allocator_.get_image(hz.depth);
+
+    // Bitfield hazard: phase-1's task shader READ the bits; phase-2's task shader will READ-MODIFY-
+    // WRITE them. Serialize task-stage bitfield access across the phase boundary.
+    {
+        const VkMemoryBarrier2 bf = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        };
+        const VkDependencyInfo bdep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &bf };
+        vkCmdPipelineBarrier2(command_buffer, &bdep);
+    }
+
+    // Resolved depth (DEPTH_ATTACHMENT, resolve dest) -> SHADER_READ for the mip-0 reduce.
+    // Vulkan resolve operations (incl. the reverse-Z MIN depth resolve at phase-1's EndRendering)
+    // execute in COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE, NOT the depth stages — so the
+    // src scope that waits on the resolve write must name that stage/access (sync-validation clean).
+    vku::transition_image(command_buffer, {
+        .image = depth.image, .old_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .src_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .src_access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+    });
+    const string::gpu::allocated_image& pyr = allocator_.get_image(hz.image);
+    vku::transition_image(command_buffer, {
+        .image = pyr.image, .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+        .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
+        .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        .level_count = hz.mips,
+    });
+    const string::gpu::pipeline& hp = hiz_program_->current();
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, hp.pipeline);
+    VkDescriptorSet set = descriptor_table_.get_set();
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, hp.pipeline_layout,
+                            0, 1, &set, 0, nullptr);
+    for (uint32_t m = 0; m < hz.mips; ++m)
+    {
+        const uint32_t dw = std::max(1u, hz.size.x >> m);
+        const uint32_t dh = std::max(1u, hz.size.y >> m);
+        HizPush hpush{};
+        if (m == 0)
+        {
+            hpush.src_slot = hz.depth_slot;
+            hpush.src_size = glm::uvec2(screen_size.width, screen_size.height);
+            hpush.copy_depth = 1;
+            hpush.src_level = 0;   // the scene-depth image has a single level
+        }
+        else
+        {
+            hpush.src_slot = hz.sample_slot;
+            hpush.src_size = glm::uvec2(std::max(1u, hz.size.x >> (m - 1)), std::max(1u, hz.size.y >> (m - 1)));
+            hpush.copy_depth = 0;
+            hpush.src_level = m - 1;   // reduce the previous pyramid level (the whole-chain view exposes all mips)
+        }
+        hpush.dst_slot = hz.mip_storage_slots[m];
+        hpush.dst_size = glm::uvec2(dw, dh);
+        vkCmdPushConstants(command_buffer, hp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(HizPush), &hpush);
+        vkCmdDispatch(command_buffer, (dw + 7) / 8, (dh + 7) / 8, 1);
+        const VkMemoryBarrier2 mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        };
+        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
+        vkCmdPipelineBarrier2(command_buffer, &dep);
+    }
+    // Whole pyramid -> SHADER_READ for the phase-2 task shader's SampleLevel.
+    vku::transition_image(command_buffer, {
+        .image = pyr.image, .old_layout = VK_IMAGE_LAYOUT_GENERAL,
+        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dst_stage = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
+        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        .level_count = hz.mips,
+    });
+    // Return hz.depth to DEPTH_ATTACHMENT so the phase-2 group can keep depth-testing/writing the MSAA
+    // depth (the resolve target is separate; this keeps its tracker state consistent for next frame's
+    // resolve). Not strictly required for correctness this frame but keeps layouts predictable.
+    vku::transition_image(command_buffer, {
+        .image = depth.image, .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .new_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .src_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .dst_stage = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+        .dst_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+    });
+}
+
+// Brief 04d PHASE 2: recorded INSIDE the reopened MSAA group (which LOADed phase-1's color+depth).
+// Renders the disocclusion complement (bit-clear meshlets that the fresh pyramid says are visible),
+// sets their bits, then the sorted transparency pass (tests vs the final opaque depth, as before).
+void GeometryPass::record_after_between(string::gpu::command_recorder& recorder, uint16_t current_frame)
+{
+    if (!meshlet_program_ || !draw_info_mapped_) return;
+    VkCommandBuffer command_buffer = recorder.get_command_buffer();
+    record_opaque_phase(command_buffer, current_frame, /*phase*/ 2u);
+    const uint32_t transp_count = build_transparency_list(current_frame);
+    record_transparency(command_buffer, current_frame, transp_count);
 }
 
 }  // namespace sandbox

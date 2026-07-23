@@ -64,6 +64,7 @@ struct Surface
     uint4 slots;        // base, normal, mr, occlusion
     float2 metal_rough;
     float4 frag_coord;  // SV_Position (for froxel lookup)
+    float cutout_alpha; // brief 04: if >= 0, clip() base-color alpha below it; < 0 disables the test
 };
 
 // --- BRDF terms -------------------------------------------------------------------------------
@@ -159,9 +160,16 @@ uint froxel_index_for(SceneData s, float4 frag_coord, float view_z)
 }
 
 // Shade one surface. `debug_tint` (rgb) is mixed in when its .a > 0 (meshlet/LOD/occlusion views).
-float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0))
+// `blend_alpha` controls the returned alpha: false (default) => opaque (alpha 1, for the opaque/
+// cutout/two-sided main pass, whose pipeline blends SRC_ALPHA over dst — a non-1 alpha there would
+// wrongly make solid geometry translucent); true => the material's base-color alpha, for the M2
+// sorted transparency pass. The base-color alpha is still read for the cutout clip() regardless.
+float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), bool blend_alpha = false)
 {
     float4 base = lit_textures[surf.slots.x].Sample(surf.uv) * surf.base_color;
+    // Brief 04 alpha-tested cutout: discard fragments whose base-color alpha is below the material's
+    // threshold (foliage/curtains). Threshold < 0 disables (opaque/blend materials).
+    if (surf.cutout_alpha >= 0.0 && base.a < surf.cutout_alpha) discard;
     float3 albedo = base.rgb;
     float3 mr = lit_textures[surf.slots.z].Sample(surf.uv).rgb;
     float roughness = clamp(mr.g * surf.metal_rough.y, 0.04, 1.0);
@@ -246,5 +254,5 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0))
     // Meshlet / LOD / occlusion debug views: flat tint mixed over the shaded colour.
     if (debug_tint.a > 0.0) color = lerp(color, debug_tint.rgb, debug_tint.a);
 
-    return float4(color, base.a);
+    return float4(color, blend_alpha ? base.a : 1.0);
 }

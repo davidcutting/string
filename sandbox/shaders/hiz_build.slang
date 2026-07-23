@@ -8,7 +8,7 @@ struct Push
     uint2 dst_size;   // destination mip dimensions (px)
     uint2 src_size;   // source mip dimensions (px)
     uint copy_depth;  // 1 = mip0 copy from the scene depth (Sampler2D), 0 = pyramid->pyramid
-    uint _pad;
+    uint src_level;   // mip level of src_slot to sample (pyramid->pyramid: the level being reduced)
 };
 [[vk::push_constant]] Push pc;
 
@@ -51,10 +51,16 @@ void build_main(uint3 id : SV_DispatchThreadID)
         float2 uv10 = (float2(min(s + int2(1,0), mx)) + 0.5) * texel;
         float2 uv01 = (float2(min(s + int2(0,1), mx)) + 0.5) * texel;
         float2 uv11 = (float2(min(s + int2(1,1), mx)) + 0.5) * texel;
-        float d0 = src_textures[pc.src_slot].SampleLevel(uv00, 0).r;
-        float d1 = src_textures[pc.src_slot].SampleLevel(uv10, 0).r;
-        float d2 = src_textures[pc.src_slot].SampleLevel(uv01, 0).r;
-        float d3 = src_textures[pc.src_slot].SampleLevel(uv11, 0).r;
+        // MUST sample the SOURCE mip (src_level), not level 0. src_slot is the whole-chain view; a
+        // hardcoded level-0 sample read mip0 for EVERY level with the current level's coarser grid,
+        // so each coarse mip min-reduced only a SPARSE subset of mip0 texels and MISSED the farthest
+        // ones between them — coarse `occ` came back too NEAR, over-culling visible geometry (worse
+        // the more mips there are: the >800px / 11-mip resolution-dependent HiZ over-cull bug).
+        float lvl = float(pc.src_level);
+        float d0 = src_textures[pc.src_slot].SampleLevel(uv00, lvl).r;
+        float d1 = src_textures[pc.src_slot].SampleLevel(uv10, lvl).r;
+        float d2 = src_textures[pc.src_slot].SampleLevel(uv01, lvl).r;
+        float d3 = src_textures[pc.src_slot].SampleLevel(uv11, lvl).r;
         // Reverse-Z: farthest = smallest depth value. Min reduce.
         reduced = min(min(d0, d1), min(d2, d3));
     }

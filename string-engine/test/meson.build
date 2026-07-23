@@ -5,7 +5,9 @@ test_files = [
     'residency_manager_test.cpp',
     'font_test.cpp',
     'file_watch_service_test.cpp',
-    'shader_compiler_test.cpp'
+    'shader_compiler_test.cpp',
+    'cvar_test.cpp',
+    'debug_draw_test.cpp'
 ]
 
 test_dep = [

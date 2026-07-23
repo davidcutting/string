@@ -10,7 +10,7 @@ struct Shape
     float4 rect;    // xy = pos (px, top-left), zw = size (px)
     float4 fill;    // rgba, linear
     float4 stroke;  // rgba, linear
-    float4 params;  // x = corner radius (px), y = stroke width (px)
+    float4 params;  // x = corner radius (px), y = stroke width (px), z = cooldown sweep frac (0..1)
 };
 
 // Bindless storage-buffer array at set 0, binding 0 (matches descriptor_table).
@@ -21,6 +21,7 @@ struct Push
 {
     float2 screen_size;
     uint shape_slot;
+    uint first;   // base index of this sub-draw's range (the overlay layer draws a tail range)
 };
 [[vk::push_constant]]
 Push pc;
@@ -34,6 +35,7 @@ struct VSOut
     float2 size : TEXCOORD1;         // px
     float radius : TEXCOORD2;        // px
     float stroke_width : TEXCOORD3;  // px
+    float cooldown : TEXCOORD4;      // 0..1 radial sweep (darken the not-yet-elapsed arc)
 };
 
 static const float2 corners[6] = {
@@ -44,7 +46,7 @@ static const float2 corners[6] = {
 [shader("vertex")]
 VSOut vertex_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID)
 {
-    Shape s = shape_buffers[pc.shape_slot][instance_id];
+    Shape s = shape_buffers[pc.shape_slot][pc.first + instance_id];
 
     float2 corner = corners[vertex_id];
     float2 pixel = s.rect.xy + corner * s.rect.zw;
@@ -58,6 +60,7 @@ VSOut vertex_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID
     o.size = s.rect.zw;
     o.radius = s.params.x;
     o.stroke_width = s.params.y;
+    o.cooldown = s.params.z;
     return o;
 }
 
@@ -85,6 +88,20 @@ float4 fragment_main(VSOut input) : SV_Target
     {
         float border = smoothstep(-input.stroke_width - 0.5, -input.stroke_width + 0.5, d);
         col = lerp(input.fill, input.stroke, border);
+    }
+
+    // Radial cooldown sweep: darken the arc that has NOT yet elapsed (a clockwise wipe from 12
+    // o'clock). cooldown 1 = fully on cooldown (whole icon dimmed), 0 = ready (no mask).
+    if (input.cooldown > 0.0)
+    {
+        float2 c = input.uv - 0.5;
+        float ang = atan2(c.x, -c.y);              // 0 at top, increasing clockwise
+        if (ang < 0.0) ang += 6.2831853;
+        float frac = ang / 6.2831853;              // 0..1 clockwise from 12 o'clock
+        if (frac < input.cooldown)
+        {
+            col.rgb *= 0.30;                        // dim the remaining-cooldown wedge
+        }
     }
 
     // Outer edge: ~1px antialiased coverage of the whole shape.

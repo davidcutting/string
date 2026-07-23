@@ -129,7 +129,17 @@ endif
 # header), so it rides along on public_args. tracy_enable turns on the client in the wrap.
 if get_option('tracy')
     message('Tracy profiler: enabled')
-    deps += dependency('tracy', default_options : ['tracy_enable=true'])
+    # On nix the client comes from the nixpkgs `tracy` package, which exports a CMake config
+    # (Tracy::TracyClient) but no pkg-config and no meson-name match — probe that first. Off-nix
+    # (no system Tracy) fall back to the meson wrap, which builds the vendored client with the
+    # client compiled in (tracy_enable=true). allow_fallback:false keeps the first probe from
+    # erroring under --wrap-mode=nodownload before we reach the wrap.
+    tracy_dep = dependency('Tracy', method : 'cmake', modules : ['Tracy::TracyClient'],
+                           required : false, allow_fallback : false)
+    if not tracy_dep.found()
+        tracy_dep = dependency('tracy', default_options : ['tracy_enable=true'])
+    endif
+    deps += tracy_dep
     public_args += '-DSTRING_PROFILE'
     build_args += '-DSTRING_PROFILE'
 endif
@@ -146,8 +156,10 @@ core_src = [
     'src/application.cpp',
     'src/scene.cpp',
     'src/core/job_system.cpp',
+    'src/core/cvar.cpp',
     'src/core/file_watch_service.cpp',
     'src/core/font.cpp',
+    'src/core/dynamic_font.cpp',
     'src/platform/input_map.cpp',
     'src/scene/camera.cpp',
     'src/vulkan/renderer.cpp',
@@ -159,6 +171,8 @@ core_src = [
     'src/gpu/residency_manager.cpp',
     'src/gpu/command_recorder.cpp',
     'src/vulkan/transfer_batch.cpp',
+    'src/vulkan/gpu_profiler.cpp',
+    'src/debug_draw.cpp',
     'src/vulkan/resource_state.cpp',
     'src/vulkan/vulkan_utils.cpp',
     'src/gpu/pipeline_builder.cpp',

@@ -45,6 +45,9 @@ public:
     explicit Grid2DPass(String::PassContext& context);
     virtual ~Grid2DPass() override;
 
+    // Stable identity for tooling (Tracy zones, inspector). Brief 06.
+    std::string_view debug_name() const override { return "grid2d"; }
+
     // No update() override — the grid is static, so it uses Pass's default no-op.
     virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 };

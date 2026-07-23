@@ -37,6 +37,11 @@ public:
     auto get_device() -> VkDevice&;
     auto get_queue(queue_type type) -> queue;
 
+    // True if VK_EXT_calibrated_timestamps was available and enabled at device creation. The
+    // Tracy GPU context uses this to build a calibrated (host<->device correlated) context;
+    // otherwise it falls back to an uncalibrated one. Optional feature — never a hard requirement.
+    bool supports_calibrated_timestamps() const { return calibrated_timestamps_enabled_; }
+
 private:
     std::shared_ptr<String::Window> window_;
     driver& driver_;
@@ -49,6 +54,8 @@ private:
     // every get_queue()/create_logical_device(), and re-querying properties for limits.
     queue_family_indices queue_family_indices_{};
     VkPhysicalDeviceProperties properties_{};
+    // Whether VK_EXT_calibrated_timestamps was present and enabled (optional; profiler-only).
+    bool calibrated_timestamps_enabled_ = false;
 
     void select_physical_device();
     void create_logical_device();

@@ -5,6 +5,7 @@
 #include <string/application.hpp>
 #include <string/core/logger.hpp>
 
+#include "debug_cvars.hpp"
 #include "demo_scene.hpp"
 
 namespace
@@ -28,6 +29,10 @@ std::filesystem::path resolve_resources_directory()
 int main()
 {
     String::Application app;
+
+    // Register the sandbox debug CVars and apply the STRING_* env bridge (legacy aliases honoured)
+    // before the plan/passes are built, so the passes read already-overridden values at construction.
+    sandbox::register_debug_cvars();
 
     const std::filesystem::path resources_directory = resolve_resources_directory();
     STRING_LOG_INFO("Using resources directory: {}", resources_directory.string());

@@ -1,16 +1,24 @@
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <string>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
+#include <string/core/cache_dir.hpp>
+#include <string/core/cvar.hpp>
+#include <string/core/png_writer.hpp>
+#include <string/debug_draw.hpp>
 #include <string/gpu/driver.hpp>
 #include <string/vulkan/renderer.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
@@ -29,6 +37,55 @@
 namespace String
 {
 
+// Frame-capture levers, now CVar-backed. The env bridge honours the canonical STRING_R_CAPTURE_*
+// names, and the aliases keep the legacy STRING_CAPTURE_FRAME / STRING_CAPTURE_PATH names working
+// verbatim (the alias "capture_frame" maps to STRING_CAPTURE_FRAME via env_name_for). This is the
+// engine-side proof-of-use for the CVar system; sandbox env-lever migration is a follow-up.
+namespace
+{
+string::core::CVar<int32_t>& capture_frame_cvar()
+{
+    static string::core::CVar<int32_t> v{
+        "r.capture.frame", 0,
+        "capture the resolved HDR target after this frame index then stop (0 = disabled)"};
+    static const bool aliased = [] { v.add_alias("capture_frame"); return true; }();
+    (void)aliased;
+    return v;
+}
+string::core::CVar<std::string>& capture_path_cvar()
+{
+    static string::core::CVar<std::string> v{
+        "r.capture.path", "/tmp/string_capture.bmp", "output path for r.capture.frame"};
+    static const bool aliased = [] { v.add_alias("capture_path"); return true; }();
+    (void)aliased;
+    return v;
+}
+// Brief 06: capture-sequence. When >0, capture every Nth frame to a numbered file derived from
+// r.capture.path (e.g. /tmp/cap.png -> /tmp/cap_00042.png). Runs alongside the single-shot
+// r.capture.frame; independent lever, honoured live from the console.
+string::core::CVar<int32_t>& capture_every_n_cvar()
+{
+    static string::core::CVar<int32_t> v{
+        "r.capture.every_n", 0,
+        "capture every Nth frame to numbered files derived from r.capture.path (0 = off)"};
+    static const bool aliased = [] { v.add_alias("capture_every_n"); return true; }();
+    (void)aliased;
+    return v;
+}
+
+// Insert a zero-padded frame index before the extension: "/a/b.png" + 42 -> "/a/b_00042.png".
+std::string numbered_capture_path(const std::string& base, uint64_t frame)
+{
+    const std::size_t dot = base.find_last_of('.');
+    const std::size_t slash = base.find_last_of("/\\");
+    const bool has_ext = dot != std::string::npos && (slash == std::string::npos || dot > slash);
+    char idx[16];
+    std::snprintf(idx, sizeof(idx), "_%05llu", static_cast<unsigned long long>(frame));
+    if (has_ext) return base.substr(0, dot) + idx + base.substr(dot);
+    return base + idx;
+}
+}  // namespace
+
 Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Window> window,
                    const RenderPlan& plan)
 : application_info_(application_info)
@@ -46,10 +103,10 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 // shaders/ tree is the include/import search root.
 , shader_jobs_(1)
 , file_watcher_(shader_jobs_)
-// Cache lives under the OS temp dir (the resources/shaders tree may be read-only, e.g. the Nix
-// store); it is content-hash keyed so a stale entry is simply never hit.
+// Cache lives under the per-user cache dir (the resources/shaders tree may be read-only, e.g.
+// the Nix store); it is content-hash keyed so a stale entry is simply never hit.
 , shader_compiler_(
-    std::filesystem::temp_directory_path() / "string-shader-cache",
+    string::core::user_cache_dir("shaders"),
     { std::filesystem::path(application_info.resources_directory) / "shaders" })
 , shader_registry_(device_, shader_compiler_, file_watcher_, shader_jobs_)
 , composite_pass_(device_, std::filesystem::path(application_info.resources_directory), global_descriptor_table_.get_layout(), presenter_.get_format(), shader_registry_)
@@ -57,12 +114,18 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     STRING_LOG_DEBUG("Initializing renderer...");
     const auto resources_path = std::filesystem::path(application_info_.resources_directory);
 
-    if (const char* cap = std::getenv("STRING_CAPTURE_FRAME"))
-    {
-        capture_frame_ = std::strtoull(cap, nullptr, 10);
-        const char* path = std::getenv("STRING_CAPTURE_PATH");
-        capture_path_ = path ? path : "/tmp/string_capture.bmp";
-    }
+    // Frame-capture config via CVars. Touch the accessors so both are registered, apply the env
+    // bridge (honours STRING_R_CAPTURE_FRAME and legacy STRING_CAPTURE_FRAME/PATH aliases), then
+    // read. apply_env() is idempotent and cheap; calling it here initialises these levers.
+    capture_frame_cvar();
+    capture_path_cvar();
+    // Touch the capture-sequence CVar too BEFORE apply_env, or its env override (STRING_CAPTURE_EVERY_N
+    // / STRING_R_CAPTURE_EVERY_N) is never registered and headless capture sequences are silently
+    // ignored (the accessor is otherwise first touched at frame end, long after apply_env ran).
+    capture_every_n_cvar();
+    string::core::CVarRegistry::instance().apply_env();
+    capture_frame_ = static_cast<uint64_t>(std::max(0, capture_frame_cvar().get()));
+    capture_path_ = capture_path_cvar().get();
 
     window_->register_resize_event_callback(std::bind(&Renderer::handle_resize, this, std::placeholders::_1));
 
@@ -94,7 +157,10 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_D32_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        // Brief 04d: SAMPLED so the two-phase min-resolve compute can texelFetch its MSAA samples
+        // to build the HiZ pyramid mip-0 (min = farthest, reverse-Z conservative) between phase-1
+        // and phase-2 opaque draws. Still 4x MSAA D32; only read, never storage-written.
+        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         .aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
@@ -129,6 +195,9 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         resources_path,
         static_cast<uint16_t>(frames_in_flight_),
         msaa_samples_,
+        // Address of the Tracy GPU ctx member (created later in init_gpu_profiler); passes store the
+        // pointer and read it live at record time. Brief 06.
+        &gpu_profiler_ctx_,
     };
     scene_passes_ = plan.build(pass_context);
 
@@ -185,12 +254,49 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     {
         throw std::runtime_error("Failed to create timeline semaphore for resource allocator!");
     }
+
+    init_gpu_profiler();
+    gpu_timing_.init(device_, frames_in_flight_);
+    GpuProfiler::set_global(&gpu_timing_);
+}
+
+// Stand up the Tracy GPU context on the graphics queue. Compiles to a no-op (ctx == nullptr) when
+// -Dtracy is off. Uses frame 0's command buffer to probe the timestamp period; the buffer is reset
+// again in the first begin_frame(), so this doesn't disturb normal recording.
+//
+// TracyVkContext* records+submits+waits on the probe buffer ITSELF (it calls vkBeginCommandBuffer
+// internally). Our command pool is created without VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+// (buffers are recycled via vkResetCommandPool), so we must hand Tracy a buffer in the INITIAL
+// state — never begin/end it ourselves here, or Tracy's begin becomes an illegal implicit reset.
+void Renderer::init_gpu_profiler()
+{
+#if defined(STRING_PROFILE) && !defined(STRING_RELEASE)
+    VkCommandBuffer probe = frames_[0].recorder.get_command_buffer();
+    if (device_.supports_calibrated_timestamps())
+    {
+        STRING_PROFILE_GPU_CONTEXT_CREATE(gpu_profiler_ctx_, device_.get_physical_device(),
+            device_.get_device(), graphics_queue_.queue, probe);
+    }
+    else
+    {
+        STRING_PROFILE_GPU_CONTEXT_CREATE_BASIC(gpu_profiler_ctx_, device_.get_physical_device(),
+            device_.get_device(), graphics_queue_.queue, probe);
+    }
+    static constexpr char kGpuCtxName[] = "graphics";
+    STRING_PROFILE_GPU_CONTEXT_NAME(gpu_profiler_ctx_, kGpuCtxName, sizeof(kGpuCtxName) - 1);
+    frames_[0].recorder.reset();
+#endif
 }
 
 Renderer::~Renderer()
 {
     STRING_LOG_DEBUG("Waiting for device to be idle...");
     vkDeviceWaitIdle(device_.get_device());
+
+    // Tear down the Tracy GPU context (no-op when profiling is off) before the device goes away.
+    STRING_PROFILE_GPU_CONTEXT_DESTROY(gpu_profiler_ctx_);
+    GpuProfiler::set_global(nullptr);
+    gpu_timing_.destroy(device_.get_device());
 
     // Destroy the passes while the allocator, table, and device are still alive.
     scene_passes_.clear();
@@ -210,13 +316,30 @@ Renderer::~Renderer()
 
 void Renderer::update()
 {
+    STRING_PROFILE_SCOPE("update (CPU passes)")
     // Real per-frame delta (seconds since the previous update), for framerate-independent
     // motion like the camera. First frame clamps to ~0.
     static auto last_time = std::chrono::high_resolution_clock::now();
     const auto current_time = std::chrono::high_resolution_clock::now();
-    const float delta_time =
+    float delta_time =
         std::chrono::duration<float, std::chrono::seconds::period>(current_time - last_time).count();
     last_time = current_time;
+    // STRING_FIXED_DT=<seconds> forces a deterministic per-frame timestep, so scripted motion
+    // (dbg.orbit) advances by a fixed amount every frame regardless of wall-clock jitter. Essential
+    // for headless A/B under MOTION: HiZ-on vs HiZ-off captures at the same frame index then land at
+    // the SAME camera pose (wall-clock dt otherwise desynchronizes them). 0/unset = real dt.
+    static const float fixed_dt = [] {
+        if (const char* e = std::getenv("STRING_FIXED_DT")) { float v = std::atof(e); if (v > 0.0f) return v; }
+        return 0.0f;
+    }();
+    if (fixed_dt > 0.0f) delta_time = fixed_dt;
+
+    // Frame time on the Tracy timeline (ms). Cheap literal-named plot; no-op without -Dtracy.
+    STRING_PROFILE_PLOT("frame time (ms)", delta_time * 1000.0f)
+
+    // Brief 06: reset the immediate-mode debug-draw ring at the top of the frame. Systems then
+    // accumulate lines/labels during update()/record(); the debug line pass drains it in record().
+    string::debug::context().clear();
 
     // Rolling frame-time log (until Tracy is wired): avg/max ms per 600 frames.
     static float acc = 0.0f, worst = 0.0f;
@@ -226,17 +349,30 @@ void Renderer::update()
     {
         STRING_LOG_INFO("[frametime] avg {:.2f} ms ({:.0f} fps), worst {:.2f} ms",
                         acc / n * 1000.0f, n / acc, worst * 1000.0f);
+        // Brief 06: append the per-pass GPU breakdown (in-game timestamp readback) to the same
+        // cadence, so headless logs carry the GPU cost split, not just the CPU frame total.
+        if (gpu_timing_.enabled())
+        {
+            const std::vector<GpuProfiler::PassStat> ps = gpu_timing_.stats();
+            std::string line = "[frametime] gpu per-pass (ms):";
+            for (const GpuProfiler::PassStat& s : ps)
+                line += std::format(" {}={:.3f}", s.name, s.avg_ms);
+            line += std::format(" | total={:.3f}", gpu_timing_.total_avg_ms());
+            STRING_LOG_INFO("{}", line);
+        }
         acc = 0.0f; worst = 0.0f; n = 0;
     }
 
     for (auto& pass : scene_passes_)
     {
+        STRING_PROFILE_SCOPE_DYNAMIC(pass->debug_name().data(), pass->debug_name().size())
         pass->update(delta_time, static_cast<uint16_t>(current_frame_));
     }
 }
 
 void Renderer::begin_frame()
 {
+    STRING_PROFILE_SCOPE("begin_frame")
     auto& frame = frames_[current_frame_];
 
     VkSemaphoreWaitInfo wait_info = {
@@ -256,7 +392,10 @@ void Renderer::begin_frame()
     // semaphore wait above). Poll the file watcher for edits, then apply any completed recompiles:
     // swap the rebuilt pipeline in and retire the old one through THIS frame's garbage collector,
     // so it is destroyed only after the ring cycles back (past all in-flight frames).
-    file_watcher_.poll_main_thread();
+    {
+        STRING_PROFILE_SCOPE("shader hot-reload poll")
+        file_watcher_.poll_main_thread();
+    }
     shader_registry_.apply_pending_swaps([&frame, this](string::gpu::pipeline old) {
         frame.garbage_collector.push_function([this, old] {
             vkDestroyPipeline(device_.get_device(), old.pipeline, nullptr);
@@ -269,7 +408,10 @@ void Renderer::begin_frame()
     // Push any streamed uploads recorded during update() onto the graphics queue (submit, don't
     // wait). A no-op until a streamer records into the batch; the trailing transfer barrier makes
     // the writes visible to this frame's draws via submission order on the shared queue.
-    transfer_batch_.flush();
+    {
+        STRING_PROFILE_SCOPE("transfer_batch flush")
+        transfer_batch_.flush();
+    }
 
     // Acquire now, before recording, so end_rendering has a valid blit target. Copy the
     // handles out of string::gpu::acquired_image (which holds references into vectors resize() reallocates).
@@ -282,9 +424,15 @@ void Renderer::begin_frame()
 
 void Renderer::record_frame()
 {
+    STRING_PROFILE_SCOPE("record_frame")
     auto& frame = frames_[current_frame_];
     VkCommandBuffer command_buffer = frame.recorder.begin();
     const VkExtent2D extent = presenter_.get_extent();
+
+    // Brief 06: reset this frame index's GPU-timestamp pool (and read back its previous cycle's
+    // results — that GPU work is provably complete since the renderer already waited on this frame
+    // index's timeline value). Must precede any timestamp writes below.
+    gpu_timing_.begin_frame(command_buffer, static_cast<uint32_t>(current_frame_));
 
     const VkViewport viewport = {
         .x = 0.0f, .y = 0.0f,
@@ -299,7 +447,14 @@ void Renderer::record_frame()
     // those storage writes visible to the indirect draws / vertex-stage reads that follow.
     bool recorded_compute = false;
     for (Pass* pass : frame_passes_)
+    {
+        const std::string pass_name(pass->debug_name());
+        STRING_PROFILE_SCOPE_DYNAMIC(pass_name.data(), pass_name.size())
+        STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, pass_name.c_str())
+        gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), pass_name + " (cs)");
         recorded_compute |= pass->record_compute(frame.recorder, static_cast<uint16_t>(current_frame_));
+        gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
+    }
     if (recorded_compute)
     {
         const VkMemoryBarrier2 compute_to_draw = {
@@ -337,22 +492,58 @@ void Renderer::record_frame()
     const auto depth_target_of = [](const Pass* pass) -> std::optional<string::gpu::resource_id> {
         for (const ResourceUsage& usage : pass->usages)
             if (usage.access == Access::DepthWrite) return usage.resource;
+        // Depth READS must also bind the depth image as an attachment: depth-tested/write-off
+        // pipelines (debug lines) need it, and — critically — the reopened group that hosts a
+        // breaker's phase-2 draws inherits THIS group's depth attachment. Matching only DepthWrite
+        // left that group with pDepthAttachment = NULL, so the phase-2 opaque + sorted-transparency
+        // draws ran with NO depth test at all: every disoccluded meshlet landed on top of the scene
+        // (far geometry over near = persistent semi-transparent surfaces, popping under motion,
+        // clean with HiZ off because single-pass never splits the group).
+        for (const ResourceUsage& usage : pass->usages)
+            if (usage.access == Access::DepthRead) return usage.resource;
         return std::nullopt;
     };
 
     // Group consecutive passes that share a color target and run each group as one render-pass
     // instance. All barriers are derived from the passes' declared usages via resource_states_.
+    //
+    // Brief 04d: a pass may declare breaks_scene_group() to force the group to END after it so a
+    // COMPUTE step (record_between — the HiZ min-resolve + pyramid) can run OUTSIDE rendering before
+    // the next group. Consecutive COLOR_TARGET (MSAA) groups then form a chain: the FIRST clears the
+    // MSAA color+depth, later ones LOAD (preserve) them, and only the LAST resolves msaa_color_ ->
+    // color_attachment_ (intermediate MSAA groups STORE their samples for the next to load).
     size_t start = 0;
+    bool seen_msaa_group = false;   // has a COLOR_TARGET group already cleared the MSAA targets?
+    Pass* pending_after_between = nullptr;   // breaker whose phase-2 runs in the next (reopened) group
     while (start < frame_passes_.size())
     {
         const string::gpu::resource_id group_color = color_target_of(frame_passes_[start]);
         std::optional<string::gpu::resource_id> group_depth;
         size_t end = start;
+        bool break_after = false;
         while (end < frame_passes_.size() && color_target_of(frame_passes_[end]) == group_color)
         {
             if (auto depth = depth_target_of(frame_passes_[end])) group_depth = depth;
+            const bool breaks = frame_passes_[end]->breaks_scene_group();
             ++end;
+            if (breaks) { break_after = true; break; }   // end this group right after the breaker
         }
+
+        // Is this the LAST COLOR_TARGET (MSAA) group in the chain? Only the last one resolves; the
+        // rest STORE their MSAA samples for the following group to LOAD. A group is the last MSAA
+        // group iff it writes COLOR_TARGET and the pass immediately after `end` does NOT.
+        const bool this_is_msaa = (group_color == string::gpu::COLOR_TARGET);
+        const bool next_is_msaa = this_is_msaa && end < frame_passes_.size()
+            && color_target_of(frame_passes_[end]) == string::gpu::COLOR_TARGET;
+        const bool msaa_is_first = this_is_msaa && !seen_msaa_group;   // clears vs loads
+        const bool msaa_is_last = this_is_msaa && !next_is_msaa;       // resolves vs stores
+        if (this_is_msaa) seen_msaa_group = true;
+
+        // Brief 04d: a breaking group MIN-resolves its MSAA depth into the breaker's single-sample
+        // depth-resolve target (reverse-Z: min = farthest = conservative HiZ occluder), so
+        // record_between() can build the pyramid from a normally-samplable depth. 0 = no resolve.
+        const string::gpu::resource_id depth_resolve = break_after
+            ? frame_passes_[end - 1]->depth_resolve_target(static_cast<uint16_t>(current_frame_)) : 0;
 
         // Barriers: transition each graph-written image the group touches to the state its usage
         // needs (deduped per resource). Static uploaded inputs are skipped — they aren't in
@@ -365,54 +556,187 @@ void Renderer::record_frame()
             {
                 if (!written_resources_.contains(usage.resource)) continue;
                 if (access_scope(usage.access).layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
-                group_transitions[usage.resource] = usage;
+                // Writes take precedence: a group that both writes and reads a resource as an
+                // attachment must sit in the WRITE layout for the whole rendering (the group's
+                // attachment info uses ATTACHMENT_OPTIMAL; attachment reads are legal there). A
+                // read-usage last-wins here once put depth in READ_ONLY under a group whose
+                // rendering declared ATTACHMENT_OPTIMAL -> per-frame validation errors.
+                auto [it, inserted] = group_transitions.try_emplace(usage.resource, usage);
+                if (!inserted && is_write(usage.access) && !is_write(it->second.access))
+                    it->second = usage;
             }
+        // The group's depth image is bound as a read-write attachment (depth_attachment_info uses
+        // DEPTH_STENCIL_ATTACHMENT_OPTIMAL) whenever group_depth is set — even if the group's own
+        // passes only READ depth (debug lines). Force the write scope so the tracked layout matches
+        // the attachment layout, and so it covers the breaker's phase-2 depth WRITES, which are
+        // recorded into this group ahead of its own passes. Without this, a read-only group would
+        // sit in the READ_ONLY layout while rendering declares ATTACHMENT_OPTIMAL.
+        if (group_depth && written_resources_.contains(*group_depth))
+        {
+            const ResourceUsage depth_rw = { *group_depth, Access::DepthWrite,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
+                    | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT };
+            auto [it, inserted] = group_transitions.try_emplace(*group_depth, depth_rw);
+            if (!inserted && !is_write(it->second.access)) it->second = depth_rw;
+        }
         for (const auto& [resource, usage] : group_transitions)
         {
             const VkImageAspectFlags aspect =
                 (usage.access == Access::DepthWrite || usage.access == Access::DepthRead)
                     ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            // Brief 04d: a non-first MSAA group LOADs the depth phase-1 wrote — do NOT discard it
+            // (discard would drop the phase-1 depth the pyramid/phase-2 depend on). record_between()
+            // already put msaa_depth_ back in DEPTH_ATTACHMENT after the min-resolve read.
+            const bool load_depth = this_is_msaa && !msaa_is_first
+                && aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
             resource_states_.transition(command_buffer, image_of(resource), aspect,
-                usage.access, usage.stage, /*discard=*/is_write(usage.access));
+                usage.access, usage.stage, /*discard=*/is_write(usage.access) && !load_depth);
         }
 
         // The scene group (COLOR_TARGET) is multisampled: passes render into msaa_color_ and it's
         // resolved into color_attachment_ (which the group_transitions loop already moved to
         // COLOR_ATTACHMENT_OPTIMAL as the resolve dest). The composite group (SWAPCHAIN) is
         // single-sample and renders straight into the swapchain image.
-        const bool msaa_group = (group_color == string::gpu::COLOR_TARGET);
-        if (msaa_group)
+        const bool msaa_group = this_is_msaa;
+        if (msaa_group && msaa_is_first)
         {
-            // msaa_color_ isn't a graph resource; transition it here (discard — fully cleared).
+            // msaa_color_ isn't a graph resource; transition it here. The FIRST MSAA group clears
+            // (discard); later groups LOAD it (below), so they must NOT discard — the resource
+            // tracker already holds it in COLOR_ATTACHMENT_OPTIMAL from the previous group's store.
             resource_states_.transition(command_buffer, allocator_.get_image(msaa_color_).image,
                 VK_IMAGE_ASPECT_COLOR_BIT, Access::ColorWrite,
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, /*discard=*/true);
+
+            // CROSS-FRAME (frames-in-flight) hazard fix. msaa_color_ is a SINGLE shared image, not
+            // ringed per frame. This frame's phase-1 LOAD_OP_CLEAR + writes race the PREVIOUS frame's
+            // still-in-flight AVERAGE resolve READ of the same image (both COLOR_ATTACHMENT_OUTPUT).
+            // The transition() above is a no-op across the frame boundary (the tracker already holds
+            // COLOR_ATTACHMENT_OPTIMAL from the prior frame's store), so it emits NO dependency — and
+            // the existing self-barrier below only fires INTRA-frame (!msaa_is_first). Without this,
+            // the prior frame's resolve averages half-clobbered samples -> large surfaces render
+            // SEMI-TRANSPARENT (roofline visible THROUGH the ceiling/curtains) under camera motion.
+            // Same-queue submission order makes this barrier's COLOR_ATTACHMENT_OUTPUT src scope wait
+            // on the prior frame's resolve read. (Headless captures vkDeviceWaitIdle before copy, so
+            // the prior frame has fully drained and the race is serialized away — which is exactly why
+            // captures looked clean while the live 3-deep pipeline ghosted.)
+            const VkImageMemoryBarrier2 msaa_color_frame_barrier = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = allocator_.get_image(msaa_color_).image,
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+            };
+            const VkDependencyInfo msaa_color_frame_dep = {
+                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &msaa_color_frame_barrier,
+            };
+            vkCmdPipelineBarrier2(command_buffer, &msaa_color_frame_dep);
+        }
+        else if (msaa_group && !msaa_is_first)
+        {
+            // Brief 04d motion-ghosting fix: a later MSAA group LOADs msaa_color_ that the previous
+            // group STORED, but msaa_color_ is NOT a graph resource, so the tracker never emits a
+            // barrier for it — its layout is already COLOR_ATTACHMENT_OPTIMAL from the store, making
+            // resource_states_.transition() a silent no-op. Without an execution+memory dependency
+            // between the previous group's color STORE (COLOR_ATTACHMENT_WRITE) and this group's LOAD
+            // + resolve read (COLOR_ATTACHMENT_WRITE|READ), phase-1's stored samples are not
+            // guaranteed visible to phase-2's load, and phase-2's writes race the store. On a static
+            // frame phase 2 draws nothing so the resolve happened to read intact phase-1 samples and
+            // the hazard never bit — but under camera motion phase 2 writes into the shared MSAA
+            // image and the AVERAGE resolve mixes stale + fresh samples, rendering large surfaces
+            // (e.g. the interior ceiling vault) SEMI-TRANSPARENT with a previous-frame ghost. The
+            // same class of dependency (depth STORE->LOAD) IS covered because msaa_depth_ is a graph
+            // resource; msaa_color_ needs this explicit self-barrier. (Both stages/accesses are
+            // COLOR_ATTACHMENT_OUTPUT; a memory barrier makes the store both available and visible.)
+            const VkImageMemoryBarrier2 msaa_color_barrier = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .pNext = nullptr,
+                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = allocator_.get_image(msaa_color_).image,
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+            };
+            const VkDependencyInfo msaa_color_dep = {
+                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                .pNext = nullptr,
+                .dependencyFlags = 0,
+                .memoryBarrierCount = 0,
+                .pMemoryBarriers = nullptr,
+                .bufferMemoryBarrierCount = 0,
+                .pBufferMemoryBarriers = nullptr,
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &msaa_color_barrier,
+            };
+            vkCmdPipelineBarrier2(command_buffer, &msaa_color_dep);
         }
 
+        // Brief 04d MSAA chain: first group clears, later groups load; only the last resolves.
+        const VkAttachmentLoadOp msaa_color_load =
+            msaa_is_first ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        const VkAttachmentStoreOp msaa_color_store =
+            msaa_is_last ? VK_ATTACHMENT_STORE_OP_DONT_CARE   // resolved, MS samples not kept
+                         : VK_ATTACHMENT_STORE_OP_STORE;      // kept for the next MSAA group to load
         const VkRenderingAttachmentInfo color_attachment_info = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .pNext = nullptr,
             .imageView = msaa_group ? allocator_.get_image(msaa_color_).view : image_view_of(group_color),
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            // Resolve the multisampled scene color down into color_attachment_ (image_view_of the
-            // group's COLOR_TARGET) at end of rendering; the MS samples themselves aren't kept.
-            .resolveMode = msaa_group ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_NONE,
-            .resolveImageView = msaa_group ? image_view_of(group_color) : VK_NULL_HANDLE,
-            .resolveImageLayout = msaa_group ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = msaa_group ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
+            // Resolve the multisampled scene color into color_attachment_ only on the LAST MSAA group.
+            .resolveMode = (msaa_group && msaa_is_last) ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_NONE,
+            .resolveImageView = (msaa_group && msaa_is_last) ? image_view_of(group_color) : VK_NULL_HANDLE,
+            .resolveImageLayout = (msaa_group && msaa_is_last) ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = msaa_group ? msaa_color_load : VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = msaa_group ? msaa_color_store : VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = { .color = {{ 0.0f, 0.0f, 0.0f, 0.0f }} },
         };
+        // Depth: first MSAA group clears, later ones load the phase-1 depth. STORE it while more
+        // MSAA groups follow (phase-2 + transparency depth-test against it); the last may drop it.
+        const VkAttachmentLoadOp depth_load =
+            (msaa_group && !msaa_is_first) ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+        const VkAttachmentStoreOp depth_store =
+            (msaa_group && !msaa_is_last) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        // Brief 04d: MIN depth resolve into the breaker's single-sample target (if any). Transition it
+        // to the depth-attachment (resolve dest) layout first; record_between() moves it to SHADER_READ.
+        // Vulkan resolve ops write in COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE (even a depth
+        // resolve), so this layout transition must be made available to that stage/access — else
+        // sync-validation flags a WRITE_AFTER_WRITE between the transition and the EndRendering resolve.
+        // Direct barrier (not the tracker's DepthWrite scope, which would name LATE_FRAGMENT_TESTS):
+        // record_between() manages hz.depth's subsequent transitions with its own hardcoded barriers,
+        // and it is re-discarded (UNDEFINED) here every frame, so the tracker need not track it.
+        if (depth_resolve != 0)
+            vku::transition_image(command_buffer, {
+                .image = image_of(depth_resolve),
+                .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,   // discard: prior contents not needed
+                .new_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,   // last used by the pyramid reduce
+                .src_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                .dst_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,  // the resolve write stage
+                .dst_access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+            });
         const VkRenderingAttachmentInfo depth_attachment_info = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .pNext = nullptr,
             .imageView = group_depth ? image_view_of(*group_depth) : VK_NULL_HANDLE,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            .resolveMode = VK_RESOLVE_MODE_NONE,
-            .resolveImageView = VK_NULL_HANDLE,
-            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .resolveMode = depth_resolve != 0 ? VK_RESOLVE_MODE_MIN_BIT : VK_RESOLVE_MODE_NONE,
+            .resolveImageView = depth_resolve != 0 ? image_view_of(depth_resolve) : VK_NULL_HANDLE,
+            .resolveImageLayout = depth_resolve != 0 ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = depth_load,
+            .storeOp = depth_store,
             // Reverse-Z: far plane is 0 (see the depth pipeline's GREATER_OR_EQUAL compare).
             .clearValue = { .depthStencil = { 0.0f, 0 } },
         };
@@ -433,16 +757,54 @@ void Renderer::record_frame()
         vkCmdSetViewport(command_buffer, 0, 1, &viewport);
         vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 
+        // Brief 04d: the previous group's breaker draws its phase-2 geometry here, into the reloaded
+        // MSAA targets, tested against the pyramid its record_between() just built — before this
+        // group's own passes.
+        if (pending_after_between)
+        {
+            const std::string an(pending_after_between->debug_name());
+            STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, "phase2")
+            gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), an + " (phase2)");
+            pending_after_between->record_after_between(frame.recorder, static_cast<uint16_t>(current_frame_));
+            gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
+            pending_after_between = nullptr;
+        }
+
         for (size_t i = start; i < end; ++i)
+        {
+            const std::string pass_name(frame_passes_[i]->debug_name());
+            STRING_PROFILE_SCOPE_DYNAMIC(pass_name.data(), pass_name.size())
+            STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, pass_name.c_str())
+            gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), pass_name);
             frame_passes_[i]->record(frame.recorder, static_cast<uint16_t>(current_frame_));
+            gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
+        }
 
         vkCmdEndRendering(command_buffer);
+
+        // Brief 04d: the breaker's compute step (HiZ min-resolve + pyramid) runs here — OUTSIDE
+        // rendering, after phase-1's depth is stored, before phase-2's group reopens.
+        if (break_after)
+        {
+            Pass* breaker = frame_passes_[end - 1];
+            const std::string bn(breaker->debug_name());
+            STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, "hiz-build")
+            gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), bn + " (between)");
+            breaker->record_between(frame.recorder, static_cast<uint16_t>(current_frame_));
+            gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
+            pending_after_between = breaker;   // its phase-2 runs in the next group
+        }
         start = end;
     }
 
     // The swapchain was rendered by the final group; ready it for presentation.
     resource_states_.transition(command_buffer, acquired_image_, VK_IMAGE_ASPECT_COLOR_BIT,
         Access::Present, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+
+    // Collect this frame's GPU timestamp queries into the command buffer (once per frame, on the
+    // still-recording buffer). Non-blocking — Tracy reads back completed queries opportunistically
+    // across the frames-in-flight ring. No-op without -Dtracy.
+    STRING_PROFILE_GPU_COLLECT(gpu_profiler_ctx_, command_buffer)
 
     frame.recorder.end();
 }
@@ -535,8 +897,16 @@ void Renderer::end_frame()
 
     if (capture_frame_ != 0 && frame_count_ >= capture_frame_)
     {
-        capture_color_target();
+        capture_color_target(capture_path_);
         capture_frame_ = 0;
+    }
+
+    // Capture-sequence (r.capture.every_n): every Nth frame to a numbered file. Read live so the
+    // console can start/stop it at runtime. Independent of the single-shot capture above.
+    if (const int32_t every = capture_every_n_cvar().get();
+        every > 0 && (frame_count_ % static_cast<uint64_t>(every)) == 0)
+    {
+        capture_color_target(numbered_capture_path(capture_path_cvar().get(), frame_count_));
     }
 
     // Increment frame
@@ -547,7 +917,7 @@ void Renderer::end_frame()
 // Debug capture: drain the GPU, copy color_attachment_ (single-sample resolved HDR) to a host
 // buffer, tonemap to 8-bit, write a bottom-up 24-bit BMP. Transitions go through
 // resource_states_ so the tracker stays consistent for the next frame.
-void Renderer::capture_color_target()
+void Renderer::capture_color_target(const std::string& path)
 {
     vkDeviceWaitIdle(device_.get_device());
 
@@ -597,6 +967,41 @@ void Renderer::capture_color_target()
 
     const uint16_t* pixels =
         static_cast<const uint16_t*>(allocator_.get_buffer(staging).allocation_info.pMappedData);
+
+    // Brief 06: PNG branch when the path ends ".png" (case-insensitive). Existing agent recipes use
+    // .bmp and take the byte-identical legacy path below; only the ".png" suffix opts into PNG, so no
+    // recipe regresses. PNG is top-down RGB8 (no BGR/row-flip surprises for diffing tools).
+    const auto ends_with_png = [](const std::string& p) {
+        if (p.size() < 4) return false;
+        std::string s = p.substr(p.size() - 4);
+        for (char& c : s) c = char(std::tolower((unsigned char)c));
+        return s == ".png";
+    };
+
+    if (ends_with_png(path))
+    {
+        std::vector<uint8_t> rgb(std::size_t(extent.width) * extent.height * 3);
+        for (uint32_t y = 0; y < extent.height; ++y)
+        {
+            uint8_t* row = rgb.data() + std::size_t(y) * extent.width * 3;  // top-down
+            const uint16_t* src_row = pixels + VkDeviceSize(y) * extent.width * 4;
+            for (uint32_t x = 0; x < extent.width; ++x)
+            {
+                row[x * 3 + 0] = encode(src_row[x * 4 + 0]);  // R
+                row[x * 3 + 1] = encode(src_row[x * 4 + 1]);  // G
+                row[x * 3 + 2] = encode(src_row[x * 4 + 2]);  // B
+            }
+        }
+        const std::vector<uint8_t> png =
+            string::core::png::encode(rgb.data(), extent.width, extent.height, 3);
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(png.data()), std::streamsize(png.size()));
+        out.close();
+        allocator_.destroy_resource(staging);
+        STRING_LOG_INFO("[capture] frame {} -> {} (png)", frame_count_, path);
+        return;
+    }
+
     const uint32_t row_bytes = (extent.width * 3 + 3) & ~3u;  // BMP rows pad to 4 bytes
     const uint32_t image_bytes = row_bytes * extent.height;
     std::vector<uint8_t> bmp(54 + image_bytes, 0);
@@ -622,11 +1027,11 @@ void Renderer::capture_color_target()
             row[x * 3 + 2] = encode(src_row[x * 4 + 0]);  // R
         }
     }
-    std::ofstream out(capture_path_, std::ios::binary);
+    std::ofstream out(path, std::ios::binary);
     out.write(reinterpret_cast<const char*>(bmp.data()), std::streamsize(bmp.size()));
     out.close();
     allocator_.destroy_resource(staging);
-    STRING_LOG_INFO("[capture] frame {} -> {}", frame_count_, capture_path_);
+    STRING_LOG_INFO("[capture] frame {} -> {}", frame_count_, path);
 }
 
 // The whole-frame entry point, called once per frame from Application::run.
@@ -635,6 +1040,14 @@ void Renderer::draw()
     begin_frame();
     record_frame();
     end_frame();
+    // STRING_SERIALIZE_FRAMES=1: drain the GPU after every frame (like the headless capture path).
+    // Diagnostic for frames-in-flight hazards: if a live artifact vanishes with this set, it is a
+    // cross-frame race on a shared (non-ringed) resource, not an algorithmic/over-cull bug.
+    static const bool serialize = [] {
+        const char* e = std::getenv("STRING_SERIALIZE_FRAMES");
+        return e && e[0] == '1';
+    }();
+    if (serialize) vkDeviceWaitIdle(device_.get_device());
 }
 
 void Renderer::bind_composite_source()
@@ -686,7 +1099,10 @@ void Renderer::handle_resize(const String::View::Extent& extent)
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_D32_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        // Brief 04d: SAMPLED so the two-phase min-resolve compute can texelFetch its MSAA samples
+        // to build the HiZ pyramid mip-0 (min = farthest, reverse-Z conservative) between phase-1
+        // and phase-2 opaque draws. Still 4x MSAA D32; only read, never storage-written.
+        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         .aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},

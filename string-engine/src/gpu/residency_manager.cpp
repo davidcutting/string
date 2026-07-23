@@ -2,6 +2,7 @@
 #include <vector>
 
 #include <string/gpu/residency_manager.hpp>
+#include <string/core/profiler.hpp>
 
 namespace string::gpu
 {
@@ -117,6 +118,7 @@ bool residency_manager::evict_one(std::uint64_t frame)
 
 void residency_manager::tick(std::uint64_t frame)
 {
+    STRING_PROFILE_SCOPE("residency tick")
     // 1. Complete in-flight streams whose GPU upload has landed.
     for (auto& [id, e] : entries_)
     {

@@ -165,6 +165,23 @@ struct element
     // falls out as its own buffer for a text pass — the string itself never rides in the element.
     // A text measurer resolves this index against the table (see core/text_measurer.hpp).
     uint32_t text = 0;
+    // Absolute-positioned ("floating") overlay escape. A floating node (and its subtree) is placed
+    // at (float_x, float_y) in the ROOT's coordinate space, ignoring its parent's flow — and it does
+    // not contribute to its parent's fit size or push siblings. This is the overlay/anchor primitive
+    // world-anchored UI (nameplates, ping markers, tooltips, radial menus) needs; without it every
+    // node is packed into the flow. Default off: existing layouts are unchanged.
+    bool floating = false;
+    uint16_t float_x = 0;
+    uint16_t float_y = 0;
+    // Topmost render layer (inherited by the subtree): the renderer draws overlay content — shapes
+    // AND text — after ALL non-overlay content, so a modal surface (debug console, HUD) covers the
+    // scene UI's text as well as its shapes (shapes and glyphs are separate draw streams, so tree
+    // order alone cannot put a later shape over an earlier node's text). Layout ignores it.
+    bool overlay = false;
+    // Radial cooldown-sweep fraction (0 = none/ready, 255 = fully on cooldown). A renderer that
+    // supports it (the UI overlay's shape shader) dims the not-yet-elapsed clockwise wedge — the
+    // ability/cooldown affordance games use. Purely visual; layout ignores it.
+    uint8_t sweep = 0;
 };
 
 // A run of text attached to an element, held in the layout_builder's side-table. `str` is
@@ -384,6 +401,15 @@ public:
         for (const layout_node& n : nodes_)
             if (n.box.contains(x, y))
                 hit = &n;   // later nodes are painted on top → keep the last match
+        // An id-less top node (e.g. a button's label painted over it) is not interactive itself —
+        // resolve to the nearest ancestor carrying an id so hover/click land on the widget, not
+        // its text. A hit with no id'd ancestor returns as-is (empty-space click semantics).
+        for (const layout_node* n = hit; n != nullptr;)
+        {
+            if (n->element.id.hash != 0)
+                return n;
+            n = n->is_root() ? nullptr : &nodes_[n->parent];
+        }
         return hit;
     }
 
@@ -492,6 +518,8 @@ constexpr void layout_builder::fit_sizing(uint32_t index, Measure& measure)
     int child_count = 0;
     for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
     {
+        if (nodes_[c].element.floating)
+            continue;  // overlay child: out of flow, no contribution to the parent's fit size
         const dimension d = nodes_[c].box.dimension;
         main_content += horizontal ? d.width : d.height;
         cross_content = std::max(cross_content, static_cast<int>(horizontal ? d.height : d.width));
@@ -544,6 +572,8 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
         int child_count = 0;
         for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
         {
+            if (nodes_[c].element.floating)
+                continue;  // overlay child: out of flow
             used += main_of(c);
             ++child_count;
         }
@@ -557,7 +587,7 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
         {
             int growers = 0;
             for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
-                if (main_sizing(c).mode == size_mode::GROW && main_of(c) < main_sizing(c).max)
+                if (!nodes_[c].element.floating && main_sizing(c).mode == size_mode::GROW && main_of(c) < main_sizing(c).max)
                     ++growers;
             if (growers == 0)
                 break;
@@ -566,7 +596,7 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
             bool progressed = false;
             for (uint32_t c = node.first_child; c != layout_node::none && leftover > 0; c = nodes_[c].next_sibling)
             {
-                if (main_sizing(c).mode != size_mode::GROW)
+                if (nodes_[c].element.floating || main_sizing(c).mode != size_mode::GROW)
                     continue;
                 const int room = static_cast<int>(main_sizing(c).max) - main_of(c);
                 if (room <= 0)
@@ -586,7 +616,7 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
         {
             int shrinkers = 0;
             for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
-                if (main_sizing(c).mode != size_mode::FIXED && main_of(c) > main_sizing(c).min)
+                if (!nodes_[c].element.floating && main_sizing(c).mode != size_mode::FIXED && main_of(c) > main_sizing(c).min)
                     ++shrinkers;
             if (shrinkers == 0)
                 break;
@@ -595,7 +625,7 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
             bool progressed = false;
             for (uint32_t c = node.first_child; c != layout_node::none && deficit > 0; c = nodes_[c].next_sibling)
             {
-                if (main_sizing(c).mode == size_mode::FIXED)
+                if (nodes_[c].element.floating || main_sizing(c).mode == size_mode::FIXED)
                     continue;
                 const int room = main_of(c) - static_cast<int>(main_sizing(c).min);
                 if (room <= 0)
@@ -612,6 +642,8 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
         // Cross axis: GROW children stretch to fill the container.
         for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
         {
+            if (nodes_[c].element.floating)
+                continue;
             const axis_sizing& cross = horizontal ? nodes_[c].element.sizing.height : nodes_[c].element.sizing.width;
             if (cross.mode != size_mode::GROW)
                 continue;
@@ -642,11 +674,14 @@ constexpr void layout_builder::position(uint32_t index, uint16_t origin_x, uint1
     const int inner_cross = std::max(0,
         (horizontal ? node.box.dimension.height : node.box.dimension.width) - detail::cross_axis_padding(node.format));
 
-    // Main-axis leftover drives justify (leading offset + extra spacing between children).
+    // Main-axis leftover drives justify (leading offset + extra spacing between children). Floating
+    // (overlay) children are out of flow — they don't count here and are placed absolutely below.
     int used = 0;
     int child_count = 0;
     for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
     {
+        if (nodes_[c].element.floating)
+            continue;
         used += horizontal ? nodes_[c].box.dimension.width : nodes_[c].box.dimension.height;
         ++child_count;
     }
@@ -683,6 +718,12 @@ constexpr void layout_builder::position(uint32_t index, uint16_t origin_x, uint1
     int cursor = leading;
     for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
     {
+        // Overlay child: place its subtree at its absolute anchor (root space) and skip the flow.
+        if (nodes_[c].element.floating)
+        {
+            position(c, nodes_[c].element.float_x, nodes_[c].element.float_y);
+            continue;
+        }
         const dimension d = nodes_[c].box.dimension;
         const int child_main = horizontal ? d.width : d.height;
         const int child_cross = horizontal ? d.height : d.width;
@@ -951,6 +992,35 @@ consteval bool layout_scope_self_test()
 }
 
 static_assert(layout_scope_self_test(), "layout: RAII scope self-test failed");
+
+// Floating (overlay) child: placed at its absolute anchor, out of the parent's flow (a flowed
+// sibling ignores it, and it doesn't grow the parent).
+consteval bool layout_floating_self_test()
+{
+    element root{};
+    root.sizing = size_fixed(100, 100);
+    element flow{};
+    flow.sizing = size_fixed(10, 10);
+    element over{};
+    over.sizing = size_fixed(20, 20);
+    over.floating = true;
+    over.float_x = 60;
+    over.float_y = 40;
+
+    layout_builder builder;
+    builder.begin(root, format{ .direction = direction::VERTICAL })
+               .add_element(flow)
+               .add_element(over)
+           .end();
+
+    const layout_node* nf = &builder.nodes()[1];
+    const layout_node* no = &builder.nodes()[2];
+    return nf->box.x == 0 && nf->box.y == 0            // flow child at origin, unshifted by overlay
+        && no->box.x == 60 && no->box.y == 40          // overlay at its absolute anchor
+        && no->box.dimension.width == 20;
+}
+
+static_assert(layout_floating_self_test(), "layout: floating overlay self-test failed");
 
 static_assert(make_id("panel").hash == fnv1a("panel"), "layout: id hash mismatch");
 
