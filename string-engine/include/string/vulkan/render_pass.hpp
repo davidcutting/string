@@ -40,6 +40,23 @@ struct Pass
     virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) = 0;
     void resize(VkExtent2D extent) { screen_size = extent; }
 
+    // --- Brief 09: compute-only frame passes -----------------------------------------------------
+    // A pass that records NO draws: its record() runs OUTSIDE any rendering group, at its toposorted
+    // position in the frame (post-processing between the scene resolve and the composite). The
+    // renderer derives its image transitions (StorageImageRead/Write -> GENERAL, SampledRead) and
+    // buffer barriers from `usages` at that point — same contract as attachment passes, different
+    // execution site. Its record_compute() is NOT called in the frame-top compute prepass (the
+    // whole pass already runs at a compute point).
+    virtual bool compute_only() const { return false; }
+
+    // Brief 09: the renderer re-binds the offscreen HDR color target into the bindless table at
+    // init and on every resize, then notifies the passes that consume it (the post chain samples
+    // and storage-writes it). `physical_id` is the allocator id of the CURRENT color attachment
+    // (the logical COLOR_TARGET id in `usages` still names it for the graph); `sampled_slot` is
+    // its bindless combined-image-sampler slot.
+    virtual void bind_color_source(uint32_t /*sampled_slot*/,
+                                   string::gpu::resource_id /*physical_id*/) {}
+
     // --- Brief 04e M4: async-compute lane work --------------------------------------------------
     // A DEPENDENCY-FREE compute chain (inputs host-written or persistent; nothing produced by
     // this frame's other GPU work) that the renderer places onto an async compute lane when the

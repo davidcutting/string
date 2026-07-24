@@ -18,6 +18,7 @@
 #include "debug_cvars.hpp"
 #include "passes/debug_line_pass.hpp"
 #include "passes/geometry_pass.hpp"
+#include "passes/post_pass.hpp"
 #include "passes/ui_background_pass.hpp"
 #include "passes/ui_pass.hpp"
 #include "passes/ui_scene.hpp"
@@ -154,9 +155,14 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
         // GeometryPass, so sun/TOD scrub keys, the furnace CVar, IBL, shadows and all capture
         // levers work identically. Debug lines + UI ride along for the console/HUD.
         auto mesh_stats = std::make_shared<MeshOverlayStats>();
+        // Brief 09: the lookdev scene PINS MANUAL exposure by default (it is the EV100/material
+        // calibration reference — auto-metering a sphere grid over grey would defeat that).
+        // setenv with overwrite=0: an explicit STRING_EXPOSURE_AUTO from the user still wins.
+        setenv("STRING_EXPOSURE_AUTO", "0", 0);
         plan.add<GeometryPass>(std::vector<std::filesystem::path>{}, mesh_stats, /*lookdev=*/true);
         plan.add<DebugLinePass>(mesh_stats);
         plan.add<UIPass>(atlas, make_ui_author(mesh_stats, 0));
+        plan.add<PostProcessPass>();
         const auto t1 = std::chrono::steady_clock::now();
         STRING_LOG_INFO("lookdev scene: plan built in {} ms",
                         std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -180,6 +186,11 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
     plan.add<DebugLinePass>(mesh_stats);
     const int np_stress = std::max(0, cv_ui_nameplates().get());
     plan.add<UIPass>(atlas, make_ui_author(mesh_stats, static_cast<std::size_t>(np_stress)));
+    // Brief 09 post chain (compute-only pass; the renderer runs it after the last MSAA group's
+    // resolve, before the composite). Last in the plan so bloom/metering see the final HDR frame
+    // (including the UI overlay — the UI draws into the scene target pre-tonemap today; moving it
+    // post-composite is an open follow-up noted in the brief log).
+    plan.add<PostProcessPass>();
     return plan;
 }
 

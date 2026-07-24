@@ -264,6 +264,119 @@ CVar<std::string>& cv_ui_screen()
     return v;
 }
 
+// --- Post-processing (brief 09) ------------------------------------------------------------------
+CVar<bool>& cv_bloom_enabled()
+{
+    static CVar<bool> v{"r.bloom.enabled", true, "Karis bloom chain (threshold-free, clamped)"};
+    static const bool a = [] { v.add_alias("bloom"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_bloom_intensity()
+{
+    static CVar<float> v{"r.bloom.intensity", 0.04f, "bloom contribution added to the scene"};
+    static const bool a = [] { v.add_alias("bloom_intensity"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_bloom_clamp()
+{
+    static CVar<float> v{"r.bloom.clamp", 64.0f,
+                         "firefly/haze clamp on the first bloom downsample (scene knits)"};
+    static const bool a = [] { v.add_alias("bloom_clamp"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_bloom_radius()
+{
+    static CVar<float> v{"r.bloom.radius", 0.85f,
+                         "per-level upsample-accumulate scale (lower = tighter glow)"};
+    static const bool a = [] { v.add_alias("bloom_radius"); return true; }(); (void)a;
+    return v;
+}
+CVar<int32_t>& cv_bloom_mips()
+{
+    static CVar<int32_t> v{"r.bloom.mips", 6, "bloom pyramid depth (1..8; smallest mip >= 4px)"};
+    static const bool a = [] { v.add_alias("bloom_mips"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_exposure_min_ev()
+{
+    static CVar<float> v{"r.exposure.min_ev", 6.0f, "auto-exposure EV100 floor (night)"};
+    static const bool a = [] { v.add_alias("exposure_min_ev"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_exposure_max_ev()
+{
+    static CVar<float> v{"r.exposure.max_ev", 17.0f, "auto-exposure EV100 ceiling (noon sun)"};
+    static const bool a = [] { v.add_alias("exposure_max_ev"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_exposure_speed_up()
+{
+    static CVar<float> v{"r.exposure.speed_up", 3.0f,
+                         "adaptation rate when EV rises (scene brightened), 1/s"};
+    static const bool a = [] { v.add_alias("exposure_speed_up"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_exposure_speed_down()
+{
+    static CVar<float> v{"r.exposure.speed_down", 1.5f,
+                         "adaptation rate when EV falls (dark adaptation), 1/s"};
+    static const bool a = [] { v.add_alias("exposure_speed_down"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_exposure_comp()
+{
+    static CVar<float> v{"r.exposure.comp", 0.0f, "exposure compensation (stops; + brightens)"};
+    static const bool a = [] { v.add_alias("exposure_comp"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_exposure_cut_low()
+{
+    static CVar<float> v{"r.exposure.cut_low", 0.50f,
+                         "histogram percentile trimmed from the dark end before averaging"};
+    static const bool a = [] { v.add_alias("exposure_cut_low"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_exposure_cut_high()
+{
+    static CVar<float> v{"r.exposure.cut_high", 0.05f,
+                         "histogram percentile trimmed from the bright end (sun/sky)"};
+    static const bool a = [] { v.add_alias("exposure_cut_high"); return true; }(); (void)a;
+    return v;
+}
+CVar<bool>& cv_exposure_verify()
+{
+    static CVar<bool> v{"dbg.exposure_verify", false,
+                        "one-shot log: histogram total vs pixel count + metering value"};
+    static const bool a = [] { v.add_alias("exposure_verify"); return true; }(); (void)a;
+    return v;
+}
+CVar<bool>& cv_gtao_enabled()
+{
+    static CVar<bool> v{"r.gtao.enabled", true,
+                        "half-res GTAO with bent normals (needs the HiZ two-phase depth)"};
+    static const bool a = [] { v.add_alias("gtao"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_gtao_strength()
+{
+    static CVar<float> v{"r.gtao.strength", 1.0f, "GTAO strength (0 = off, 1 = full visibility)"};
+    static const bool a = [] { v.add_alias("gtao_strength"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_gtao_radius()
+{
+    static CVar<float> v{"r.gtao.radius", 0.8f, "GTAO world-space sampling radius (meters)"};
+    static const bool a = [] { v.add_alias("gtao_radius"); return true; }(); (void)a;
+    return v;
+}
+CVar<bool>& cv_gtao_spec_occ()
+{
+    static CVar<bool> v{"r.gtao.spec_occ", true,
+                        "bent-normal specular occlusion (off = brief-07 AO-derived Lagarde fallback)"};
+    static const bool a = [] { v.add_alias("gtao_spec_occ"); return true; }(); (void)a;
+    return v;
+}
+
 void register_debug_cvars()
 {
     // Touch every accessor so all CVars + aliases are registered, then apply the env bridge once.
@@ -296,6 +409,23 @@ void register_debug_cvars()
     cv_inspector_enabled();
     cv_console_open();
     cv_draw_test();
+    cv_bloom_enabled();
+    cv_bloom_intensity();
+    cv_bloom_clamp();
+    cv_bloom_radius();
+    cv_bloom_mips();
+    cv_exposure_min_ev();
+    cv_exposure_max_ev();
+    cv_exposure_speed_up();
+    cv_exposure_speed_down();
+    cv_exposure_comp();
+    cv_exposure_cut_low();
+    cv_exposure_cut_high();
+    cv_exposure_verify();
+    cv_gtao_enabled();
+    cv_gtao_strength();
+    cv_gtao_radius();
+    cv_gtao_spec_occ();
     string::core::CVarRegistry::instance().apply_env();
 }
 

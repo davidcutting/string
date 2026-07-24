@@ -25,6 +25,9 @@ struct Push
     uint glyph_slot;
     uint atlas_slot;
     uint first;   // base index of this sub-draw's range (the overlay layer draws a tail range)
+    // 1/exposure_scale: cancels the composite's EV100 exposure so display-referred text keeps its
+    // authored brightness regardless of scene EV (see ui_shader.slang).
+    float inv_exposure;
 };
 [[vk::push_constant]]
 Push pc;
@@ -53,7 +56,7 @@ VSOut vertex_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID
     VSOut o;
     o.position = float4(ndc, 0.0, 1.0);
     o.uv = lerp(g.uv.xy, g.uv.zw, corner);  // interpolate u0v0..u1v1 across the quad
-    o.color = g.color;
+    o.color = float4(g.color.rgb * pc.inv_exposure, g.color.a);
     return o;
 }
 

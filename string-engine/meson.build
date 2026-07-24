@@ -157,6 +157,7 @@ core_src = [
     'src/scene.cpp',
     'src/core/job_system.cpp',
     'src/core/cvar.cpp',
+    'src/core/tonemap.cpp',
     'src/core/file_watch_service.cpp',
     'src/core/font.cpp',
     'src/core/dynamic_font.cpp',

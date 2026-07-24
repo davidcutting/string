@@ -84,6 +84,16 @@ struct SceneData
     uint32_t env_mips;              // prefiltered ladder mip count
     uint32_t dfg_slot;              // bindless Sampler2D slot of the split-sum DFG LUT
     uint32_t _tail2;
+
+    // Brief 09 GTAO (APPENDED tail — every earlier offset unchanged). The AO texture was computed
+    // from the PREVIOUS frame's resolved depth under prev_view_proj; the lit shader reprojects
+    // world positions through it (exact for static geometry; disocclusions read stale AO for one
+    // frame and fall back to 1 off screen). gtao_slot == ~0u disables.
+    glm::mat4 prev_view_proj;       // 704 (natural layout: float4x4 is scalar-aligned)
+    uint32_t gtao_slot;             // 768 half-res AO+bent-normal texture (rgb bent*0.5+0.5, a vis)
+    float gtao_strength;            // 772
+    uint32_t gtao_w;                // 776 half-res AO texture size (normal-aware joint upsample)
+    uint32_t gtao_h;                // 780 (also pads sizeof to an 8 multiple for pointer members)
 };
 
 // Lock the layout against Slang's NATURAL layout for pointer-loaded structs (scalar packing:
@@ -106,6 +116,12 @@ static_assert(offsetof(SceneData, sh) == 680);
 static_assert(offsetof(SceneData, env_slot) == 688);
 static_assert(offsetof(SceneData, env_mips) == 692);
 static_assert(offsetof(SceneData, dfg_slot) == 696);
-static_assert(sizeof(SceneData) == 704);
+// Brief 09 tail (natural layout: the mat4 packs scalar-aligned right after _tail2's 704 boundary).
+static_assert(offsetof(SceneData, prev_view_proj) == 704);
+static_assert(offsetof(SceneData, gtao_slot) == 768);
+static_assert(offsetof(SceneData, gtao_strength) == 772);
+static_assert(offsetof(SceneData, gtao_w) == 776);
+static_assert(offsetof(SceneData, gtao_h) == 780);
+static_assert(sizeof(SceneData) == 784);
 
 }  // namespace sandbox

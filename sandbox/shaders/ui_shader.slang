@@ -22,6 +22,11 @@ struct Push
     float2 screen_size;
     uint shape_slot;
     uint first;   // base index of this sub-draw's range (the overlay layer draws a tail range)
+    // UI colors are DISPLAY-referred but drawn into the scene-referred HDR target, which the
+    // composite then multiplies by the EV100 exposure scale (~0.03 at sunny-16) before the
+    // tonemap — un-compensated UI reads near-black. Pre-multiplying by 1/exposure cancels the
+    // composite's exposure exactly, making UI brightness independent of scene EV.
+    float inv_exposure;
 };
 [[vk::push_constant]]
 Push pc;
@@ -54,8 +59,8 @@ VSOut vertex_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID
 
     VSOut o;
     o.position = float4(ndc, 0.0, 1.0);
-    o.fill = s.fill;
-    o.stroke = s.stroke;
+    o.fill = float4(s.fill.rgb * pc.inv_exposure, s.fill.a);
+    o.stroke = float4(s.stroke.rgb * pc.inv_exposure, s.stroke.a);
     o.uv = corner;
     o.size = s.rect.zw;
     o.radius = s.params.x;

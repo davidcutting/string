@@ -121,7 +121,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     string::core::user_cache_dir("shaders"),
     { std::filesystem::path(application_info.resources_directory) / "shaders" })
 , shader_registry_(device_, shader_compiler_, file_watcher_, shader_jobs_)
-, composite_pass_(device_, std::filesystem::path(application_info.resources_directory), global_descriptor_table_.get_layout(), presenter_.get_format(), shader_registry_)
+, composite_pass_(device_, allocator_, global_descriptor_table_, std::filesystem::path(application_info.resources_directory), presenter_.get_format(), shader_registry_)
 {
     STRING_LOG_DEBUG("Initializing renderer...");
     const auto resources_path = std::filesystem::path(application_info_.resources_directory);
@@ -160,7 +160,9 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        // Brief 09: + STORAGE so the post-processing compute chain can write bloom back into the
+        // resolved HDR target in place (the composite and the capture writer then both see it).
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
         .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
@@ -223,6 +225,15 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         frame_scratch_,
     };
     scene_passes_ = plan.build(pass_context);
+
+    // Brief 09: the passes exist now — notify the ones that consume the resolved HDR target
+    // (bind_composite_source() already bound it into the table before plan.build ran).
+    {
+        const uint32_t color_slot = global_descriptor_table_.get_binding_slot(
+            color_attachment_, string::gpu::descriptor_type::TEXTURE);
+        for (auto& pass : scene_passes_)
+            pass->bind_color_source(color_slot, color_attachment_);
+    }
 
     // Brief 04e M3: all passes have declared their per-frame scratch needs; back them with one
     // device-local arena per frame slot (logged as the VRAM consolidation number).
@@ -386,6 +397,9 @@ void Renderer::update()
         STRING_PROFILE_SCOPE_DYNAMIC(pass->debug_name().data(), pass->debug_name().size())
         pass->update(delta_time, static_cast<uint16_t>(current_frame_));
     }
+    // Brief 09: the composite is renderer-owned (not in scene_passes_) but now has real per-frame
+    // work — the output-transform LUT bake (first frame) / re-bake on grading CVar change.
+    composite_pass_.update(delta_time, static_cast<uint16_t>(current_frame_));
 }
 
 void Renderer::begin_frame()
@@ -684,8 +698,12 @@ void Renderer::record_frame()
     // Compute prepass: passes may dispatch GPU work (e.g. GPU culling that fills indirect
     // worklists) outside dynamic rendering, before any graphics group. Each pass's declared
     // compute-stage buffer usages derive the barriers it needs (vs prior tracked accesses).
+    // Brief 09: compute_only passes are excluded — they execute whole at their toposorted
+    // position in the group loop below (post-processing must run AFTER the scene resolve),
+    // and their declared usages are processed there, not here.
     for (Pass* pass : execution_order)
     {
+        if (pass->compute_only()) continue;
         for (const ResourceUsage& usage : pass->usages)
             if (is_buffer_usage(usage) && is_compute_stage(usage.stage))
                 resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
@@ -757,6 +775,43 @@ void Renderer::record_frame()
     Pass* pending_after_between = nullptr;   // breaker whose phase-2 runs in the next (reopened) group
     while (start < execution_order.size())
     {
+        // Brief 09: a compute_only pass executes standalone, OUTSIDE any rendering group, at its
+        // toposorted position (the post chain runs here: after the last MSAA group's resolve into
+        // COLOR_TARGET, before the composite group samples it). Its barriers derive from its
+        // declared usages exactly like a group's would: image usages transition through the
+        // tracker (StorageImageWrite -> GENERAL covers the sample+storage-write mix), buffer
+        // usages merge into one flushed memory barrier. Its own transient chains (bloom mips)
+        // are intra-pass state with local barriers — the documented allowed class.
+        if (execution_order[start]->compute_only())
+        {
+            Pass* pass = execution_order[start];
+            std::unordered_map<string::gpu::resource_id, ResourceUsage> compute_transitions;
+            for (const ResourceUsage& usage : pass->usages)
+            {
+                if (is_buffer_usage(usage))
+                {
+                    resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+                    continue;
+                }
+                if (!written_resources_.contains(usage.resource)) continue;
+                auto [it, inserted] = compute_transitions.try_emplace(usage.resource, usage);
+                if (!inserted && is_write(usage.access) && !is_write(it->second.access))
+                    it->second = usage;
+            }
+            for (const auto& [resource, usage] : compute_transitions)
+                resource_states_.transition(command_buffer, image_of(resource),
+                    VK_IMAGE_ASPECT_COLOR_BIT, usage.access, usage.stage, /*discard=*/false);
+            resource_states_.flush_buffers(command_buffer);
+
+            const std::string pass_name(pass->debug_name());
+            STRING_PROFILE_SCOPE_DYNAMIC(pass_name.data(), pass_name.size())
+            STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, pass_name.c_str())
+            gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), pass_name);
+            pass->record(recorder, static_cast<uint16_t>(current_frame_));
+            gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
+            ++start;
+            continue;
+        }
         const string::gpu::resource_id group_color = color_target_of(execution_order[start]);
         // First (and only) group targeting the screen: latch the swapchain image now, before the
         // group's transitions/attachment info dereference image_of/image_view_of(SWAPCHAIN_TARGET).
@@ -1155,17 +1210,17 @@ void Renderer::capture_color_target(const std::string& path)
         else v = (1.0f + man / 1024.0f) * std::pow(2.0f, int(exp) - 15);
         return sign ? -v : v;
     };
-    // Brief 07: encode with the SAME exposure + ACES the composite applies on screen (the old
-    // exposure-less Reinhard made captures useless for judging the EV100/unit calibration).
-    const float capture_exposure = CompositePass::exposure_scale();
-    const auto aces = [](float x) -> float {
-        return std::clamp((x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f), 0.0f, 1.0f);
+    // Brief 07/09: encode with the SAME exposure + output-transform LUT the composite applies on
+    // screen (exposure honours auto-exposure; the LUT carries grading + the aces2/aces1 curve).
+    // Per-PIXEL now, not per-channel — the aces2 CAM DRT mixes channels.
+    const auto encode_pixel = [&](const uint16_t* px) -> glm::vec3 {
+        const glm::vec3 hdr(half_to_float(px[0]), half_to_float(px[1]), half_to_float(px[2]));
+        glm::vec3 v = CompositePass::encode_display(hdr);   // display-linear [0,1]
+        v = glm::pow(v, glm::vec3(1.0f / 2.2f));            // gamma
+        return v;
     };
-    const auto encode = [&](uint16_t h) -> uint8_t {
-        float v = std::max(half_to_float(h), 0.0f) * capture_exposure;
-        v = aces(v);                             // matches composite.slang
-        v = std::pow(v, 1.0f / 2.2f);            // gamma
-        return uint8_t(std::min(v, 1.0f) * 255.0f + 0.5f);
+    const auto to_u8 = [](float v) -> uint8_t {
+        return uint8_t(std::min(std::max(v, 0.0f), 1.0f) * 255.0f + 0.5f);
     };
 
     const uint16_t* pixels =
@@ -1190,9 +1245,10 @@ void Renderer::capture_color_target(const std::string& path)
             const uint16_t* src_row = pixels + VkDeviceSize(y) * extent.width * 4;
             for (uint32_t x = 0; x < extent.width; ++x)
             {
-                row[x * 3 + 0] = encode(src_row[x * 4 + 0]);  // R
-                row[x * 3 + 1] = encode(src_row[x * 4 + 1]);  // G
-                row[x * 3 + 2] = encode(src_row[x * 4 + 2]);  // B
+                const glm::vec3 v = encode_pixel(src_row + x * 4);
+                row[x * 3 + 0] = to_u8(v.r);
+                row[x * 3 + 1] = to_u8(v.g);
+                row[x * 3 + 2] = to_u8(v.b);
             }
         }
         const std::vector<uint8_t> png =
@@ -1225,9 +1281,10 @@ void Renderer::capture_color_target(const std::string& path)
         const uint16_t* src_row = pixels + VkDeviceSize(y) * extent.width * 4;
         for (uint32_t x = 0; x < extent.width; ++x)
         {
-            row[x * 3 + 0] = encode(src_row[x * 4 + 2]);  // B
-            row[x * 3 + 1] = encode(src_row[x * 4 + 1]);  // G
-            row[x * 3 + 2] = encode(src_row[x * 4 + 0]);  // R
+            const glm::vec3 v = encode_pixel(src_row + x * 4);
+            row[x * 3 + 0] = to_u8(v.b);  // B
+            row[x * 3 + 1] = to_u8(v.g);  // G
+            row[x * 3 + 2] = to_u8(v.r);  // R
         }
     }
     std::ofstream out(path, std::ios::binary);
@@ -1258,6 +1315,11 @@ void Renderer::bind_composite_source()
     global_descriptor_table_.bind(color_attachment_, string::gpu::descriptor_type::TEXTURE);
     const uint32_t slot = global_descriptor_table_.get_binding_slot(color_attachment_, string::gpu::descriptor_type::TEXTURE);
     composite_pass_.set_source(global_descriptor_table_.get_set(), slot);
+    // Brief 09: passes that consume the resolved HDR target (the post chain) get the physical id
+    // + sampled slot too. No-op for passes that don't override the hook. At init this loop is
+    // empty (the passes are built after the first bind); the constructor re-notifies post-build.
+    for (auto& pass : scene_passes_)
+        pass->bind_color_source(slot, color_attachment_);
 }
 
 void Renderer::handle_resize(const String::View::Extent& extent)
@@ -1276,12 +1338,14 @@ void Renderer::handle_resize(const String::View::Extent& extent)
         .extent = {extent.width, extent.height, 1},
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        // Brief 09: + STORAGE (post compute writes bloom into the resolved target in place).
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
         .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
     });
-    // Re-bind the new HDR target into the table and refresh the composite pass's slot.
+    // Re-bind the new HDR target into the table and refresh the composite pass's slot (and the
+    // scene passes that consume the target — the brief-09 post chain).
     bind_composite_source();
 
     // Recreate the multisampled scene targets at the new size.

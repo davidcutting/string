@@ -21,6 +21,8 @@ slang_shaders = files(
     'meshlet_expand.slang',    # brief 04c expansion: order-stable prefix scan + worklist fill
     'hiz_build.slang',      # HiZ depth-pyramid downsample compute (brief 03)
     'meshlet_reset.slang',  # per-frame stats/visibility reset compute (brief 03)
+    'post.slang',           # brief 09: histogram auto-exposure + Karis bloom chain
+    'gtao.slang',           # brief 09: half-res GTAO + bent normals + spatial denoise
 )
 install_data(slang_shaders, install_dir : 'include/string/shaders')
 

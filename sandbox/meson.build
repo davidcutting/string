@@ -82,6 +82,7 @@ executable(
         'passes/ui_pass.cpp',
         'passes/ui_background_pass.cpp',
         'passes/debug_line_pass.cpp',
+        'passes/post_pass.cpp',
         'ui/motion.cpp',
         'ui/widgets.cpp',
         'ui/screens.cpp',

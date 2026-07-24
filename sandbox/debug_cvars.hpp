@@ -91,4 +91,30 @@ string::core::CVar<bool>&    cv_console_open();     // dbg.console         <- ST
 // pipeline can be verified from a headless capture. <- STRING_DRAW_TEST
 string::core::CVar<bool>&    cv_draw_test();        // dbg.draw_test       <- STRING_DRAW_TEST
 
+// --- Post-processing (brief 09) ----------------------------------------------------------------
+// Bloom: threshold-free Karis downsample/upsample chain, applied into the HDR target pre-composite.
+string::core::CVar<bool>&    cv_bloom_enabled();    // r.bloom.enabled     <- STRING_BLOOM
+string::core::CVar<float>&   cv_bloom_intensity();  // r.bloom.intensity   <- STRING_BLOOM_INTENSITY
+string::core::CVar<float>&   cv_bloom_clamp();      // r.bloom.clamp       <- STRING_BLOOM_CLAMP (knits)
+string::core::CVar<float>&   cv_bloom_radius();     // r.bloom.radius      <- STRING_BLOOM_RADIUS
+string::core::CVar<int32_t>& cv_bloom_mips();       // r.bloom.mips        <- STRING_BLOOM_MIPS
+// Auto-exposure metering (histogram): percentile trim + EV clamps + adaptation rates. The
+// enable lever is engine-side (r.exposure.auto, composite_pass.cpp).
+string::core::CVar<float>&   cv_exposure_min_ev();  // r.exposure.min_ev   <- STRING_EXPOSURE_MIN_EV
+string::core::CVar<float>&   cv_exposure_max_ev();  // r.exposure.max_ev   <- STRING_EXPOSURE_MAX_EV
+string::core::CVar<float>&   cv_exposure_speed_up();   // r.exposure.speed_up   <- STRING_EXPOSURE_SPEED_UP
+string::core::CVar<float>&   cv_exposure_speed_down(); // r.exposure.speed_down <- STRING_EXPOSURE_SPEED_DOWN
+string::core::CVar<float>&   cv_exposure_comp();    // r.exposure.comp     <- STRING_EXPOSURE_COMP (stops)
+string::core::CVar<float>&   cv_exposure_cut_low(); // r.exposure.cut_low  <- STRING_EXPOSURE_CUT_LOW
+string::core::CVar<float>&   cv_exposure_cut_high();// r.exposure.cut_high <- STRING_EXPOSURE_CUT_HIGH
+// One-shot histogram sanity log (total == pixel count).
+string::core::CVar<bool>&    cv_exposure_verify();  // dbg.exposure_verify <- STRING_EXPOSURE_VERIFY
+// GTAO (half-res, bent normals; consumed by lighting.slang's ambient terms).
+string::core::CVar<bool>&    cv_gtao_enabled();     // r.gtao.enabled      <- STRING_GTAO
+string::core::CVar<float>&   cv_gtao_strength();    // r.gtao.strength     <- STRING_GTAO_STRENGTH
+string::core::CVar<float>&   cv_gtao_radius();      // r.gtao.radius       <- STRING_GTAO_RADIUS (world)
+// Bent-normal specular occlusion (Lagarde cone vs reflection lobe). Off = fall back to brief-07's
+// AO-derived Lagarde spec-occ (spec_ao only). A/B lever for the mirror-reflection defect.
+string::core::CVar<bool>&    cv_gtao_spec_occ();    // r.gtao.spec_occ     <- STRING_GTAO_SPEC_OCC
+
 }  // namespace sandbox

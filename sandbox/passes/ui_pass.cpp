@@ -13,6 +13,7 @@
 #include <string/core/logger.hpp>
 #include <string/core/text_measurer.hpp>
 #include <string/gpu/pipeline_builder.hpp>
+#include <string/vulkan/passes/composite_pass.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 
 namespace sandbox
@@ -35,6 +36,7 @@ struct ShapePush
     float screen_size[2];
     std::uint32_t shape_slot;
     std::uint32_t first;   // base index of this sub-draw's range (overlay layer = tail range)
+    float inv_exposure;    // cancels the composite's EV100 exposure (display-referred UI)
 };
 
 // Resolve an element's shape enum to the SDF corner radius: sharp rect = 0, rounded = its radius,
@@ -108,6 +110,7 @@ struct TextPush
     std::uint32_t glyph_slot;
     std::uint32_t atlas_slot;
     std::uint32_t first;   // base index of this sub-draw's range (overlay layer = tail range)
+    float inv_exposure;    // cancels the composite's EV100 exposure (display-referred UI)
 };
 
 // Shape the text nodes' strings into positioned glyph quads. Decodes UTF-8 to codepoints (dynamic
@@ -664,6 +667,12 @@ void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_fr
     const Ring& sr = shape_ring_[current_frame];
     const Ring& gr = glyph_ring_[current_frame];
 
+    // The UI draws display-referred colors into the scene-referred HDR target; the composite will
+    // multiply the whole frame by the EV100 exposure scale before the tonemap LUT. Pre-divide the
+    // UI colors by that same scale (same frame, same value the composite's record() reads) so the
+    // exposure cancels and the console/HUD keep their authored brightness at any scene EV.
+    const float inv_exposure = 1.0f / String::CompositePass::exposure_scale();
+
     const auto draw_shapes = [&](std::uint32_t first, std::uint32_t count) {
         if (count == 0) return;
         vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shape_p.pipeline);
@@ -671,7 +680,7 @@ void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_fr
             shape_p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
         const ShapePush push{
             { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
-            sr.slot, first };
+            sr.slot, first, inv_exposure };
         vkCmdPushConstants(command_buffer, shape_p.pipeline_layout, shape_p.push_constants.stageFlags,
             0, sizeof(ShapePush), &push);
         vkCmdDraw(command_buffer, 6, count, 0, 0);
@@ -683,7 +692,7 @@ void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_fr
             text_p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
         const TextPush push{
             { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
-            gr.slot, atlas_slot_, first };
+            gr.slot, atlas_slot_, first, inv_exposure };
         vkCmdPushConstants(command_buffer, text_p.pipeline_layout,
             text_p.push_constants.stageFlags, 0, sizeof(TextPush), &push);
         vkCmdDraw(command_buffer, 6, count, 0, 0);

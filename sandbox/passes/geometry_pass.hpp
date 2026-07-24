@@ -218,6 +218,28 @@ struct HizPush
     uint32_t src_level;   // mip level of `src_slot` to sample (pyramid->pyramid: the level being reduced)
 };
 
+// Push for the brief-09 GTAO chain (matches Push in shaders/gtao.slang; std430: mat4s at 0/64,
+// scalars from 128, uint2s 8-aligned at 136/144).
+struct GtaoPush
+{
+    glm::mat4 view;         // 0    prev-frame world->view
+    glm::mat4 inv_proj;     // 64   prev-frame inverse projection
+    uint32_t depth_slot;    // 128  prev hz.depth sampled slot
+    uint32_t dst_slot;      // 132
+    glm::uvec2 dst_size;    // 136
+    glm::uvec2 depth_size;  // 144
+    float radius;           // 152
+    float proj00;           // 156
+    float proj11;           // 160
+    uint32_t src_slot;      // 164  denoise input (raw AO)
+    uint32_t _pad0;         // 168
+    uint32_t _pad1;         // 172
+};
+static_assert(offsetof(GtaoPush, depth_slot) == 128);
+static_assert(offsetof(GtaoPush, dst_size) == 136);
+static_assert(offsetof(GtaoPush, radius) == 152);
+static_assert(sizeof(GtaoPush) == 176);
+
 // Push for the per-frame stats reset (matches Push in shaders/meshlet_reset.slang).
 struct ResetPush
 {
@@ -568,6 +590,33 @@ class GeometryPass final : public String::Pass
     VkSampler hiz_sampler_ = VK_NULL_HANDLE;
     uint32_t hiz_screen_w_ = 0, hiz_screen_h_ = 0;
     void ensure_hiz(uint16_t current_frame);
+
+    // --- Brief 09: half-res GTAO with bent normals ----------------------------------------------
+    // Computed at the top of record_compute from the PREVIOUS frame slot's min-resolved depth
+    // (hz.depth) under that frame's matrices; consumed by this frame's lit fragments through
+    // SceneData.prev_view_proj reprojection (exact for the static scene; 1-frame-late AO, zero
+    // temporal accumulation so nothing can ghost). raw -> denoise -> per-slot final (RGBA8:
+    // rgb bent world normal, a visibility). Requires the two-phase HiZ depth; auto-off otherwise.
+    string::gpu::resource_id gtao_raw_ = 0;
+    uint32_t gtao_raw_sampled_slot_ = 0;
+    uint32_t gtao_raw_storage_slot_ = UINT32_MAX;
+    bool gtao_raw_initialized_ = false;      // UNDEFINED -> first-layout transition done
+    std::vector<string::gpu::resource_id> gtao_final_;
+    std::vector<uint32_t> gtao_final_sampled_slots_;
+    std::vector<uint32_t> gtao_final_storage_slots_;
+    std::vector<uint8_t> gtao_final_ready_;  // slot image holds data + sits in SHADER_READ_ONLY
+    glm::uvec2 gtao_size_{ 0, 0 };
+    VkSampler gtao_sampler_ = VK_NULL_HANDLE;   // linear clamp (half-res AO upsampled in the shader)
+    string::gpu::shader_program* gtao_program_ = nullptr;
+    string::gpu::shader_program* gtao_denoise_program_ = nullptr;
+    // Per-slot camera state captured when that slot's depth was resolved (reproject targets).
+    std::vector<uint8_t> hz_depth_valid_;    // slot's hz.depth holds a resolved frame
+    std::vector<glm::mat4> gtao_slot_view_;
+    std::vector<glm::mat4> gtao_slot_proj_;
+    std::vector<glm::mat4> gtao_slot_view_proj_;
+    bool gtao_runs_this_frame_ = false;      // decided in update() (SceneData needs it pre-record)
+    void ensure_gtao();
+    void record_gtao(VkCommandBuffer cb, uint16_t current_frame);
 
     // Brief 06: address of the renderer's Tracy GPU context (from PassContext), for finer per-stage
     // GPU zones inside record_compute/record. Null when the renderer exposes none; the zone macros

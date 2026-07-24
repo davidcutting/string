@@ -31,6 +31,12 @@ enum class Access : std::uint8_t
     TransferRead,   // copy source
     TransferWrite,  // copy destination
     Present,        // ready for the presentation engine
+    // Brief 09: storage-IMAGE accesses (post-processing compute reading/writing render targets in
+    // GENERAL layout). Distinct from StorageRead/StorageWrite, whose UNDEFINED layout marks them as
+    // buffer usages throughout the renderer. StorageImageWrite's scope also covers SAMPLED reads —
+    // post compute passes commonly sample a target they then write back (bloom apply).
+    StorageImageRead,
+    StorageImageWrite,
 };
 
 constexpr bool is_write(Access access)
@@ -41,6 +47,7 @@ constexpr bool is_write(Access access)
         case Access::DepthWrite:
         case Access::StorageWrite:
         case Access::TransferWrite:
+        case Access::StorageImageWrite:
             return true;
         default:
             return false;
@@ -96,6 +103,15 @@ constexpr AccessScope access_scope(Access access)
             return { VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL };
         case Access::Present:
             return { 0, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR };
+        case Access::StorageImageRead:
+            return { VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                     VK_IMAGE_LAYOUT_GENERAL };
+        case Access::StorageImageWrite:
+            // WRITE|READ|SAMPLED: post compute both samples and storage-writes the target in one
+            // record hook (histogram + bloom read the scene color, bloom-apply writes it back).
+            return { VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                         | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                     VK_IMAGE_LAYOUT_GENERAL };
     }
     return { 0, VK_IMAGE_LAYOUT_UNDEFINED };
 }

@@ -67,6 +67,15 @@ struct SceneData
     uint env_mips;             // ladder mip count (perceptual roughness r -> lod r*(env_mips-1))
     uint dfg_slot;             // bindless Sampler2D slot of the split-sum DFG LUT
     uint _tail2;
+
+    // Brief 09 GTAO (appended — earlier offsets unchanged; lighting_data.hpp asserts). The AO
+    // texture holds the PREVIOUS frame's screen-space visibility + world bent normal; sample by
+    // reprojecting the world position through prev_view_proj. gtao_slot == 0xFFFFFFFF disables.
+    float4x4 prev_view_proj;
+    uint gtao_slot;            // half-res texture: rgb = world bent normal * 0.5 + 0.5, a = vis
+    float gtao_strength;
+    uint gtao_w;               // half-res AO texture size (normal-aware joint upsample)
+    uint gtao_h;
 };
 
 // The interpolated surface the fragment shades. Both front-ends fill this.
@@ -322,8 +331,7 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
     // Diffuse: L2 SH irradiance (E/pi). Specular: prefiltered GGX ladder, perceptual-roughness
     // mip mapping. Multi-scatter energy compensation per Fdez-Aguera (same DFG LUT), which closes
     // the furnace-test gap for rough metals. AO: baked AO multiplies the diffuse ambient only;
-    // specular ambient gets horizon-based specular occlusion derived from AO (Lagarde); direct
-    // light is never AO'd.
+    // direct light is never AO'd.
     float3 R = reflect(-V, N);
     float lod = roughness * float(max(s.env_mips, 1u) - 1u);
     float3 prefiltered = lit_cube_textures[s.env_slot].SampleLevel(R, lod).rgb;
@@ -336,8 +344,139 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
     float3 Fms = FssEss * Favg / max(1.0 - Ems * Favg, 1e-3);
     float3 kD = diffuse_color * max(1.0 - FssEss - Fms * Ems, 0.0);
 
+    // --- Brief 09 GTAO: screen-space visibility + bent normal, reprojected from the previous
+    // frame's AO pass (see SceneData.gtao_slot). Diffuse ambient gets the multi-bounce-corrected
+    // visibility (Jimenez cubic fit against the real albedo — avoids over-darkened corners);
+    // specular ambient uses the BENT-NORMAL cone vs the reflection lobe (replacing the brief-07
+    // AO-derived approximation for the screen-space term). The BAKED material AO keeps its 07
+    // rules: diffuse multiply + Lagarde horizon term on specular.
+    float3 gtao_diffuse = float3(1.0);
+    float gtao_spec = 1.0;
+    if (s.gtao_slot != 0xFFFFFFFFu)
+    {
+        float4 prev_clip = mul(s.prev_view_proj, float4(surf.world_pos, 1.0));
+        if (prev_clip.w > 1e-4)
+        {
+            float2 prev_uv = prev_clip.xy / prev_clip.w * 0.5 + 0.5;
+            if (all(prev_uv >= 0.0) && all(prev_uv <= 1.0))
+            {
+                // NORMAL-AWARE JOINT UPSAMPLE of the half-res AO. A plain bilinear sample mixes
+                // the 2x2 half-res footprint regardless of what surface each texel belongs to; at
+                // silhouettes that always blends this surface's AO with the BACKGROUND's (whose
+                // valid bent normal points elsewhere and whose vis may carry real occlusion, e.g.
+                // ground contact shadow behind a sphere edge) — the leaked bent cone then reads as
+                // dark pixelated edge artifacts on mirror silhouettes. Weight each texel by
+                // bilinear coverage x agreement of its bent normal with THIS fragment's geometric
+                // normal: cross-surface texels are rejected instead of blended. Sky texels store a
+                // zero bent vector, so the un-normalized dot rejects them for free.
+                float2 gdim = float2(max(s.gtao_w, 1u), max(s.gtao_h, 1u));
+                float2 st = prev_uv * gdim - 0.5;
+                float2 gb = floor(st);
+                float2 gf = st - gb;
+                float4 g = float4(0.0);
+                float g_wsum = 0.0;
+                [unroll] for (int gy = 0; gy < 2; ++gy)
+                    [unroll] for (int gx = 0; gx < 2; ++gx)
+                    {
+                        float2 tuv = clamp((gb + float2(gx, gy) + 0.5) / gdim,
+                                           float2(0.0), float2(1.0));
+                        float4 t = lit_textures[s.gtao_slot].SampleLevel(tuv, 0);
+                        float3 tb = t.xyz * 2.0 - 1.0;   // un-normalized: length ~1 on surfaces, 0 on sky
+                        float w_bil = (gx == 0 ? 1.0 - gf.x : gf.x)
+                                    * (gy == 0 ? 1.0 - gf.y : gf.y);
+                        float w_n = pow(saturate(dot(tb, geom_n)), 4.0);
+                        float w = w_bil * w_n;
+                        g += t * w;
+                        g_wsum += w;
+                    }
+                // If NO texel agrees with this surface (the depth min-resolve erodes silhouettes
+                // by up to a pixel, so edge fragments can sit entirely over background AO), there
+                // is no valid AO information for this fragment. Fall back to NO occlusion — the
+                // same rule disocclusions use — instead of averaging the disagreeing background
+                // texels, which leaked their occlusion onto mirror silhouettes as dark pixels.
+                if (g_wsum > 1e-3)
+                {
+                g /= g_wsum;
+                float vis = 1.0 - s.gtao_strength * (1.0 - g.a);
+                // Multi-bounce approximation (Jimenez et al. 2016, eq. 10).
+                float3 al = diffuse_color;
+                float3 mb = ((vis * (2.0404 * al - 0.3324) + (-4.7951 * al + 0.6417)) * vis
+                             + (2.7552 * al + 0.6903)) * vis;
+                gtao_diffuse = max(float3(vis), min(mb, float3(1.0)));
+                // debug_flags bit 2: disable bent-normal spec-occ (fall back to brief-07's
+                // AO-derived Lagarde term, spec_ao below). A/B lever for the mirror defect.
+                if ((s.debug_flags & 4u) == 0u) {
+                // Bent-normal specular occlusion (Lagarde/"Moving Frostbite to PBR", eq. from the
+                // bent-cone construction). The KEY correctness rule: an UNOCCLUDED point (vis==1)
+                // must return visibility 1 for the reflection lobe no matter how the surface curves
+                // — curvature (the angle between the bent normal and R) is NOT occlusion. The
+                // previous cone-intersection form treated a smooth lobe on a curved sphere top as
+                // occluded (d_bc ~ angle(N,R) fell inside the ramp), darkening mirror reflections
+                // of the open sky. We compute a visibility cone aperture that OPENS to the full
+                // hemisphere as vis->1, so the intersection with the (narrow, for low roughness)
+                // reflection lobe is unoccluded whenever the point sees the sky.
+                // Edge confidence: the AO texture stores NORMALIZED bent vectors on surfaces and
+                // an exact ZERO vector on sky texels; the bilinear sample here shortens the
+                // decoded vector wherever its half-res footprint straddles a silhouette (sphere
+                // edge against sky/background) or mixes disagreeing surfaces. normalize() of that
+                // near-zero blend is garbage (NaN at exactly zero) and manufactured a pixelated
+                // black rim around the mirror spheres. Use the decoded length as a confidence —
+                // ~1 on valid interior texels, collapsing at edges — and fade the occlusion out
+                // with it: an unreliable bent direction must never occlude.
+                float3 bn_raw = g.xyz * 2.0 - 1.0;
+                float bn_len = length(bn_raw);
+                float bn_conf = smoothstep(0.5, 0.9, bn_len);
+                float3 bent = bn_raw / max(bn_len, 1e-4);
+                // Visibility cone half-angle: vis is the fraction of the hemisphere visible around
+                // the bent normal; solid angle 2*pi*(1-cos) => cos(aperture) = 1 - vis, aperture
+                // ranges 0 (fully occluded) .. pi/2 (open). At vis==1 the cone is the full open
+                // hemisphere and cannot occlude anything ahead of the bent normal.
+                float cos_av = clamp(1.0 - vis, -1.0, 1.0);
+                float a_v = acos(cos_av);
+                // Reflection-lobe half-angle: a narrow cone for mirrors, widening with roughness.
+                float a_s = clamp(roughness, 0.0, 1.0) * 1.5707963 * 0.5;
+                // Angle between the bent (visible) direction and the reflection vector.
+                float d_bc = acos(clamp(dot(bent, R), -1.0, 1.0));
+                // ONE-SIDED ramp starting AT the cone edge: d_bc <= a_v is exactly unoccluded.
+                // A centered ramp ([a_v - a_s, a_v + a_s]) evaluated 0.5 at d_bc == a_v — and at
+                // every curved silhouette the incidence goes grazing, so d_bc -> pi/2 while a_v
+                // caps at pi/2 even for a fully OPEN point: every unoccluded silhouette pixel got
+                // ~half-occluded, which read as a pixelated dark rim around the mirror spheres.
+                // The lobe half that dips below the geometric horizon at grazing is already
+                // accounted for by the BRDF/prefilter; counting it here double-darkens.
+                //
+                // RAMP WIDTH = the estimator's noise floor, not just the lobe width. For a fully
+                // open surface at GRAZING (every silhouette: gamma -> pi/2 in ALL slices) the
+                // 3-slice estimator's worst IGN phase yields vis ~ 0.9 instead of 1 (the sum of
+                // per-slice projected-normal weights spans ~1.73..1.97 of the expected 1.91), and
+                // the 5x5 denoise cannot fully average it out there because the depth-valid
+                // neighborhood at a silhouette is a thin band. vis 0.9 puts a_v at ~84.6 deg while
+                // d_bc sits at ~90 deg — a few-degree deficit that a narrow ramp converts into
+                // strong phantom occlusion (the surviving pixelated edge artifact). A ~20 deg
+                // minimum ramp keeps that deficit imperceptible while real occluders (crevices:
+                // d_bc tens of degrees past a_v) still saturate.
+                float occ = smoothstep(a_v, a_v + max(a_s, 0.35), d_bc) * bn_conf;
+                // Full-visibility gate widened over the same noise band: vis >= ~0.95 is "open
+                // within measurement noise" — no occluder information, spec-occ must vanish. The
+                // fade starts at 0.8 so the noisy 0.85..0.95 silhouette range is strongly damped;
+                // genuinely occluded points (vis 0.3..0.7) keep the full term.
+                occ *= 1.0 - smoothstep(0.8, 0.95, vis);
+                // Rough lobes are nearly hemispherical — the narrow-cone-at-R model over-occludes
+                // them (all-or-nothing occlusion on materials whose ENTIRE env term matters; a
+                // drastic appearance flip on rough metals). Blend the cone result toward the
+                // plain cosine-hemisphere visibility as roughness rises (Frostbite convention:
+                // specular occlusion -> AO at roughness 1).
+                float so = lerp(1.0 - occ, vis, roughness);
+                gtao_spec = lerp(1.0, so, s.gtao_strength);
+                }
+                }
+            }
+        }
+    }
+
     float spec_ao = clamp(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
-    float3 ambient = FssEss * prefiltered * spec_ao + (Fms * Ems + kD) * irradiance * ao;
+    float3 ambient = FssEss * prefiltered * (spec_ao * gtao_spec)
+                   + (Fms * Ems + kD) * irradiance * (ao * gtao_diffuse);
 
     float3 color = direct + ambient;
 

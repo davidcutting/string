@@ -23,6 +23,7 @@
 #include "../debug_cvars.hpp"
 #include <glm/gtc/constants.hpp>
 #include <string/gpu/pipeline_builder.hpp>
+#include <string/vulkan/passes/composite_pass.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 #include "string/gpu/descriptor_allocator.hpp"
 #include "string/gpu/resource.hpp"
@@ -925,6 +926,51 @@ GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::pa
 
         // Brief 07: dynamic sky IBL resources + pipelines (env cubemaps, SH buffer, DFG LUT).
         create_ibl_resources(context);
+
+        // Brief 09: GTAO pipelines + sampler (the half-res targets are screen-sized — created
+        // lazily in ensure_gtao once the extent is known). Linear clamp: the lit shader bilinearly
+        // upsamples the half-res AO.
+        {
+            const VkSamplerCreateInfo gtao_sampler_info = {
+                .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                .magFilter = VK_FILTER_LINEAR,
+                .minFilter = VK_FILTER_LINEAR,
+                .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            };
+            if (vkCreateSampler(device_.get_device(), &gtao_sampler_info, nullptr, &gtao_sampler_)
+                != VK_SUCCESS)
+                throw std::runtime_error("GeometryPass: failed to create GTAO sampler");
+            VkDescriptorSetLayout gtao_layout = descriptor_table_.get_layout();
+            const auto make_gtao_entry = [&](const char* entry) {
+                return context.shader_registry.create(
+                    context.resources_path / "shaders" / "gtao.slang",
+                    [gtao_layout, entry](string::gpu::device& dev,
+                                         const string::gpu::compiled_program& compiled) {
+                        string::gpu::pipeline p{};
+                        p.push_constants = compiled.layout.push_constant;
+                        p.pipeline_layout = string::gpu::pipeline_layout_builder()
+                            .set_descriptor_set_layout({ gtao_layout })
+                            .set_push_constant_ranges({ compiled.layout.push_constant })
+                            .build(dev);
+                        string::gpu::pipeline_builder builder(dev, string::gpu::pipeline_type::COMPUTE);
+                        for (const auto& stage : compiled.stages)
+                            if (stage.stage == VK_SHADER_STAGE_COMPUTE_BIT && stage.entry_point == entry)
+                                builder.add_compute_shader_spirv(stage.spirv, stage.entry_point);
+                        p.pipeline = builder.build_compute_pipeline(p.pipeline_layout);
+                        p.pipeline_type = string::gpu::pipeline_type::COMPUTE;
+                        return p;
+                    });
+            };
+            gtao_program_ = make_gtao_entry("gtao_main");
+            gtao_denoise_program_ = make_gtao_entry("gtao_denoise_main");
+            hz_depth_valid_.assign(frames_in_flight_, 0);
+            gtao_slot_view_.assign(frames_in_flight_, glm::mat4(1.0f));
+            gtao_slot_proj_.assign(frames_in_flight_, glm::mat4(1.0f));
+            gtao_slot_view_proj_.assign(frames_in_flight_, glm::mat4(1.0f));
+        }
 
         // Debug controls: T animate sun (time-of-day), [ / ] scrub it, L toggle local lights,
         // H toggle the froxel heatmap.
@@ -1905,6 +1951,189 @@ void GeometryPass::ensure_hiz(uint16_t current_frame)
         }
     }
     STRING_LOG_INFO("[hiz] pyramid {}x{}, {} mips (x{} frames)", base_w, base_h, mips, frames_in_flight_);
+    // Brief 09: the hz.depth images were just recreated — every slot's resolved-depth content
+    // (GTAO's input) is gone.
+    std::fill(hz_depth_valid_.begin(), hz_depth_valid_.end(), uint8_t(0));
+}
+
+// --- Brief 09: GTAO targets ------------------------------------------------------------------------
+// Half-res RGBA8 (rgb = world bent normal, a = visibility): one shared raw target (produced and
+// denoised within one record hook) + one final target per frame slot (this frame's fragments
+// sample it while the next frame's chain rewrites its own slot).
+void GeometryPass::ensure_gtao()
+{
+    if (screen_size.width == 0 || screen_size.height == 0) return;
+    const glm::uvec2 size((screen_size.width + 1) / 2, (screen_size.height + 1) / 2);
+    if (gtao_raw_ != 0 && size == gtao_size_) return;
+    gtao_size_ = size;
+
+    const auto drop_image = [&](string::gpu::resource_id& id) {
+        if (id == 0) return;
+        descriptor_table_.unbind(id, string::gpu::descriptor_type::TEXTURE);
+        allocator_.destroy_resource(id);
+        id = 0;
+    };
+    if (gtao_raw_storage_slot_ != UINT32_MAX)
+        descriptor_table_.unbind_storage_view(gtao_raw_storage_slot_);
+    for (uint32_t s : gtao_final_storage_slots_) descriptor_table_.unbind_storage_view(s);
+    gtao_final_storage_slots_.clear();
+    gtao_final_sampled_slots_.clear();
+    drop_image(gtao_raw_);
+    for (string::gpu::resource_id& id : gtao_final_) drop_image(id);
+    gtao_final_.assign(frames_in_flight_, 0);
+    gtao_final_ready_.assign(frames_in_flight_, 0);
+    gtao_raw_initialized_ = false;
+
+    const auto make_target = [&](uint32_t& sampled_slot, uint32_t& storage_slot) {
+        // RGBA16F, not RGBA8: 8-bit visibility quantizes into wide soft bands on smooth
+        // slowly-curving receivers (the Sponza vaults — 1/255 vis steps multiply straight into
+        // the ambient term). Half-res 16F is ~4 B/px extra; the bent normal rides along at the
+        // higher precision for free.
+        const string::gpu::resource_id id = allocator_.create_resource(string::gpu::image_info{
+            .extent = { size.x, size.y, 1 },
+            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+            .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+            .allocation_flags = {},
+        });
+        const string::gpu::allocated_image& img = allocator_.get_image(id);
+        descriptor_table_.bind(id, string::gpu::descriptor_type::TEXTURE);
+        sampled_slot = descriptor_table_.get_binding_slot(id, string::gpu::descriptor_type::TEXTURE);
+        descriptor_table_.update_texture(sampled_slot, img.view, gtao_sampler_);
+        storage_slot = descriptor_table_.bind_storage_view(img.view);
+        return id;
+    };
+    gtao_raw_ = make_target(gtao_raw_sampled_slot_, gtao_raw_storage_slot_);
+    gtao_final_sampled_slots_.resize(frames_in_flight_);
+    gtao_final_storage_slots_.resize(frames_in_flight_);
+    for (uint32_t f = 0; f < frames_in_flight_; ++f)
+        gtao_final_[f] = make_target(gtao_final_sampled_slots_[f], gtao_final_storage_slots_[f]);
+    STRING_LOG_INFO("[gtao] half-res targets {}x{} (raw + {} final slots)", size.x, size.y,
+                    frames_in_flight_);
+}
+
+// Record the GTAO chain (top of record_compute): horizon-search AO + bent normal from the
+// PREVIOUS slot's resolved depth, then the spatial denoise into this slot's final target.
+// Barriers are the documented cross-frame local class (07 precedent: same-queue, cross-CB;
+// hz.depth is untracked pass-managed state, its resolve re-discards from UNDEFINED).
+void GeometryPass::record_gtao(VkCommandBuffer cb, uint16_t current_frame)
+{
+    const uint16_t prev = (current_frame + frames_in_flight_ - 1) % frames_in_flight_;
+    if (prev >= hiz_.size() || hiz_[prev].depth == 0 || gtao_raw_ == 0) return;
+    const HizPyramid& hz = hiz_[prev];
+    const string::gpu::allocated_image& depth = allocator_.get_image(hz.depth);
+    const string::gpu::allocated_image& raw = allocator_.get_image(gtao_raw_);
+    const string::gpu::allocated_image& fin = allocator_.get_image(gtao_final_[current_frame]);
+
+    STRING_PROFILE_GPU_ZONE(gpu_ctx(), cb, "gtao")
+
+    // Prev-frame resolved depth: DEPTH_ATTACHMENT (where record_between parked it) -> sampled.
+    // Left in SHADER_READ_ONLY afterwards — the renderer's next resolve of this slot re-discards
+    // from UNDEFINED with a src scope that already names COMPUTE sampled reads.
+    vku::transition_image(cb, {
+        .image = depth.image,
+        .old_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .src_stage = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
+                   | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+        .src_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+    });
+    if (!gtao_raw_initialized_)
+    {
+        gtao_raw_initialized_ = true;
+        vku::transition_image(cb, {
+            .image = raw.image,
+            .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+            .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
+            .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        });
+    }
+    else
+    {
+        vku::transition_image(cb, {
+            .image = raw.image,
+            .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+            .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .src_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        });
+    }
+    vku::transition_image(cb, {
+        .image = fin.image,
+        .old_layout = gtao_final_ready_[current_frame] ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                       : VK_IMAGE_LAYOUT_UNDEFINED,
+        .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+        .src_stage = gtao_final_ready_[current_frame]
+            ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+        .src_access = gtao_final_ready_[current_frame]
+            ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : VkAccessFlags2(0),
+        .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+    });
+
+    const glm::mat4& proj = gtao_slot_proj_[prev];
+    GtaoPush push{};
+    push.view = gtao_slot_view_[prev];
+    push.inv_proj = glm::inverse(proj);
+    push.depth_slot = hz.depth_slot;
+    push.dst_slot = gtao_raw_storage_slot_;
+    push.dst_size = gtao_size_;
+    push.depth_size = glm::uvec2(screen_size.width, screen_size.height);
+    push.radius = std::max(cv_gtao_radius().get(), 0.01f);
+    push.proj00 = std::abs(proj[0][0]);
+    push.proj11 = std::abs(proj[1][1]);
+
+    VkDescriptorSet set = descriptor_table_.get_set();
+    const auto dispatch = [&](string::gpu::shader_program* prog, const GtaoPush& p_push) {
+        const string::gpu::pipeline& p = prog->current();
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
+                                0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(GtaoPush), &p_push);
+        vkCmdDispatch(cb, (gtao_size_.x + 7) / 8, (gtao_size_.y + 7) / 8, 1);
+    };
+    dispatch(gtao_program_, push);
+
+    // raw writes -> denoise sampled reads.
+    vku::transition_image(cb, {
+        .image = raw.image,
+        .old_layout = VK_IMAGE_LAYOUT_GENERAL,
+        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+    });
+    GtaoPush denoise = push;
+    denoise.src_slot = gtao_raw_sampled_slot_;
+    denoise.dst_slot = gtao_final_storage_slots_[current_frame];
+    dispatch(gtao_denoise_program_, denoise);
+
+    // Final -> sampled for this frame's lit fragments.
+    vku::transition_image(cb, {
+        .image = fin.image,
+        .old_layout = VK_IMAGE_LAYOUT_GENERAL,
+        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+    });
+    gtao_final_ready_[current_frame] = 1;
 }
 
 // Brief 03b: dispatch the GPU draw-cull compute to build a work list (commands[] + records[] + count)
@@ -2481,6 +2710,8 @@ GeometryPass::~GeometryPass()
     destroy_program(meshlet_transparent_program_);
     destroy_program(meshlet_shadow_program_);
     destroy_program(hiz_program_);
+    destroy_program(gtao_program_);
+    destroy_program(gtao_denoise_program_);
     destroy_program(reset_program_);
     destroy_program(draw_cull_program_);
     destroy_program(expand_scan_blocks_program_);
@@ -2506,6 +2737,21 @@ GeometryPass::~GeometryPass()
             }
         }
         if (hiz_sampler_ != VK_NULL_HANDLE) vkDestroySampler(device_.get_device(), hiz_sampler_, nullptr);
+        // Brief 09 GTAO targets.
+        if (gtao_raw_storage_slot_ != UINT32_MAX)
+            descriptor_table_.unbind_storage_view(gtao_raw_storage_slot_);
+        for (uint32_t s : gtao_final_storage_slots_) descriptor_table_.unbind_storage_view(s);
+        if (gtao_raw_ != 0)
+        {
+            descriptor_table_.unbind(gtao_raw_, string::gpu::descriptor_type::TEXTURE);
+            allocator_.destroy_resource(gtao_raw_);
+        }
+        for (string::gpu::resource_id id : gtao_final_)
+            if (id != 0)
+            {
+                descriptor_table_.unbind(id, string::gpu::descriptor_type::TEXTURE);
+                allocator_.destroy_resource(id);
+            }
         for (const string::gpu::resource_id b : stats_buffers_) allocator_.destroy_resource(b);
         // Brief 04e M3: worklists + draw_lod live in the renderer-owned scratch arena — nothing
         // to free here.
@@ -2550,6 +2796,9 @@ GeometryPass::~GeometryPass()
         allocator_.destroy_resource(dfg_lut_);
         allocator_.destroy_resource(sh_buffer_);
         vkDestroySampler(device_.get_device(), env_sampler_, nullptr);
+        // Brief 09: the GTAO sampler is created alongside the IBL resources.
+        if (gtao_sampler_ != VK_NULL_HANDLE)
+            vkDestroySampler(device_.get_device(), gtao_sampler_, nullptr);
     }
 
     descriptor_table_.unbind(white_image_, string::gpu::descriptor_type::TEXTURE);
@@ -2736,6 +2985,15 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
     // Brief 07 furnace test lever (r.furnace): shader-side it forces a uniform white environment
     // + white albedo and skips sun/local lights; here it also drives the IBL capture + sky pass.
     furnace_ = cv_furnace().get();
+    // Brief 09 fix: the furnace PINS the exposure (beats auto AND manual) so the radiance-1
+    // furnace environment renders flat WHITE — under scene exposure it reads as uniform grey,
+    // defeating the visual gate. The pin targets exposed = 4.0 (EV ~7.70), NOT 1.0: filmic-style
+    // output transforms map scene 1.0 to only ~80-85% display (the shoulder reserves headroom
+    // above scene-white; the aces2 CAM DRT sits lower still), so an exposed-1.0 furnace showed as
+    // light grey. Two stops above reference white lands the flat field at display white
+    // (>= ~0.96 sRGB) through BOTH tonemap curves while staying on the shoulder rather than hard
+    // clip, so non-uniformities (the gate's actual signal) remain visible.
+    String::CompositePass::set_exposure_override(std::log2(1000.0f / (1.2f * 4.0f)), furnace_);
     // Drive the sun direction + sky palette from the time of day, then refit the cascades to the live
     // camera + sun. Both move, so the cascades are recomputed every frame (stabilization keeps them
     // from shimmering).
@@ -2911,13 +3169,39 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         scene.froxels = froxel_buffers_[current_frame] != 0
                       ? allocator_.get_buffer(froxel_buffers_[current_frame]).device_address : 0;
         scene.max_lights_per_froxel = kMaxLightsPerFroxel;
-        scene.debug_flags = (froxel_heatmap_ ? 1u : 0u) | (furnace_ ? 2u : 0u);
+        scene.debug_flags = (froxel_heatmap_ ? 1u : 0u) | (furnace_ ? 2u : 0u)
+                          | (cv_gtao_spec_occ().get() ? 0u : 4u);   // bit2: disable bent-normal spec-occ
         // Brief 07: the sky-IBL products (single-buffered; the update chain is ordered against
         // in-flight readers inside record_ibl_update / by the declared SH usages).
         scene.sh = sh_buffer_ != 0 ? allocator_.get_buffer(sh_buffer_).device_address : 0;
         scene.env_slot = env_prefiltered_slot_;
         scene.env_mips = kEnvPrefilterMips;
         scene.dfg_slot = dfg_sample_slot_;
+
+        // Brief 09 GTAO: decide HERE (pre-record) whether the chain runs this frame — the shader
+        // reads gtao_slot from this SceneData, so the decision and the recording must agree.
+        // Needs the PREVIOUS slot's resolved depth (two-phase HiZ path); descriptor updates for
+        // (re)created targets land in ensure_gtao(), safely before any set bind this frame.
+        // The furnace test must be a flat white background at every roughness/metallic — GTAO on
+        // the furnace must read as vis == 1 (the brief-09 gate). Rather than trust the AO pass to
+        // produce exactly 1.0 over a depthful furnace scene, disable the whole chain under furnace
+        // so ambient occlusion cannot perturb the uniform-white acceptance state.
+        const bool gtao_allowed = cv_gtao_enabled().get() && !furnace_;
+        if (meshlet_program_ && draw_info_mapped_ && gtao_program_ != nullptr && gtao_allowed)
+            ensure_gtao();
+        const uint16_t gtao_prev = static_cast<uint16_t>(
+            (current_frame + frames_in_flight_ - 1) % frames_in_flight_);
+        gtao_runs_this_frame_ = gtao_allowed && gtao_program_ != nullptr
+            && gtao_denoise_program_ != nullptr && gtao_raw_ != 0
+            && gtao_prev < hz_depth_valid_.size() && hz_depth_valid_[gtao_prev] != 0;
+        scene.prev_view_proj = gtao_runs_this_frame_ ? gtao_slot_view_proj_[gtao_prev]
+                                                     : glm::mat4(1.0f);
+        scene.gtao_slot = gtao_runs_this_frame_ ? gtao_final_sampled_slots_[current_frame]
+                                                : 0xFFFFFFFFu;
+        scene.gtao_strength = std::clamp(cv_gtao_strength().get(), 0.0f, 1.0f);
+        scene.gtao_w = gtao_size_.x;   // half-res AO extent for the lit shader's joint upsample
+        scene.gtao_h = gtao_size_.y;
+
         std::memcpy(scene_mapped_[current_frame], &scene, sizeof(SceneData));
     }
 
@@ -3097,6 +3381,13 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
     // UPDATES, and the set has no UPDATE_AFTER_BIND flag, so they must land BEFORE anything in
     // this command buffer binds the set (the IBL chain below is the first binder).
     if (meshlet_program_ && draw_info_mapped_) ensure_hiz(current_frame);
+
+    // --- Brief 09: GTAO chain (prev-frame depth -> this slot's AO+bent target) -----------------
+    // Runs first so this frame's fragments (phase 1 onward) read a finished AO texture. The
+    // go/no-go decision was made in update() (SceneData.gtao_slot must agree with what actually
+    // records). ensure_gtao() ran in update() — its descriptor updates precede every set bind.
+    if (gtao_runs_this_frame_)
+        record_gtao(command_buffer, current_frame);
 
     // --- Brief 07: sky-IBL update chain (amortized; see the trigger in update()) ---------------
     // Recorded before everything else so the frame's draws read this frame's environment. The
@@ -3502,6 +3793,18 @@ void GeometryPass::record_between(string::gpu::command_recorder& recorder, uint1
         .dst_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
         .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
     });
+
+    // Brief 09: this slot's hz.depth now holds this frame's resolved phase-1 depth — capture the
+    // matrices GTAO will reproject through when it consumes this slot NEXT frame. Rendering uses
+    // the LIVE camera even under freeze-cull, so these are the true depth-buffer transforms.
+    if (current_frame < hz_depth_valid_.size())
+    {
+        hz_depth_valid_[current_frame] = 1;
+        gtao_slot_view_[current_frame] = camera_.view();
+        gtao_slot_view_proj_[current_frame] = camera_.view_proj();
+        gtao_slot_proj_[current_frame] =
+            camera_.view_proj() * glm::inverse(camera_.view());
+    }
 }
 
 // Brief 04d PHASE 2: recorded INSIDE the reopened MSAA group (which LOADed phase-1's color+depth).
