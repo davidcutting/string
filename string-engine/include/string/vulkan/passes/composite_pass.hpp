@@ -33,6 +33,11 @@ public:
     // (re-supplied on resize, when the target is re-created and re-bound).
     void set_source(VkDescriptorSet descriptor_set, uint32_t source_slot);
 
+    // The linear exposure scale the composite applies before its tonemap (EV100 CVar
+    // r.exposure.ev100 + the brief-07 kilo-unit factor). Exposed so the headless capture writer
+    // encodes the SAME image the screen shows.
+    static float exposure_scale();
+
     std::string_view debug_name() const override { return "composite"; }
     virtual void update(float delta_time, uint16_t current_frame) override;
     virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;

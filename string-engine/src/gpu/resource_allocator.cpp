@@ -132,7 +132,7 @@ auto resource_allocator::create_resource(const image_info& info) -> resource_id
     VkImageCreateInfo image_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
-        .flags = 0,
+        .flags = info.cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : VkImageCreateFlags{ 0 },
         .imageType = VK_IMAGE_TYPE_2D,
         .format = info.format,
         .extent = {
@@ -141,7 +141,7 @@ auto resource_allocator::create_resource(const image_info& info) -> resource_id
             .depth = info.extent.depth,
         },
         .mipLevels = info.mip_levels,
-        .arrayLayers = 1,
+        .arrayLayers = info.cube ? 6u : 1u,
         .samples = info.samples,
         .tiling = info.tiling,
         .usage = info.usage,
@@ -169,6 +169,7 @@ auto resource_allocator::create_resource(const image_info& info) -> resource_id
     }
 
     new_image.mip_levels = info.mip_levels;
+    new_image.array_layers = info.cube ? 6u : 1u;
     create_image_sampler(new_image);
     create_image_view(new_image, info.aspect_flags);
 
@@ -270,7 +271,7 @@ void resource_allocator::create_image_view(allocated_image& allocated_image, VkI
         .pNext = nullptr,
         .flags = 0,
         .image = allocated_image.image,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .viewType = allocated_image.array_layers == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D,
         .format = allocated_image.format,
         .components = {},
         .subresourceRange = {
@@ -278,7 +279,7 @@ void resource_allocator::create_image_view(allocated_image& allocated_image, VkI
             .baseMipLevel = 0,
             .levelCount = allocated_image.mip_levels,
             .baseArrayLayer = 0,
-            .layerCount = 1
+            .layerCount = allocated_image.array_layers
         }
     };
 

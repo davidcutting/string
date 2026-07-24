@@ -65,6 +65,11 @@ struct image_info
     // MSAA sample count. >1 for multisampled render targets (which are resolved to a 1-sample
     // image for sampling); such images can't have a mip chain and aren't sampled directly.
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    // Cube map (brief 07: the runtime sky IBL environment). Creates the image with 6 array
+    // layers + CUBE_COMPATIBLE and a CUBE default view, so it can be sampled as a SamplerCube
+    // through the bindless table. Per-mip 2D_ARRAY storage views (for compute writes) are the
+    // caller's job (bind_storage_view), same as the HiZ pyramid's per-mip views.
+    bool cube = false;
 };
 
 struct allocated_image
@@ -76,6 +81,7 @@ struct allocated_image
     VkFormat format;
     VkExtent3D extent;
     uint32_t mip_levels = 1;
+    uint32_t array_layers = 1;   // 6 for cube maps (default view is then CUBE)
     VmaAllocation allocation;
     VmaAllocationInfo allocation_info;
 };

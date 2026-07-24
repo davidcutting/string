@@ -52,6 +52,23 @@ string::core::CVar<int32_t>& cv_ui_nameplates();    // dbg.ui.nameplates   <- ST
 // Which mock screen the ui-dev scene shows: nameplates | inventory | actionbar | chat | all.
 string::core::CVar<std::string>& cv_ui_screen();    // dbg.ui.screen       <- STRING_UI_SCREEN
 
+// --- PBR / IBL (brief 07) ---------------------------------------------------------------------
+// White-furnace test: uniform white environment, sun + local lights off, albedo forced white,
+// AO off. An energy-conserving BRDF makes the scene disappear into the background — the
+// acceptance gate for the brief-07 BRDF work.
+string::core::CVar<bool>&    cv_furnace();          // r.furnace           <- STRING_FURNACE
+// Numeric IBL verification: at a settled frame, read the DFG LUT + SH coefficients back and check
+// them against CPU references (uniform-env SH DC, DFG corner/interior values). Logs PASS/FAIL.
+string::core::CVar<bool>&    cv_ibl_verify();       // dbg.ibl_verify      <- STRING_IBL_VERIFY
+// Force the IBL update chain (capture/prefilter/SH) to re-run EVERY frame regardless of the
+// sun-delta trigger — for measuring the worst-case per-frame cost (Tracy "ibl-update" zone).
+string::core::CVar<bool>&    cv_ibl_every_frame();  // dbg.ibl_every_frame <- STRING_IBL_EVERY_FRAME
+// Headless time-of-day: >= 0 pins time_of_day_ to this value (0..1); < 0 = scene default.
+string::core::CVar<float>&   cv_time_of_day();      // r.tod               <- STRING_TOD
+// Headless sun animation: start with time-of-day advancing (the T key toggle), for TOD motion
+// sequences without input.
+string::core::CVar<bool>&    cv_sun_animate();      // dbg.sun_animate     <- STRING_SUN_ANIM
+
 // --- Transparency A/B verification -----------------------------------------------------------
 string::core::CVar<bool>&    cv_transp_test();      // dbg.transp_test     <- STRING_TRANSP_TEST
 string::core::CVar<bool>&    cv_transp_reverse();   // dbg.transp_reverse  <- STRING_TRANSP_REVERSE

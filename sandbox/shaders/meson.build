@@ -9,7 +9,9 @@ slang_shaders = files(
     'text_shader.slang',
     'ui_background.slang',  # ui-dev sandbox flat gradient background (brief 05, milestone 0)
     'sky_shader.slang',
-    'sky.slang',        # imported by sky_shader.slang and lighting.slang (image-based ambient)
+    'sky.slang',        # imported by sky_shader.slang, lighting.slang and ibl.slang
+    'lighting.slang',   # shared lit-shading module (was missing from the install set pre-07)
+    'ibl.slang',        # brief 07: sky->cubemap capture, GGX prefilter, SH projection, DFG LUT
     'froxel_cull.slang', # clustered light-binning compute (brief 02)
     'meshlet.slang',     # shared meshlet data model (imported by the mesh pipeline; brief 03)
     'meshlet_cull.slang',   # brief 04d M1: shared pure per-meshlet cull primitives (frustum/cone/HiZ/LOD)

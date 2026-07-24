@@ -74,11 +74,11 @@ struct LightingSettings
 struct SkyPush
 {
     glm::mat4 inv_view_proj;
-    glm::vec3 camera_pos;  float _sp0;
+    glm::vec3 camera_pos;  float furnace;   // brief 07: 1 -> uniform white background
     glm::vec3 sun_dir;     float _sp1;
     glm::vec3 sky_zenith;  float _sp2;
-    glm::vec3 sky_ground;  float _sp3;
-    glm::vec3 sun_color;   float _sp4;
+    glm::vec3 sky_ground;  float _sp3;           // ground ALBEDO (radiance derived in-shader)
+    glm::vec3 sun_color;   float sun_intensity;  // klx perpendicular
 };
 
 // Push constant for the task/mesh meshlet draw path (matches Push in shaders/meshlet_mesh.slang;
@@ -226,6 +226,28 @@ struct ResetPush
     uint32_t _pad;
 };
 
+// Push for the brief-07 IBL compute chain (matches Push in shaders/ibl.slang; std430: float4s at
+// 0/16/32/48, scalars from 64, the 8-byte pointer 8-aligned at 96).
+struct IblPush
+{
+    glm::vec4 sun_dir;       // xyz sun dir; w furnace flag (capture writes uniform white)
+    glm::vec4 sky_zenith;
+    glm::vec4 sky_ground;
+    glm::vec4 sun_color;
+    uint32_t src_slot;       // 64
+    uint32_t dst_slot;       // 68
+    uint32_t dst_size;       // 72
+    uint32_t src_size;       // 76
+    float roughness;         // 80  prefilter: PERCEPTUAL roughness of this ladder mip
+    uint32_t sample_count;   // 84
+    uint32_t mip_count;      // 88  capture chain mips (prefilter PDF lod clamp)
+    uint32_t _pad0;          // 92
+    VkDeviceAddress sh;      // 96  ShBuffer address (sh_project)
+};
+static_assert(offsetof(IblPush, src_slot) == 64);
+static_assert(offsetof(IblPush, sh) == 96);
+static_assert(sizeof(IblPush) == 104);
+
 // Renders a whole glTF model: uploads its shared vertex/index buffers plus every texture (each
 // into a bindless slot), then issues one indexed draw per node-instanced primitive, pushing the
 // primitive's transform and material inline. Content-agnostic — the model path is supplied by
@@ -296,13 +318,64 @@ class GeometryPass final : public String::Pass
 
     // Environment (procedural sky + image-based ambient). The sky colours drive BOTH the visible sky
     // background and the lit shader's ambient, so shaded surfaces read as lit by the same sky.
-    glm::vec3 sky_zenith_ = glm::vec3(0.14f, 0.30f, 0.62f);  // clear-day zenith blue (linear)
-    glm::vec3 sky_ground_ = glm::vec3(0.22f, 0.19f, 0.15f);  // warm ground/bounce
+    // Brief 07 M4 units: radiance in kilo-nits, illuminance in kilolux (see sun_for_time).
+    glm::vec3 sky_zenith_ = glm::vec3(2.8f, 6.0f, 12.4f);    // clear-day zenith blue (knits)
+    // Ground band ALBEDO (reflectance, not radiance): the shader derives its radiance from the
+    // CURRENT sun + sky (sky_ground_radiance in sky.slang) so the ground tracks time of day.
+    // Calibrated so noon (t=0.5) reproduces the pre-fix constant (2.64, 2.28, 1.80) knits.
+    glm::vec3 sky_ground_ = glm::vec3(0.0824f, 0.0699f, 0.0503f);
     glm::vec3 sun_color_ = glm::vec3(1.0f, 0.96f, 0.9f);
-    float sun_intensity_ = 3.0f;
+    float sun_intensity_ = 100.0f;                           // klx perpendicular (noon)
     // Fullscreen procedural sky, drawn before geometry. Ported to Slang: the pipeline is owned by
     // the hot-reload registry (recompiles + swaps on save); the pass binds sky_program_->current().
     string::gpu::shader_program* sky_program_ = nullptr;
+
+    // --- Brief 07: dynamic sky IBL ---------------------------------------------------------------
+    // The live sky is captured to a small cubemap, GGX-prefiltered into a roughness ladder and
+    // SH-projected — all on the GPU, re-run only when the sun moves past a threshold (amortized;
+    // <0.3 ms budget). Products: env_prefiltered_ (SamplerCube ladder), sh_buffer_ (9 float4 E/pi
+    // coefficients), dfg_lut_ (split-sum BRDF LUT, baked once). Single-buffered: the chain records
+    // at the top of the frame's main-queue command buffer, ordered against last frame's fragment
+    // reads by the intra-pass barriers (documented local-barrier class, like the HiZ mip chain).
+    static constexpr uint32_t kEnvSize = 128;           // capture / prefilter face size
+    static constexpr uint32_t kEnvCaptureMips = 6;      // capture average chain (PDF mips + SH source)
+    static constexpr uint32_t kEnvPrefilterMips = 6;    // roughness ladder 128..4 (r = mip/(mips-1))
+    static constexpr uint32_t kShSourceMip = 3;         // 16x16 capture mip the SH projects from
+    static constexpr uint32_t kDfgSize = 128;
+    static constexpr uint32_t kPrefilterSamples = 64;
+    static constexpr uint32_t kDfgSamples = 1024;
+    string::gpu::resource_id env_capture_ = 0;          // cube, RGBA16F, kEnvCaptureMips
+    string::gpu::resource_id env_prefiltered_ = 0;      // cube, RGBA16F, kEnvPrefilterMips
+    string::gpu::resource_id dfg_lut_ = 0;              // 2D RGBA16F (rg used)
+    string::gpu::resource_id sh_buffer_ = 0;            // 9 x float4, device-local
+    uint32_t env_capture_sample_slot_ = 0;              // SamplerCube (prefilter source)
+    uint32_t env_prefiltered_slot_ = 0;                 // SamplerCube (shading)
+    uint32_t dfg_sample_slot_ = 0;                      // Sampler2D (shading)
+    uint32_t dfg_storage_slot_ = 0;
+    std::vector<VkImageView> env_capture_mip_views_;    // per-mip 2D_ARRAY storage views
+    std::vector<uint32_t> env_capture_mip_slots_;
+    std::vector<VkImageView> env_prefiltered_mip_views_;
+    std::vector<uint32_t> env_prefiltered_mip_slots_;
+    VkSampler env_sampler_ = VK_NULL_HANDLE;            // linear, clamp, mip-linear (env + LUT)
+    string::gpu::shader_program* env_capture_program_ = nullptr;
+    string::gpu::shader_program* env_mip_program_ = nullptr;
+    string::gpu::shader_program* env_prefilter_program_ = nullptr;
+    string::gpu::shader_program* sh_project_program_ = nullptr;
+    string::gpu::shader_program* dfg_program_ = nullptr;
+    bool dfg_baked_ = false;
+    bool ibl_layouts_initialized_ = false;   // env images moved UNDEFINED -> GENERAL once
+    bool ibl_primed_ = false;                // at least one capture recorded
+    bool ibl_update_pending_ = false;        // update() trigger -> record_compute runs the chain
+    glm::vec3 ibl_captured_sun_dir_{ 0.0f };
+    bool ibl_captured_furnace_ = false;
+    uint64_t ibl_update_count_ = 0;          // instrumentation (amortization honesty)
+    bool furnace_ = false;                   // r.furnace (white-furnace acceptance test)
+    bool lookdev_ = false;                   // material-probe scene (STRING_SCENE=lookdev)
+    void create_ibl_resources(String::PassContext& context);
+    void record_ibl_update(VkCommandBuffer cb);
+    // dbg.ibl_verify: reads the DFG LUT + SH coefficients back and checks them against CPU
+    // references (M1 numeric gate). Stalls the device; debug only.
+    void run_ibl_verification();
     // Shadow depth images: [frame_in_flight][cascade]. One D32 map per cascade per frame in flight,
     // so frame N+1's shadow render doesn't race N's sample and each cascade has its own map.
     std::vector<std::array<string::gpu::resource_id, kMaxCascades>> shadow_images_;
@@ -572,8 +645,12 @@ public:
     // merged into one draw set (shared vertex/index/material/texture tables — the NewSponza packs
     // overlay the same world space). `overlay_stats` (may be null) receives the meshlet culling
     // stats + path/HiZ/view flags each frame for the UI overlay.
+    // `lookdev` (brief 07): ignore model_paths and build the standing material-probe scene
+    // instead — a roughness x metallic sphere grid + a white/mirror pair over a neutral ground
+    // slab, baked through the same cook library (one draw per sphere; factors drive the
+    // materials, no textures). The permanent lookdev sandbox: STRING_SCENE=lookdev ./run.sh.
     GeometryPass(String::PassContext& context, std::vector<std::filesystem::path> model_paths,
-                 std::shared_ptr<MeshOverlayStats> overlay_stats = nullptr);
+                 std::shared_ptr<MeshOverlayStats> overlay_stats = nullptr, bool lookdev = false);
     virtual ~GeometryPass() override;
 
     // Stable identity for tooling (Tracy zones, inspector). Brief 06. The renderer names the

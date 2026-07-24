@@ -1,8 +1,34 @@
 #include <string/vulkan/passes/composite_pass.hpp>
 #include <string/gpu/pipeline_builder.hpp>
 
+#include <cmath>
+
+#include <string/core/cvar.hpp>
+
 namespace String
 {
+
+namespace
+{
+
+// Brief 07: manual EV100 exposure (auto-exposure/histogram adaptation slots into this in brief 09).
+// Scene radiometric units are KILO-nits-scale (1 unit = 1000 cd/m^2 — the brief-07 "physical-ish"
+// unit convention; sun illuminance in kilolux, luminous intensity in kilocandela), so the standard
+// saturation-based exposure H = 1/(1.2 * 2^EV100) picks up a x1000 unit factor here. That factor
+// IS the pre-exposure that keeps midday-sun values well inside HDR16F range.
+string::core::CVar<float>& ev100_cvar()
+{
+    // Default 14.6 = sunny-16, exact for the brief-07 unit convention: noon sun 100 klx -> an
+    // 18% grey card in full sun lands on middle grey after the ACES curve (verified against the
+    // lookdev captures). Interiors/dusk are correspondingly darker until brief-09 auto-exposure.
+    static string::core::CVar<float> v{"r.exposure.ev100", 14.6f,
+        "manual exposure value (EV100); higher = darker. 14.6 = sunny-16 (noon calibration)"};
+    static const bool aliased = [] { v.add_alias("ev100"); return true; }();
+    (void)aliased;
+    return v;
+}
+
+}  // namespace
 
 CompositePass::CompositePass(string::gpu::device& device, const std::filesystem::path& resources_path,
                              VkDescriptorSetLayout global_layout, VkFormat color_format,
@@ -49,6 +75,10 @@ CompositePass::CompositePass(string::gpu::device& device, const std::filesystem:
             p.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
             return p;
         });
+
+    // Touch the exposure CVar so it is registered before the renderer's apply_env() (the pass is
+    // a renderer member, constructed first) — STRING_EV100 must work headlessly.
+    ev100_cvar();
 }
 
 CompositePass::~CompositePass()
@@ -56,6 +86,11 @@ CompositePass::~CompositePass()
     const string::gpu::pipeline& p = program_->current();
     vkDestroyPipeline(device_.get_device(), p.pipeline, nullptr);
     vkDestroyPipelineLayout(device_.get_device(), p.pipeline_layout, nullptr);
+}
+
+float CompositePass::exposure_scale()
+{
+    return 1000.0f / (1.2f * std::exp2(ev100_cvar().get()));
 }
 
 void CompositePass::set_source(VkDescriptorSet descriptor_set, uint32_t source_slot)
@@ -79,8 +114,9 @@ void CompositePass::record(string::gpu::command_recorder& recorder, uint16_t cur
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
         p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
-    // { source_slot, exposure } — exposure scales the HDR before the tonemap curve (see composite.slang).
-    struct { uint32_t source_slot; float exposure; } push{ source_slot_, 1.0f };
+    // { source_slot, exposure } — exposure scales the HDR before the tonemap curve (see
+    // composite.slang). EV100 -> linear scale, with the x1000 kilo-unit factor (see ev100_cvar).
+    struct { uint32_t source_slot; float exposure; } push{ source_slot_, exposure_scale() };
     vkCmdPushConstants(command_buffer, p.pipeline_layout,
         p.push_constants.stageFlags, 0, sizeof(push), &push);
     vkCmdDraw(command_buffer, 3, 1, 0, 0);

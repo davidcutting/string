@@ -147,6 +147,22 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
         return plan;
     }
 
+    if (scene_sel == "lookdev")
+    {
+        // Brief 07: the standing material-probe scene — a roughness x metallic sphere grid plus a
+        // white/mirror pair, generated in-process (no glTF load; near-instant startup). Same
+        // GeometryPass, so sun/TOD scrub keys, the furnace CVar, IBL, shadows and all capture
+        // levers work identically. Debug lines + UI ride along for the console/HUD.
+        auto mesh_stats = std::make_shared<MeshOverlayStats>();
+        plan.add<GeometryPass>(std::vector<std::filesystem::path>{}, mesh_stats, /*lookdev=*/true);
+        plan.add<DebugLinePass>(mesh_stats);
+        plan.add<UIPass>(atlas, make_ui_author(mesh_stats, 0));
+        const auto t1 = std::chrono::steady_clock::now();
+        STRING_LOG_INFO("lookdev scene: plan built in {} ms",
+                        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+        return plan;
+    }
+
     // Default: the full Sponza scene (which draws its own procedural sky background), then the single
     // UI overlay last. Main + curtains + ivy share one world space and merge into a single draw set;
     // the curtains exercise the brief-04 two-sided/blend material paths on real content.

@@ -207,10 +207,161 @@ bool aabb_in_frustum(const glm::mat4& vp, const glm::vec3& mn, const glm::vec3& 
     return true;
 }
 
+// Pack a tangent + handedness into the 10:10:10:2 vertex layout meshlet_mesh.slang unpacks.
+uint32_t pack_tangent(const glm::vec3& t, float sign)
+{
+    const auto sn = [](float v) {
+        return static_cast<uint32_t>(static_cast<int32_t>(std::round(glm::clamp(v, -1.0f, 1.0f) * 511.0f))) & 0x3FFu;
+    };
+    const uint32_t w = sign < 0.0f ? 3u : 1u;   // signed 2-bit: 1 -> +1, 3 (-1 as 2-bit) -> -1
+    return sn(t.x) | (sn(t.y) << 10) | (sn(t.z) << 20) | (w << 30);
+}
+
+// Brief 07: the standing material-probe (lookdev) scene, baked through the same cook library as
+// real content so the whole meshlet path is exercised. A roughness x metallic sphere grid (cols =
+// perceptual roughness 0..1, rows = metallic 0..1), a white/mirror pair on the ground in front,
+// and a neutral ground slab (shadow catcher). Vertices are pre-transformed (identity draw
+// transforms) so DrawInfo.center stays world-space, matching the cooked-scene convention.
+assetbake::LoadedScene build_lookdev_scene()
+{
+    std::vector<String::Vertex> vertices;
+    std::vector<uint32_t> indices;
+    std::vector<GltfDraw> draws;
+    std::vector<GltfMaterial> materials;
+
+    // Unit-sphere template (UV sphere; normal = position, tangent along +phi).
+    constexpr int kStacks = 24, kSlices = 48;
+    std::vector<String::Vertex> sphere_verts;
+    std::vector<uint32_t> sphere_indices;
+    for (int st = 0; st <= kStacks; ++st)
+    {
+        const float theta = glm::pi<float>() * float(st) / float(kStacks);
+        for (int sl = 0; sl <= kSlices; ++sl)
+        {
+            const float phi = 2.0f * glm::pi<float>() * float(sl) / float(kSlices);
+            const glm::vec3 n(std::sin(theta) * std::cos(phi), std::cos(theta),
+                              std::sin(theta) * std::sin(phi));
+            const glm::vec3 t(-std::sin(phi), 0.0f, std::cos(phi));
+            sphere_verts.push_back(String::Vertex{ n, glm::vec3(1.0f),
+                { float(sl) / kSlices, float(st) / kStacks }, n, pack_tangent(t, 1.0f) });
+        }
+    }
+    for (int st = 0; st < kStacks; ++st)
+        for (int sl = 0; sl < kSlices; ++sl)
+        {
+            const uint32_t a = uint32_t(st * (kSlices + 1) + sl);
+            const uint32_t b = a + kSlices + 1;
+            // CCW when viewed from outside (matches the back-face-cull main pipeline).
+            sphere_indices.insert(sphere_indices.end(), { a, a + 1, b, b, a + 1, b + 1 });
+        }
+
+    const auto add_sphere = [&](const glm::vec3& center, float radius, int material) {
+        const uint32_t v0 = static_cast<uint32_t>(vertices.size());
+        const uint32_t i0 = static_cast<uint32_t>(indices.size());
+        for (String::Vertex v : sphere_verts)
+        {
+            v.pos = v.pos * radius + center;
+            vertices.push_back(v);
+        }
+        for (uint32_t i : sphere_indices) indices.push_back(i + v0);
+        GltfDraw d;
+        d.index_offset = i0;
+        d.index_count = static_cast<uint32_t>(sphere_indices.size());
+        d.material = material;
+        d.transform = glm::mat4(1.0f);
+        d.aabb_min = center - glm::vec3(radius);
+        d.aabb_max = center + glm::vec3(radius);
+        draws.push_back(d);
+    };
+    const auto add_material = [&](glm::vec3 albedo, float metallic, float roughness) {
+        GltfMaterial m;
+        m.base_color_factor = glm::vec4(albedo, 1.0f);
+        m.metallic_factor = metallic;
+        m.roughness_factor = roughness;
+        materials.push_back(m);
+        return static_cast<int>(materials.size()) - 1;
+    };
+
+    // The grid: 8 roughness columns (0..1, perceptual) x 5 metallic rows (0..1), radius-0.5
+    // spheres on a wall in the XY plane. Neutral albedo (brighter for metals so the ladder reads).
+    constexpr int kCols = 8, kRows = 5;
+    constexpr float kSpacing = 1.4f, kRadius = 0.5f;
+    for (int row = 0; row < kRows; ++row)
+        for (int col = 0; col < kCols; ++col)
+        {
+            const float metallic = float(row) / float(kRows - 1);
+            const float roughness = float(col) / float(kCols - 1);
+            const glm::vec3 albedo = glm::mix(glm::vec3(0.5f), glm::vec3(0.9f), metallic);
+            add_sphere(glm::vec3((float(col) - (kCols - 1) * 0.5f) * kSpacing,
+                                 1.2f + float(row) * kSpacing, 0.0f),
+                       kRadius, add_material(albedo, metallic, roughness));
+        }
+    // The white/mirror pair, on the ground in front of the grid.
+    add_sphere(glm::vec3(-1.0f, 0.62f, 2.2f), 0.6f, add_material(glm::vec3(1.0f), 0.0f, 1.0f));
+    add_sphere(glm::vec3(1.0f, 0.62f, 2.2f), 0.6f, add_material(glm::vec3(1.0f), 1.0f, 0.0f));
+
+    // Ground slab (two triangles), neutral 40% grey.
+    {
+        const int mat = add_material(glm::vec3(0.4f), 0.0f, 0.85f);
+        const float s = 24.0f;
+        const uint32_t v0 = static_cast<uint32_t>(vertices.size());
+        const uint32_t i0 = static_cast<uint32_t>(indices.size());
+        const glm::vec3 n(0.0f, 1.0f, 0.0f);
+        const uint32_t tan = pack_tangent(glm::vec3(1, 0, 0), 1.0f);
+        const glm::vec3 corners[4] = { { -s, 0, -s }, { s, 0, -s }, { s, 0, s }, { -s, 0, s } };
+        const glm::vec2 uvs[4] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+        for (int i = 0; i < 4; ++i)
+            vertices.push_back(String::Vertex{ corners[i], glm::vec3(1.0f), uvs[i], n, tan });
+        const uint32_t quad[6] = { v0, v0 + 2, v0 + 1, v0, v0 + 3, v0 + 2 };   // CCW from +Y
+        for (uint32_t i : quad) indices.push_back(i);
+        GltfDraw d;
+        d.index_offset = i0;
+        d.index_count = 6;
+        d.material = mat;
+        d.transform = glm::mat4(1.0f);
+        d.aabb_min = { -s, -0.01f, -s };
+        d.aabb_max = { s, 0.01f, s };
+        draws.push_back(d);
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    assetbake::CookedScene cs = assetbake::bake_scene(vertices, indices, draws, assetbake::BakeParams{});
+
+    assetbake::LoadedScene out;
+    out.vertices = std::move(cs.vertices);
+    out.meshlets = std::move(cs.meshlets);
+    out.meshlet_vertices = std::move(cs.meshlet_vertices);
+    out.meshlet_triangles = std::move(cs.meshlet_triangles);
+    out.total_meshlets = cs.total_meshlets;
+    out.materials = std::move(materials);
+    for (const assetbake::CookedDraw& cd : cs.draws)
+    {
+        GpuDrawInfo info{};
+        info.center = cd.center;
+        info.radius = cd.radius;
+        info.lod_count = cd.lod_count;
+        info.first_meshlet = cd.first_meshlet;
+        info.total_meshlets = cd.total_meshlets;
+        for (uint32_t l = 0; l < kMaxLods; ++l) info.lods[l] = cd.lods[l];
+        out.draws.push_back(info);
+        out.draw_windows.push_back({ cd.vertex_count == 0 ? 0u : cd.vertex_offset, cd.vertex_count });
+        GltfDraw meta;
+        meta.index_offset = cd.index_offset;
+        meta.index_count = cd.index_count;
+        meta.material = cd.material;
+        meta.transform = cd.transform;
+        meta.aabb_min = cd.aabb_min;
+        meta.aabb_max = cd.aabb_max;
+        out.draws_meta.push_back(meta);
+    }
+    out.load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return out;
+}
+
 }  // namespace
 
 GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::path> model_paths,
-                           std::shared_ptr<MeshOverlayStats> overlay_stats)
+                           std::shared_ptr<MeshOverlayStats> overlay_stats, bool lookdev)
 : device_(context.device)
 , allocator_(context.allocator)
 , descriptor_table_(context.descriptor_table)
@@ -234,8 +385,12 @@ GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::pa
     // the .c<budget>.cooked file, so both variants must be pre-cooked.
     // Brief 06: CVar-backed (r.chunk.budget; legacy STRING_CHUNK alias). Default = kChunkMaxMeshlets.
     uint32_t chunk_budget = static_cast<uint32_t>(std::max(0, cv_chunk_budget().get()));
-    assetbake::LoadedScene loaded =
-        assetbake::load_cooked_scenes(context.resources_path, model_paths, chunk_budget);
+    lookdev_ = lookdev;
+    // Brief 07: the lookdev scene is generated in-process through the same bake library instead
+    // of loading cooked glTF (no textures, factors drive the materials).
+    assetbake::LoadedScene loaded = lookdev_
+        ? build_lookdev_scene()
+        : assetbake::load_cooked_scenes(context.resources_path, model_paths, chunk_budget);
 
     // Adopt the merged geometry-only tables into the runtime containers (the rest of the pass is
     // unchanged: build_meshlet_gpu fills material/transform onto meshlet_model_.draws, the streamer
@@ -595,6 +750,11 @@ GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::pa
     // r.crowd.enabled (STRING_CROWD) triggers the K-toggle crowd stress path at first update
     // (headless benchmark). The build is deferred to update() (needs residency known).
     crowd_enabled_ = cv_crowd_enabled().get();
+    // Brief 07: headless TOD sequence lever (the T key toggle, pre-armed).
+    sun_animate_ = cv_sun_animate().get();
+    // The lookdev probe scene reads material response under sun + sky IBL only — the local-light
+    // stress set would pollute it (L / STRING_LIGHTS=1 still re-enable it explicitly).
+    if (lookdev_ && std::getenv("STRING_LIGHTS") == nullptr) lights_enabled_ = false;
     // (STRING_DRAW_MIN/MAX bisection removed with brief 03b: draws are now GPU-generated into one
     //  indirect list, so a CPU draw-index window no longer maps to the dispatch loop.)
 
@@ -763,6 +923,9 @@ GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::pa
                 return p;
             });
 
+        // Brief 07: dynamic sky IBL resources + pipelines (env cubemaps, SH buffer, DFG LUT).
+        create_ibl_resources(context);
+
         // Debug controls: T animate sun (time-of-day), [ / ] scrub it, L toggle local lights,
         // H toggle the froxel heatmap.
         input_map_.bind_button("sun_animate", String::KeyCode::T);
@@ -771,6 +934,475 @@ GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::pa
         input_map_.bind_button("toggle_lights", String::KeyCode::L);
         input_map_.bind_button("toggle_heatmap", String::KeyCode::H);
     }
+}
+
+// --- Brief 07: dynamic sky IBL --------------------------------------------------------------------
+// Two small RGBA16F cubemaps (capture chain + prefiltered roughness ladder), the 9-coefficient SH
+// buffer and the split-sum DFG LUT, plus the five compute pipelines that fill them (ibl.slang).
+// The cubemaps live in GENERAL layout for their whole life (compute writes + sampled reads both
+// legal there; 128px — layout-optimal compression is irrelevant), which keeps the intra-pass sync
+// to plain memory barriers. The DFG LUT is baked once and parked in SHADER_READ_ONLY.
+void GeometryPass::create_ibl_resources(PassContext& context)
+{
+    // Linear clamp-to-edge trilinear sampler: the prefilter ladder interpolates between roughness
+    // mips, and the DFG LUT must not wrap at NdotV/roughness extremes (the allocator's default
+    // sampler REPEATs).
+    const VkSamplerCreateInfo sampler_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .maxLod = VK_LOD_CLAMP_NONE,
+        .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+    };
+    if (vkCreateSampler(device_.get_device(), &sampler_info, nullptr, &env_sampler_) != VK_SUCCESS)
+        throw std::runtime_error("GeometryPass: failed to create env sampler");
+
+    const auto make_cube = [&](uint32_t mips) {
+        return allocator_.create_resource(string::gpu::image_info{
+            .extent = { kEnvSize, kEnvSize, 1 },
+            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+            .allocation_flags = {},
+            .mip_levels = mips,
+            .cube = true,
+        });
+    };
+    env_capture_ = make_cube(kEnvCaptureMips);
+    env_prefiltered_ = make_cube(kEnvPrefilterMips);
+
+    // Sampled (SamplerCube) slots + per-mip 2D_ARRAY storage views for the compute writes.
+    const auto bind_cube = [&](string::gpu::resource_id id, uint32_t mips,
+                               std::vector<VkImageView>& views, std::vector<uint32_t>& slots) {
+        const string::gpu::allocated_image& img = allocator_.get_image(id);
+        descriptor_table_.bind(id, string::gpu::descriptor_type::TEXTURE);
+        const uint32_t sample_slot =
+            descriptor_table_.get_binding_slot(id, string::gpu::descriptor_type::TEXTURE);
+        descriptor_table_.update_texture(sample_slot, img.view, env_sampler_);
+        for (uint32_t m = 0; m < mips; ++m)
+        {
+            const VkImageViewCreateInfo vi = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = img.image,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 0, 6 },
+            };
+            VkImageView view = VK_NULL_HANDLE;
+            if (vkCreateImageView(device_.get_device(), &vi, nullptr, &view) != VK_SUCCESS)
+                throw std::runtime_error("GeometryPass: failed to create env mip view");
+            views.push_back(view);
+            slots.push_back(descriptor_table_.bind_storage_view(view));
+        }
+        return sample_slot;
+    };
+    env_capture_sample_slot_ = bind_cube(env_capture_, kEnvCaptureMips,
+                                         env_capture_mip_views_, env_capture_mip_slots_);
+    env_prefiltered_slot_ = bind_cube(env_prefiltered_, kEnvPrefilterMips,
+                                      env_prefiltered_mip_views_, env_prefiltered_mip_slots_);
+
+    // DFG LUT: 2D RGBA16F (rg used), baked once; TRANSFER_SRC for the dbg.ibl_verify readback.
+    dfg_lut_ = allocator_.create_resource(string::gpu::image_info{
+        .extent = { kDfgSize, kDfgSize, 1 },
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+               | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    });
+    const string::gpu::allocated_image& dfg = allocator_.get_image(dfg_lut_);
+    descriptor_table_.bind(dfg_lut_, string::gpu::descriptor_type::TEXTURE);
+    dfg_sample_slot_ = descriptor_table_.get_binding_slot(dfg_lut_, string::gpu::descriptor_type::TEXTURE);
+    descriptor_table_.update_texture(dfg_sample_slot_, dfg.view, env_sampler_);
+    dfg_storage_slot_ = descriptor_table_.bind_storage_view(dfg.view);
+
+    // SH coefficients (9 x float4), written by the projection compute, read by every lit fragment.
+    sh_buffer_ = allocator_.create_resource(string::gpu::buffer_info{
+        .size = sizeof(float) * 4 * 9,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+               | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    });
+
+    // The five compute pipelines, one per ibl.slang entry point (hot-reload registry).
+    VkDescriptorSetLayout layout = descriptor_table_.get_layout();
+    const auto make_ibl_entry = [&](const char* entry) {
+        return context.shader_registry.create(
+            context.resources_path / "shaders" / "ibl.slang",
+            [layout, entry](string::gpu::device& dev, const string::gpu::compiled_program& compiled) {
+                string::gpu::pipeline p{};
+                p.push_constants = compiled.layout.push_constant;
+                p.pipeline_layout = string::gpu::pipeline_layout_builder()
+                    .set_descriptor_set_layout({ layout })
+                    .set_push_constant_ranges({ compiled.layout.push_constant })
+                    .build(dev);
+                string::gpu::pipeline_builder builder(dev, string::gpu::pipeline_type::COMPUTE);
+                for (const auto& stage : compiled.stages)
+                    if (stage.stage == VK_SHADER_STAGE_COMPUTE_BIT && stage.entry_point == entry)
+                        builder.add_compute_shader_spirv(stage.spirv, stage.entry_point);
+                p.pipeline = builder.build_compute_pipeline(p.pipeline_layout);
+                p.pipeline_type = string::gpu::pipeline_type::COMPUTE;
+                return p;
+            });
+    };
+    env_capture_program_ = make_ibl_entry("capture_main");
+    env_mip_program_ = make_ibl_entry("mip_main");
+    env_prefilter_program_ = make_ibl_entry("prefilter_main");
+    sh_project_program_ = make_ibl_entry("sh_project_main");
+    dfg_program_ = make_ibl_entry("dfg_main");
+
+    STRING_LOG_INFO("[ibl] env {}px cube x{} mips (capture) / x{} mips (prefiltered ladder), "
+                    "DFG {}px, L2 SH", kEnvSize, kEnvCaptureMips, kEnvPrefilterMips, kDfgSize);
+}
+
+// Record the sky-IBL update chain: capture -> capture mip chain -> SH projection + GGX prefilter
+// ladder. Runs only on frames where the sun moved past the trigger (see update()) — the whole
+// chain is a single-frame update, so the ambient is always self-consistent (no popping). The DFG
+// LUT bake rides the first call. All barriers here are the documented INTRA-pass class (like the
+// HiZ mip chain): everything is produced and consumed by this pass; the SH buffer's fragment-read
+// edge is graph-declared (usages) and the final memory barrier makes the image writes visible to
+// the fragment stage.
+void GeometryPass::record_ibl_update(VkCommandBuffer cb)
+{
+    VkDescriptorSet set = descriptor_table_.get_set();
+    const auto dispatch = [&](string::gpu::shader_program* prog, const IblPush& push,
+                              uint32_t gx, uint32_t gy, uint32_t gz) {
+        const string::gpu::pipeline& p = prog->current();
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
+                                0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(IblPush), &push);
+        vkCmdDispatch(cb, gx, gy, gz);
+    };
+    const auto compute_barrier = [&](VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+        const VkMemoryBarrier2 mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_access,
+        };
+        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
+        vkCmdPipelineBarrier2(cb, &dep);
+    };
+
+    IblPush push{};
+    push.sun_dir = glm::vec4(glm::normalize(sun_dir_), furnace_ ? 1.0f : 0.0f);
+    push.sky_zenith = glm::vec4(sky_zenith_, 0.0f);
+    push.sky_ground = glm::vec4(sky_ground_, 0.0f);
+    push.sun_color = glm::vec4(sun_color_, sun_intensity_);   // w: klx (ground-band lighting)
+    push.sh = allocator_.get_buffer(sh_buffer_).device_address;
+
+    // One-time: DFG LUT bake + move the cubemaps into their permanent GENERAL layout.
+    if (!dfg_baked_)
+    {
+        const string::gpu::allocated_image& dfg = allocator_.get_image(dfg_lut_);
+        vku::transition_image(cb, {
+            .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+            .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
+            .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        });
+        IblPush dpush = push;
+        dpush.dst_slot = dfg_storage_slot_;
+        dpush.dst_size = kDfgSize;
+        dpush.sample_count = kDfgSamples;
+        dispatch(dfg_program_, dpush, (kDfgSize + 7) / 8, (kDfgSize + 7) / 8, 1);
+        vku::transition_image(cb, {
+            .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_GENERAL,
+            .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        });
+        dfg_baked_ = true;
+    }
+    if (!ibl_layouts_initialized_)
+    {
+        for (string::gpu::resource_id id : { env_capture_, env_prefiltered_ })
+        {
+            const string::gpu::allocated_image& img = allocator_.get_image(id);
+            vku::transition_image(cb, {
+                .image = img.image, .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+                .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
+                .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+                            | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                .level_count = img.mip_levels,
+                .layer_count = 6,
+            });
+        }
+        ibl_layouts_initialized_ = true;
+    }
+    else
+    {
+        // Cross-frame WAR: last frame's fragment reads of the prefiltered ladder must retire
+        // before this frame's rewrite (execution dependency; no memory flush needed for reads).
+        const VkMemoryBarrier2 war = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = 0,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        };
+        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &war };
+        vkCmdPipelineBarrier2(cb, &dep);
+    }
+
+    // 1) Sky -> capture mip 0.
+    {
+        IblPush cpush = push;
+        cpush.dst_slot = env_capture_mip_slots_[0];
+        cpush.dst_size = kEnvSize;
+        dispatch(env_capture_program_, cpush, kEnvSize / 8, kEnvSize / 8, 6);
+    }
+    // 2) Capture average chain (PDF-mip source + SH source).
+    for (uint32_t m = 1; m < kEnvCaptureMips; ++m)
+    {
+        compute_barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        IblPush mpush = push;
+        mpush.src_slot = env_capture_mip_slots_[m - 1];
+        mpush.dst_slot = env_capture_mip_slots_[m];
+        mpush.src_size = kEnvSize >> (m - 1);
+        mpush.dst_size = kEnvSize >> m;
+        dispatch(env_mip_program_, mpush, (mpush.dst_size + 7) / 8, (mpush.dst_size + 7) / 8, 6);
+    }
+    // Capture writes -> SH storage reads + prefilter SAMPLED reads.
+    compute_barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    // 3) L2 SH projection (one workgroup; the fragment-read edge is graph-declared in usages).
+    {
+        IblPush spush = push;
+        spush.src_slot = env_capture_mip_slots_[kShSourceMip];
+        spush.src_size = kEnvSize >> kShSourceMip;
+        dispatch(sh_project_program_, spush, 1, 1, 1);
+    }
+    // 4) GGX prefilter ladder (mips independent — no barriers between them).
+    for (uint32_t m = 0; m < kEnvPrefilterMips; ++m)
+    {
+        IblPush ppush = push;
+        ppush.src_slot = env_capture_sample_slot_;
+        ppush.src_size = kEnvSize;
+        ppush.dst_slot = env_prefiltered_mip_slots_[m];
+        ppush.dst_size = kEnvSize >> m;
+        ppush.roughness = float(m) / float(kEnvPrefilterMips - 1);
+        ppush.sample_count = kPrefilterSamples;
+        ppush.mip_count = kEnvCaptureMips;
+        dispatch(env_prefilter_program_, ppush, (ppush.dst_size + 7) / 8, (ppush.dst_size + 7) / 8, 6);
+    }
+    // Ladder writes -> the lit fragments' sampled reads (image stays in GENERAL).
+    compute_barrier(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+    ibl_captured_sun_dir_ = glm::normalize(sun_dir_);
+    ibl_captured_furnace_ = furnace_;
+    ibl_primed_ = true;
+    ++ibl_update_count_;
+}
+
+namespace
+{
+
+float half_to_float(uint16_t h)
+{
+    const uint32_t sign = (h >> 15) & 1u;
+    const uint32_t exp = (h >> 10) & 0x1Fu;
+    const uint32_t man = h & 0x3FFu;
+    float v;
+    if (exp == 0) v = std::ldexp(static_cast<float>(man), -24);
+    else if (exp == 31) v = man ? std::numeric_limits<float>::quiet_NaN()
+                               : std::numeric_limits<float>::infinity();
+    else v = std::ldexp(static_cast<float>(man + 1024), static_cast<int>(exp) - 25);
+    return sign ? -v : v;
+}
+
+// CPU reference for the split-sum DFG integral — the same estimator (Hammersley + GGX importance
+// sampling + height-correlated Smith visibility) as dfg_main in ibl.slang, in double precision.
+glm::dvec2 dfg_reference(double NdotV, double perceptual, uint32_t samples)
+{
+    const double alpha = perceptual * perceptual;
+    const glm::dvec3 V(std::sqrt(std::max(1.0 - NdotV * NdotV, 0.0)), 0.0, NdotV);
+    double a = 0.0, b = 0.0;
+    for (uint32_t i = 0; i < samples; ++i)
+    {
+        uint32_t bits = i;
+        bits = (bits << 16) | (bits >> 16);
+        bits = ((bits & 0x55555555u) << 1) | ((bits & 0xAAAAAAAAu) >> 1);
+        bits = ((bits & 0x33333333u) << 2) | ((bits & 0xCCCCCCCCu) >> 2);
+        bits = ((bits & 0x0F0F0F0Fu) << 4) | ((bits & 0xF0F0F0F0u) >> 4);
+        bits = ((bits & 0x00FF00FFu) << 8) | ((bits & 0xFF00FF00u) >> 8);
+        const glm::dvec2 xi(double(i) / samples, double(bits) * 2.3283064365386963e-10);
+        const double phi = 2.0 * glm::pi<double>() * xi.x;
+        const double ct = std::sqrt((1.0 - xi.y) / (1.0 + (alpha * alpha - 1.0) * xi.y));
+        const double st = std::sqrt(std::max(1.0 - ct * ct, 0.0));
+        const glm::dvec3 H(st * std::cos(phi), st * std::sin(phi), ct);
+        const glm::dvec3 L = 2.0 * glm::dot(V, H) * H - V;
+        if (L.z <= 0.0) continue;
+        const double NdotL = L.z;
+        const double NdotH = std::max(H.z, 0.0);
+        const double VdotH = std::max(glm::dot(V, H), 1e-4);
+        const double a2 = alpha * alpha;
+        const double gv = NdotL * std::sqrt(NdotV * NdotV * (1.0 - a2) + a2);
+        const double gl = NdotV * std::sqrt(NdotL * NdotL * (1.0 - a2) + a2);
+        const double vis = 0.5 / std::max(gv + gl, 1e-7);
+        const double g_vis = 4.0 * vis * VdotH * NdotL / std::max(NdotH, 1e-4);
+        const double fc = std::pow(1.0 - VdotH, 5.0);
+        a += (1.0 - fc) * g_vis;
+        b += fc * g_vis;
+    }
+    return { a / samples, b / samples };
+}
+
+}  // namespace
+
+// dbg.ibl_verify (brief 07 M1 numeric gate): read the DFG LUT + SH coefficients back and check
+// them against references. PASS criteria: (a) DFG matches the CPU double-precision integral at
+// probe points within 0.02 and A+B stays in (0, 1.01] (single-scatter albedo can't exceed 1);
+// (b) under r.furnace the SH DC reconstructs E/pi = 1 +- 0.02 with all higher bands ~0; without
+// the furnace, reconstructed sky irradiance is finite and up > down (sky brighter than ground).
+void GeometryPass::run_ibl_verification()
+{
+    if (sh_buffer_ == 0 || dfg_lut_ == 0) return;
+    vkDeviceWaitIdle(device_.get_device());
+
+    const VkDeviceSize sh_bytes = sizeof(float) * 4 * 9;
+    const VkDeviceSize dfg_bytes = VkDeviceSize(kDfgSize) * kDfgSize * 8;   // RGBA16F
+    const string::gpu::resource_id staging = allocator_.create_resource(string::gpu::buffer_info{
+        .size = sh_bytes + dfg_bytes,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
+        .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
+                          | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+    });
+    {
+        string::gpu::command_recorder rec;
+        rec.init(device_.get_device(), device_.get_queue(string::gpu::queue_type::GRAPHICS));
+        VkCommandBuffer cb = rec.begin();
+        const VkBufferCopy sh_region = { 0, 0, sh_bytes };
+        vkCmdCopyBuffer(cb, allocator_.get_buffer(sh_buffer_).buffer,
+                        allocator_.get_buffer(staging).buffer, 1, &sh_region);
+        const string::gpu::allocated_image& dfg = allocator_.get_image(dfg_lut_);
+        vku::transition_image(cb, {
+            .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .new_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .src_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .src_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .dst_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .dst_access = VK_ACCESS_2_TRANSFER_READ_BIT,
+            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        });
+        const VkBufferImageCopy dfg_region = {
+            .bufferOffset = sh_bytes,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageExtent = { kDfgSize, kDfgSize, 1 },
+        };
+        vkCmdCopyImageToBuffer(cb, dfg.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               allocator_.get_buffer(staging).buffer, 1, &dfg_region);
+        vku::transition_image(cb, {
+            .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .src_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .src_access = VK_ACCESS_2_TRANSFER_READ_BIT,
+            .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        });
+        rec.end().immediate_submit();
+        rec.destroy();
+    }
+
+    const uint8_t* mapped = static_cast<const uint8_t*>(
+        allocator_.get_buffer(staging).allocation_info.pMappedData);
+    const float* sh = reinterpret_cast<const float*>(mapped);
+    const uint16_t* dfg = reinterpret_cast<const uint16_t*>(mapped + sh_bytes);
+
+    bool pass = true;
+
+    // --- SH checks --------------------------------------------------------------------------
+    const auto sh_c = [&](int i) { return glm::vec3(sh[i * 4 + 0], sh[i * 4 + 1], sh[i * 4 + 2]); };
+    const auto e_over_pi = [&](const glm::vec3& n) {
+        return sh_c(0) * 0.282095f
+             + sh_c(1) * (0.488603f * n.y) + sh_c(2) * (0.488603f * n.z) + sh_c(3) * (0.488603f * n.x)
+             + sh_c(4) * (1.092548f * n.x * n.y) + sh_c(5) * (1.092548f * n.y * n.z)
+             + sh_c(6) * (0.315392f * (3.0f * n.z * n.z - 1.0f))
+             + sh_c(7) * (1.092548f * n.x * n.z)
+             + sh_c(8) * (0.546274f * (n.x * n.x - n.y * n.y));
+    };
+    if (furnace_)
+    {
+        const float dc = sh_c(0).r * 0.282095f;
+        float residual = 0.0f;
+        for (int i = 1; i < 9; ++i)
+            residual = std::max(residual, std::max(std::abs(sh_c(i).r),
+                        std::max(std::abs(sh_c(i).g), std::abs(sh_c(i).b))));
+        const bool ok = std::abs(dc - 1.0f) < 0.02f && residual < 0.02f;
+        pass = pass && ok;
+        STRING_LOG_INFO("[ibl-verify] furnace SH: DC E/pi = {:.5f} (expect 1.0), max |l>0| = {:.5f} -> {}",
+                        dc, residual, ok ? "PASS" : "FAIL");
+    }
+    else
+    {
+        const glm::vec3 up = e_over_pi(glm::vec3(0, 1, 0));
+        const glm::vec3 down = e_over_pi(glm::vec3(0, -1, 0));
+        const bool ok = std::isfinite(up.r + up.g + up.b) && up.g > down.g && down.g >= -0.05f;
+        pass = pass && ok;
+        STRING_LOG_INFO("[ibl-verify] sky SH: E/pi(+Y) = ({:.3f},{:.3f},{:.3f}), E/pi(-Y) = "
+                        "({:.3f},{:.3f},{:.3f}) -> {}",
+                        up.r, up.g, up.b, down.r, down.g, down.b, ok ? "PASS" : "FAIL");
+    }
+
+    // --- DFG checks -------------------------------------------------------------------------
+    const auto dfg_at = [&](uint32_t x, uint32_t y) {
+        const uint16_t* t = dfg + (VkDeviceSize(y) * kDfgSize + x) * 4;
+        return glm::vec2(half_to_float(t[0]), half_to_float(t[1]));
+    };
+    float sum_max = 0.0f, sum_min = 10.0f;
+    for (uint32_t y = 0; y < kDfgSize; ++y)
+        for (uint32_t x = 0; x < kDfgSize; ++x)
+        {
+            const glm::vec2 v = dfg_at(x, y);
+            sum_max = std::max(sum_max, v.x + v.y);
+            sum_min = std::min(sum_min, v.x + v.y);
+        }
+    const bool bounded = sum_max <= 1.01f && sum_min > 0.0f;
+    pass = pass && bounded;
+    STRING_LOG_INFO("[ibl-verify] DFG A+B range [{:.4f}, {:.4f}] (expect (0, 1.01]) -> {}",
+                    sum_min, sum_max, bounded ? "PASS" : "FAIL");
+    const glm::vec2 probes[5] = { { 0.5f, 0.5f }, { 0.9f, 0.1f }, { 0.2f, 0.8f },
+                                  { 0.7f, 0.3f }, { 0.95f, 0.95f } };
+    for (const glm::vec2& p : probes)
+    {
+        const uint32_t x = std::min(kDfgSize - 1, uint32_t(p.x * kDfgSize));
+        const uint32_t y = std::min(kDfgSize - 1, uint32_t(p.y * kDfgSize));
+        const double nv = (x + 0.5) / kDfgSize;
+        const double r = (y + 0.5) / kDfgSize;
+        const glm::vec2 gpu = dfg_at(x, y);
+        const glm::dvec2 ref = dfg_reference(nv, r, kDfgSamples);
+        const bool ok = std::abs(gpu.x - ref.x) < 0.02 && std::abs(gpu.y - ref.y) < 0.02;
+        pass = pass && ok;
+        STRING_LOG_INFO("[ibl-verify] DFG({:.2f},{:.2f}): gpu ({:.4f},{:.4f}) ref ({:.4f},{:.4f}) -> {}",
+                        nv, r, gpu.x, gpu.y, ref.x, ref.y, ok ? "PASS" : "FAIL");
+    }
+
+    STRING_LOG_INFO("[ibl-verify] overall: {}", pass ? "PASS" : "FAIL");
+    allocator_.destroy_resource(staging);
 }
 
 // Upload the meshlet heaps, build the DrawInfo table (materials + transforms + bounds + LOD ranges),
@@ -1721,9 +2353,18 @@ SunState sun_for_time(float t)
     // Warm at the horizon (sunrise/sunset), neutral-bright at noon.
     const float noon = glm::clamp(elevation, 0.0f, 1.0f);
     s.sun_color = glm::mix(glm::vec3(1.0f, 0.55f, 0.28f), glm::vec3(1.0f, 0.96f, 0.9f), noon);
-    s.sun_intensity = glm::mix(1.6f, 3.2f, noon);
-    s.sky_zenith = glm::mix(glm::vec3(0.06f, 0.10f, 0.24f), glm::vec3(0.14f, 0.30f, 0.62f), noon);
-    s.sky_ground = glm::mix(glm::vec3(0.10f, 0.07f, 0.06f), glm::vec3(0.22f, 0.19f, 0.15f), noon);
+    // Brief 07 M4 units (self-consistent, "physical-ish"): illuminance in KILOLUX, luminance /
+    // radiance in KILO-NITS (1 unit = 1000 lx / 1000 cd/m^2 — see r.exposure.ev100 for the
+    // matching EV100 exposure). Sun: ~100 klx perpendicular at noon, ~7 klx at the horizon.
+    // Sky radiance: clear-day zenith ~6 knits at noon falling toward dusk (consistency: pi * mean
+    // sky radiance ~= 15-25 klx of diffuse skylight, the right fraction of the 100 klx global).
+    s.sun_intensity = glm::mix(7.0f, 100.0f, noon);
+    s.sky_zenith = glm::mix(glm::vec3(0.24f, 0.40f, 0.96f), glm::vec3(2.8f, 6.0f, 12.4f), noon);
+    // Ground band is a constant ALBEDO; its radiance is derived per-direction in the shader from
+    // the CURRENT sun + sky (sky_ground_radiance in sky.slang), so it dims/warms with time of day
+    // instead of radiating noon-warm at dusk. Calibrated to reproduce the old noon ground
+    // radiance (2.64, 2.28, 1.80 knits) at t=0.5.
+    s.sky_ground = glm::vec3(0.0824f, 0.0699f, 0.0503f);
     return s;
 }
 }  // namespace
@@ -1762,7 +2403,9 @@ void GeometryPass::build_light_stress_scene(const glm::vec3& aabb_min, const glm
 
         GpuLight L{};
         L.position_radius = glm::vec4(a.center, light_range);
-        L.color_intensity = glm::vec4(color, spot ? 24.0f : 12.0f);
+        // Brief 07 M4 units: luminous intensity in kilocandela (illuminance = I/d^2 in klx).
+        // Stress lights are deliberately floodlight-class so they still read against daylight.
+        L.color_intensity = glm::vec4(color, spot ? 300.0f : 150.0f);
         const glm::vec3 dir = glm::normalize(glm::vec3(rnd() - 0.5f, -1.0f, rnd() - 0.5f));
         L.direction_type = glm::vec4(dir, spot ? 1.0f : 0.0f);
         L.cone = glm::vec4(std::cos(glm::radians(18.0f)), std::cos(glm::radians(30.0f)), 0.0f, 0.0f);
@@ -1828,6 +2471,11 @@ GeometryPass::~GeometryPass()
     };
     destroy_program(sky_program_);
     destroy_program(froxel_program_);
+    destroy_program(env_capture_program_);
+    destroy_program(env_mip_program_);
+    destroy_program(env_prefilter_program_);
+    destroy_program(sh_project_program_);
+    destroy_program(dfg_program_);
     destroy_program(meshlet_program_);
     destroy_program(meshlet_twosided_program_);
     destroy_program(meshlet_transparent_program_);
@@ -1883,6 +2531,25 @@ GeometryPass::~GeometryPass()
         for (const string::gpu::resource_id b : light_buffers_) allocator_.destroy_resource(b);
         for (const string::gpu::resource_id b : froxel_buffers_)
             if (b != 0) allocator_.destroy_resource(b);
+    }
+
+    // Brief 07 IBL resources.
+    if (env_capture_ != 0)
+    {
+        const auto drop_cube = [&](string::gpu::resource_id id, std::vector<VkImageView>& views,
+                                   std::vector<uint32_t>& slots) {
+            for (uint32_t s : slots) descriptor_table_.unbind_storage_view(s);
+            for (VkImageView v : views) vkDestroyImageView(device_.get_device(), v, nullptr);
+            descriptor_table_.unbind(id, string::gpu::descriptor_type::TEXTURE);
+            allocator_.destroy_resource(id);
+        };
+        drop_cube(env_capture_, env_capture_mip_views_, env_capture_mip_slots_);
+        drop_cube(env_prefiltered_, env_prefiltered_mip_views_, env_prefiltered_mip_slots_);
+        descriptor_table_.unbind_storage_view(dfg_storage_slot_);
+        descriptor_table_.unbind(dfg_lut_, string::gpu::descriptor_type::TEXTURE);
+        allocator_.destroy_resource(dfg_lut_);
+        allocator_.destroy_resource(sh_buffer_);
+        vkDestroySampler(device_.get_device(), env_sampler_, nullptr);
     }
 
     descriptor_table_.unbind(white_image_, string::gpu::descriptor_type::TEXTURE);
@@ -2062,6 +2729,13 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         froxel_heatmap_ = !froxel_heatmap_;
         STRING_LOG_INFO("Froxel heatmap {}", froxel_heatmap_ ? "ON" : "OFF");
     }
+    // Brief 07: headless TOD pin (r.tod / STRING_TOD) — wins over the scrub keys/animation so
+    // captures are deterministic.
+    if (const float tod = cv_time_of_day().get(); tod >= 0.0f)
+        time_of_day_ = glm::clamp(tod, 0.0f, 1.0f);
+    // Brief 07 furnace test lever (r.furnace): shader-side it forces a uniform white environment
+    // + white albedo and skips sun/local lights; here it also drives the IBL capture + sky pass.
+    furnace_ = cv_furnace().get();
     // Drive the sun direction + sky palette from the time of day, then refit the cascades to the live
     // camera + sun. Both move, so the cascades are recomputed every frame (stabilization keeps them
     // from shimmering).
@@ -2075,6 +2749,24 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
     {
         compute_cascades();
         animate_lights(delta_time);
+    }
+
+    // Brief 07: amortized IBL update trigger. The chain re-runs only when the sun has moved more
+    // than ~0.1 deg since the last capture (TOD scrub/animation -> every frame; static sun ->
+    // never), when the furnace lever flips, or on the first frame. dbg.ibl_every_frame forces the
+    // worst case for cost measurement.
+    if (env_capture_ != 0)
+    {
+        constexpr float kSunDeltaCos = 0.999998477f;   // cos(0.1 deg)
+        const float align = glm::dot(glm::normalize(sun_dir_), ibl_captured_sun_dir_);
+        if (!ibl_primed_ || cv_ibl_every_frame().get() || furnace_ != ibl_captured_furnace_
+            || align < kSunDeltaCos)
+            ibl_update_pending_ = true;
+
+        // M1 numeric gate (dbg.ibl_verify): after the chain has settled, read the DFG LUT + SH
+        // coefficients back and check them against CPU references. Stalls the device; debug only.
+        if (cv_ibl_verify().get() && stream_frame_ == 40)
+            run_ibl_verification();
     }
 
     // Residency feedback — textures and geometry driven by the SAME per-draw frustum visibility.
@@ -2186,7 +2878,17 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         scene.sun_intensity = sun_intensity_;
         scene.sun_color = sun_color_;
         scene.ambient_sky = sky_zenith_;
-        scene.ambient_ground = sky_ground_;
+        // sky_ground_ is an ALBEDO now; mirror sky_ground_radiance() (sky.slang) so this field
+        // keeps its "hemispheric ambient, down" radiance meaning (unused by the lit shader since
+        // the brief-07 IBL, but kept coherent).
+        {
+            const float lum = glm::dot(sky_zenith_, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+            const glm::vec3 horizon = glm::mix(sky_zenith_, glm::vec3(lum), 0.6f) * 2.0f;
+            const glm::vec3 e_sun = sun_color_ * sun_intensity_
+                                    * glm::clamp(glm::normalize(sun_dir_).y, 0.0f, 1.0f);
+            const glm::vec3 e_sky = glm::pi<float>() * 0.5f * (sky_zenith_ + horizon);
+            scene.ambient_ground = sky_ground_ / glm::pi<float>() * (e_sun + e_sky);
+        }
         for (uint32_t c = 0; c < settings_.cascade_count; ++c)
         {
             scene.cascade_view_proj[c] = cascade_view_proj_[c];
@@ -2209,7 +2911,13 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         scene.froxels = froxel_buffers_[current_frame] != 0
                       ? allocator_.get_buffer(froxel_buffers_[current_frame]).device_address : 0;
         scene.max_lights_per_froxel = kMaxLightsPerFroxel;
-        scene.debug_flags = froxel_heatmap_ ? 1u : 0u;
+        scene.debug_flags = (froxel_heatmap_ ? 1u : 0u) | (furnace_ ? 2u : 0u);
+        // Brief 07: the sky-IBL products (single-buffered; the update chain is ordered against
+        // in-flight readers inside record_ibl_update / by the declared SH usages).
+        scene.sh = sh_buffer_ != 0 ? allocator_.get_buffer(sh_buffer_).device_address : 0;
+        scene.env_slot = env_prefiltered_slot_;
+        scene.env_mips = kEnvPrefilterMips;
+        scene.dfg_slot = dfg_sample_slot_;
         std::memcpy(scene_mapped_[current_frame], &scene, sizeof(SceneData));
     }
 
@@ -2306,6 +3014,9 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
             const uint32_t shadow_before = active_draw_count_ * settings_.cascade_count;
             STRING_LOG_INFO("[shadow-cull] cascades {}: shadow draws {} -> {} (per-cascade light-sphere reject)",
                             settings_.cascade_count, shadow_before, s.shadow_draws);
+            // Brief 07 amortization honesty: how many frames actually re-ran the IBL chain.
+            STRING_LOG_INFO("[ibl] frame {}: {} env updates so far ({} static sun -> 1 expected)",
+                            stream_frame_, ibl_update_count_, sun_animate_ ? "animating" : "");
         }
     }
 
@@ -2352,6 +3063,18 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
                                | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT
                                | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT });
     }
+    // Brief 07: the SH coefficient buffer — written by the IBL compute chain on update frames,
+    // read by every lit fragment. The graph derives the compute->fragment barrier (and the
+    // cross-frame ordering) from these declarations; the cubemap/DFG images use intra-pass
+    // barriers (documented local class, like the HiZ mip chain).
+    if (sh_buffer_ != 0)
+    {
+        if (ibl_update_pending_)
+            usages.push_back({ sh_buffer_, String::Access::StorageWrite,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT });
+        usages.push_back({ sh_buffer_, String::Access::StorageRead,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT });
+    }
     // The persistent visibility bitfield: task-stage read-modify-write every two-phase frame.
     // StorageWrite's scope is READ|WRITE, so the derived TASK->TASK barrier orders the previous
     // frame's phase-2 writes before BOTH this frame's phase-1 reads (RAW) and phase-2 writes
@@ -2369,6 +3092,22 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
     }
 
     VkCommandBuffer& command_buffer = recorder.get_command_buffer();
+
+    // The HiZ (re)build binds new per-mip storage views into the bindless set — descriptor
+    // UPDATES, and the set has no UPDATE_AFTER_BIND flag, so they must land BEFORE anything in
+    // this command buffer binds the set (the IBL chain below is the first binder).
+    if (meshlet_program_ && draw_info_mapped_) ensure_hiz(current_frame);
+
+    // --- Brief 07: sky-IBL update chain (amortized; see the trigger in update()) ---------------
+    // Recorded before everything else so the frame's draws read this frame's environment. The
+    // whole chain updates in ONE frame (capture -> mips -> SH + prefilter), so the ambient is
+    // always self-consistent — amortization can never pop mid-update.
+    if ((ibl_update_pending_ || !dfg_baked_) && env_capture_program_ != nullptr && env_capture_ != 0)
+    {
+        STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "ibl-update")
+        record_ibl_update(command_buffer);
+        ibl_update_pending_ = false;
+    }
 
     // (Brief 04e M2: the cross-frame visibility-bitfield barrier that lived here is now DERIVED
     // by the renderer from this pass's declared {visbits, StorageWrite, TASK} usage — see the
@@ -2580,10 +3319,12 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
         const SkyPush sky_push{
             .inv_view_proj = glm::inverse(vp),
             .camera_pos = camera_.position(),
+            .furnace = furnace_ ? 1.0f : 0.0f,
             .sun_dir = sun_dir_,
             .sky_zenith = sky_zenith_,
-            .sky_ground = sky_ground_,
+            .sky_ground = sky_ground_,   // albedo; radiance derived in-shader
             .sun_color = sun_color_,
+            .sun_intensity = sun_intensity_,
         };
         const string::gpu::pipeline& sky_p = sky_program_->current();
         vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_p.pipeline);

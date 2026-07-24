@@ -126,6 +126,51 @@ CVar<float>& cv_orbit()
     return v;
 }
 
+CVar<bool>& cv_furnace()
+{
+    static CVar<bool> v{"r.furnace", false,
+                        "white-furnace test: uniform white env, no sun/lights, white albedo (brief 07)"};
+    static const bool a = [] { v.add_alias("furnace"); return true; }();
+    (void)a;
+    return v;
+}
+
+CVar<bool>& cv_ibl_verify()
+{
+    static CVar<bool> v{"dbg.ibl_verify", false,
+                        "read back DFG LUT + SH coefficients and check against CPU references"};
+    static const bool a = [] { v.add_alias("ibl_verify"); return true; }();
+    (void)a;
+    return v;
+}
+
+CVar<bool>& cv_ibl_every_frame()
+{
+    static CVar<bool> v{"dbg.ibl_every_frame", false,
+                        "re-run the IBL update chain every frame (worst-case cost measurement)"};
+    static const bool a = [] { v.add_alias("ibl_every_frame"); return true; }();
+    (void)a;
+    return v;
+}
+
+CVar<float>& cv_time_of_day()
+{
+    static CVar<float> v{"r.tod", -1.0f,
+                         "pin time-of-day to this value in [0,1] (headless TOD captures); <0 = default"};
+    static const bool a = [] { v.add_alias("tod"); return true; }();
+    (void)a;
+    return v;
+}
+
+CVar<bool>& cv_sun_animate()
+{
+    static CVar<bool> v{"dbg.sun_animate", false,
+                        "start with time-of-day animating (the T toggle), for headless TOD sequences"};
+    static const bool a = [] { v.add_alias("sun_anim"); return true; }();
+    (void)a;
+    return v;
+}
+
 CVar<bool>& cv_transp_test()
 {
     static CVar<bool> v{"dbg.transp_test", false, "inject synthetic alpha-blended quads for sort verify"};
@@ -194,7 +239,8 @@ CVar<bool>& cv_draw_test()
 CVar<std::string>& cv_scene()
 {
     static CVar<std::string> v{"dbg.scene", "demo",
-                               "scene selector: \"demo\" (Sponza + UI) or \"ui\" (UI-dev sandbox)"};
+                               "scene selector: \"demo\" (Sponza + UI), \"ui\" (UI-dev sandbox) or "
+                               "\"lookdev\" (roughness x metallic sphere grid, brief 07)"};
     static const bool a = [] { v.add_alias("scene"); return true; }();
     (void)a;
     return v;
@@ -237,6 +283,11 @@ void register_debug_cvars()
     cv_scene();
     cv_ui_nameplates();
     cv_ui_screen();
+    cv_furnace();
+    cv_ibl_verify();
+    cv_ibl_every_frame();
+    cv_time_of_day();
+    cv_sun_animate();
     cv_transp_test();
     cv_transp_reverse();
     cv_isolate_draw();

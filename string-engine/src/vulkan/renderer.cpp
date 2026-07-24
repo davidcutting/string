@@ -431,13 +431,10 @@ void Renderer::begin_frame()
         transfer_batch_.flush();
     }
 
-    // Acquire now, before recording, so end_rendering has a valid blit target. Copy the
-    // handles out of string::gpu::acquired_image (which holds references into vectors resize() reallocates).
-    string::gpu::acquired_image acquired = presenter_.acquire_next_frame();
-    acquired_image_ = acquired.image;
-    acquired_image_view_ = acquired.image_view;
-    acquired_wait_semaphore_ = acquired.wait_for_image_available;
-    acquired_signal_semaphore_ = acquired.signal_when_ready_to_present;
+    // NOTE: the swapchain acquire happens LATE, inside record_frame() just before the composite
+    // group — not here. Acquiring at the top of the frame blocked the CPU behind the previous
+    // frame's present and capped run-ahead at ~1 frame (the 04e M4 overlap miss). The per-slot
+    // pacing throttle is the timeline wait above, not the acquire.
 }
 
 void Renderer::record_frame()
@@ -732,12 +729,38 @@ void Renderer::record_frame()
     // the next group. Consecutive COLOR_TARGET (MSAA) groups then form a chain: the FIRST clears the
     // MSAA color+depth, later ones LOAD (preserve) them, and only the LAST resolves msaa_color_ ->
     // color_attachment_ (intermediate MSAA groups STORE their samples for the next to load).
+    // Brief 04e follow-up (late-latch acquire): the swapchain image is acquired HERE, mid-record,
+    // at the first point the frame actually needs it — the composite group, which renders straight
+    // into the swapchain image view. Everything recorded before that point (async submit, compute
+    // prepass, all offscreen groups) touches only non-swapchain resources, so moving the blocking
+    // vkAcquireNextImageKHR off the top of the frame restores CPU run-ahead: the async-compute
+    // submit for frame N is already on its queue before the CPU can block here, letting it overlap
+    // frame N-1's main-queue work instead of landing in the inter-frame idle gap. If acquire hits
+    // OUT_OF_DATE, the presenter recreates the swapchain (device-idle) and retries internally —
+    // the partially recorded command buffer stays valid because nothing recorded so far references
+    // the swapchain, and the fresh image/view is latched before any swapchain command is recorded.
+    // Copy the handles out of string::gpu::acquired_image (which holds references into vectors
+    // resize() reallocates).
+    bool swapchain_acquired = false;
+    const auto acquire_swapchain = [&] {
+        if (swapchain_acquired) return;
+        swapchain_acquired = true;
+        string::gpu::acquired_image acquired = presenter_.acquire_next_frame();
+        acquired_image_ = acquired.image;
+        acquired_image_view_ = acquired.image_view;
+        acquired_wait_semaphore_ = acquired.wait_for_image_available;
+        acquired_signal_semaphore_ = acquired.signal_when_ready_to_present;
+    };
+
     size_t start = 0;
     bool seen_msaa_group = false;   // has a COLOR_TARGET group already cleared the MSAA targets?
     Pass* pending_after_between = nullptr;   // breaker whose phase-2 runs in the next (reopened) group
     while (start < execution_order.size())
     {
         const string::gpu::resource_id group_color = color_target_of(execution_order[start]);
+        // First (and only) group targeting the screen: latch the swapchain image now, before the
+        // group's transitions/attachment info dereference image_of/image_view_of(SWAPCHAIN_TARGET).
+        if (group_color == string::gpu::SWAPCHAIN_TARGET) acquire_swapchain();
         std::optional<string::gpu::resource_id> group_depth;
         size_t end = start;
         bool break_after = false;
@@ -963,7 +986,9 @@ void Renderer::record_frame()
         start = end;
     }
 
-    // The swapchain was rendered by the final group; ready it for presentation.
+    // The swapchain was rendered by the final group; ready it for presentation. (Defensive: a
+    // plan with no screen-targeting group would reach here without having latched an image.)
+    acquire_swapchain();
     resource_states_.transition(command_buffer, acquired_image_, VK_IMAGE_ASPECT_COLOR_BIT,
         Access::Present, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 
@@ -1001,8 +1026,10 @@ void Renderer::end_frame()
 {
     auto& frame = frames_[current_frame_];
 
-    // The swapchain image was acquired in begin_frame; wait on image-availability at the
-    // COLOR_ATTACHMENT_OUTPUT stage since the first thing we do to it is the composite draw.
+    // The swapchain image was acquired late in record_frame (just before the composite group);
+    // this main submit is the FIRST submission that touches it (the async submit references no
+    // swapchain state), so it waits on image-availability at the COLOR_ATTACHMENT_OUTPUT stage —
+    // the first thing done to the image is the composite draw.
     // Brief 04e M4: plus any cross-lane timeline waits the async placement registered this
     // frame (each at the union of its declared read stages).
     std::vector<VkSemaphoreSubmitInfo> wait_semaphore_infos = {
@@ -1128,9 +1155,15 @@ void Renderer::capture_color_target(const std::string& path)
         else v = (1.0f + man / 1024.0f) * std::pow(2.0f, int(exp) - 15);
         return sign ? -v : v;
     };
+    // Brief 07: encode with the SAME exposure + ACES the composite applies on screen (the old
+    // exposure-less Reinhard made captures useless for judging the EV100/unit calibration).
+    const float capture_exposure = CompositePass::exposure_scale();
+    const auto aces = [](float x) -> float {
+        return std::clamp((x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f), 0.0f, 1.0f);
+    };
     const auto encode = [&](uint16_t h) -> uint8_t {
-        float v = std::max(half_to_float(h), 0.0f);
-        v = v / (1.0f + v);                      // simple tonemap
+        float v = std::max(half_to_float(h), 0.0f) * capture_exposure;
+        v = aces(v);                             // matches composite.slang
         v = std::pow(v, 1.0f / 2.2f);            // gamma
         return uint8_t(std::min(v, 1.0f) * 255.0f + 0.5f);
     };

@@ -172,7 +172,10 @@ auto presenter::acquire_next_frame() -> acquired_image
                 VK_NULL_HANDLE,
                 &current_image_index_);
 
-        if (result == VK_SUCCESS)
+        // SUBOPTIMAL counts as an acquire: the image IS acquired and the semaphore IS signalled,
+        // so we must use it — recreating here would retry the acquire with an already-signalled
+        // semaphore. present() sees SUBOPTIMAL too and triggers the recreate after this frame.
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
         {
             current_frame_id_ = frame_id;
 
@@ -183,8 +186,12 @@ auto presenter::acquire_next_frame() -> acquired_image
                 .signal_when_ready_to_present = signal_when_ready_to_present_semaphores_[current_image_index_],
             };
         }
-        else if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+        else if (result == VK_ERROR_OUT_OF_DATE_KHR)
         {
+            // OUT_OF_DATE does NOT signal the semaphore, so it is safe to recreate and retry
+            // with the same one. Callers may be mid-record when this happens (late-latch
+            // acquire); that is fine as long as nothing recorded so far references the
+            // swapchain — the renderer acquires before recording any swapchain command.
             resize(extent_);
             continue;
         }

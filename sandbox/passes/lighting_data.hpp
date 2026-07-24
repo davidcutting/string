@@ -73,9 +73,17 @@ struct SceneData
     VkDeviceAddress lights;         // device address of the GpuLight SSBO
     VkDeviceAddress froxels;        // device address of the per-froxel light-index SSBO
     uint32_t max_lights_per_froxel;
-    uint32_t debug_flags;           // bit 0: froxel light-count heatmap
+    uint32_t debug_flags;           // bit 0: froxel light-count heatmap; bit 1: furnace test (brief 07)
     uint32_t _tail0;
     uint32_t _tail1;
+
+    // Brief 07 dynamic sky IBL. APPENDED so every pre-07 offset above is unchanged; must match
+    // the tail of SceneData in lighting.slang (natural layout, pointer 8-aligned at 680).
+    VkDeviceAddress sh;             // ShBuffer: 9 float4 L2 SH irradiance coefficients (E/pi)
+    uint32_t env_slot;              // bindless SamplerCube slot of the prefiltered environment
+    uint32_t env_mips;              // prefiltered ladder mip count
+    uint32_t dfg_slot;              // bindless Sampler2D slot of the split-sum DFG LUT
+    uint32_t _tail2;
 };
 
 // Lock the layout against Slang's NATURAL layout for pointer-loaded structs (scalar packing:
@@ -93,6 +101,11 @@ static_assert(offsetof(SceneData, froxel_planes) == 628);
 static_assert(offsetof(SceneData, lights) == 648);
 static_assert(offsetof(SceneData, froxels) == 656);
 static_assert(offsetof(SceneData, max_lights_per_froxel) == 664);
-static_assert(sizeof(SceneData) == 680);
+// Brief 07 tail (verified against %SceneData_natural OpMemberDecorate offsets, see the brief log).
+static_assert(offsetof(SceneData, sh) == 680);
+static_assert(offsetof(SceneData, env_slot) == 688);
+static_assert(offsetof(SceneData, env_mips) == 692);
+static_assert(offsetof(SceneData, dfg_slot) == 696);
+static_assert(sizeof(SceneData) == 704);
 
 }  // namespace sandbox
