@@ -77,6 +77,14 @@ public:
     // Override the dynamic-rendering color target format (default: the offscreen HDR
     // R16G16B16A16_SFLOAT). Composite/present passes set this to the swapchain format.
     pipeline_builder& set_color_format(VkFormat format);
+    // Multiple render targets (MRT): one color format per attachment, in location order. The
+    // current blend state is replicated across all attachments. Used by the probe capture G-buffer
+    // (albedo + normal/dist + depth). Overrides set_color_format.
+    pipeline_builder& set_color_formats(const std::vector<VkFormat>& formats);
+    // Multiview (VK_KHR_multiview): the render pass broadcasts each draw to every bit set in the
+    // mask, the shader reading SV_ViewID to specialize per view. Sets VkPipelineRenderingCreateInfo
+    // .viewMask. Used by the probe capture (0x3F = 6 cube faces in one pass). Default 0 = disabled.
+    pipeline_builder& set_view_mask(uint32_t mask);
 
     VkPipeline build_graphics_pipeline(const VkPipelineLayout& pipeline_layout);
     VkPipeline build_compute_pipeline(const VkPipelineLayout& pipeline_layout);
@@ -121,8 +129,12 @@ private:
     // enable_depth_stencil() is called, so passes without a depth attachment (e.g. the
     // composite pass) don't declare one.
     VkFormat color_format_ = VK_FORMAT_R16G16B16A16_SFLOAT;
+    // MRT: when non-empty, one color attachment per entry (overrides color_format_). Blend state is
+    // replicated across all attachments at build time.
+    std::vector<VkFormat> color_formats_;
     VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
     bool color_enabled_ = true;   // depth_only() clears this (no color attachment)
+    uint32_t view_mask_ = 0;      // multiview viewMask (0 = single-view; 0x3F = 6-face probe capture)
 };
 
 }

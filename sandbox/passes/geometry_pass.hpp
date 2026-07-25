@@ -24,6 +24,7 @@
 #include "texture_streamer.hpp"
 #include "lighting_data.hpp"
 #include "meshlet_data.hpp"
+#include "probe_gi.hpp"
 #include "meshlet_builder.hpp"
 #include "assetbake/scene_loader.hpp"
 
@@ -398,6 +399,83 @@ class GeometryPass final : public String::Pass
     // dbg.ibl_verify: reads the DFG LUT + SH coefficients back and checks them against CPU
     // references (M1 numeric gate). Stalls the device; debug only.
     void run_ibl_verification();
+
+    // --- Brief 09b: relightable irradiance probe volume (DDGI-style) -----------------------------
+    // A uniform probe grid fit to the scene AABB. Static per-probe capture G-buffer (albedo, normal,
+    // distance) + visibility (mean/mean^2 distance) octahedral atlases, rasterized once at load; a
+    // compute pass RELIGHTS them into an octahedral irradiance atlas whenever the sun moves (like the
+    // sky IBL). Shading samples the irradiance atlas (Chebyshev-visibility-gated 8-probe trilinear)
+    // for the ambient DIFFUSE term, falling back to the sky-SH ambient outside the volume. See
+    // probe_gi.hpp / probe_common.slang for the layout + math. r.gi toggles the whole feature.
+    // M1 capture: a single reused per-probe cube G-buffer (albedo + normal/dist + depth), rasterized
+    // per cube face then collapsed into this probe's octahedral atlases. K probes/frame, amortized.
+    static constexpr uint32_t kProbeCubeFace = 32;    // cube face size (cheap; > vis tile so no aliasing)
+    // Capture is a full-scene mesh render x6 faces x this many probes PER FRAME — the dominant
+    // load-time cost. 1 face/frame keeps every frame under the hitch budget (capture spreads over
+    // ~faces*probes frames; the scene is playable throughout). See record_probe_capture.
+    // Brief 09b (fast capture): all 6 cube faces render in ONE multiview pass, so the amortization
+    // unit is PROBES/frame (not faces): with the per-face CPU loop gone, a full probe is one
+    // vkCmdDrawMeshTasksEXT. ~10+ probes/frame finishes a ~250-probe bake in a couple of seconds.
+    static constexpr uint32_t kProbeCubeViewMask = 0x3Fu;   // 6-face multiview mask
+    // Probes captured per frame (amortized). Each probe is one multiview dispatch over the coarse-LOD
+    // meshlet domain (distance + face culled on GPU), so this bounds the per-frame bake burst. 2 keeps
+    // it under the hitch threshold; a ~750-probe bake still finishes in a few seconds.
+    static constexpr uint32_t kProbesPerFrame = 2;
+    ProbeVolume probe_volume_{};
+    string::gpu::resource_id probe_cube_albedo_ = 0;  // cube RGBA16F: captured base color
+    string::gpu::resource_id probe_cube_nd_ = 0;      // cube RGBA16F: world normal.xyz + linear dist(w)
+    string::gpu::resource_id probe_cube_depth_ = 0;   // cube D32: nearest-surface depth (per face)
+    uint32_t probe_cube_albedo_sample_slot_ = 0;      // SamplerCube (collapse read)
+    uint32_t probe_cube_nd_sample_slot_ = 0;
+    // 6-layer 2D_ARRAY views over the whole cube — the multiview render pass targets all 6 layers in
+    // one BeginRendering (SV_ViewID selects the layer/face).
+    VkImageView probe_cube_albedo_array_view_ = VK_NULL_HANDLE;
+    VkImageView probe_cube_nd_array_view_ = VK_NULL_HANDLE;
+    VkImageView probe_cube_depth_array_view_ = VK_NULL_HANDLE;
+    string::gpu::resource_id probe_active_ = 0;       // per-probe activation (uint: 1 active / 0 inside)
+    string::gpu::resource_id probe_offset_ = 0;       // per-probe relocation offset (float4: xyz world)
+    string::gpu::resource_id probe_meshlet_draw_ = 0; // global LOD0-meshlet-id -> owning draw index (uint)
+    uint32_t probe_total_lod0_meshlets_ = 0;          // total LOD0 meshlets (flat capture dispatch domain)
+    float probe_cull_far_ = 0.0f;                     // capture distance-cull radius (bounded ~= few cells)
+    string::gpu::shader_program* probe_capture_raster_program_ = nullptr;  // cube-face G-buffer raster
+    string::gpu::shader_program* probe_collapse_program_ = nullptr;        // cube -> octa atlases + classify
+    uint32_t probe_capture_cursor_ = 0;               // probe currently being captured (amortization)
+    bool probe_cube_layouts_initialized_ = false;     // cube G-buffer images: UNDEFINED -> first use
+    double probe_capture_ms_ = 0.0;                   // accumulated capture wall time (log on complete)
+    string::gpu::resource_id probe_irrad_ = 0;        // octa irradiance atlas (RGBA16F, relit)
+    string::gpu::resource_id probe_cap_gbuf_ = 0;     // octa capture normal.xyz + hit distance (w)
+    string::gpu::resource_id probe_cap_albedo_ = 0;   // octa capture albedo.rgb
+    string::gpu::resource_id probe_vis_ = 0;          // octa visibility mean/mean^2 (RG16F used)
+    uint32_t probe_irrad_sample_slot_ = 0;            // Sampler2D (shading + debug + bounce)
+    uint32_t probe_irrad_storage_slot_ = 0;           // RWTexture2D (relight write)
+    uint32_t probe_cap_gbuf_sample_slot_ = 0;
+    uint32_t probe_cap_gbuf_storage_slot_ = 0;
+    uint32_t probe_cap_albedo_sample_slot_ = 0;
+    uint32_t probe_cap_albedo_storage_slot_ = 0;
+    uint32_t probe_vis_sample_slot_ = 0;
+    uint32_t probe_vis_storage_slot_ = 0;
+    VkSampler probe_sampler_ = VK_NULL_HANDLE;        // linear clamp (atlas bilinear w/ gutter)
+    string::gpu::shader_program* probe_clear_program_ = nullptr;   // capture: clear/init (M0), raster (M1)
+    string::gpu::shader_program* probe_relight_program_ = nullptr; // relight + convolve
+    string::gpu::shader_program* probe_debug_program_ = nullptr;   // instanced debug spheres
+    bool probe_layouts_initialized_ = false;  // atlases moved UNDEFINED -> GENERAL once
+    bool probe_captured_ = false;             // static capture (clear/vis) recorded once
+    bool probe_primed_ = false;               // at least one FULL relight pass has completed
+    bool probe_relight_pending_ = false;      // armed passes remain -> record_compute runs relight
+    // M2 amortized relight: K probes per frame, round-robin cursor. A sun trigger arms N converge
+    // passes: each full wrap propagates the bounce one step further (infinite bounce) and the
+    // hysteresis EMA settles (h^N residual), then relight goes idle until the sun moves (~0 static).
+    static constexpr uint32_t kRelightProbesPerFrame = 128;
+    static constexpr uint32_t kRelightConvergePasses = 32;
+    uint32_t probe_relight_cursor_ = 0;       // next probe to relight within the current pass
+    uint32_t probe_relight_passes_left_ = 0;  // full passes remaining before relight goes idle
+    glm::vec3 probe_relit_sun_dir_{ 0.0f };
+    uint32_t probe_debug_mode_ = 0;           // r.gi.probe_debug snapshot for this frame's record()
+    void fit_probe_volume();                  // grid fit to the scene AABB (spacing CVar)
+    void create_probe_resources(String::PassContext& context);
+    void record_probe_capture(VkCommandBuffer cb);   // static capture (once): init/raster + visibility
+    void record_probe_relight(VkCommandBuffer cb, uint16_t current_frame);  // relight -> irradiance
+    void record_probe_debug(VkCommandBuffer cb);     // instanced probe-debug spheres (into scene)
     // Shadow depth images: [frame_in_flight][cascade]. One D32 map per cascade per frame in flight,
     // so frame N+1's shadow render doesn't race N's sample and each cascade has its own map.
     std::vector<std::array<string::gpu::resource_id, kMaxCascades>> shadow_images_;

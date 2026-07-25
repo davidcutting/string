@@ -328,6 +328,10 @@ void device::create_logical_device()
     mesh_shader_features.pNext = &extended_dynamic_state2_features;
     mesh_shader_features.taskShader = VK_TRUE;
     mesh_shader_features.meshShader = VK_TRUE;
+    // Brief 09b: the probe capture renders all 6 cube faces of a probe in ONE multiview render pass
+    // with a mesh-shader pipeline — that combination needs multiviewMeshShader (separate from the
+    // core Vulkan 1.1 `multiview` feature, which only covers vertex-pipeline multiview).
+    mesh_shader_features.multiviewMeshShader = VK_TRUE;
 
     VkPhysicalDeviceVulkan11Features vulkan11_features{};
     vulkan11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
@@ -335,6 +339,10 @@ void device::create_logical_device()
     // Slang lowers SV_VertexID/SV_InstanceID relative to gl_BaseVertex/gl_BaseInstance,
     // which declares the SPIR-V DrawParameters capability.
     vulkan11_features.shaderDrawParameters = VK_TRUE;
+    // Brief 09b: VK_KHR_multiview (core in 1.1) — the probe capture renders all 6 cube faces in a
+    // SINGLE render pass (viewMask=0x3F), the mesh shader selecting the per-face view-projection via
+    // SV_ViewID. Removes the per-face BeginRendering + CPU draw loop that made capture laggy.
+    vulkan11_features.multiview = VK_TRUE;
 
     VkPhysicalDeviceVulkan12Features vulkan12_features{};
     vulkan12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
@@ -377,6 +385,12 @@ void device::create_logical_device()
     // Sampling BC7 (transcoded from cooked KTX2 textures) requires this feature enabled;
     // is_device_suitable() already rejects any device that doesn't support it.
     enabled_device_features.textureCompressionBC = VK_TRUE;
+    // Brief 09b: the probe capture/relight/debug shaders access buffer_reference pointers (vertex,
+    // meshlet, draw, probe offset/active buffers), which Slang lowers to 64-bit PhysicalStorageBuffer
+    // addresses and declares the SPIR-V Int64 capability. Without this the validation layer flags
+    // every probe vkCreateShaderModule (Int64 declared but shaderInt64 not enabled) and the behavior
+    // is technically UB even where the driver tolerates it.
+    enabled_device_features.shaderInt64 = VK_TRUE;
 
     // clang-format off
     VkPhysicalDeviceFeatures2 enabled_device_features2 = {

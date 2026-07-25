@@ -71,13 +71,34 @@ driver::driver(const String::ApplicationInfo& info, const std::shared_ptr<String
     // clang-format on
 
     auto extensions = window->get_platform_extensions(enable_validation_layers);
-    extensions.emplace_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+
+    // VK_KHR_portability_enumeration is only needed for portability drivers (e.g. MoltenVK) and is
+    // NOT exposed by some capture layers (RenderDoc), which otherwise fails to attach. Request it —
+    // and the matching create flag — ONLY when the loader actually reports it available.
+    bool has_portability = false;
+    {
+        uint32_t ext_count = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &ext_count, nullptr);
+        std::vector<VkExtensionProperties> props(ext_count);
+        vkEnumerateInstanceExtensionProperties(nullptr, &ext_count, props.data());
+        for (const VkExtensionProperties& p : props)
+        {
+            if (strcmp(p.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0)
+            {
+                has_portability = true;
+                extensions.emplace_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+                break;
+            }
+        }
+    }
 
     // clang-format off
     VkInstanceCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pNext = nullptr,
-        .flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
+        .flags = has_portability
+                     ? static_cast<VkInstanceCreateFlags>(VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR)
+                     : 0u,
         .pApplicationInfo = &application_info,
         .enabledLayerCount = 0,
         .ppEnabledLayerNames = nullptr,

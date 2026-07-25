@@ -927,6 +927,10 @@ GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::pa
         // Brief 07: dynamic sky IBL resources + pipelines (env cubemaps, SH buffer, DFG LUT).
         create_ibl_resources(context);
 
+        // Brief 09b: relightable irradiance probe volume (grid fit to the scene AABB + atlases +
+        // relight/capture/debug pipelines). Fits the scene AABB computed just above.
+        create_probe_resources(context);
+
         // Brief 09: GTAO pipelines + sampler (the half-res targets are screen-sized — created
         // lazily in ensure_gtao once the extent is known). Linear clamp: the lit shader bilinearly
         // upsamples the half-res AO.
@@ -1261,6 +1265,755 @@ void GeometryPass::record_ibl_update(VkCommandBuffer cb)
     ibl_captured_furnace_ = furnace_;
     ibl_primed_ = true;
     ++ibl_update_count_;
+}
+
+// --- Brief 09b: probe volume ---------------------------------------------------------------------
+
+// Fit a uniform probe grid to the scene AABB using the spacing CVar. Padded half a cell so the
+// volume boundary probes sit just outside the geometry (edge interpolation stays valid). Counts
+// clamped per-axis and by total (atlas VRAM / relight cost guard).
+void GeometryPass::fit_probe_volume()
+{
+    const glm::vec3 ext = scene_aabb_max_ - scene_aabb_min_;
+    if (ext.x <= 0.0f || ext.y <= 0.0f || ext.z <= 0.0f)
+    {
+        probe_volume_.valid = false;
+        return;
+    }
+    float spacing = cv_gi_spacing().get();
+    if (spacing <= 0.0f)
+    {
+        // Auto: aim for ~16 probes along the longest axis.
+        const float longest = std::max(ext.x, std::max(ext.y, ext.z));
+        spacing = std::max(longest / 16.0f, 0.25f);
+    }
+    // Anisotropic spacing (main-agent tip 6): architectural scenes vary less vertically than
+    // horizontally, and a coarser Y is a cheap probe-count win — while still keeping >=2 layers in
+    // any room. Y spacing is 1.5x the horizontal spacing.
+    glm::vec3 sp{ spacing, spacing * 1.5f, spacing };
+
+    // Grid FIXED-spacing, fit to a TRUE half-cell inset of the AABB (main-agent tip 2): geometry
+    // sits at axis-aligned positions, so a grid flush to the AABB plants probes exactly in
+    // floors/walls/column axes. The outermost probe layer on every axis lands within half a cell
+    // INSIDE the AABB (never outside it): with the centred origin below, `ceil(e/s)` probes span
+    // [min + up to 0.5s, max - up to 0.5s]. (The previous `ceil(e/s) + 1` planted an extra layer a
+    // full half-cell OUTSIDE each face — a wasted probe layer below the floor and above the roofline,
+    // which is exactly the stranded-probe artifact this fixes.) Trilinear clamps at the volume edge,
+    // so boundary surfaces (floor, outer walls) sample the nearest in-volume layer.
+    const auto axis_count = [&](float e, float s) {
+        return std::clamp(uint32_t(std::ceil(e / s)), 2u, kProbeMaxPerAxis);
+    };
+    glm::uvec3 counts{ axis_count(ext.x, sp.x), axis_count(ext.y, sp.y), axis_count(ext.z, sp.z) };
+    while (counts.x * counts.y * counts.z > kProbeMaxTotal)
+    {
+        sp *= 1.25f;   // too many probes -> coarsen uniformly and retry
+        counts = glm::uvec3{ axis_count(ext.x, sp.x), axis_count(ext.y, sp.y), axis_count(ext.z, sp.z) };
+    }
+    // Centred inset origin: the probe lattice (span `grid_span` <= ext) is centred in the AABB, so
+    // the leftover `ext - grid_span` (in [0, sp]) splits evenly and both end layers sit within half
+    // a cell INSIDE their faces — symmetric, hugging neither min nor max.
+    const glm::vec3 grid_span = glm::vec3(counts - glm::uvec3(1u)) * sp;
+    probe_volume_.origin = scene_aabb_min_ + (ext - grid_span) * 0.5f;
+    probe_volume_.spacing = sp;
+    probe_volume_.counts = counts;
+    probe_volume_.valid = true;
+
+    // ANALYTIC capture distance-cull radius (derived, not tuned). The visibility atlas only ever
+    // answers Chebyshev queries from shading points inside a probe's ADJACENT cells (the 8-probe
+    // trilinear samples the enclosing cell's corners), so the largest distance that must be captured
+    // accurately is exactly:
+    //     r_vis = |spacing|            worst-case shading point at the opposite cell corner
+    //           + 0.5 * max(spacing)   relocation can move the probe up to half a cell
+    //           + 0.75 * min(spacing)  the DDGI normal/view sampling bias applied at shading
+    // Geometry beyond r_vis can read as "far" without changing ANY visibility result, and the radius
+    // now scales with the grid: tighter spacing -> tighter radius -> cheaper bake, automatically.
+    // Radiance caveat (documented trade-off): the M2 relight treats first-hits beyond the radius as
+    // open sky. Acceptable for Sponza-class scenes (interior ceilings sit well within r_vis of their
+    // probes; the tall central atrium genuinely is open sky) — flagged in the brief's running log as
+    // the term that stops the radius going tighter than r_vis.
+    const float diag = glm::length(ext);
+    const float cell_diag = glm::length(sp);
+    const float r_vis = cell_diag + 0.5f * std::max(sp.x, std::max(sp.y, sp.z))
+                      + 0.75f * std::min(sp.x, std::min(sp.y, sp.z));
+    probe_cull_far_ = std::min(diag, r_vis);
+
+    const uint32_t total = probe_volume_.total();
+    const glm::uvec2 vtiles = probe_volume_.tile_grid();
+    const uint32_t irrad_w = vtiles.x * kProbeIrradStride, irrad_h = vtiles.y * kProbeIrradStride;
+    const uint32_t vis_w = vtiles.x * kProbeVisStride, vis_h = vtiles.y * kProbeVisStride;
+    // Atlas memory: irradiance RGBA16F, vis RG16F(as RGBA16F), 2x capture RGBA16F.
+    const double mb = (double(irrad_w) * irrad_h * 8.0             // irradiance RGBA16F
+                       + double(vis_w) * vis_h * 8.0               // visibility
+                       + double(vis_w) * vis_h * 8.0 * 2.0)        // capture gbuf + albedo
+                      / (1024.0 * 1024.0);
+    STRING_LOG_INFO("[gi] probe grid {}x{}x{} = {} probes, spacing ({:.2f},{:.2f},{:.2f}) m, "
+                    "irrad atlas {}x{}, vis atlas {}x{}, ~{:.2f} MB",
+                    counts.x, counts.y, counts.z, total, sp.x, sp.y, sp.z,
+                    irrad_w, irrad_h, vis_w, vis_h, mb);
+}
+
+void GeometryPass::create_probe_resources(PassContext& context)
+{
+    fit_probe_volume();
+    if (!probe_volume_.valid) return;
+
+    const VkSamplerCreateInfo sampler_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .maxLod = VK_LOD_CLAMP_NONE,
+        .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+    };
+    if (vkCreateSampler(device_.get_device(), &sampler_info, nullptr, &probe_sampler_) != VK_SUCCESS)
+        throw std::runtime_error("GeometryPass: failed to create probe sampler");
+
+    const glm::uvec2 vtiles = probe_volume_.tile_grid();
+    const auto make_atlas = [&](uint32_t stride, uint32_t& sample_slot, uint32_t& storage_slot) {
+        const string::gpu::resource_id id = allocator_.create_resource(string::gpu::image_info{
+            .extent = { vtiles.x * stride, vtiles.y * stride, 1 },
+            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            // TRANSFER_DST: the capture init vkCmdClearColorImage-zeroes the irradiance atlas
+            // (relight is amortized, so shading/debug can read texels before their first relight).
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                   | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+            .allocation_flags = {},
+        });
+        const string::gpu::allocated_image& img = allocator_.get_image(id);
+        descriptor_table_.bind(id, string::gpu::descriptor_type::TEXTURE);
+        sample_slot = descriptor_table_.get_binding_slot(id, string::gpu::descriptor_type::TEXTURE);
+        descriptor_table_.update_texture(sample_slot, img.view, probe_sampler_);
+        storage_slot = descriptor_table_.bind_storage_view(img.view);
+        return id;
+    };
+    probe_irrad_ = make_atlas(kProbeIrradStride, probe_irrad_sample_slot_, probe_irrad_storage_slot_);
+    probe_cap_gbuf_ = make_atlas(kProbeVisStride, probe_cap_gbuf_sample_slot_, probe_cap_gbuf_storage_slot_);
+    probe_cap_albedo_ = make_atlas(kProbeVisStride, probe_cap_albedo_sample_slot_, probe_cap_albedo_storage_slot_);
+    probe_vis_ = make_atlas(kProbeVisStride, probe_vis_sample_slot_, probe_vis_storage_slot_);
+
+    VkDescriptorSetLayout layout = descriptor_table_.get_layout();
+    const auto make_probe_compute = [&](const char* file, const char* entry) {
+        return context.shader_registry.create(
+            context.resources_path / "shaders" / file,
+            [layout, entry](string::gpu::device& dev, const string::gpu::compiled_program& compiled) {
+                string::gpu::pipeline p{};
+                p.push_constants = compiled.layout.push_constant;
+                p.pipeline_layout = string::gpu::pipeline_layout_builder()
+                    .set_descriptor_set_layout({ layout })
+                    .set_push_constant_ranges({ compiled.layout.push_constant })
+                    .build(dev);
+                string::gpu::pipeline_builder builder(dev, string::gpu::pipeline_type::COMPUTE);
+                for (const auto& stage : compiled.stages)
+                    if (stage.stage == VK_SHADER_STAGE_COMPUTE_BIT && stage.entry_point == entry)
+                        builder.add_compute_shader_spirv(stage.spirv, stage.entry_point);
+                p.pipeline = builder.build_compute_pipeline(p.pipeline_layout);
+                p.pipeline_type = string::gpu::pipeline_type::COMPUTE;
+                return p;
+            });
+    };
+    probe_clear_program_ = make_probe_compute("probe_capture.slang", "clear_main");
+    probe_collapse_program_ = make_probe_compute("probe_capture.slang", "collapse_main");
+    probe_relight_program_ = make_probe_compute("probe_relight.slang", "relight_main");
+
+    // Cube G-buffer (albedo + normal/dist + depth), reused across probes within a frame. All 6 faces
+    // render in ONE multiview pass, so each image gets a single 6-layer 2D_ARRAY view (the render
+    // target, viewMask=0x3F) + a SamplerCube read slot for collapse.
+    const auto make_gbuf_cube = [&](VkFormat fmt, VkImageAspectFlags aspect, VkImageUsageFlags usage,
+                                    VkImageView& array_view, uint32_t* sample_slot) {
+        const string::gpu::resource_id id = allocator_.create_resource(string::gpu::image_info{
+            .extent = { kProbeCubeFace, kProbeCubeFace, 1 },
+            .format = fmt,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = usage,
+            .aspect_flags = aspect,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+            .allocation_flags = {},
+            .cube = true,
+        });
+        const string::gpu::allocated_image& img = allocator_.get_image(id);
+        if (sample_slot != nullptr)   // SamplerCube read slot (albedo / normal-dist only; not depth)
+        {
+            descriptor_table_.bind(id, string::gpu::descriptor_type::TEXTURE);
+            *sample_slot = descriptor_table_.get_binding_slot(id, string::gpu::descriptor_type::TEXTURE);
+            descriptor_table_.update_texture(*sample_slot, img.view, probe_sampler_);
+        }
+        const VkImageViewCreateInfo vi = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = img.image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+            .format = fmt,
+            .subresourceRange = { aspect, 0, 1, 0, 6 },   // all 6 cube layers (multiview target)
+        };
+        if (vkCreateImageView(device_.get_device(), &vi, nullptr, &array_view) != VK_SUCCESS)
+            throw std::runtime_error("GeometryPass: failed to create probe cube array view");
+        return id;
+    };
+    probe_cube_albedo_ = make_gbuf_cube(VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        probe_cube_albedo_array_view_, &probe_cube_albedo_sample_slot_);
+    probe_cube_nd_ = make_gbuf_cube(VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        probe_cube_nd_array_view_, &probe_cube_nd_sample_slot_);
+    probe_cube_depth_ = make_gbuf_cube(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, probe_cube_depth_array_view_, nullptr);
+
+    // Per-probe activation state (classification output): 1 = active, 0 = inside geometry.
+    probe_active_ = allocator_.create_resource(string::gpu::buffer_info{
+        .size = std::max<VkDeviceSize>(sizeof(uint32_t) * probe_volume_.total(), sizeof(uint32_t)),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+               | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    });
+    // Per-probe relocation offset (RTXGI): float4 per probe (xyz world offset). Written by the collapse;
+    // consumed via probe_common probe_world (relight bounce / M3 shading) + the debug spheres.
+    probe_offset_ = allocator_.create_resource(string::gpu::buffer_info{
+        .size = std::max<VkDeviceSize>(sizeof(glm::vec4) * probe_volume_.total(), sizeof(glm::vec4)),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+               | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    });
+
+    // Flat-capture -> {draw index, global meshlet id} table, built ONCE from the meshlet model so the
+    // capture task shader resolves a flat dispatch index to its draw + real global meshlet id with no
+    // CPU per-draw loop. Entry layout: {uint draw, uint meshlet_id} per flat slot.
+    //
+    // The capture uses each draw's COARSEST LOD, not LOD0: the cube faces are 32x32 px, so full-detail
+    // geometry is pure waste — the bake cost is dominated by (meshlets x 64 vertex transforms) per
+    // probe, and the coarse LOD cuts the meshlet count ~an order of magnitude (Sponza: 122k LOD0
+    // meshlets over 450 draws). GI capture on proxy/low-LOD geometry is the shipped-engine standard;
+    // the slight surface shift is far below the probe grid's spatial resolution.
+    {
+        std::vector<glm::uvec2> mdraw;   // (draw index, global meshlet id)
+        for (uint32_t d = 0; d < meshlet_model_.draws.size(); ++d)
+        {
+            const GpuDrawInfo& di = meshlet_model_.draws[d];
+            if (di.lod_count == 0) continue;
+            const uint32_t coarse = di.lod_count - 1;
+            const uint32_t off = di.lods[coarse].meshlet_offset;
+            const uint32_t cnt = di.lods[coarse].meshlet_count;
+            for (uint32_t m = 0; m < cnt; ++m) mdraw.push_back({ d, off + m });
+        }
+        probe_total_lod0_meshlets_ = static_cast<uint32_t>(mdraw.size());
+        if (mdraw.empty()) mdraw.push_back({ 0, 0 });
+        probe_meshlet_draw_ = allocator_.create_resource(string::gpu::buffer_info{
+            .size = sizeof(glm::uvec2) * mdraw.size(),
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                   | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+            .allocation_flags = {},
+        });
+        context.transfer.upload_buffer(mdraw.data(), sizeof(glm::uvec2) * mdraw.size(), probe_meshlet_draw_);
+        STRING_LOG_INFO("[gi] capture dispatch domain: {} coarse-LOD meshlets over {} draws "
+                        "(per-probe task groups: {})", probe_total_lod0_meshlets_,
+                        meshlet_model_.draws.size(), (probe_total_lod0_meshlets_ + 31u) / 32u);
+    }
+
+    // M1 cube-face G-buffer raster: task/mesh/fragment MRT (albedo + normal-dist) + depth. Modelled
+    // on the meshlet_shadow pipeline; two RGBA16F color targets, D32 depth (reverse-Z GREATER).
+    probe_capture_raster_program_ = context.shader_registry.create(
+        context.resources_path / "shaders" / "probe_capture_raster.slang",
+        [layout](string::gpu::device& dev, const string::gpu::compiled_program& compiled) {
+            string::gpu::pipeline p{};
+            p.push_constants = compiled.layout.push_constant;
+            p.pipeline_layout = string::gpu::pipeline_layout_builder()
+                .set_descriptor_set_layout({ layout })
+                .set_push_constant_ranges({ compiled.layout.push_constant })
+                .build(dev);
+            string::gpu::pipeline_builder builder(dev);
+            for (const auto& stage : compiled.stages)
+            {
+                if (stage.stage == VK_SHADER_STAGE_TASK_BIT_EXT)
+                    builder.add_task_shader_spirv(stage.spirv, stage.entry_point);
+                else if (stage.stage == VK_SHADER_STAGE_MESH_BIT_EXT)
+                    builder.add_mesh_shader_spirv(stage.spirv, stage.entry_point);
+                else if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                    builder.add_fragment_shader_spirv(stage.spirv, stage.entry_point);
+            }
+            p.pipeline = builder
+                .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .set_multisampling()
+                .enable_depth_stencil(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                .disable_color_blending()
+                .set_color_formats({ VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT })
+                .set_view_mask(kProbeCubeViewMask)   // 6-face multiview: SV_ViewID picks the face vp
+                .build_mesh_pipeline(p.pipeline_layout);
+            p.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+            return p;
+        });
+
+    // Debug-sphere graphics pipeline (instanced, procedural sphere; MSAA + depth-test, no blend).
+    const VkSampleCountFlagBits scene_samples = context.sample_count;
+    probe_debug_program_ = context.shader_registry.create(
+        context.resources_path / "shaders" / "probe_debug.slang",
+        [layout, scene_samples](string::gpu::device& dev, const string::gpu::compiled_program& compiled) {
+            string::gpu::pipeline p{};
+            p.push_constants = compiled.layout.push_constant;
+            p.pipeline_layout = string::gpu::pipeline_layout_builder()
+                .set_descriptor_set_layout({ layout })
+                .set_push_constant_ranges({ compiled.layout.push_constant })
+                .build(dev);
+            string::gpu::pipeline_builder builder(dev, string::gpu::pipeline_type::GRAPHICS);
+            for (const auto& stage : compiled.stages)
+            {
+                if (stage.stage == VK_SHADER_STAGE_VERTEX_BIT)
+                    builder.add_vertex_shader_spirv(stage.spirv, stage.entry_point);
+                else if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                    builder.add_fragment_shader_spirv(stage.spirv, stage.entry_point);
+            }
+            p.pipeline = builder
+                .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+                .set_tessellation()
+                .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT)
+                .set_multisampling(scene_samples)
+                .enable_depth_stencil(true, true)   // reverse-Z: GREATER (matches scene pipelines)
+                .enable_color_blending()
+                .build_graphics_pipeline(p.pipeline_layout);
+            p.pipeline_type = string::gpu::pipeline_type::GRAPHICS;
+            return p;
+        });
+}
+
+// Fill the ProbeRelightPush grid fields from probe_volume_ (shared by relight + debug).
+namespace
+{
+glm::vec4 probe_origin_spacing(const ProbeVolume& v) { return glm::vec4(v.origin, v.spacing.x); }
+}  // namespace
+
+namespace
+{
+// The M1 collapse push mirrors probe_capture.slang's Push exactly (std430; offsets verified against
+// %Push_std430 OpMemberDecorate: probe_pos@48, probe_index@60, active ptr@64).
+struct ProbeCapturePush
+{
+    uint32_t probe_base, probe_count, counts_x, counts_y, counts_z;
+    uint32_t cap_gbuf_slot, cap_albedo_slot, vis_slot;
+    float far_distance;
+    uint32_t cube_albedo_slot, cube_nd_slot;
+    uint32_t round2;         // 44: bake round (0 = relocate, 1 = re-capture from relocated pos)
+    glm::vec3 probe_pos;
+    uint32_t probe_index;
+    VkDeviceAddress active;
+    float _pad1;             // 72 (pad so spacing lands on its 16B boundary)
+    float _pad2;             // 76
+    glm::vec3 spacing;       // 80 (relocation clamp)
+    float _pad3;             // 92
+    VkDeviceAddress offset;  // 96 (per-probe relocation output)
+};
+static_assert(offsetof(ProbeCapturePush, probe_pos) == 48);
+static_assert(offsetof(ProbeCapturePush, probe_index) == 60);
+static_assert(offsetof(ProbeCapturePush, active) == 64);
+static_assert(offsetof(ProbeCapturePush, spacing) == 80);
+static_assert(offsetof(ProbeCapturePush, offset) == 96);
+
+// NOTE: the per-face cube-face basis + view-projection now live IN probe_capture_raster.slang
+// (face_view_proj / kFaceF/R/U), built from probe_pos so the push stays tiny (6 mat4 would blow the
+// 256B budget). The convention still mirrors ibl.slang face_dir() so the collapse SamplerCube reads
+// agree with the raster writes.
+}  // namespace
+
+// Static capture, amortized over frames (brief 09b M1). First call: init all atlases (clear_main) +
+// zero the activation buffer + move cube G-buffers to their layouts. Every call: capture the next K
+// probes — for each, rasterize the static scene into a 6-face cube G-buffer (albedo + world normal +
+// linear distance) then collapse it into that probe's octahedral capture + visibility atlases, and
+// classify it (inside-geometry probes -> INACTIVE). probe_captured_ latches once the cursor wraps;
+// the atlases are STATIC thereafter (only relight re-runs).
+void GeometryPass::record_probe_capture(VkCommandBuffer cb)
+{
+    if (!probe_volume_.valid || probe_clear_program_ == nullptr || probe_capture_raster_program_ == nullptr
+        || probe_collapse_program_ == nullptr || draw_info_mapped_ == nullptr)
+        return;
+    VkDescriptorSet set = descriptor_table_.get_set();
+    const uint32_t total = probe_volume_.total();
+    const float far_distance = glm::length(scene_aabb_max_ - scene_aabb_min_);
+    const auto t0 = std::chrono::steady_clock::now();
+
+    const auto counts = probe_volume_.counts;
+
+    // --- One-time init: atlas layouts + clear_main over all probes + zero activation ---------------
+    if (!probe_layouts_initialized_)
+    {
+        for (string::gpu::resource_id id : { probe_irrad_, probe_cap_gbuf_, probe_cap_albedo_, probe_vis_ })
+        {
+            const string::gpu::allocated_image& img = allocator_.get_image(id);
+            vku::transition_image(cb, {
+                .image = img.image, .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .new_layout = VK_IMAGE_LAYOUT_GENERAL,
+                .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
+                // TRANSFER in scope: the irradiance atlas is vkCmdClearColorImage-zeroed just below.
+                .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                            | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+            });
+        }
+        probe_layouts_initialized_ = true;
+
+        vkCmdFillBuffer(cb, allocator_.get_buffer(probe_active_).buffer, 0, VK_WHOLE_SIZE, 1u);  // default active
+        vkCmdFillBuffer(cb, allocator_.get_buffer(probe_offset_).buffer, 0, VK_WHOLE_SIZE, 0u);  // zero relocation
+
+        // Zero the irradiance atlas: relight is amortized behind capture completion, so shading/debug
+        // can legally sample texels before their first relight — they must read black, not garbage.
+        {
+            const string::gpu::allocated_image& irr = allocator_.get_image(probe_irrad_);
+            const VkClearColorValue zero{ .float32 = { 0, 0, 0, 0 } };
+            const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCmdClearColorImage(cb, irr.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+        }
+
+        ProbeCapturePush cp{};
+        cp.probe_base = 0; cp.probe_count = total;
+        cp.counts_x = counts.x; cp.counts_y = counts.y; cp.counts_z = counts.z;
+        cp.cap_gbuf_slot = probe_cap_gbuf_storage_slot_;
+        cp.cap_albedo_slot = probe_cap_albedo_storage_slot_;
+        cp.vis_slot = probe_vis_storage_slot_;
+        cp.far_distance = far_distance;
+        const string::gpu::pipeline& clr = probe_clear_program_->current();
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, clr.pipeline);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, clr.pipeline_layout, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cb, clr.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ProbeCapturePush), &cp);
+        vkCmdDispatch(cb, (kProbeVisStride + 7) / 8, (kProbeVisStride + 7) / 8, total);
+        // clear writes -> subsequent collapse overwrites (and the activation fill) must be visible.
+        const VkMemoryBarrier2 mb0 = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                           | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        };
+        const VkDependencyInfo dep0 = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &mb0 };
+        vkCmdPipelineBarrier2(cb, &dep0);
+    }
+
+    const string::gpu::allocated_image& cube_alb = allocator_.get_image(probe_cube_albedo_);
+    const string::gpu::allocated_image& cube_nd = allocator_.get_image(probe_cube_nd_);
+    const string::gpu::allocated_image& cube_dep = allocator_.get_image(probe_cube_depth_);
+    const VkDeviceAddress active_addr = allocator_.get_buffer(probe_active_).device_address;
+
+    // --- Capture, GPU-driven multiview, amortized by PROBE -----------------------------------------
+    // All 6 cube faces render in ONE BeginRendering (multiview viewMask=0x3F) over 6-layer array
+    // views; the mesh shader picks the per-face view-projection by SV_ViewID. The dispatch is a SINGLE
+    // flat vkCmdDrawMeshTasksEXT over all LOD0 meshlets — the task shader resolves each flat index to
+    // {draw, meshlet} via the load-time table, GPU frustum-culls against all 6 faces, and amplifies
+    // only survivors. NO CPU per-draw loop, NO CPU culling. We capture kProbesPerFrame probes/frame,
+    // so a ~250-probe bake finishes in ~20 frames (a couple seconds) with no visible hitch.
+    const string::gpu::pipeline& rp = probe_capture_raster_program_->current();
+    const VkViewport vp = { 0.0f, 0.0f, float(kProbeCubeFace), float(kProbeCubeFace), 0.0f, 1.0f };
+    const VkRect2D sc = { { 0, 0 }, { kProbeCubeFace, kProbeCubeFace } };
+    const uint32_t task_groups = (probe_total_lod0_meshlets_ + 31u) / 32u;
+
+    // TWO bake rounds (RTXGI-style relocation consistency): round 1 rasters each probe from its
+    // GRID position and the collapse derives the relocation offset + classification from that view.
+    // Round 2 re-rasters from the RELOCATED position (the raster shader adds offset[probe_index],
+    // which reads zero in round 1) and re-collapses, so the visibility/hit distances stored in the
+    // atlases are measured from the SAME position every consumer uses via probe_world() — without
+    // this, relight reconstructed hit points (and Chebyshev compared distances) up to 0.5*spacing
+    // off for every relocated probe: wrongly-shadowed sun taps (under-lit probes) + leak/reject
+    // errors at walls. Round 2 keeps the round-1 offset (no drift) but re-votes classification
+    // (a probe that escaped a wall can become ACTIVE).
+    const uint32_t total_work = total * 2;
+    for (uint32_t done = 0; done < kProbesPerFrame && probe_capture_cursor_ < total_work; ++done)
+    {
+        const uint32_t probe = probe_capture_cursor_ % total;
+        const uint32_t round = probe_capture_cursor_ / total;
+        const glm::uvec3 c{ probe % counts.x, (probe / counts.x) % counts.y, probe / (counts.x * counts.y) };
+        const glm::vec3 probe_pos = probe_volume_.origin + glm::vec3(c) * probe_volume_.spacing;
+
+        // Acquire the cube images into attachment layout (sampled by the previous probe's collapse, or
+        // UNDEFINED on the very first capture). All 6 layers at once (multiview target).
+        {
+            const VkImageLayout old_color = probe_cube_layouts_initialized_
+                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            for (const string::gpu::allocated_image* img : { &cube_alb, &cube_nd })
+                vku::transition_image(cb, {
+                    .image = img->image, .old_layout = old_color,
+                    .new_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    .src_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                    .dst_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    .dst_access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    .aspect = VK_IMAGE_ASPECT_COLOR_BIT, .layer_count = 6,
+                });
+            vku::transition_image(cb, {
+                .image = cube_dep.image,
+                .old_layout = probe_cube_layouts_initialized_ ? VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
+                                                              : VK_IMAGE_LAYOUT_UNDEFINED,
+                .new_layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                .src_stage = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                .src_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                .dst_stage = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                .dst_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                .aspect = VK_IMAGE_ASPECT_DEPTH_BIT, .layer_count = 6,
+            });
+            probe_cube_layouts_initialized_ = true;
+        }
+
+        // Render all 6 faces of this probe's cube G-buffer in ONE multiview pass.
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rp.pipeline);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rp.pipeline_layout, 0, 1, &set, 0, nullptr);
+        vkCmdSetViewport(cb, 0, 1, &vp);
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        {
+            const VkRenderingAttachmentInfo color_att[2] = {
+                { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                  .imageView = probe_cube_albedo_array_view_,
+                  .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                  .clearValue = { .color = { .float32 = { 0, 0, 0, 0 } } } },
+                { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                  .imageView = probe_cube_nd_array_view_,
+                  .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                  .clearValue = { .color = { .float32 = { 0, 0, 0, -1.0f } } } },  // w<0 = sky miss
+            };
+            const VkRenderingAttachmentInfo depth_att = {
+                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = probe_cube_depth_array_view_,
+                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = { .depthStencil = { 0.0f, 0 } },  // reverse-Z far = 0
+            };
+            // Multiview: viewMask=0x3F broadcasts each mesh workgroup to all 6 layers; layerCount is
+            // ignored (must be 1 per the spec when viewMask != 0).
+            const VkRenderingInfo ri = {
+                .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .renderArea = sc, .layerCount = 1, .viewMask = kProbeCubeViewMask,
+                .colorAttachmentCount = 2, .pColorAttachments = color_att,
+                .pDepthAttachment = &depth_att,
+            };
+            vkCmdBeginRendering(cb, &ri);
+            // Push: geometry pointers + the flat-capture table + probe_pos (the 6 face view-projections
+            // are built IN the shader from probe_pos — 6 mat4 would blow the 256B push budget).
+            struct RasterPush {
+                VkDeviceAddress vertices, meshlets, mverts, mtris, draws, mdraw;
+                glm::vec3 probe_pos; uint32_t meshlet_count;
+                float cull_far; uint32_t probe_index;
+                VkDeviceAddress offsets;   // relocation (raster adds offset[probe_index] GPU-side)
+            } rpush{};
+            static_assert(offsetof(RasterPush, probe_pos) == 48);
+            static_assert(offsetof(RasterPush, meshlet_count) == 60);
+            static_assert(offsetof(RasterPush, cull_far) == 64);
+            static_assert(offsetof(RasterPush, probe_index) == 68);
+            static_assert(offsetof(RasterPush, offsets) == 72);
+            static_assert(sizeof(RasterPush) == 80);
+            rpush.vertices = allocator_.get_buffer(vertex_buffer_).device_address;
+            rpush.meshlets = allocator_.get_buffer(meshlet_buffer_).device_address;
+            rpush.mverts = allocator_.get_buffer(meshlet_vertices_).device_address;
+            rpush.mtris = allocator_.get_buffer(meshlet_triangles_).device_address;
+            rpush.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
+            rpush.mdraw = allocator_.get_buffer(probe_meshlet_draw_).device_address;
+            rpush.probe_pos = probe_pos;
+            rpush.meshlet_count = probe_total_lod0_meshlets_;
+            rpush.cull_far = probe_cull_far_;
+            rpush.probe_index = probe;
+            rpush.offsets = allocator_.get_buffer(probe_offset_).device_address;
+            vkCmdPushConstants(cb, rp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(RasterPush), &rpush);
+            vkCmdDrawMeshTasksEXT(cb, task_groups, 1, 1);   // ONE flat GPU-driven dispatch
+            vkCmdEndRendering(cb);
+        }
+
+        // Cube color -> SHADER_READ for the collapse SamplerCube. (Depth stays an attachment.)
+        for (const string::gpu::allocated_image* img : { &cube_alb, &cube_nd })
+            vku::transition_image(cb, {
+                .image = img->image, .old_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .src_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .src_access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                .aspect = VK_IMAGE_ASPECT_COLOR_BIT, .layer_count = 6,
+            });
+
+        // Collapse this probe's cube into its octahedral atlases + classify + relocate.
+        ProbeCapturePush cp{};
+        cp.counts_x = counts.x; cp.counts_y = counts.y; cp.counts_z = counts.z;
+        cp.cap_gbuf_slot = probe_cap_gbuf_storage_slot_;
+        cp.cap_albedo_slot = probe_cap_albedo_storage_slot_;
+        cp.vis_slot = probe_vis_storage_slot_;
+        cp.far_distance = far_distance;
+        cp.cube_albedo_slot = probe_cube_albedo_sample_slot_;
+        cp.cube_nd_slot = probe_cube_nd_sample_slot_;
+        cp.probe_pos = probe_pos;
+        cp.probe_index = probe;
+        cp.round2 = round;
+        cp.active = active_addr;
+        cp.spacing = probe_volume_.spacing;
+        cp.offset = allocator_.get_buffer(probe_offset_).device_address;
+        const string::gpu::pipeline& col = probe_collapse_program_->current();
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, col.pipeline);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, col.pipeline_layout, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cb, col.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ProbeCapturePush), &cp);
+        vkCmdDispatch(cb, 1, 1, 1);   // one workgroup (18x18) per probe
+
+        const VkMemoryBarrier2 mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            // TASK/MESH: the round-2 capture raster reads the offset buffer (relocated centre) in
+            // its task/mesh/fragment stages — the collapse's offset write must be visible there.
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                          | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                          | VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        };
+        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
+        vkCmdPipelineBarrier2(cb, &dep);
+
+        ++probe_capture_cursor_;
+    }
+
+    probe_capture_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (probe_capture_cursor_ >= total * 2 && !probe_captured_)
+    {
+        probe_captured_ = true;
+        STRING_LOG_INFO("[gi] probe capture complete: {} probes x 2 rounds (relocate + re-capture), "
+                        "{:.1f} ms CPU-record over frames",
+                        total, probe_capture_ms_);
+    }
+}
+
+// M2 dynamic relight -> irradiance atlas: capture-driven radiance (miss -> live sky; hit -> albedo
+// x (1-tap-CSM-shadowed sun + bounce from the previous atlas)) cosine-convolved per octa texel with
+// hysteresis. AMORTIZED: kRelightProbesPerFrame per frame, round-robin; a sun trigger arms
+// kRelightConvergePasses full passes (each pass propagates the bounce one step; the hysteresis EMA
+// settles to h^N), then relight goes idle (~0 static cost). Under TOD animation the trigger re-arms
+// every frame, so the volume tracks the sun continuously.
+void GeometryPass::record_probe_relight(VkCommandBuffer cb, uint16_t current_frame)
+{
+    if (!probe_volume_.valid || probe_relight_program_ == nullptr || sh_buffer_ == 0
+        || current_frame >= scene_buffers_.size() || scene_buffers_[current_frame] == 0)
+        return;
+    VkDescriptorSet set = descriptor_table_.get_set();
+
+    // RAW: relight reads the sky-SH buffer at COMPUTE. The IBL chain (recorded just before, same CB)
+    // ends its SH write with a FRAGMENT-only barrier, so make the SH write visible to this compute
+    // read here (intra-pass, like the IBL local barrier class). Harmless when SH is unchanged.
+    {
+        const VkMemoryBarrier2 sh_raw = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        };
+        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &sh_raw };
+        vkCmdPipelineBarrier2(cb, &dep);
+    }
+
+    // Cross-frame WAR: last frame's fragment reads of the irradiance atlas must retire before this
+    // rewrite (execution dependency; the atlas lives permanently in GENERAL).
+    if (probe_primed_)
+    {
+        const VkMemoryBarrier2 war = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = 0,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        };
+        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1, .pMemoryBarriers = &war };
+        vkCmdPipelineBarrier2(cb, &dep);
+    }
+
+    const uint32_t total = probe_volume_.total();
+    const uint32_t base = probe_relight_cursor_;
+    const uint32_t count = std::min(kRelightProbesPerFrame, total - base);
+
+    ProbeRelightPush push{};
+    push.origin_spacing = probe_origin_spacing(probe_volume_);
+    push.spacing = glm::vec4(probe_volume_.spacing, 0.0f);
+    push.counts = glm::uvec4(probe_volume_.counts, total);
+    push.sun_dir = glm::vec4(glm::normalize(sun_dir_), sun_intensity_);
+    push.sun_color = glm::vec4(sun_color_, probe_primed_ ? std::clamp(cv_gi_hysteresis().get(), 0.0f, 0.99f) : 0.0f);
+    push.sky_zenith = glm::vec4(sky_zenith_, 0.0f);
+    push.sky_ground = glm::vec4(sky_ground_, 0.0f);
+    push.cap_gbuf_slot = probe_cap_gbuf_sample_slot_;
+    push.cap_albedo_slot = probe_cap_albedo_sample_slot_;
+    push.irrad_prev_slot = probe_irrad_sample_slot_;
+    push.irrad_dst_slot = probe_irrad_storage_slot_;
+    push.vis_slot = probe_vis_sample_slot_;
+    push.first_frame = probe_primed_ ? 0u : 1u;
+    push.probe_base = base;
+    push.probe_count = count;
+    push.sh = allocator_.get_buffer(sh_buffer_).device_address;
+    push.active = allocator_.get_buffer(probe_active_).device_address;
+    push.offsets = allocator_.get_buffer(probe_offset_).device_address;
+    push.scene = allocator_.get_buffer(scene_buffers_[current_frame]).device_address;
+
+    const string::gpu::pipeline& p = probe_relight_program_->current();
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ProbeRelightPush), &push);
+    // One workgroup (10x10 threads) per probe in this frame's slice; z = probe.
+    vkCmdDispatch(cb, 1, 1, count);
+
+    // Relight writes -> shading + debug + next-frame bounce reads. Also an EXECUTION edge to the
+    // depth-test stages: relight's 1-tap sun shadow READ this slot's cascade shadow maps at COMPUTE,
+    // and the shadow pass recorded later this frame WRITES them (WAR — no memory flush needed).
+    const VkMemoryBarrier2 mb = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                      | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                       | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+    };
+    const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
+    vkCmdPipelineBarrier2(cb, &dep);
+
+    // Advance the round-robin cursor; a completed pass consumes one armed converge pass.
+    probe_relight_cursor_ = base + count;
+    if (probe_relight_cursor_ >= total)
+    {
+        probe_relight_cursor_ = 0;
+        probe_primed_ = true;
+        probe_relit_sun_dir_ = glm::normalize(sun_dir_);
+        if (probe_relight_passes_left_ > 0) --probe_relight_passes_left_;
+        probe_relight_pending_ = probe_relight_passes_left_ > 0;
+    }
+}
+
+// Instanced probe-debug spheres, drawn into the (already-open) scene MSAA render pass after opaque
+// geometry (depth-tested). One instance per probe; the sphere is procedural (no vertex buffer).
+void GeometryPass::record_probe_debug(VkCommandBuffer cb)
+{
+    if (!probe_volume_.valid || probe_debug_program_ == nullptr || probe_debug_mode_ == 0) return;
+    VkDescriptorSet set = descriptor_table_.get_set();
+    const string::gpu::pipeline& p = probe_debug_program_->current();
+
+    ProbeDebugPush push{};
+    push.view_proj = camera_.view_proj();
+    const float min_sp = std::min(probe_volume_.spacing.x,
+                                  std::min(probe_volume_.spacing.y, probe_volume_.spacing.z));
+    push.origin_spacing = glm::vec4(probe_volume_.origin, min_sp * 0.15f);   // sphere radius
+    push.spacing = glm::vec4(probe_volume_.spacing, 0.0f);
+    push.counts = glm::uvec4(probe_volume_.counts, probe_debug_mode_);   // 1 grey, 2 irradiance, 3 vis
+    push.camera_pos = glm::vec4(camera_.position(), String::CompositePass::exposure_scale());
+    push.irrad_slot = probe_irrad_sample_slot_;
+    push.vis_slot = probe_vis_sample_slot_;
+    push.active = allocator_.get_buffer(probe_active_).device_address;
+    push.offset = allocator_.get_buffer(probe_offset_).device_address;
+
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline_layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, p.pipeline_layout, p.push_constants.stageFlags, 0, sizeof(ProbeDebugPush), &push);
+    // rings*sectors*6 verts per sphere (kRings=8, kSectors=12 -> 576), one instance per probe.
+    vkCmdDraw(cb, 8u * 12u * 6u, probe_volume_.total(), 0, 0);
 }
 
 namespace
@@ -2511,14 +3264,24 @@ void GeometryPass::compute_cascades()
                     corners[ci++] = glm::vec3(w) / w.w;
                 }
         // Split the near/far corner pairs (indices z=0 far, z=1 near in reverse-Z above) so this
-        // cascade covers [last_split, split] of the camera's linear depth.
+        // cascade covers [last_split, split] of the camera's linear depth. March along the frustum
+        // edge FROM the near corner TOWARD the far corner by (view_depth - near_clip)/range: at
+        // last_split we get this cascade's near edge, at split its far edge. (The previous code based
+        // the lerp on the FAR corner with an inverted parameter, so last_split=near_clip returned the
+        // far corner — planting every cascade kilometres out at the camera far plane, ~2 m/texel, so
+        // the scene got ~15 texels of shadow and nothing resolved.)
+        // The frustum edge spans the CAMERA's full depth (near .. camera far plane), so the lerp
+        // parameter that maps a view-space depth onto that edge must divide by the camera's far
+        // distance, NOT shadow_depth_range. (`range` above is only for the split SCHEME over
+        // [near, shadow_depth_range]; using it here left cascades ~camera_far/shadow_range x too big.)
+        const float cam_range = camera_.far_plane() - near_clip;
         for (int i = 0; i < 4; ++i)
         {
-            const glm::vec3 ray = corners[i * 2 + 1] - corners[i * 2 + 0];  // far -> near direction
-            const glm::vec3 near_corner = corners[i * 2 + 0] + ray * ((last_split - near_clip) / range);
-            const glm::vec3 far_corner = corners[i * 2 + 0] + ray * ((split - near_clip) / range);
-            corners[i * 2 + 0] = far_corner;
-            corners[i * 2 + 1] = near_corner;
+            const glm::vec3 far_c = corners[i * 2 + 0];   // z=0 -> camera far plane
+            const glm::vec3 near_c = corners[i * 2 + 1];  // z=1 -> camera near plane
+            const glm::vec3 edge = far_c - near_c;        // near -> far along this frustum edge
+            corners[i * 2 + 0] = near_c + edge * ((split - near_clip) / cam_range);       // cascade far edge
+            corners[i * 2 + 1] = near_c + edge * ((last_split - near_clip) / cam_range);  // cascade near edge
         }
 
         glm::vec3 center(0.0f);
@@ -2532,8 +3295,28 @@ void GeometryPass::compute_cascades()
         const float texel = (2.0f * radius) / static_cast<float>(settings_.shadow_resolution);
         cascade_world_texel_[c] = texel;
 
+        // Depth range: bracket the SCENE AABB along the light axis (a BOUNDED extent), NOT the cascade
+        // radius. Pulling the eye back by `radius` blew the far cascades' depth range (radius >> the
+        // 30 m scene, so cascade 2 got a ~1.5 km-deep box) — depth precision collapsed and distant /
+        // grazing floor lost its shadows on rotation. Projecting the scene AABB onto L gives the true
+        // caster..receiver span; the eye sits just behind the nearest-to-sun caster, far reaches the
+        // farthest receiver. XY still uses `radius`; only near/far come from the scene.
+        float min_proj = std::numeric_limits<float>::max();
+        float max_proj = std::numeric_limits<float>::lowest();
+        for (int ci = 0; ci < 8; ++ci)
+        {
+            const glm::vec3 corner((ci & 1) ? scene_aabb_max_.x : scene_aabb_min_.x,
+                                   (ci & 2) ? scene_aabb_max_.y : scene_aabb_min_.y,
+                                   (ci & 4) ? scene_aabb_max_.z : scene_aabb_min_.z);
+            const float d = glm::dot(corner - center, L);   // signed distance along L (toward sun = +)
+            min_proj = std::min(min_proj, d);
+            max_proj = std::max(max_proj, d);
+        }
+        const float margin = 1.0f;
+        const float eye_back = max_proj + margin;                   // eye just behind the sun-most caster
+        const float far_d = (max_proj - min_proj) + 2.0f * margin;  // reach the farthest receiver
         const glm::vec3 up = std::abs(L.y) > 0.99f ? glm::vec3(0, 0, 1) : glm::vec3(0, 1, 0);
-        const glm::vec3 eye = center + L * radius;
+        const glm::vec3 eye = center + L * eye_back;
         glm::mat4 view = glm::lookAt(eye, center, up);
 
         // Snap the center to whole texels in light space (stabilization).
@@ -2541,13 +3324,11 @@ void GeometryPass::compute_cascades()
         center_ls.x = std::floor(center_ls.x / texel) * texel;
         center_ls.y = std::floor(center_ls.y / texel) * texel;
         const glm::vec3 snapped_center = glm::vec3(glm::inverse(view) * glm::vec4(center_ls, 1.0f));
-        const glm::vec3 snapped_eye = snapped_center + L * radius;
+        const glm::vec3 snapped_eye = snapped_center + L * eye_back;
         view = glm::lookAt(snapped_eye, snapped_center, up);
 
-        // Ortho box: [-radius, radius] in x/y; depth spans the sphere plus a pull-back for off-frustum
-        // occluders (a tall pillar casting into the slice from outside it).
-        const float depth_pad = radius * 3.0f;
-        glm::mat4 proj = glm::ortho(-radius, radius, -radius, radius, 0.0f, 2.0f * radius + depth_pad);
+        // Ortho box: [-radius, radius] in x/y; near=0 (at the eye), far = scene depth span along L.
+        glm::mat4 proj = glm::ortho(-radius, radius, -radius, radius, 0.0f, far_d);
         proj[1][1] *= -1.0f;  // Vulkan Y-flip
         glm::mat4 reverse_z(1.0f);
         reverse_z[2][2] = -1.0f;
@@ -2556,11 +3337,11 @@ void GeometryPass::compute_cascades()
 
         cascade_view_proj_[c] = proj * view;
         // Brief 04 M4: conservative world-space bounding sphere of this cascade for the draw-level
-        // shadow cull. The stabilized fit already bounds XY by `radius`; the ortho depth extends
-        // `radius` (near) .. `2*radius + depth_pad` (far) along -L, so inflate the radius to cover the
-        // full depth slab. Conservative (never under-covers) -> off-cascade draws are safely kept.
+        // shadow cull. XY is bounded by `radius`; the ortho depth now spans the scene AABB along L
+        // (far_d), so inflate the cull radius to cover the XY disc + full depth slab. Conservative
+        // (never under-covers) -> off-cascade casters are safely kept.
         cascade_center_[c] = center;
-        cascade_cull_radius_[c] = 2.0f * radius + depth_pad;
+        cascade_cull_radius_[c] = radius + far_d;
         last_split = split;
     }
 }
@@ -2717,6 +3498,12 @@ GeometryPass::~GeometryPass()
     destroy_program(expand_scan_blocks_program_);
     destroy_program(expand_scan_carry_program_);
     destroy_program(expand_fill_program_);
+    // Brief 09b probe GI programs.
+    destroy_program(probe_clear_program_);
+    destroy_program(probe_collapse_program_);
+    destroy_program(probe_relight_program_);
+    destroy_program(probe_capture_raster_program_);
+    destroy_program(probe_debug_program_);
 
     // Brief 03 meshlet resources.
     if (meshlet_model_.total_meshlets > 0)
@@ -2799,6 +3586,35 @@ GeometryPass::~GeometryPass()
         // Brief 09: the GTAO sampler is created alongside the IBL resources.
         if (gtao_sampler_ != VK_NULL_HANDLE)
             vkDestroySampler(device_.get_device(), gtao_sampler_, nullptr);
+        // Brief 09b: probe volume atlases + sampler.
+        if (probe_volume_.valid)
+        {
+            for (string::gpu::resource_id id : { probe_irrad_, probe_cap_gbuf_, probe_cap_albedo_, probe_vis_ })
+            {
+                if (id != 0)
+                {
+                    descriptor_table_.unbind(id, string::gpu::descriptor_type::TEXTURE);
+                    allocator_.destroy_resource(id);
+                }
+            }
+            // Cube G-buffer: 6-layer array views, cube images (albedo/nd sampled), classification +
+            // relocation buffers, meshlet->draw table.
+            for (VkImageView v : { probe_cube_albedo_array_view_, probe_cube_nd_array_view_,
+                                   probe_cube_depth_array_view_ })
+                if (v) vkDestroyImageView(device_.get_device(), v, nullptr);
+            for (string::gpu::resource_id id : { probe_cube_albedo_, probe_cube_nd_ })
+                if (id != 0)
+                {
+                    descriptor_table_.unbind(id, string::gpu::descriptor_type::TEXTURE);
+                    allocator_.destroy_resource(id);
+                }
+            if (probe_cube_depth_ != 0) allocator_.destroy_resource(probe_cube_depth_);
+            if (probe_active_ != 0) allocator_.destroy_resource(probe_active_);
+            if (probe_offset_ != 0) allocator_.destroy_resource(probe_offset_);
+            if (probe_meshlet_draw_ != 0) allocator_.destroy_resource(probe_meshlet_draw_);
+            if (probe_sampler_ != VK_NULL_HANDLE)
+                vkDestroySampler(device_.get_device(), probe_sampler_, nullptr);
+        }
     }
 
     descriptor_table_.unbind(white_image_, string::gpu::descriptor_type::TEXTURE);
@@ -3027,6 +3843,27 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
             run_ibl_verification();
     }
 
+    // Brief 09b: probe relight trigger. The relight tracks the sun the same way the sky IBL does
+    // (amortized on sun-delta; static sun -> relit once). Gated by r.gi. The static capture runs
+    // once in record_compute. The debug-sphere mode is snapshotted here for record().
+    probe_debug_mode_ = cv_gi_enabled().get()
+        ? static_cast<uint32_t>(std::max(0, cv_gi_probe_debug().get()))
+        : 0u;
+    if (probe_volume_.valid && cv_gi_enabled().get())
+    {
+        constexpr float kSunDeltaCos = 0.999998477f;   // cos(0.1 deg) — matches the IBL trigger
+        const float align = glm::dot(glm::normalize(sun_dir_), probe_relit_sun_dir_);
+        // A sun move (or first light) ARMS a full set of converge passes: each amortized full pass
+        // propagates the bounce one step further and settles the hysteresis EMA; when the passes
+        // run out, relight goes idle until the next trigger (~0 static-sun cost). Relight depends
+        // on the sky-SH (miss/fallback source), so the IBL must have primed first.
+        if (ibl_primed_ && (!probe_primed_ || cv_ibl_every_frame().get() || align < kSunDeltaCos))
+        {
+            probe_relight_passes_left_ = kRelightConvergePasses;
+            probe_relight_pending_ = true;
+        }
+    }
+
     // Residency feedback — textures and geometry driven by the SAME per-draw frustum visibility.
     //  - Textures: every streamed texture is pinned to its coarse-tail floor (so the whole scene is
     //    blurry-but-real), and each *visible* draw raises its base-color texture toward the mip its
@@ -3156,8 +3993,8 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         }
         scene.cascade_count = settings_.cascade_count;
         scene.shadow_texel = 1.0f / static_cast<float>(settings_.shadow_resolution);
-        scene.shadow_bias = settings_.shadow_bias;
-        scene.shadow_normal_offset_scale = settings_.shadow_normal_offset_scale;
+        scene.shadow_bias = cv_shadow_bias().get();
+        scene.shadow_normal_offset_scale = cv_shadow_normal_offset().get();
         scene.cascade_blend = settings_.cascade_blend;
         scene.view = camera_.view();
         scene.froxel_dims = glm::uvec4(froxel_tiles_x_, froxel_tiles_y_, kFroxelDepthSlices, kFroxelTileSize);
@@ -3170,7 +4007,8 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
                       ? allocator_.get_buffer(froxel_buffers_[current_frame]).device_address : 0;
         scene.max_lights_per_froxel = kMaxLightsPerFroxel;
         scene.debug_flags = (froxel_heatmap_ ? 1u : 0u) | (furnace_ ? 2u : 0u)
-                          | (cv_gtao_spec_occ().get() ? 0u : 4u);   // bit2: disable bent-normal spec-occ
+                          | (cv_gtao_spec_occ().get() ? 0u : 4u)    // bit2: disable bent-normal spec-occ
+                          | ((static_cast<uint32_t>(std::max(cv_light_debug().get(), 0)) & 0xFu) << 4);  // bits4-7: lighting isolate
         // Brief 07: the sky-IBL products (single-buffered; the update chain is ordered against
         // in-flight readers inside record_ibl_update / by the declared SH usages).
         scene.sh = sh_buffer_ != 0 ? allocator_.get_buffer(sh_buffer_).device_address : 0;
@@ -3201,6 +4039,25 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         scene.gtao_strength = std::clamp(cv_gtao_strength().get(), 0.0f, 1.0f);
         scene.gtao_w = gtao_size_.x;   // half-res AO extent for the lit shader's joint upsample
         scene.gtao_h = gtao_size_.y;
+
+        // Brief 09b probe GI. probe_gi gates the whole shading-side feature: 0 under r.gi 0 (the
+        // pixel-parity lever — the shader then takes the pre-09b sky-SH path bit-identically),
+        // under r.furnace (the furnace validates the BRDF against the analytic environment, same
+        // rule as GTAO), and until the capture + FIRST FULL relight pass complete (the atlas is
+        // zero-cleared before that — sampling it would darken instead of falling back).
+        const bool probe_gi_on = probe_volume_.valid && cv_gi_enabled().get() && !furnace_
+                              && probe_captured_ && probe_primed_;
+        scene.probe_origin = probe_volume_.origin;
+        scene.probe_spacing = probe_volume_.spacing;
+        scene.probe_counts = probe_volume_.counts;
+        scene.probe_irrad_slot = probe_irrad_sample_slot_;
+        scene.probe_vis_slot = probe_vis_sample_slot_;
+        // probe_gi: 0 off, 1 normal probe-GI shading, 2 = GI-debug isolate view (indirect diffuse
+        // x albedo only) — the reference-free-scene judging tool (r.gi.debug 1).
+        scene.probe_gi = probe_gi_on ? (cv_gi_debug().get() != 0 ? 2u : 1u) : 0u;
+        scene.probe_offsets = probe_offset_ != 0 ? allocator_.get_buffer(probe_offset_).device_address : 0;
+        scene.probe_active = probe_active_ != 0 ? allocator_.get_buffer(probe_active_).device_address : 0;
+        scene.probe_occluded_floor = std::clamp(cv_gi_occluded_floor().get(), 0.0f, 1.0f);
 
         std::memcpy(scene_mapped_[current_frame], &scene, sizeof(SceneData));
     }
@@ -3398,6 +4255,28 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
         STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "ibl-update")
         record_ibl_update(command_buffer);
         ibl_update_pending_ = false;
+    }
+
+    // --- Brief 09b: probe volume — static capture (once) + dynamic relight (amortized) ----------
+    // Ordered after the IBL chain so relight's sky-SH source is this frame's SH. Capture is a
+    // one-time init (M0) / raster (M1); relight re-runs whenever the sun moved (see update()).
+    if (probe_volume_.valid && cv_gi_enabled().get() && probe_clear_program_ != nullptr)
+    {
+        if (!probe_captured_)
+        {
+            STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "gi-capture")
+            record_probe_capture(command_buffer);
+        }
+        // M2: relight starts only after the capture COMPLETES — partially-captured probes would
+        // relight from the cleared (all-sky-miss) capture and read as outdoor probes until their
+        // capture landed. It also guarantees the CSM shadow maps this slot samples have been
+        // rendered at least once. record_probe_relight manages the cursor/pending state itself
+        // (pending stays true until the armed converge passes are exhausted).
+        if (probe_captured_ && probe_relight_pending_ && ibl_primed_)
+        {
+            STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "gi-relight")
+            record_probe_relight(command_buffer, current_frame);
+        }
     }
 
     // (Brief 04e M2: the cross-frame visibility-bitfield barrier that lived here is now DERIVED
@@ -3644,6 +4523,8 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
                 STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "main-draw")
                 record_opaque_phase(command_buffer, current_frame, /*phase*/ 0u);
             }
+            // Brief 09b: probe-debug spheres after opaque, before transparency.
+            record_probe_debug(command_buffer);
             {
                 STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "transparency")
                 const uint32_t transp_count = build_transparency_list(current_frame);
@@ -3815,6 +4696,8 @@ void GeometryPass::record_after_between(string::gpu::command_recorder& recorder,
     if (!meshlet_program_ || !draw_info_mapped_) return;
     VkCommandBuffer command_buffer = recorder.get_command_buffer();
     record_opaque_phase(command_buffer, current_frame, /*phase*/ 2u);
+    // Brief 09b: probe-debug spheres after opaque, before transparency (opaque, depth-tested).
+    record_probe_debug(command_buffer);
     const uint32_t transp_count = build_transparency_list(current_frame);
     record_transparency(command_buffer, current_frame, transp_count);
 }

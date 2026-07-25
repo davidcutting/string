@@ -376,6 +376,77 @@ CVar<bool>& cv_gtao_spec_occ()
     static const bool a = [] { v.add_alias("gtao_spec_occ"); return true; }(); (void)a;
     return v;
 }
+CVar<int32_t>& cv_light_debug()
+{
+    // Lighting isolate view: 0 normal, 1 sun-direct only, 2 ambient only, 3 local (froxel) lights,
+    // 4 sun shadow coverage (white = lit, black = in shadow / back-facing).
+    static CVar<int32_t> v{"r.debug.lighting", 0,
+                           "lighting isolate: 0 off, 1 sun-direct, 2 ambient, 3 local, 4 shadow coverage"};
+    static const bool a = [] { v.add_alias("light_debug"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_shadow_bias()
+{
+    // Constant depth bias (reverse-Z units), slope-scaled up to 3x at grazing in-shader. Higher =
+    // less acne, more peter-panning (sun leaks onto faces geometry should self-shadow).
+    static CVar<float> v{"r.shadow.bias", 0.0006f, "CSM constant depth bias (reverse-Z units)"};
+    static const bool a = [] { v.add_alias("shadow_bias"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_shadow_normal_offset()
+{
+    // Shadow sample pushed this many cascade world-texels along the surface normal. Higher = less
+    // acne, more leak. Typical 1-2; 3 leaks on grazing faces (the "lit interior pillar face").
+    static CVar<float> v{"r.shadow.normal_offset", 0.8f, "CSM normal-offset bias (cascade world-texels)"};
+    static const bool a = [] { v.add_alias("shadow_normal_offset"); return true; }(); (void)a;
+    return v;
+}
+
+CVar<bool>& cv_gi_enabled()
+{
+    static CVar<bool> v{"r.gi", true, "probe GI: relightable irradiance volume (brief 09b)"};
+    static const bool a = [] { v.add_alias("gi"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_gi_spacing()
+{
+    static CVar<float> v{"r.gi.spacing", 2.0f, "probe grid spacing in world meters (0 = auto)"};
+    static const bool a = [] { v.add_alias("gi_spacing"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_gi_hysteresis()
+{
+    // 0.9 with 32 converge passes leaves h^32 ~= 3% residual when relight goes idle (0.95 left 19%).
+    static CVar<float> v{"r.gi.hysteresis", 0.9f,
+                         "probe relight temporal blend (fraction of previous atlas kept per update)"};
+    static const bool a = [] { v.add_alias("gi_hysteresis"); return true; }(); (void)a;
+    return v;
+}
+CVar<float>& cv_gi_occluded_floor()
+{
+    // Fraction of the sky-SH ambient a fully collapsed probe cage keeps (thin walls/vaults with no
+    // interior-side probe). 0 = black crevices, ~1 = bright leak; ~0.3 reads as gentle occluded fill.
+    static CVar<float> v{"r.gi.occluded_floor", 0.3f,
+                         "fraction of sky ambient kept where the probe cage collapses (thin geometry)"};
+    static const bool a = [] { v.add_alias("gi_occluded_floor"); return true; }(); (void)a;
+    return v;
+}
+CVar<int32_t>& cv_gi_probe_debug()
+{
+    static CVar<int32_t> v{"r.gi.probe_debug", 0,
+                           "probe debug spheres: 0 off, 1 flat grey, 2 irradiance, 3 visibility"};
+    static const bool a = [] { v.add_alias("gi_probe_debug"); return true; }(); (void)a;
+    return v;
+}
+CVar<int32_t>& cv_gi_debug()
+{
+    // Isolates the probe GI term on-screen so a reference-free scene becomes judgeable:
+    //   0 off (normal shading), 1 = indirect diffuse irradiance x albedo ONLY (pure probe result).
+    static CVar<int32_t> v{"r.gi.debug", 0,
+                           "GI debug view: 0 off, 1 = indirect diffuse (probe irradiance x albedo) only"};
+    static const bool a = [] { v.add_alias("gi_debug"); return true; }(); (void)a;
+    return v;
+}
 
 void register_debug_cvars()
 {
@@ -426,6 +497,15 @@ void register_debug_cvars()
     cv_gtao_strength();
     cv_gtao_radius();
     cv_gtao_spec_occ();
+    cv_shadow_bias();
+    cv_shadow_normal_offset();
+    cv_light_debug();
+    cv_gi_enabled();
+    cv_gi_spacing();
+    cv_gi_hysteresis();
+    cv_gi_occluded_floor();
+    cv_gi_probe_debug();
+    cv_gi_debug();
     string::core::CVarRegistry::instance().apply_env();
 }
 

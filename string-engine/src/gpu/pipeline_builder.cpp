@@ -378,6 +378,18 @@ pipeline_builder& pipeline_builder::set_color_format(VkFormat format)
     return *this;
 }
 
+pipeline_builder& pipeline_builder::set_color_formats(const std::vector<VkFormat>& formats)
+{
+    color_formats_ = formats;
+    return *this;
+}
+
+pipeline_builder& pipeline_builder::set_view_mask(uint32_t mask)
+{
+    view_mask_ = mask;
+    return *this;
+}
+
 pipeline_builder& pipeline_builder::disable_color_blending()
 {
     color_blend_attachment_info_ = {
@@ -474,13 +486,23 @@ VkPipeline pipeline_builder::build_graphics_pipeline(const VkPipelineLayout& pip
     const bool has_fragment = fragment_shader_module_ != VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo shader_stages[] = { vertex_shader_stage_info_, fragment_shader_stage_info_ };
 
+    // MRT: replicate the blend attachment across every color format (if set_color_formats was used).
+    std::vector<VkPipelineColorBlendAttachmentState> mrt_blend;
+    const uint32_t color_count = color_enabled_ ? (color_formats_.empty() ? 1u : static_cast<uint32_t>(color_formats_.size())) : 0u;
+    if (color_enabled_ && !color_formats_.empty())
+    {
+        mrt_blend.assign(color_formats_.size(), color_blend_attachment_info_);
+        color_blending_info_.attachmentCount = color_count;
+        color_blending_info_.pAttachments = mrt_blend.data();
+    }
+
     VkPipelineRenderingCreateInfo pipeline_render_info
     {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .pNext = nullptr,
-        .viewMask = 0,
-        .colorAttachmentCount = color_enabled_ ? 1u : 0u,
-        .pColorAttachmentFormats = color_enabled_ ? &color_format : nullptr,
+        .viewMask = view_mask_,
+        .colorAttachmentCount = color_count,
+        .pColorAttachmentFormats = color_enabled_ ? (color_formats_.empty() ? &color_format : color_formats_.data()) : nullptr,
         .depthAttachmentFormat = depth_format_,
         .stencilAttachmentFormat = {}
     };
@@ -554,12 +576,20 @@ VkPipeline pipeline_builder::build_mesh_pipeline(const VkPipelineLayout& pipelin
     if (has_fragment) stages.push_back(fragment_shader_stage_info_);
 
     VkFormat color_format = color_format_;
+    std::vector<VkPipelineColorBlendAttachmentState> mrt_blend;
+    const uint32_t color_count = color_enabled_ ? (color_formats_.empty() ? 1u : static_cast<uint32_t>(color_formats_.size())) : 0u;
+    if (color_enabled_ && !color_formats_.empty())
+    {
+        mrt_blend.assign(color_formats_.size(), color_blend_attachment_info_);
+        color_blending_info_.attachmentCount = color_count;
+        color_blending_info_.pAttachments = mrt_blend.data();
+    }
     VkPipelineRenderingCreateInfo pipeline_render_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .pNext = nullptr,
-        .viewMask = 0,
-        .colorAttachmentCount = color_enabled_ ? 1u : 0u,
-        .pColorAttachmentFormats = color_enabled_ ? &color_format : nullptr,
+        .viewMask = view_mask_,
+        .colorAttachmentCount = color_count,
+        .pColorAttachmentFormats = color_enabled_ ? (color_formats_.empty() ? &color_format : color_formats_.data()) : nullptr,
         .depthAttachmentFormat = depth_format_,
         .stencilAttachmentFormat = {}
     };

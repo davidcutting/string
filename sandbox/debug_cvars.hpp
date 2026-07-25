@@ -116,5 +116,18 @@ string::core::CVar<float>&   cv_gtao_radius();      // r.gtao.radius       <- ST
 // Bent-normal specular occlusion (Lagarde cone vs reflection lobe). Off = fall back to brief-07's
 // AO-derived Lagarde spec-occ (spec_ao only). A/B lever for the mirror-reflection defect.
 string::core::CVar<bool>&    cv_gtao_spec_occ();    // r.gtao.spec_occ     <- STRING_GTAO_SPEC_OCC
+string::core::CVar<float>&   cv_shadow_bias();      // r.shadow.bias       <- STRING_SHADOW_BIAS
+string::core::CVar<float>&   cv_shadow_normal_offset();// r.shadow.normal_offset <- STRING_SHADOW_NORMAL_OFFSET
+string::core::CVar<int32_t>& cv_light_debug();       // r.debug.lighting    <- STRING_DEBUG_LIGHTING
+
+// --- Probe GI (brief 09b): relightable irradiance volume -------------------------------------
+string::core::CVar<bool>&    cv_gi_enabled();       // r.gi                <- STRING_GI
+string::core::CVar<float>&   cv_gi_spacing();       // r.gi.spacing        <- STRING_GI_SPACING (world m)
+string::core::CVar<float>&   cv_gi_hysteresis();    // r.gi.hysteresis     <- STRING_GI_HYSTERESIS (0..1)
+string::core::CVar<float>&   cv_gi_occluded_floor();// r.gi.occluded_floor <- STRING_GI_OCCLUDED_FLOOR (0..1)
+// Debug probe spheres: 0 off, 1 flat grey (placement), 2 irradiance, 3 visibility.
+string::core::CVar<int32_t>& cv_gi_probe_debug();   // r.gi.probe_debug    <- STRING_GI_PROBE_DEBUG
+// GI debug view: 0 off, 1 = indirect diffuse (probe irradiance x albedo) only.
+string::core::CVar<int32_t>& cv_gi_debug();         // r.gi.debug          <- STRING_GI_DEBUG
 
 }  // namespace sandbox

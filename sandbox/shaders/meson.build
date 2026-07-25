@@ -23,6 +23,11 @@ slang_shaders = files(
     'meshlet_reset.slang',  # per-frame stats/visibility reset compute (brief 03)
     'post.slang',           # brief 09: histogram auto-exposure + Karis bloom chain
     'gtao.slang',           # brief 09: half-res GTAO + bent normals + spatial denoise
+    'probe_common.slang',   # brief 09b: shared probe octahedral/grid/DDGI-sample math
+    'probe_capture.slang',  # brief 09b: raster mini G-buffer cubemap -> octa capture + visibility
+    'probe_capture_raster.slang', # brief 09b M1: per-probe cube-face G-buffer raster (task+mesh+frag)
+    'probe_relight.slang',  # brief 09b: relight capture texels -> irradiance atlas (convolve)
+    'probe_debug.slang',    # brief 09b: instanced probe-debug spheres (irradiance / visibility view)
 )
 install_data(slang_shaders, install_dir : 'include/string/shaders')
 

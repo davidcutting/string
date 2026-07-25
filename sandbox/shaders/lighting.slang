@@ -4,6 +4,7 @@
 // This module owns the bindless texture array, SceneData/GpuLight/froxel structs, and shade_surface()
 // which takes an interpolated surface and returns linear HDR. It declares NO entry points.
 import sky;
+import probe_common;   // brief 09b: DDGI probe-volume ambient diffuse (grid addressing + sampling)
 
 static const float PI = 3.14159265359;
 static const uint kMaxCascades = 4;
@@ -76,6 +77,22 @@ struct SceneData
     float gtao_strength;
     uint gtao_w;               // half-res AO texture size (normal-aware joint upsample)
     uint gtao_h;
+
+    // Brief 09b probe GI (appended — earlier offsets unchanged; lighting_data.hpp asserts). When
+    // probe_gi != 0 the ambient DIFFUSE term samples the relit probe volume (Chebyshev-gated
+    // 8-probe trilinear) instead of the sky SH; outside the volume / at ~0 weight it falls back to
+    // the sky SH exactly as before. probe_gi is 0 when r.gi is off, under r.furnace, or until the
+    // capture + first full relight pass have completed — the r.gi-0 path is bit-identical to
+    // pre-brief shading (the pixel-parity checkpoint).
+    float3 probe_origin;       // world pos of probe (0,0,0)
+    float3 probe_spacing;      // per-axis spacing
+    uint3 probe_counts;        // per-axis probe counts
+    uint probe_irrad_slot;     // irradiance atlas sampled slot
+    uint probe_vis_slot;       // visibility atlas sampled slot
+    uint probe_gi;             // 0 = off (sky-SH ambient, the pre-09b path)
+    ProbeOffsetBuffer *probe_offsets;   // per-probe relocation
+    ProbeActiveBuffer *probe_active;    // per-probe activation (inactive probes skipped)
+    float probe_occluded_floor;         // fraction of sky-SH ambient a collapsed cage keeps
 };
 
 // The interpolated surface the fragment shades. Both front-ends fill this.
@@ -180,7 +197,7 @@ float sample_cascade(SceneData s, uint cascade, float3 world_pos, float3 geom_n,
     [unroll] for (int y = -2; y <= 2; ++y)
         [unroll] for (int x = -2; x <= 2; ++x)
         {
-            float occluder = lit_textures[slot].Sample(uv + float2(x, y) * s.shadow_texel).r;
+            float occluder = lit_textures[slot].SampleLevel(uv + float2(x, y) * s.shadow_texel, 0).r;
             shadow += (frag_depth < occluder - bias) ? 1.0 : 0.0;
         }
     return shadow / 25.0;
@@ -280,6 +297,7 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
     float view_z = mul(s.view, float4(surf.world_pos, 1.0)).z;
 
     float3 direct = float3(0.0);
+    float3 dbg_sun = float3(0.0);   // sun-only direct term (debug view)
     uint dbg_count = 0;
     if (!furnace)
     {
@@ -291,8 +309,9 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
             // surface facing the sun; the BRDF integrates it as E_perp * BRDF * NdotL.
             float3 sun_illuminance = s.sun_color * s.sun_intensity;
             float shadow = shadow_factor(s, surf.world_pos, geom_n, NdotL, view_z);
-            direct = shade_brdf(N, V, L, diffuse_color, roughness, F0, f90, energy_comp,
-                                sun_illuminance) * (1.0 - shadow);
+            dbg_sun = shade_brdf(N, V, L, diffuse_color, roughness, F0, f90, energy_comp,
+                                 sun_illuminance) * (1.0 - shadow);
+            direct = dbg_sun;
         }
 
         uint froxel = froxel_index_for(s, surf.frag_coord, view_z);
@@ -335,7 +354,55 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
     float3 R = reflect(-V, N);
     float lod = roughness * float(max(s.env_mips, 1u) - 1u);
     float3 prefiltered = lit_cube_textures[s.env_slot].SampleLevel(R, lod).rgb;
-    float3 irradiance = sh_irradiance(s.sh, N);   // E/pi
+    float3 irradiance = sh_irradiance(s.sh, N);   // E/pi (sky SH — the fallback + r.gi-0 path)
+    float3 sky_diffuse_ref = irradiance;          // open-sky diffuse, kept as the GI-spec-occ reference
+
+    // --- Brief 09b probe GI: the ambient DIFFUSE switches to the relit probe volume -------------
+    // Chebyshev-visibility-gated 8-probe trilinear (probe_common) — the visibility test is what
+    // keeps courtyard probes from leaking into the interiors. The volume-hull fade blends back to
+    // the sky SH over one cell OUTSIDE the grid; a ~0 total weight (pathological: every cell
+    // corner inactive/rejected) also falls back. The specular ambient still samples the sky IBL cube,
+    // but is now occluded by a GI-derived spec-occ (below) so blocked faces stop reflecting unseen
+    // sky; GTAO keeps multiplying below (it is the sub-probe-scale detail layer).
+    if (s.probe_gi != 0u)
+    {
+        ProbeGrid pg;
+        pg.origin = s.probe_origin;
+        pg.spacing = s.probe_spacing;
+        pg.counts = s.probe_counts;
+        pg.irrad_stride = 10;
+        pg.vis_stride = 18;
+        pg.offsets = s.probe_offsets;
+        pg.active = s.probe_active;
+        float3 cellf = (surf.world_pos - pg.origin) / pg.spacing;
+        float3 dmin = min(cellf, float3(pg.counts) - 1.0 - cellf);
+        float hull = saturate(min(dmin.x, min(dmin.y, dmin.z)) + 1.0);   // 1 inside, 0 a cell out
+        if (hull > 0.0)
+        {
+            float pw = 0.0;
+            float3 pe = probe_irradiance(pg, lit_textures[s.probe_irrad_slot],
+                                         lit_textures[s.probe_vis_slot],
+                                         surf.world_pos, N, V, pw);
+            // Where the cage COLLAPSES (a point occluded from all 8 corners -> pw ~ 0, i.e. a wall or
+            // vault thinner than the probe spacing) the probe field has no data. A hard cutoff there
+            // snaps between full probe and a fixed floor, which reads as a sharp bright LEAK or a black
+            // crevice. Instead ramp SMOOTHLY on the cage weight `pw`: well-covered points take the
+            // probe result; as coverage falls, blend toward a dim, normal-shaped stand-in (a fraction
+            // of the sky-SH ambient) so the probe term stays a clean LOW-FREQUENCY base with no
+            // discontinuity. GTAO then contours it; a future SSGI pass would supply the real near-field
+            // detail. The ramp band is anchored low so genuinely well-covered points are untouched.
+            float conf = smoothstep(0.01, 0.1, pw);                    // 0 = collapsed, 1 = covered
+            float3 floor_ambient = irradiance * s.probe_occluded_floor; // dim sky ambient (N-shaped)
+            float3 probe_e = lerp(floor_ambient, pe, conf);
+            irradiance = lerp(irradiance, probe_e, hull);
+        }
+    }
+    // GI-debug isolate view (r.gi.debug 1 => probe_gi==2): show ONLY the indirect diffuse response
+    // (probe irradiance x albedo), no direct light, no specular ambient — makes a reference-free
+    // scene judgeable and lets the user point at a wrong probe. `irradiance` above is the (possibly
+    // probe-fed) E/pi term; multiply by the diffuse albedo to get the indirect diffuse radiance.
+    if (s.probe_gi == 2u)
+        return float4(irradiance * diffuse_color, blend_alpha ? base.a : 1.0);
 
     float3 FssEss = F0 * dfg.x + f90 * dfg.y;
     float Ess = dfg.x + dfg.y;
@@ -474,11 +541,47 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
         }
     }
 
+    // GI-derived specular occlusion. The probe volume already occluded the DIFFUSE ambient
+    // (`irradiance` is dark where the sky is blocked — e.g. an arcade interior face), but the
+    // specular ambient samples the GLOBAL prefiltered sky and would otherwise reflect sky the surface
+    // cannot see (the "lit occluded face" artifact). Use how much the probe darkened the diffuse vs
+    // the open-sky reference as an ambient-occlusion factor for the specular term too, so blocked
+    // faces stop reflecting the sky. This is an approximation (diffuse visibility, not the reflection
+    // cone) but a standard AO-driven spec-occ, reusing data we already have. GI off -> ratio 1 (no-op).
+    float gi_spec_ao = 1.0;
+    if (s.probe_gi != 0u)
+    {
+        const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
+        float open = dot(sky_diffuse_ref, kLuma);
+        gi_spec_ao = open > 1e-5 ? saturate(dot(irradiance, kLuma) / open) : 1.0;
+    }
+
     float spec_ao = clamp(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
-    float3 ambient = FssEss * prefiltered * (spec_ao * gtao_spec)
+    float3 ambient = FssEss * prefiltered * (spec_ao * gtao_spec * gi_spec_ao)
                    + (Fms * Ems + kD) * irradiance * (ao * gtao_diffuse);
 
     float3 color = direct + ambient;
+
+    // Lighting isolate views (debug_flags bits 4..7 <- r.debug.lighting): decompose what actually
+    // lights a pixel so a "wrongly lit" surface can be attributed without guessing. 1/2/3 are raw HDR
+    // (composite tonemaps them like the real frame); 4 is a scaled B/W shadow-coverage view.
+    //   1 = sun direct only (cast shadows read as BLACK inside sun-lit surfaces)
+    //   2 = ambient only (sky IBL diffuse + specular)
+    //   3 = local (froxel) lights only
+    //   4 = sun shadow coverage: WHITE = sun-lit, BLACK = in shadow / back-facing (scaled so EV100
+    //       exposure + ACES can't crush it)
+    uint light_dbg = (s.debug_flags >> 4) & 0xFu;
+    if (light_dbg == 1u) return float4(dbg_sun, 1.0);
+    if (light_dbg == 2u) return float4(ambient, 1.0);
+    if (light_dbg == 3u) return float4(max(direct - dbg_sun, float3(0.0)), 1.0);
+    if (light_dbg == 4u)
+    {
+        float3 Ld = normalize(s.sun_dir);
+        float ndl = max(dot(N, Ld), 0.0);
+        if (ndl <= 0.0 || s.sun_intensity <= 0.0) return float4(0.0, 0.0, 0.0, 1.0);
+        float sh = shadow_factor(s, surf.world_pos, geom_n, ndl, view_z);
+        return float4(float3(1.0 - sh) * 1e6, 1.0);   // white = lit, black = shadowed
+    }
 
     if ((s.debug_flags & 1u) != 0u)
     {

@@ -94,6 +94,25 @@ struct SceneData
     float gtao_strength;            // 772
     uint32_t gtao_w;                // 776 half-res AO texture size (normal-aware joint upsample)
     uint32_t gtao_h;                // 780 (also pads sizeof to an 8 multiple for pointer members)
+
+    // Brief 09b probe GI (APPENDED tail — every earlier offset unchanged; must match the tail of
+    // SceneData in lighting.slang). probe_gi == 0 -> shader takes the pre-09b sky-SH ambient path
+    // bit-identically (the pixel-parity lever); it is forced 0 under r.furnace and until the
+    // capture + first full relight have completed.
+    glm::vec3 probe_origin;         // 784 (natural: float3 is 12B, 4-aligned)
+    glm::vec3 probe_spacing;        // 796
+    glm::uvec3 probe_counts;        // 808
+    uint32_t probe_irrad_slot;      // 820
+    uint32_t probe_vis_slot;        // 824
+    uint32_t probe_gi;              // 828
+    VkDeviceAddress probe_offsets;  // 832 (8-aligned)
+    VkDeviceAddress probe_active;   // 840
+    // Fraction of the sky-SH ambient kept where the probe cage COLLAPSES (a shading point occluded
+    // from all 8 corner probes — a wall/vault thinner than the probe spacing). Not a physical value:
+    // the low-frequency stand-in for indirect the coarse grid can't represent. 0 = black crevices,
+    // 1 = full sky (leak); tuned live via r.gi.occluded_floor. The collapse is ramped smoothly on the
+    // cage weight in-shader, so this only sets the floor the ramp lands on.
+    float probe_occluded_floor;     // 848 (float, 4-aligned; sizeof pads to 856 for the 8-aligned ptrs)
 };
 
 // Lock the layout against Slang's NATURAL layout for pointer-loaded structs (scalar packing:
@@ -122,6 +141,16 @@ static_assert(offsetof(SceneData, gtao_slot) == 768);
 static_assert(offsetof(SceneData, gtao_strength) == 772);
 static_assert(offsetof(SceneData, gtao_w) == 776);
 static_assert(offsetof(SceneData, gtao_h) == 780);
-static_assert(sizeof(SceneData) == 784);
+// Brief 09b tail (verified against %SceneData_natural OpMemberDecorate offsets, see the brief log).
+static_assert(offsetof(SceneData, probe_origin) == 784);
+static_assert(offsetof(SceneData, probe_spacing) == 796);
+static_assert(offsetof(SceneData, probe_counts) == 808);
+static_assert(offsetof(SceneData, probe_irrad_slot) == 820);
+static_assert(offsetof(SceneData, probe_vis_slot) == 824);
+static_assert(offsetof(SceneData, probe_gi) == 828);
+static_assert(offsetof(SceneData, probe_offsets) == 832);
+static_assert(offsetof(SceneData, probe_active) == 840);
+static_assert(offsetof(SceneData, probe_occluded_floor) == 848);
+static_assert(sizeof(SceneData) == 856);
 
 }  // namespace sandbox
