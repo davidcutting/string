@@ -3,6 +3,7 @@
 #include <string/gpu/command_recorder.hpp>
 #include <string/vulkan/resource_usage.hpp>
 
+#include <functional>
 #include <string_view>
 #include <vector>
 
@@ -23,6 +24,16 @@ struct Pass
     // one list; is_write(usage.access) distinguishes them. Not yet consumed — the forward hook
     // the render graph will build execution order + barriers from.
     std::vector<ResourceUsage> usages;
+
+    // Brief 11 Phase 2 (M3): per-pass enable/disable. When set and returning false, the renderer
+    // skips this pass entirely this frame — it leaves the graph, the execution order, and the
+    // written-resource set (so downstream reads see whatever the target already holds; there is no
+    // graceful-degrade fallback in the current planner, so disabling a producer with hard consumers
+    // is the caller's responsibility for now — safe for the top-level passes, which only write the
+    // color target that composite reads). Empty predicate = always enabled (byte-identical default).
+    // This is the pass-toggle mechanism the debug UI (brief 14) drives via CVars.
+    std::function<bool()> enable_predicate;
+    bool is_enabled() const { return !enable_predicate || enable_predicate(); }
 
     virtual ~Pass() = 0;
     // Human-readable identity for tooling (profiler zones, the future scene/draw inspector, log
@@ -87,12 +98,9 @@ struct Pass
     // group's own passes. This is where the breaker draws its phase-2 geometry into the reloaded MSAA
     // targets (tested against the pyramid record_between just built). record() drew phase-1.
     virtual void record_after_between(string::gpu::command_recorder& /*recorder*/, uint16_t /*current_frame*/) {}
-    // depth_resolve_target(): when this pass breaks the scene group, the renderer resolves the MSAA
-    // depth into this single-sample image with VK_RESOLVE_MODE_MIN_BIT at the pre-break group's
-    // EndRendering (reverse-Z: min = farthest = conservative HiZ occluder). 0 = no depth resolve.
-    // The pass owns the image (single-sample, DEPTH usage + SAMPLED, D32); record_between() then
-    // builds its HiZ pyramid from it. Frame index selects the per-frame-in-flight target.
-    virtual string::gpu::resource_id depth_resolve_target(uint16_t /*current_frame*/) const { return 0; }
+    // Brief 11 P2 (B1): depth_resolve_target() is RETIRED — the group's MSAA-depth resolve target is
+    // now named by a declared Access::DepthResolve usage the renderer scans for (resource_usage.hpp),
+    // not a per-pass virtual hook. (breaks_scene_group/record_between/record_after_between follow in B2.)
 };
 
 // A pure-virtual destructor still needs a definition so derived passes can link.

@@ -27,6 +27,7 @@
 #include "probe_gi.hpp"
 #include "meshlet_builder.hpp"
 #include "assetbake/scene_loader.hpp"
+#include "geometry/geometry_scene.hpp"
 #include "geometry/sky_component.hpp"
 #include "geometry/froxel_component.hpp"
 #include "geometry/ibl_component.hpp"
@@ -41,19 +42,8 @@ namespace sandbox
 {
 
 // FroxelPush moved to geometry/froxel_component.hpp (brief 11 FroxelComponent extraction).
-
-// CVar-able lighting/shadow/froxel quality constants, grouped so a future CVar system binds them in
-// one place (per the brief's "as CVars" intent).
-struct LightingSettings
-{
-    uint32_t cascade_count = 3;                 // stabilized CSM cascades (quality tier)
-    uint32_t shadow_resolution = 2048;          // per-cascade shadow map resolution
-    float cascade_split_lambda = 0.85f;         // practical-split blend (log vs uniform)
-    float cascade_blend = 0.12f;                // cross-fade band as a fraction of a cascade's far
-    float shadow_bias = 0.0009f;                // constant depth bias (reverse-Z units), re-tuned
-    float shadow_normal_offset_scale = 3.0f;    // multiplier on per-cascade world texel size
-    float shadow_depth_range = 200.0f;          // world depth the CSM covers from the camera
-};
+// LightingSettings + the shared scene state moved to geometry/geometry_scene.hpp (brief 11 P2
+// GeometryScene extraction); GeometryPass privately inherits GeometryScene below.
 
 // SkyPush moved to geometry/sky_component.hpp (brief 11 SkyComponent extraction).
 
@@ -230,7 +220,7 @@ struct ResetPush
 // into a bindless slot), then issues one indexed draw per node-instanced primitive, pushing the
 // primitive's transform and material inline. Content-agnostic — the model path is supplied by
 // the application, resolved under context.resources_path.
-class GeometryPass final : public String::Pass
+class GeometryPass final : public String::Pass, private GeometryScene
 {
     string::gpu::device& device_;
     string::gpu::resource_allocator& allocator_;
@@ -239,8 +229,7 @@ class GeometryPass final : public String::Pass
     // Froxel light binning: extracted to FroxelComponent froxel_ (declared below, brief 11).
 
     string::gpu::resource_id vertex_buffer_;
-    uint32_t draw_count_ = 0;
-    uint32_t frames_in_flight_ = 1;
+    // draw_count_ / frames_in_flight_ moved to GeometryScene (brief 11 P2).
     // Brief 04e M2: number of fixed usages declared at construction; update() truncates back to
     // this count and re-appends the current frame slot's buffer usages (worklists, froxels,
     // visibility bitfield) so the frame graph sees per-frame-true declarations.
@@ -278,40 +267,16 @@ class GeometryPass final : public String::Pass
     // orthographic view into cascade_count per-frame-in-flight D32 images (one per cascade), sampled
     // by the lit fragment shader with 5x5 PCF. Cascades are stabilized (texel-snapped) and refit each
     // frame because the sun and camera both move (dynamic time-of-day).
-    LightingSettings settings_;
-    glm::vec3 sun_dir_ = glm::normalize(glm::vec3(0.5f, 0.72f, 0.45f));  // direction TO the light
-    // Per-cascade fit, recomputed each frame in update() from the live camera + sun.
-    std::array<glm::mat4, kMaxCascades> cascade_view_proj_{};
-    std::array<float, kMaxCascades> cascade_split_{};       // view-space far distance per cascade
-    std::array<float, kMaxCascades> cascade_world_texel_{}; // world units per texel per cascade
-    // Brief 04 M4: each cascade's world-space bounding sphere (centre + depth-inflated radius) for the
-    // conservative draw-level shadow cull in the draw-cull compute.
-    std::array<glm::vec3, kMaxCascades> cascade_center_{};
-    std::array<float, kMaxCascades> cascade_cull_radius_{};
-    // Time-of-day: an angle animated (or scrubbed) that drives sun_dir_ + the sky colours.
-    float time_of_day_ = 0.30f;   // 0..1 across the day arc (0.30 ~= mid-morning)
-    bool sun_animate_ = false;    // T toggles continuous time-of-day advance
-
-    // Environment (procedural sky + image-based ambient). The sky colours drive BOTH the visible sky
-    // background and the lit shader's ambient, so shaded surfaces read as lit by the same sky.
-    // Brief 07 M4 units: radiance in kilo-nits, illuminance in kilolux (see sun_for_time).
-    glm::vec3 sky_zenith_ = glm::vec3(2.8f, 6.0f, 12.4f);    // clear-day zenith blue (knits)
-    // Ground band ALBEDO (reflectance, not radiance): the shader derives its radiance from the
-    // CURRENT sun + sky (sky_ground_radiance in sky.slang) so the ground tracks time of day.
-    // Calibrated so noon (t=0.5) reproduces the pre-fix constant (2.64, 2.28, 1.80) knits.
-    glm::vec3 sky_ground_ = glm::vec3(0.0824f, 0.0699f, 0.0503f);
-    glm::vec3 sun_color_ = glm::vec3(1.0f, 0.96f, 0.9f);
-    float sun_intensity_ = 100.0f;                           // klx perpendicular (noon)
+    // settings_/sun_dir_/cascade_*/time_of_day_/sun_animate_/sky_*/sun_*/furnace_/lookdev_ moved to
+    // GeometryScene (brief 11 P2).
     // Fullscreen procedural sky (drawn before geometry). Extracted to its own component (brief 11);
     // owns the hot-reload sky pipeline. The shared sun/sky colours above are passed into sky_.record().
     SkyComponent sky_;
 
     // Brief 07 dynamic sky IBL, extracted to its own component (brief 11). Owns the env cubemaps /
     // SH / DFG LUT + the five compute pipelines; exposes sh_address()/env_slot()/dfg_slot()/primed()
-    // for SceneData + probe GI. The shared sun/sky colours + furnace flag stay in GeometryPass.
+    // for SceneData + probe GI. The shared sun/sky colours + furnace flag stay in GeometryScene.
     IblComponent ibl_;
-    bool furnace_ = false;                   // r.furnace (white-furnace acceptance test)
-    bool lookdev_ = false;                   // material-probe scene (STRING_SCENE=lookdev)
     // IBL create/record/verify moved to IblComponent ibl_ (brief 11).
 
     // --- Brief 09b: relightable irradiance probe volume (DDGI-style) -----------------------------
@@ -399,15 +364,8 @@ class GeometryPass final : public String::Pass
     void compute_cascades();
 
     // --- Forward+ lighting: scene data + local lights + froxels --------------------------------
-    // Per-frame SceneData SSBO (device-addressed, persistent-mapped ring): all the lighting/shadow/
-    // froxel state the lit shader reads that overflows the push constant.
-    std::vector<string::gpu::resource_id> scene_buffers_;
-    std::vector<void*> scene_mapped_;
-    // Dynamic local lights (point + spot). Uploaded to a per-frame SSBO ring so the stress scene can
-    // animate them CPU-side each frame.
-    std::vector<GpuLight> lights_;
-    std::vector<string::gpu::resource_id> light_buffers_;
-    std::vector<void*> light_mapped_;
+    // scene_buffers_/scene_mapped_ + lights_/light_buffers_/light_mapped_ moved to GeometryScene
+    // (brief 11 P2).
     // Forward+ froxel light-binning, extracted to its own component (brief 11). Owns the compute
     // pipeline + per-frame index buffers; grid dims + froxel address feed SceneData via accessors.
     FroxelComponent froxel_;
@@ -416,8 +374,7 @@ class GeometryPass final : public String::Pass
     void animate_lights(float delta_time);
     struct LightAnim { glm::vec3 center; float radius; float speed; float phase; float height; };
     std::vector<LightAnim> light_anim_;
-    glm::vec3 scene_aabb_min_{ 0.0f };
-    glm::vec3 scene_aabb_max_{ 0.0f };
+    // scene_aabb_min_/scene_aabb_max_ moved to GeometryScene (brief 11 P2).
     bool lights_enabled_ = true;   // L toggles the local-light stress set
     bool froxel_heatmap_ = false;  // H toggles the froxel light-count heatmap
 
@@ -451,12 +408,7 @@ class GeometryPass final : public String::Pass
     uint64_t stream_frame_ = 0;
     bool logged_full_resident_ = false;
 
-    std::vector<GltfMaterial> materials_;
-    std::vector<GltfDraw> draws_;
-
-    // Reusable engine fly camera (glTF space, Y-up). Framed to the model's AABB at load; update()
-    // drives it through the InputMap's default fly controls + mouse-look.
-    String::Camera camera_;
+    // materials_/draws_ + camera_ moved to GeometryScene (brief 11 P2).
 
     // Debug: toggle GPU frustum culling off entirely (C) — for isolating culling from geometry.
     bool cull_enabled_ = true;
@@ -472,17 +424,9 @@ class GeometryPass final : public String::Pass
     // This constant is the CHUNKED variant's budget, used only when r.chunk.budget is set non-zero for
     // A/B; kept here so the loader + cooked-file naming agree.
     static constexpr uint32_t kChunkMaxMeshlets = 1024;
-    MeshletModel meshlet_model_;
-    string::gpu::resource_id meshlet_buffer_ = 0;      // GpuMeshlet[]
-    string::gpu::resource_id meshlet_vertices_ = 0;    // uint[] global vertex remap
-    string::gpu::resource_id meshlet_triangles_ = 0;   // uint[] packed local tris
-    string::gpu::resource_id draw_info_buffer_ = 0;    // GpuDrawInfo[] (host-visible; resident gate)
-    GpuDrawInfo* draw_info_mapped_ = nullptr;
-    // GPU-written per-frame stats, read back one frame later for the UI overlay + log line. One
-    // buffer per frame-in-flight (host-visible) so the readback doesn't stall the GPU.
-    std::vector<string::gpu::resource_id> stats_buffers_;
-    std::vector<GpuMeshStats> stats_readback_;         // last read stats per frame slot
-    GpuMeshStats stats_latest_{};                       // most recent, for the UI accessor
+    // meshlet_model_/meshlet_buffer_/meshlet_vertices_/meshlet_triangles_/draw_info_buffer_/
+    // draw_info_mapped_ + stats_buffers_/stats_readback_/stats_latest_ moved to GeometryScene
+    // (brief 11 P2).
     // Mesh pipelines (hot-reloadable via the registry).
     string::gpu::shader_program* meshlet_program_ = nullptr;
     string::gpu::shader_program* meshlet_twosided_program_ = nullptr;  // brief 04: CULL_NONE variant
@@ -508,8 +452,7 @@ class GeometryPass final : public String::Pass
     // slot scratch arena, reserved once at load (same offset in every slot's buffer); `buffer`
     // is the slot's scratch buffer, bound lazily in update() once the arena is materialized.
     struct Worklist { string::gpu::resource_id buffer = 0; VkDeviceSize offset = 0; };
-    String::FrameScratch* scratch_ = nullptr;
-    bool scratch_bound_ = false;
+    // scratch_/scratch_bound_ moved to GeometryScene (brief 11 P2).
     // Per-frame-in-flight (the GPU may still read last frame's list). Camera lists: opaque one-sided +
     // two-sided (brief 04d: shared by phase 1 and phase 2; the task shader partitions per phase — the
     // old forced-LOD0 depth-prepass lists are deleted along with the prepass itself).
@@ -641,8 +584,7 @@ class GeometryPass final : public String::Pass
     // between the base set and base+crowd. Grid side N gives (N*N - 1) extra copies of the model.
     static constexpr uint32_t kCrowdGrid = 6;   // 6x6 = 35 extra copies (+ base) of the model
     bool crowd_enabled_ = false;
-    uint32_t base_draw_count_ = 0;   // draws in the base (non-crowd) scene
-    uint32_t active_draw_count_ = 0; // base, or base + crowd when the crowd is on
+    // base_draw_count_/active_draw_count_ moved to GeometryScene (brief 11 P2).
     void build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_max);
     void build_meshlet_gpu(String::PassContext& context);
     // Brief 04d: `phase` (0 legacy/transparency, 1 = bit-set only, 2 = bit-clear+HiZ+update) is pushed
@@ -669,9 +611,7 @@ class GeometryPass final : public String::Pass
     // Zeroes visbits_buffer_ + prev_draw_lod_buffer_ (teleport/first-frame/streaming full clear).
     bool visbits_clear_pending_ = true;
 
-    // Shared overlay state written each frame for the UI (stats + which path is active), so the UI
-    // author (built separately in the RenderPlan) can display it without a direct pass pointer.
-    std::shared_ptr<MeshOverlayStats> overlay_stats_;
+    // overlay_stats_ moved to GeometryScene (brief 11 P2).
 
 public:
     // Latest GPU culling stats (read back one frame late) for the UI overlay.
@@ -708,7 +648,8 @@ public:
     // transparency) into the reloaded MSAA targets. When HiZ is disabled the pass does NOT break the
     // group: record() renders everything single-pass (phase 0) as before.
     virtual bool breaks_scene_group() const override { return two_phase_active_; }
-    virtual string::gpu::resource_id depth_resolve_target(uint16_t current_frame) const override;
+    // Brief 11 P2 (B1): depth_resolve_target() removed — the resolve target is declared as an
+    // Access::DepthResolve usage in record_compute() (see the two-phase decision) instead.
     virtual void record_between(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
     virtual void record_after_between(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
 };

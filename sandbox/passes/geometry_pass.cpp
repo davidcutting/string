@@ -367,11 +367,19 @@ GeometryPass::GeometryPass(PassContext& context, std::vector<std::filesystem::pa
 , allocator_(context.allocator)
 , descriptor_table_(context.descriptor_table)
 , input_map_(context.input_map)
-, frames_in_flight_(context.frames_in_flight)
 , residency_(kTextureBudget, kTextureStreamPerFrame)
-, overlay_stats_(std::move(overlay_stats))
 , gpu_profiler_ctx_(context.gpu_profiler_ctx)
 {
+    // frames_in_flight_ + overlay_stats_ moved to the GeometryScene base (brief 11 P2); a base
+    // class's members can't sit in the derived init list, so seed them first thing in the body
+    // (nothing above uses them).
+    frames_in_flight_ = context.frames_in_flight;
+    overlay_stats_ = std::move(overlay_stats);
+    // Brief 11 Phase 2 (M3): the whole geometry pass is CVar-toggleable (r.pass.geometry) through
+    // the renderer's per-pass enable/disable. Off -> composite reads the cleared color target.
+    // Touch the CVar NOW (init-capture invokes cv_pass_geometry()) so it self-registers at
+    // construction — before the STRING_PASS_GEOMETRY env override is applied — not lazily at frame 1.
+    enable_predicate = [&geom = cv_pass_geometry()] { return geom.get(); };
     // Brief 04e M3: per-frame transient buffers (worklists, draw_lod) reserve into the
     // renderer's scratch arena; buffers bind lazily in update() after materialization.
     scratch_ = &context.scratch;
@@ -1936,6 +1944,15 @@ bool GeometryPass::record_compute(string::gpu::command_recorder& recorder, uint1
         // group, single-pass (phase 0) — everything unconditionally, exactly like HiZ-off before.
         two_phase_active_ = hiz_enabled_ && hiz_program_ && stream_frame_ > 1;
 
+        // Brief 11 P2 (B1): name this frame's MSAA-depth resolve target as a declared usage (replacing
+        // the depth_resolve_target() hook). Appended here — AFTER update() finalized `usages` and the
+        // graph was built — because the two-phase decision isn't known until now; the renderer's group
+        // loop (which runs after this record_compute) scans for it. Dropped + re-added each frame
+        // (update() truncates back to static_usage_count_). Marker usage: not a graph write, untracked.
+        if (two_phase_active_ && current_frame < hiz_.size() && hiz_[current_frame].depth != 0)
+            usages.push_back({ hiz_[current_frame].depth, String::Access::DepthResolve,
+                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT });
+
         // Clear the persistent visibility bitfield + last-LOD on demand (first frame, teleport, a full
         // streaming reset). A cleared bitfield is CORRECT — every meshlet takes phase 2 for one frame.
         // Freeze (F) must NOT clear (it would erase the frozen visibility the debug eye is inspecting).
@@ -2113,12 +2130,6 @@ void GeometryPass::record(string::gpu::command_recorder& recorder, uint16_t curr
 
 // Brief 04d: the depth-resolve target the renderer MIN-resolves the phase-1 MSAA depth into (the
 // pyramid's single-sample mip-0 source). Valid only when the two-phase path is active this frame.
-string::gpu::resource_id GeometryPass::depth_resolve_target(uint16_t current_frame) const
-{
-    if (!two_phase_active_ || current_frame >= hiz_.size()) return 0;
-    return hiz_[current_frame].depth;
-}
-
 // Brief 04d: build the HiZ pyramid from the MIN-resolved phase-1 depth (hz.depth), OUTSIDE rendering.
 // The renderer already resolved msaa_depth_ -> hz.depth (reverse-Z MIN = farthest) at phase-1's
 // EndRendering and left it in DEPTH_ATTACHMENT layout. Reuses the exact mip-0 uniform-stretch +

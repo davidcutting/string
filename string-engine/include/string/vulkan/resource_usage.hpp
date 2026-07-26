@@ -22,6 +22,13 @@ enum class Access : std::uint8_t
     ColorWrite,     // color attachment write
     DepthWrite,     // depth attachment test + write
     DepthRead,      // depth attachment read-only test
+    // Brief 11 P2 (B1): a MARKER usage naming the single-sample image a raster group MIN-resolves its
+    // MSAA depth into at EndRendering (reverse-Z: min = farthest = conservative HiZ occluder). It
+    // replaces the Pass::depth_resolve_target() virtual hook: the group loop scans a group's usages
+    // for this access to find the resolve target, instead of asking the breaking pass. NOT a graph
+    // write (stays out of written_resources_) — the resolve target is pass-managed/untracked state;
+    // this only identifies it. The non-UNDEFINED layout keeps it off the buffer-usage path.
+    DepthResolve,
     SampledRead,    // sampled image (texture)
     StorageRead,    // storage buffer / image read
     StorageWrite,   // storage buffer / image write
@@ -81,6 +88,11 @@ constexpr AccessScope access_scope(Access access)
                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
         case Access::DepthRead:
             return { VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        case Access::DepthResolve:
+            // Marker only (see the enum comment). The scope is never consumed for a barrier — the
+            // resolve target is untracked pass-managed state — but the layout must be non-UNDEFINED so
+            // the renderer's is_buffer_usage() check doesn't misroute this image id onto the buffer path.
+            return { VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
         case Access::SampledRead:
             return { VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         case Access::StorageRead:

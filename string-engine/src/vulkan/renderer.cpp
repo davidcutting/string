@@ -471,12 +471,19 @@ void Renderer::record_frame()
     };
     const VkRect2D scissor = { .offset = { 0, 0 }, .extent = extent };
 
+    // Brief 11 Phase 2 (M3): filter out disabled passes up front — they leave the graph, the
+    // execution order, and the written-resource set below. All-enabled = byte-identical (default).
+    std::vector<Pass*> active;
+    active.reserve(frame_passes_.size());
+    for (Pass* pass : frame_passes_)
+        if (pass->is_enabled()) active.push_back(pass);
+
     // Brief 04e M2: the frame graph. Every frame the passes' declared ResourceUsages feed the
     // planner; execution follows its (stable, authored-order-preserving) toposort, and ALL
     // inter-pass barriers below derive from the same declarations through resource_states_ —
     // pass-declared usage is the single source of truth for scheduling AND sync.
     GraphBuilder graph_builder;
-    for (Pass* pass : frame_passes_)
+    for (Pass* pass : active)
     {
         PassBuilder pass_builder = graph_builder.add_pass(std::string(pass->debug_name()));
         for (const ResourceUsage& usage : pass->usages)
@@ -499,14 +506,14 @@ void Renderer::record_frame()
                                 ? static_cast<int64_t>(*lifetime.first_writer) : -1);
     }
     std::vector<Pass*> execution_order;
-    execution_order.reserve(frame_passes_.size());
+    execution_order.reserve(active.size());
     for (uint32_t index : graph.toposorted)
-        execution_order.push_back(frame_passes_[index]);
+        execution_order.push_back(active[index]);
 
     // The set of resources the graph itself writes this frame (usages may change per frame —
     // per-frame-slot buffers). Static uploaded inputs are never re-transitioned.
     written_resources_.clear();
-    for (const Pass* pass : frame_passes_)
+    for (const Pass* pass : active)
         for (const ResourceUsage& usage : pass->usages)
             if (is_write(usage.access))
                 written_resources_.insert(usage.resource);
@@ -837,11 +844,14 @@ void Renderer::record_frame()
         const bool msaa_is_last = this_is_msaa && !next_is_msaa;       // resolves vs stores
         if (this_is_msaa) seen_msaa_group = true;
 
-        // Brief 04d: a breaking group MIN-resolves its MSAA depth into the breaker's single-sample
-        // depth-resolve target (reverse-Z: min = farthest = conservative HiZ occluder), so
-        // record_between() can build the pyramid from a normally-samplable depth. 0 = no resolve.
-        const string::gpu::resource_id depth_resolve = break_after
-            ? execution_order[end - 1]->depth_resolve_target(static_cast<uint16_t>(current_frame_)) : 0;
+        // Brief 04d: a group MIN-resolves its MSAA depth into a single-sample resolve target (reverse-Z:
+        // min = farthest = conservative HiZ occluder), so the following HiZ build can read a normally-
+        // samplable depth. Brief 11 P2 (B1): the target is named by a declared Access::DepthResolve
+        // usage (scanned here) rather than the removed Pass::depth_resolve_target() hook. 0 = no resolve.
+        string::gpu::resource_id depth_resolve = 0;
+        for (size_t i = start; i < end; ++i)
+            for (const ResourceUsage& usage : execution_order[i]->usages)
+                if (usage.access == Access::DepthResolve) depth_resolve = usage.resource;
 
         // Barriers: transition each graph-written image the group touches to the state its usage
         // needs (deduped per resource). Static uploaded inputs are skipped — they aren't in

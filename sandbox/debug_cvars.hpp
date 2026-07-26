@@ -124,6 +124,7 @@ string::core::CVar<int32_t>& cv_light_debug();       // r.debug.lighting    <- S
 
 // --- Probe GI (brief 09b): relightable irradiance volume -------------------------------------
 string::core::CVar<bool>&    cv_gi_enabled();       // r.gi                <- STRING_GI
+string::core::CVar<bool>&    cv_pass_geometry();    // r.pass.geometry <- STRING_R_PASS_GEOMETRY (brief 11 P2)
 string::core::CVar<float>&   cv_gi_spacing();       // r.gi.spacing        <- STRING_GI_SPACING (world m)
 string::core::CVar<float>&   cv_gi_hysteresis();    // r.gi.hysteresis     <- STRING_GI_HYSTERESIS (0..1)
 string::core::CVar<float>&   cv_gi_occluded_floor();// r.gi.occluded_floor <- STRING_GI_OCCLUDED_FLOOR (0..1)
