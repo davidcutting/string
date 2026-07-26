@@ -3319,16 +3319,27 @@ void GeometryPass::compute_cascades()
         const glm::vec3 eye = center + L * eye_back;
         glm::mat4 view = glm::lookAt(eye, center, up);
 
-        // Snap the center to whole texels in light space (stabilization).
-        glm::vec3 center_ls = glm::vec3(view * glm::vec4(center, 1.0f));
+        // Stabilize: snap the cascade center to whole shadow texels along the light's lateral axes.
+        // CRITICAL: measuring in `view` space is a NO-OP -- lookAt(eye, center, up) puts `center` at
+        // the light-space origin every frame (x=y=0), so std::floor(0) snaps nothing and the map slid
+        // sub-texel each frame. With NEAREST sampling that flips every silhouette texel occluder<->empty
+        // per frame -> the magenta sparkle, worst under motion. Measure in a FIXED light BASIS (rotation
+        // only, no per-frame translation) so the lateral position actually quantizes to the texel grid.
+        const glm::mat3 light_basis = glm::mat3(glm::lookAt(glm::vec3(0.0f), -L, up));  // rotation only
+        glm::vec3 center_ls = light_basis * center;
         center_ls.x = std::floor(center_ls.x / texel) * texel;
         center_ls.y = std::floor(center_ls.y / texel) * texel;
-        const glm::vec3 snapped_center = glm::vec3(glm::inverse(view) * glm::vec4(center_ls, 1.0f));
+        const glm::vec3 snapped_center = glm::transpose(light_basis) * center_ls;  // back to world
         const glm::vec3 snapped_eye = snapped_center + L * eye_back;
         view = glm::lookAt(snapped_eye, snapped_center, up);
 
         // Ortho box: [-radius, radius] in x/y; near=0 (at the eye), far = scene depth span along L.
-        glm::mat4 proj = glm::ortho(-radius, radius, -radius, radius, 0.0f, far_d);
+        // Use orthoRH_ZO explicitly (NOT glm::ortho): GLM_FORCE_DEPTH_ZERO_TO_ONE is not reliably in
+        // effect in THIS translation unit (engine headers above pull glm in default [-1,1] mode before
+        // the macro lands), so plain glm::ortho produced an OpenGL [-1,1] box. The reverse_z below
+        // assumes [0,1], so the sunward half mapped to z_ndc>1 and got hard-clipped -- slicing the top
+        // (roof/upper walls) off every caster, which is why tall geometry cast no shadow.
+        glm::mat4 proj = glm::orthoRH_ZO(-radius, radius, -radius, radius, 0.0f, far_d);
         proj[1][1] *= -1.0f;  // Vulkan Y-flip
         glm::mat4 reverse_z(1.0f);
         reverse_z[2][2] = -1.0f;
@@ -3352,16 +3363,21 @@ namespace
 struct SunState { glm::vec3 dir; glm::vec3 sun_color; float sun_intensity; glm::vec3 sky_zenith; glm::vec3 sky_ground; };
 SunState sun_for_time(float t)
 {
-    // Elevation follows a half-sine over the day; azimuth sweeps east->west. Below the horizon is
-    // clamped a little above so the scene never goes pitch black (stylized dusk, not night).
-    const float angle = t * glm::pi<float>();                  // 0..pi across the arc
-    const float elevation = std::sin(angle) * 0.85f + 0.06f;   // never fully below horizon
-    const float azimuth = (t - 0.5f) * 2.4f;                   // east -> west sweep
-    const float horiz = std::sqrt(std::max(1.0f - elevation * elevation, 0.0f));
+    // Great-circle day path: the sun rides a single TILTED CIRCLE from the east horizon, arcing up
+    // and leaning south, down to the west horizon — a natural wide arc (the old model computed a
+    // half-sine elevation and a linear azimuth INDEPENDENTLY, which isn't a circle and read as a
+    // steep "^" tent because the azimuth barely swept). `lean` (r.sun.lean) tilts the arc toward
+    // south: smaller = higher noon sun (~0 = straight overhead), larger = a lower, flatter arc.
+    const float p = t * glm::pi<float>();               // 0 (east horizon) .. pi (west horizon)
+    const float lean = cv_sun_lean().get();
+    glm::vec3 d(-std::cos(p),                            // east -> west
+                std::sin(p) * std::cos(lean),            // up (arcs over the day)
+                std::sin(p) * std::sin(lean));           // south lean
+    d.y = d.y * 0.94f + 0.06f;                           // keep the "never fully below horizon" floor
     SunState s;
-    s.dir = glm::normalize(glm::vec3(std::sin(azimuth) * horiz, elevation, std::cos(azimuth) * horiz));
-    // Warm at the horizon (sunrise/sunset), neutral-bright at noon.
-    const float noon = glm::clamp(elevation, 0.0f, 1.0f);
+    s.dir = glm::normalize(d);
+    // Warm at the horizon (sunrise/sunset), neutral-bright at noon. Drive off the actual elevation.
+    const float noon = glm::clamp(s.dir.y, 0.0f, 1.0f);
     s.sun_color = glm::mix(glm::vec3(1.0f, 0.55f, 0.28f), glm::vec3(1.0f, 0.96f, 0.9f), noon);
     // Brief 07 M4 units (self-consistent, "physical-ish"): illuminance in KILOLUX, luminance /
     // radiance in KILO-NITS (1 unit = 1000 lx / 1000 cd/m^2 — see r.exposure.ev100 for the
@@ -3969,6 +3985,7 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         // Fill SceneData for this frame. The lit shader reads sun/ambient/CSM/froxel state from here.
         SceneData scene{};
         scene.camera_pos = camera_.position();
+        scene.exposure = String::CompositePass::exposure_scale();   // for display-referred debug views
         scene.sun_dir = sun_dir_;
         scene.sun_intensity = sun_intensity_;
         scene.sun_color = sun_color_;

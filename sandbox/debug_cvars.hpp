@@ -65,6 +65,8 @@ string::core::CVar<bool>&    cv_ibl_verify();       // dbg.ibl_verify      <- ST
 string::core::CVar<bool>&    cv_ibl_every_frame();  // dbg.ibl_every_frame <- STRING_IBL_EVERY_FRAME
 // Headless time-of-day: >= 0 pins time_of_day_ to this value (0..1); < 0 = scene default.
 string::core::CVar<float>&   cv_time_of_day();      // r.tod               <- STRING_TOD
+// Sun arc tilt toward south (radians): great-circle day path. Smaller = higher noon sun.
+string::core::CVar<float>&   cv_sun_lean();         // r.sun.lean          <- STRING_SUN_LEAN
 // Headless sun animation: start with time-of-day advancing (the T key toggle), for TOD motion
 // sequences without input.
 string::core::CVar<bool>&    cv_sun_animate();      // dbg.sun_animate     <- STRING_SUN_ANIM

@@ -36,7 +36,7 @@ struct FroxelBuffer { uint data[]; };
 // --- Per-frame scene data (reached by device address; NATURAL layout — see lighting_data.hpp) -----
 struct SceneData
 {
-    float3 camera_pos;   float _p0;
+    float3 camera_pos;   float exposure;   // composite EV100 exposure scale (display-referred debug views)
     float3 sun_dir;      float sun_intensity;
     float3 sun_color;    float _p1;
     float3 ambient_sky;  float _p2;
@@ -182,12 +182,13 @@ float3 sh_irradiance(ShBuffer *sh, float3 n)
 }
 
 // --- Shadows (cascaded) -----------------------------------------------------------------------
-float sample_cascade(SceneData s, uint cascade, float3 world_pos, float3 geom_n, float NdotL)
+float sample_cascade(SceneData s, uint cascade, float3 world_pos, float3 geom_n, float NdotL, out float2 out_uv)
 {
     float3 p = world_pos + geom_n * (s.cascade_texel[cascade].x * s.shadow_normal_offset_scale);
     float4 lp = mul(s.cascade_view_proj[cascade], float4(p, 1.0));
     float3 ndc = lp.xyz / lp.w;
     float2 uv = ndc.xy * 0.5 + 0.5;
+    out_uv = uv;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
         return -1.0;
     float frag_depth = ndc.z;
@@ -197,27 +198,79 @@ float sample_cascade(SceneData s, uint cascade, float3 world_pos, float3 geom_n,
     [unroll] for (int y = -2; y <= 2; ++y)
         [unroll] for (int x = -2; x <= 2; ++x)
         {
-            float occluder = lit_textures[slot].SampleLevel(uv + float2(x, y) * s.shadow_texel, 0).r;
+            // Clamp taps to the map interior so the kernel never reads the cleared border (border = 0
+            // = "no occluder" = a false LIT vote, the source of the cascade-edge seam). Reading the
+            // nearest real edge texel instead is safe here because shadow_factor's edge_t hands the
+            // final few texels off to the larger cascade anyway.
+            float2 t = clamp(uv + float2(x, y) * s.shadow_texel, s.shadow_texel, 1.0 - s.shadow_texel);
+            // NonUniformResourceIndex: `slot` comes from the PER-PIXEL cascade selection, so it
+            // diverges across a wave at cascade boundaries. A divergent bindless index without this
+            // qualifier is UB in Vulkan (the GPU scalarizes to one lane's index for all divergent
+            // lanes -> wrong cascade read -> non-deterministic shadow flicker). This was THE sparkle.
+            float occluder = lit_textures[NonUniformResourceIndex(slot)].SampleLevel(t, 0).r;
             shadow += (frag_depth < occluder - bias) ? 1.0 : 0.0;
         }
     return shadow / 25.0;
 }
+// Pick the cascade that actually covers `world_pos`. Depth chooses a starting cascade, but the
+// receiver can sit outside that cascade's lateral XY footprint (or, for tall/distant occluders, the
+// near cascade simply never rendered the caster). Walk UP to larger cascades until one contains the
+// point laterally; returns kNoCascade if even the largest doesn't. A smaller cascade being out of
+// footprint must NOT be read as "lit" (that was the bright-seam bug).
+static const uint kNoCascade = 0xFFFFFFFFu;
+uint select_cascade(SceneData s, float3 world_pos, float view_z)
+{
+    float depth = -view_z;
+    uint start = s.cascade_count - 1;
+    for (uint i = 0; i < s.cascade_count; ++i)
+        if (depth < s.cascade_split[i].x) { start = i; break; }
+    for (uint c = start; c < s.cascade_count; ++c)
+    {
+        float4 lp = mul(s.cascade_view_proj[c], float4(world_pos, 1.0));
+        float3 ndc = lp.xyz / lp.w;
+        float2 uv = ndc.xy * 0.5 + 0.5;
+        if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0)
+            return c;
+    }
+    return kNoCascade;
+}
+
 float shadow_factor(SceneData s, float3 world_pos, float3 geom_n, float NdotL, float view_z)
 {
     float depth = -view_z;
-    uint cascade = s.cascade_count - 1;
-    for (uint i = 0; i < s.cascade_count; ++i)
-        if (depth < s.cascade_split[i].x) { cascade = i; break; }
-    float sh = sample_cascade(s, cascade, world_pos, geom_n, NdotL);
+    uint cascade = select_cascade(s, world_pos, view_z);
+    if (cascade == kNoCascade) return 0.0;   // outside every cascade -> unshadowed fill
+    float2 uv;
+    float sh = sample_cascade(s, cascade, world_pos, geom_n, NdotL, uv);
     if (sh < 0.0) return 0.0;
+
+    // Blend into the next (larger) cascade by the MAX of two weights:
+    //  - depth_t: the usual view-depth cross-fade band approaching this cascade's split.
+    //  - edge_t:  proximity to this cascade's shadow-map BORDER. The PCF kernel reads a 5x5
+    //    neighbourhood, so within a few texels of the [0,1] edge some taps fall off the map into
+    //    the cleared border (occluder = 0 = "no occluder") and wrongly vote LIT -- a bright fringe
+    //    exactly on the cascade boundary. Fading to the larger cascade (which has this region well
+    //    inside its footprint) before the kernel leaves the map removes the seam.
     float split = s.cascade_split[cascade].x;
-    if (cascade + 1 < s.cascade_count && s.cascade_blend > 0.0)
+    if (cascade + 1 < s.cascade_count)
     {
-        float band = split * s.cascade_blend;
-        float t = clamp((depth - (split - band)) / max(band, 1e-4), 0.0, 1.0);
+        float band = split * max(s.cascade_blend, 1e-4);
+        float depth_t = clamp((depth - (split - band)) / band, 0.0, 1.0);
+        // Distance to the nearest shadow-map edge, in TEXELS. The 5x5 PCF kernel reads +-2 texels,
+        // so within ~3 texels of the edge some taps fall off the map (cleared border = "no occluder"
+        // = wrongly LIT). Hand FULLY to the larger cascade across that off-map zone (edge_t = 1 for
+        // <=3 texels), then ramp back to this cascade over the next ~9 texels. A soft ramp (as
+        // before) still leaked 30-70% of the lit off-map taps right at the seam.
+        float edge_texels = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) / max(s.shadow_texel, 1e-6);
+        // edge_t = 1 fully inside the off-map zone (<=3 texels = kernel radius + slack), smoothly
+        // ramping to 0 by 14 texels. smoothstep avoids a hard ramp edge that would itself read as a
+        // faint line.
+        float edge_t = 1.0 - smoothstep(3.0, 14.0, edge_texels);
+        float t = max(depth_t, edge_t);
         if (t > 0.0)
         {
-            float sh_next = sample_cascade(s, cascade + 1, world_pos, geom_n, NdotL);
+            float2 uv_next;
+            float sh_next = sample_cascade(s, cascade + 1, world_pos, geom_n, NdotL, uv_next);
             if (sh_next >= 0.0) sh = lerp(sh, sh_next, t);
         }
     }
@@ -570,6 +623,10 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
     //   3 = local (froxel) lights only
     //   4 = sun shadow coverage: WHITE = sun-lit, BLACK = in shadow / back-facing (scaled so EV100
     //       exposure + ACES can't crush it)
+    //   5 = selected shadow cascade: RED=0, GREEN=1, BLUE=2, YELLOW=3, MAGENTA=outside all cascades
+    //   6 = occluder probe: GREEN=caster above pixel (should be shadowed), RED=pixel topmost (lit /
+    //       occluder not rasterized here), MAGENTA=map empty at this uv, BLUE=uncovered
+    //   7/8 = raw shadow-map depth of cascade 0 / 1 by screen uv (bright=near sun, black=empty)
     uint light_dbg = (s.debug_flags >> 4) & 0xFu;
     if (light_dbg == 1u) return float4(dbg_sun, 1.0);
     if (light_dbg == 2u) return float4(ambient, 1.0);
@@ -581,6 +638,64 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
         if (ndl <= 0.0 || s.sun_intensity <= 0.0) return float4(0.0, 0.0, 0.0, 1.0);
         float sh = shadow_factor(s, surf.world_pos, geom_n, ndl, view_z);
         return float4(float3(1.0 - sh) * 1e6, 1.0);   // white = lit, black = shadowed
+    }
+    if (light_dbg == 5u)
+    {
+        // Categorical cascade colours must keep their HUE through the composite. ACES desaturates
+        // bright saturated values toward white (why the 1e6 trick can't be used here), so instead
+        // emit DISPLAY-REFERRED colours: multiply by inv_exposure to cancel the composite's EV100
+        // exposure, so the LUT sees the literal ~1.0 primary and preserves the hue. Same technique
+        // the UI/text shaders use for display-referred colour.
+        float inv_exposure = 1.0 / max(s.exposure, 1e-8);
+        uint c = select_cascade(s, surf.world_pos, view_z);
+        float3 col = float3(1.0, 0.0, 1.0);   // magenta = outside all cascades
+        if (c != kNoCascade)
+        {
+            float3 cols[4] = { float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1), float3(1, 1, 0) };
+            col = cols[min(c, 3u)];
+        }
+        return float4(col * inv_exposure, 1.0);
+    }
+    if (light_dbg == 6u)
+    {
+        // Occluder probe (3-way). Reproject into the selected cascade, sample the map's nearest-to-sun
+        // depth at this uv (reverse-Z: nearer sun = larger; cleared = 0), compare to the fragment's
+        // own depth.
+        //   GREEN   = occluder well above this pixel -> it SHOULD be shadowed.
+        //   RED     = occluder ~= this pixel's depth -> the pixel IS the topmost surface in the map
+        //             -> genuinely lit (the OCCLUDER specifically was not rasterized here).
+        //   MAGENTA = map is EMPTY at this uv (occluder ~= 0) -> NOTHING rendered here, not even the
+        //             receiver itself -> a coverage / cull / matrix-mismatch failure for the cascade.
+        //   BLUE    = pixel outside every cascade.
+        float inv_exposure = 1.0 / max(s.exposure, 1e-8);
+        uint c = select_cascade(s, surf.world_pos, view_z);
+        if (c == kNoCascade) return float4(float3(0, 0, 1) * inv_exposure, 1.0);
+        float3 p = surf.world_pos + geom_n * (s.cascade_texel[c].x * s.shadow_normal_offset_scale);
+        float4 lp = mul(s.cascade_view_proj[c], float4(p, 1.0));
+        float3 ndc = lp.xyz / lp.w;
+        float2 uv = ndc.xy * 0.5 + 0.5;
+        uint slot = s.cascade_slot[c].x;
+        float occluder = lit_textures[NonUniformResourceIndex(slot)].SampleLevel(uv, 0).r;
+        float delta = occluder - ndc.z;                 // >0 => something is nearer the sun than us
+        float3 col;
+        if (occluder < 0.001)      col = float3(1, 0, 1);   // magenta: empty map at this uv
+        else if (delta > 0.002)    col = float3(0, 1, 0);   // green: occluder above -> shadowed
+        else                       col = float3(1, 0, 0);   // red: topmost surface -> lit
+        return float4(col * inv_exposure, 1.0);
+    }
+    if (light_dbg == 7u || light_dbg == 8u)
+    {
+        // Raw shadow-map viewer: sample a cascade's depth directly by SCREEN uv (NOT reprojected),
+        // showing the map in its own light-space. Reverse-Z: bright = near the sun (tall casters),
+        // dark = far, BLACK = empty/unrendered. 7 = cascade 0, 8 = cascade 1. Use this to confirm
+        // whether the roof silhouette is actually present in the map at all.
+        float inv_exposure = 1.0 / max(s.exposure, 1e-8);
+        float2 res = float2(s.froxel_dims.x * s.froxel_dims.w, s.froxel_dims.y * s.froxel_dims.w);
+        float2 suv = surf.frag_coord.xy / max(res, float2(1.0));
+        uint ci = light_dbg == 7u ? 0u : 1u;
+        uint slot = s.cascade_slot[min(ci, s.cascade_count - 1)].x;
+        float d = lit_textures[slot].SampleLevel(suv, 0).r;
+        return float4(float3(d) * inv_exposure, 1.0);
     }
 
     if ((s.debug_flags & 1u) != 0u)

@@ -69,7 +69,7 @@ CVar<int32_t>& cv_meshlet_dump()
 
 CVar<bool>& cv_lights_enabled()
 {
-    static CVar<bool> v{"r.lights.enabled", true, "local-light stress set (L toggles at runtime)"};
+    static CVar<bool> v{"r.lights.enabled", false, "local-light stress set (L toggles at runtime; STRING_LIGHTS=1 to force on)"};
     static const bool a = [] { v.add_alias("lights"); return true; }();
     (void)a;
     return v;
@@ -158,6 +158,15 @@ CVar<float>& cv_time_of_day()
     static CVar<float> v{"r.tod", -1.0f,
                          "pin time-of-day to this value in [0,1] (headless TOD captures); <0 = default"};
     static const bool a = [] { v.add_alias("tod"); return true; }();
+    (void)a;
+    return v;
+}
+
+CVar<float>& cv_sun_lean()
+{
+    static CVar<float> v{"r.sun.lean", 0.6f,
+                         "sun arc tilt toward south (radians); smaller = higher noon sun, ~0 = overhead"};
+    static const bool a = [] { v.add_alias("sun_lean"); return true; }();
     (void)a;
     return v;
 }
@@ -379,9 +388,10 @@ CVar<bool>& cv_gtao_spec_occ()
 CVar<int32_t>& cv_light_debug()
 {
     // Lighting isolate view: 0 normal, 1 sun-direct only, 2 ambient only, 3 local (froxel) lights,
-    // 4 sun shadow coverage (white = lit, black = in shadow / back-facing).
+    // 4 sun shadow coverage (white = lit, black = in shadow / back-facing), 5 selected cascade,
+    // 6 occluder probe (green = caster above pixel, red = pixel topmost in map / caster drop).
     static CVar<int32_t> v{"r.debug.lighting", 0,
-                           "lighting isolate: 0 off, 1 sun-direct, 2 ambient, 3 local, 4 shadow coverage"};
+                           "lighting isolate: 0 off, 1 sun-direct, 2 ambient, 3 local, 4 shadow coverage, 5 cascade, 6 occluder-probe"};
     static const bool a = [] { v.add_alias("light_debug"); return true; }(); (void)a;
     return v;
 }
@@ -471,6 +481,7 @@ void register_debug_cvars()
     cv_ibl_verify();
     cv_ibl_every_frame();
     cv_time_of_day();
+    cv_sun_lean();
     cv_sun_animate();
     cv_transp_test();
     cv_transp_reverse();

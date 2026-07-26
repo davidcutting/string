@@ -93,7 +93,11 @@ float probe_sun_shadow(float3 world, float3 n, float ndl)
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
         return 0.0;   // outside cascade range -> lit
     float bias = s.shadow_bias * (1.0 + 2.0 * (1.0 - ndl));
-    float occluder = lit_textures[s.cascade_slot[cascade].x].SampleLevel(uv, 0).r;
+    // NonUniformResourceIndex: `cascade` is chosen per hit point, so this bindless index diverges
+    // across the relight compute wave -> UB without the qualifier (same class of bug as lighting.slang's
+    // sample_cascade). Left unmarked, GI sun-shadow read the wrong cascade non-deterministically.
+    uint slot = s.cascade_slot[cascade].x;
+    float occluder = lit_textures[NonUniformResourceIndex(slot)].SampleLevel(uv, 0).r;
     return (ndc.z < occluder - bias) ? 1.0 : 0.0;
 }
 

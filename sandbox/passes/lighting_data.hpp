@@ -42,7 +42,7 @@ static_assert(sizeof(GpuLight) == 64);
 // lighting.slang (std430 scalars; vec3s padded to 16B).
 struct SceneData
 {
-    glm::vec3 camera_pos;   float _pad0;
+    glm::vec3 camera_pos;   float exposure;   // composite EV100 exposure scale (for display-referred debug views)
     glm::vec3 sun_dir;      float sun_intensity;   // direction TO the sun (normalized)
     glm::vec3 sun_color;    float _pad1;
     glm::vec3 ambient_sky;  float _pad2;           // hemispheric ambient, up
