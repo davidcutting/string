@@ -27,6 +27,9 @@
 #include "probe_gi.hpp"
 #include "meshlet_builder.hpp"
 #include "assetbake/scene_loader.hpp"
+#include "geometry/sky_component.hpp"
+#include "geometry/froxel_component.hpp"
+#include "geometry/ibl_component.hpp"
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -37,24 +40,7 @@
 namespace sandbox
 {
 
-// Push constant for the froxel light-binning compute (matches Push in shaders/froxel_cull.slang).
-struct FroxelPush
-{
-    glm::mat4 view;
-    glm::mat4 inv_proj;
-    glm::uvec2 screen;
-    glm::uvec2 grid;
-    uint32_t slices;
-    uint32_t tile_size;
-    float near_plane;
-    float far_plane;
-    uint32_t light_count;
-    uint32_t max_per_froxel;
-    uint32_t _pad0;
-    uint32_t _pad1;
-    VkDeviceAddress lights;
-    VkDeviceAddress froxels;
-};
+// FroxelPush moved to geometry/froxel_component.hpp (brief 11 FroxelComponent extraction).
 
 // CVar-able lighting/shadow/froxel quality constants, grouped so a future CVar system binds them in
 // one place (per the brief's "as CVars" intent).
@@ -69,18 +55,7 @@ struct LightingSettings
     float shadow_depth_range = 200.0f;          // world depth the CSM covers from the camera
 };
 
-// Push constant for the procedural sky background (sky.vert/frag): the inverse view-projection (to
-// turn NDC into a world ray), the camera position, and the sky/sun colours shared with the lit
-// shader's image-based ambient. Matches the Push block in sky.frag (vec3s on 16-byte boundaries).
-struct SkyPush
-{
-    glm::mat4 inv_view_proj;
-    glm::vec3 camera_pos;  float furnace;   // brief 07: 1 -> uniform white background
-    glm::vec3 sun_dir;     float _sp1;
-    glm::vec3 sky_zenith;  float _sp2;
-    glm::vec3 sky_ground;  float _sp3;           // ground ALBEDO (radiance derived in-shader)
-    glm::vec3 sun_color;   float sun_intensity;  // klx perpendicular
-};
+// SkyPush moved to geometry/sky_component.hpp (brief 11 SkyComponent extraction).
 
 // Push constant for the task/mesh meshlet draw path (matches Push in shaders/meshlet_mesh.slang;
 // std430 push-constant layout — offsets verified against %Push_std430 OpMemberDecorate). 240B; fits
@@ -249,27 +224,7 @@ struct ResetPush
     uint32_t _pad;
 };
 
-// Push for the brief-07 IBL compute chain (matches Push in shaders/ibl.slang; std430: float4s at
-// 0/16/32/48, scalars from 64, the 8-byte pointer 8-aligned at 96).
-struct IblPush
-{
-    glm::vec4 sun_dir;       // xyz sun dir; w furnace flag (capture writes uniform white)
-    glm::vec4 sky_zenith;
-    glm::vec4 sky_ground;
-    glm::vec4 sun_color;
-    uint32_t src_slot;       // 64
-    uint32_t dst_slot;       // 68
-    uint32_t dst_size;       // 72
-    uint32_t src_size;       // 76
-    float roughness;         // 80  prefilter: PERCEPTUAL roughness of this ladder mip
-    uint32_t sample_count;   // 84
-    uint32_t mip_count;      // 88  capture chain mips (prefilter PDF lod clamp)
-    uint32_t _pad0;          // 92
-    VkDeviceAddress sh;      // 96  ShBuffer address (sh_project)
-};
-static_assert(offsetof(IblPush, src_slot) == 64);
-static_assert(offsetof(IblPush, sh) == 96);
-static_assert(sizeof(IblPush) == 104);
+// IblPush moved to geometry/ibl_component.hpp (brief 11 IblComponent extraction).
 
 // Renders a whole glTF model: uploads its shared vertex/index buffers plus every texture (each
 // into a bindless slot), then issues one indexed draw per node-instanced primitive, pushing the
@@ -281,9 +236,7 @@ class GeometryPass final : public String::Pass
     string::gpu::resource_allocator& allocator_;
     string::gpu::descriptor_table& descriptor_table_;
     String::InputMap& input_map_;
-    // Froxel light binning is a hot-reloadable Slang program (brief 01 registry); the pass binds
-    // ->current() each frame.
-    string::gpu::shader_program* froxel_program_ = nullptr;
+    // Froxel light binning: extracted to FroxelComponent froxel_ (declared below, brief 11).
 
     string::gpu::resource_id vertex_buffer_;
     uint32_t draw_count_ = 0;
@@ -349,56 +302,17 @@ class GeometryPass final : public String::Pass
     glm::vec3 sky_ground_ = glm::vec3(0.0824f, 0.0699f, 0.0503f);
     glm::vec3 sun_color_ = glm::vec3(1.0f, 0.96f, 0.9f);
     float sun_intensity_ = 100.0f;                           // klx perpendicular (noon)
-    // Fullscreen procedural sky, drawn before geometry. Ported to Slang: the pipeline is owned by
-    // the hot-reload registry (recompiles + swaps on save); the pass binds sky_program_->current().
-    string::gpu::shader_program* sky_program_ = nullptr;
+    // Fullscreen procedural sky (drawn before geometry). Extracted to its own component (brief 11);
+    // owns the hot-reload sky pipeline. The shared sun/sky colours above are passed into sky_.record().
+    SkyComponent sky_;
 
-    // --- Brief 07: dynamic sky IBL ---------------------------------------------------------------
-    // The live sky is captured to a small cubemap, GGX-prefiltered into a roughness ladder and
-    // SH-projected — all on the GPU, re-run only when the sun moves past a threshold (amortized;
-    // <0.3 ms budget). Products: env_prefiltered_ (SamplerCube ladder), sh_buffer_ (9 float4 E/pi
-    // coefficients), dfg_lut_ (split-sum BRDF LUT, baked once). Single-buffered: the chain records
-    // at the top of the frame's main-queue command buffer, ordered against last frame's fragment
-    // reads by the intra-pass barriers (documented local-barrier class, like the HiZ mip chain).
-    static constexpr uint32_t kEnvSize = 128;           // capture / prefilter face size
-    static constexpr uint32_t kEnvCaptureMips = 6;      // capture average chain (PDF mips + SH source)
-    static constexpr uint32_t kEnvPrefilterMips = 6;    // roughness ladder 128..4 (r = mip/(mips-1))
-    static constexpr uint32_t kShSourceMip = 3;         // 16x16 capture mip the SH projects from
-    static constexpr uint32_t kDfgSize = 128;
-    static constexpr uint32_t kPrefilterSamples = 64;
-    static constexpr uint32_t kDfgSamples = 1024;
-    string::gpu::resource_id env_capture_ = 0;          // cube, RGBA16F, kEnvCaptureMips
-    string::gpu::resource_id env_prefiltered_ = 0;      // cube, RGBA16F, kEnvPrefilterMips
-    string::gpu::resource_id dfg_lut_ = 0;              // 2D RGBA16F (rg used)
-    string::gpu::resource_id sh_buffer_ = 0;            // 9 x float4, device-local
-    uint32_t env_capture_sample_slot_ = 0;              // SamplerCube (prefilter source)
-    uint32_t env_prefiltered_slot_ = 0;                 // SamplerCube (shading)
-    uint32_t dfg_sample_slot_ = 0;                      // Sampler2D (shading)
-    uint32_t dfg_storage_slot_ = 0;
-    std::vector<VkImageView> env_capture_mip_views_;    // per-mip 2D_ARRAY storage views
-    std::vector<uint32_t> env_capture_mip_slots_;
-    std::vector<VkImageView> env_prefiltered_mip_views_;
-    std::vector<uint32_t> env_prefiltered_mip_slots_;
-    VkSampler env_sampler_ = VK_NULL_HANDLE;            // linear, clamp, mip-linear (env + LUT)
-    string::gpu::shader_program* env_capture_program_ = nullptr;
-    string::gpu::shader_program* env_mip_program_ = nullptr;
-    string::gpu::shader_program* env_prefilter_program_ = nullptr;
-    string::gpu::shader_program* sh_project_program_ = nullptr;
-    string::gpu::shader_program* dfg_program_ = nullptr;
-    bool dfg_baked_ = false;
-    bool ibl_layouts_initialized_ = false;   // env images moved UNDEFINED -> GENERAL once
-    bool ibl_primed_ = false;                // at least one capture recorded
-    bool ibl_update_pending_ = false;        // update() trigger -> record_compute runs the chain
-    glm::vec3 ibl_captured_sun_dir_{ 0.0f };
-    bool ibl_captured_furnace_ = false;
-    uint64_t ibl_update_count_ = 0;          // instrumentation (amortization honesty)
+    // Brief 07 dynamic sky IBL, extracted to its own component (brief 11). Owns the env cubemaps /
+    // SH / DFG LUT + the five compute pipelines; exposes sh_address()/env_slot()/dfg_slot()/primed()
+    // for SceneData + probe GI. The shared sun/sky colours + furnace flag stay in GeometryPass.
+    IblComponent ibl_;
     bool furnace_ = false;                   // r.furnace (white-furnace acceptance test)
     bool lookdev_ = false;                   // material-probe scene (STRING_SCENE=lookdev)
-    void create_ibl_resources(String::PassContext& context);
-    void record_ibl_update(VkCommandBuffer cb);
-    // dbg.ibl_verify: reads the DFG LUT + SH coefficients back and checks them against CPU
-    // references (M1 numeric gate). Stalls the device; debug only.
-    void run_ibl_verification();
+    // IBL create/record/verify moved to IblComponent ibl_ (brief 11).
 
     // --- Brief 09b: relightable irradiance probe volume (DDGI-style) -----------------------------
     // A uniform probe grid fit to the scene AABB. Static per-probe capture G-buffer (albedo, normal,
@@ -494,15 +408,9 @@ class GeometryPass final : public String::Pass
     std::vector<GpuLight> lights_;
     std::vector<string::gpu::resource_id> light_buffers_;
     std::vector<void*> light_mapped_;
-    // Per-froxel light-index lists, written by the froxel_cull compute and read by the lit shader.
-    // One per frame in flight (compute overwrites it each frame).
-    std::vector<string::gpu::resource_id> froxel_buffers_;
-    uint32_t froxel_tiles_x_ = 0;
-    uint32_t froxel_tiles_y_ = 0;
-    uint32_t froxel_count_ = 0;
-    uint32_t froxel_capacity_ = 0;   // allocated froxel count (grows with the screen)
-    // (Re)allocate the per-frame froxel index buffers for the current screen size if it grew.
-    void ensure_froxel_capacity();
+    // Forward+ froxel light-binning, extracted to its own component (brief 11). Owns the compute
+    // pipeline + per-frame index buffers; grid dims + froxel address feed SceneData via accessors.
+    FroxelComponent froxel_;
     // Light stress scene: hundreds of moving colored lights orbiting over the model (test bed).
     void build_light_stress_scene(const glm::vec3& aabb_min, const glm::vec3& aabb_max);
     void animate_lights(float delta_time);
