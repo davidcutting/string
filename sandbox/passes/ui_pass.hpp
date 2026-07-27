@@ -17,7 +17,7 @@
 #include <string/gpu/resource.hpp>
 #include <string/gpu/resource_allocator.hpp>
 #include <string/platform/input.hpp>
-#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/engine_context.hpp>
 #include <string/vulkan/render_pass.hpp>
 
 #include <volk.h>
@@ -56,7 +56,7 @@ public:
 
     // `atlas` is the dynamic (grow-on-demand, Unicode) SDF glyph atlas — shared, mutated as new
     // glyphs are seen. `author` declares the whole UI (shapes + text) each frame.
-    UIPass(String::PassContext& context, std::shared_ptr<string::dynamic_font_atlas> atlas,
+    UIPass(String::engine_context& context, std::shared_ptr<string::dynamic_font_atlas> atlas,
            Author author);
     ~UIPass() override;
 

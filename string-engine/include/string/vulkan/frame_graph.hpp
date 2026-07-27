@@ -2,7 +2,7 @@
 
 // Brief 11 — fluent render-graph authoring facade (the top-level API shape locked 2026-07-25).
 //
-// This sits ON TOP of the existing planner (render_graph.hpp: GraphBuilder/RenderGraph) and
+// This sits ON TOP of the existing planner (graph_plan.hpp: PlanBuilder/GraphPlan) and
 // lowers to the SAME `ResourceUsage` vocabulary the executor already consumes (resource_usage.hpp)
 // — one model, shared. It adds what the planner lacks and the brief-11 vision needs:
 //
@@ -22,9 +22,11 @@
 //   * *execution* — feeding CompiledFrame into the Renderer's frame loop (replacing the imperative
 //     Pass::usages + record() hooks) and the persistent compile+invalidate plan.
 //
-// Naming: `FrameGraph` (author-facing fluent builder) is distinct from `RenderGraph` (the planner
-// OUTPUT) and `GraphBuilder` (the low-level planner builder). Reconciling the three names is a
-// follow-up once execution is wired.
+// Naming (reconciled, brief 11): ONE author-facing graph — `FrameGraph` (this file, the fluent
+// builder + compiler). It lowers onto the internal planner in graph_plan.hpp: a `PlanBuilder`
+// produces a `GraphPlan` (the plan = adjacency / toposort / lifetimes). So the vocabulary is
+// FrameGraph (public) -> PlanBuilder -> GraphPlan (plan), with `CompiledFrame::plan` a GraphPlan.
+// No competing "*Graph"/"*Builder" names remain.
 
 #include <cstdint>
 #include <functional>
@@ -34,8 +36,9 @@
 #include <vector>
 
 #include <string/gpu/command_recorder.hpp>
+#include <string/gpu/pass_context.hpp>
 #include <string/gpu/resource.hpp>
-#include <string/vulkan/render_graph.hpp>
+#include <string/vulkan/graph_plan.hpp>
 #include <string/vulkan/resource_usage.hpp>
 
 #include <volk.h>
@@ -43,28 +46,51 @@
 namespace String
 {
 
-// --- lean typed handles over resource_id (no generation; reuse the existing id space) ----------
-enum class ResourceKind : std::uint8_t { Image, Buffer };
-
-template <ResourceKind K>
-struct Handle
-{
-    string::gpu::resource_id id = 0;
-    constexpr bool valid() const { return id != 0; }
-    friend constexpr bool operator==(Handle a, Handle b) { return a.id == b.id; }
-};
-using ImageHandle  = Handle<ResourceKind::Image>;
-using BufferHandle = Handle<ResourceKind::Buffer>;
+// Brief 16 M7: the graph layer identifies resources by raw `resource_id` — its identity was always a
+// resource_id, and the old phantom-typed `Handle<Image>/Handle<Buffer>` only wrapped one with a kind
+// tag. That typing job now lives one layer up on the real logical handles (`string::gpu::image`/
+// `buffer`, resource_registry.hpp); the graph doesn't need it. (`Handle<*>` retired.)
 
 enum class PassKind : std::uint8_t { Raster, Compute };
 
-// The pass body. Mirrors Pass::record's signature so the executor wiring (later milestone) is a
-// thin adapter, not a re-plumb.
-using RecordFn = std::function<void(string::gpu::command_recorder&, std::uint16_t)>;
+// The pass body. Brief 16 M1: takes a pass_context& (the execute-time surface — command_recorder +
+// registry + frame slot) instead of a bare (command_recorder&, frame). The executor builds one
+// pass_context per invocation; an authoring adapter that wraps a legacy Pass unpacks ctx.rec /
+// ctx.frame_slot, while a handle-native pass resolves its resources through ctx directly.
+using RecordFn = std::function<void(string::gpu::pass_context&)>;
 
 // Toggle predicate: re-evaluated at compile time. Empty => always enabled. A CVar-bound bool is
 // wrapped into one of these by the caller (the debug-UI checkbox writes the same CVar — brief 14).
 using EnablePredicate = std::function<bool()>;
+
+// A prepass/compute body: returns true if it recorded work (mirrors Pass::record_compute).
+using ComputeFn = std::function<bool(string::gpu::pass_context&)>;
+// A dynamic yes/no query re-evaluated each frame (e.g. "does the async chain have work this frame?").
+using QueryFn = std::function<bool()>;
+
+// A getter the graph calls to read a pass's current logical usages. Brief 16: this REPLACES the old
+// `usagesFrom(&pass->usages)` raw pointer into a pass's public member — the graph now reads usages
+// through an interface the pass controls (returns a stable reference; the graph never holds a pointer
+// into pass internals). The usages carry LOGICAL registry handles (ResourceUsage::buf/img); the
+// executor resolves the per-frame physical via ResourceUsage::resolve() — resolution is the graph's
+// single job, not the pass's.
+using UsagesFn = std::function<const std::vector<ResourceUsage>&()>;
+
+// The full RUNTIME surface of a pass — everything the executor needs to run it WITHOUT the Pass
+// interface. Callbacks close over the (stable) pass object. This retires the Pass* `source` bridge:
+// the executor drives passes as data + callbacks, not virtual dispatch. Any field may be empty/null
+// (a pass that only draws leaves record_compute null; a non-async pass leaves has_async null).
+struct PassExec
+{
+    bool compute_only = false;   // runs standalone in the group loop, after the scene resolve (post)
+    bool prepass_only = false;   // runs record_compute in the frame-top prepass, forms no group
+    RecordFn record;             // draw / compute-only body (group-loop record)
+    ComputeFn record_compute;    // frame-top prepass compute (null = none)
+    QueryFn has_async;           // dynamic async gate (null = never async)
+    RecordFn record_async;       // async chain body
+    UsagesFn usages;             // reads the pass's live logical usages (graph resolves physical)
+    UsagesFn async_usages;       // reads the pass's live async logical usages
+};
 
 // --- internal per-pass record (authoring intent, pre-compile) -----------------------------------
 struct FgRead
@@ -89,7 +115,8 @@ struct FgPass
     std::vector<FgRead> reads;
     std::vector<FgWrite> writes;
     EnablePredicate enabled;   // empty => always on
-    RecordFn record;
+    RecordFn record;           // (legacy raster()/compute() body; the executor uses exec.record now)
+    PassExec exec;             // the runtime surface the executor drives (retires the Pass* bridge)
 };
 
 // --- compile output -----------------------------------------------------------------------------
@@ -103,13 +130,26 @@ struct CompiledPass
     // Optional reads whose producer was disabled: the executor binds the resource's neutral
     // fallback here instead of the real image/buffer (brief 11 graceful-degrade).
     std::vector<string::gpu::resource_id> fallback_reads;
-    const RecordFn* record;   // points into the source FrameGraph (valid for the compile's lifetime)
+    PassExec exec;   // the runtime surface (owned by value — callbacks close over the stable passes)
 };
 
 struct CompiledFrame
 {
     std::vector<CompiledPass> passes;   // in toposorted execution order
-    RenderGraph plan;                   // planner output (adjacency / toposort / lifetimes)
+    GraphPlan plan;                   // planner output (adjacency / toposort / lifetimes)
+};
+
+// Brief 11 M4: introspection — a read-only snapshot of an AUTHORED pass, taken BEFORE the toggle-drop
+// so tooling (brief 14's pass panel) lists EVERY pass with its live enabled state + nature, including
+// the ones currently disabled. `enabled` is the toggle predicate evaluated live (false = dropped from
+// the compiled plan this frame). Pair with GpuProfiler::stats() (keyed by the same name) for timing.
+struct PassInfo
+{
+    std::string_view name;
+    PassKind kind;
+    bool compute_only;
+    bool prepass_only;
+    bool enabled;
 };
 
 class FrameGraph;
@@ -139,30 +179,75 @@ public:
     }
 
     // --- reads (optional by default: a disabled producer -> neutral fallback, pass still runs) ---
-    // Typed convenience: an image read defaults to SampledRead, a buffer read to StorageRead, both
-    // at the pass's main stage. Use the explicit .read(res, Access, stage) form for anything else
-    // (vertex/index/indirect fetch, task/mesh-stage reads, storage-image reads).
-    PassSpec& reads(ImageHandle h)  { add_read(h.id, Access::SampledRead, main_stage(building_.kind), false); return *this; }
-    PassSpec& reads(BufferHandle h) { add_read(h.id, Access::StorageRead, main_stage(building_.kind), false); return *this; }
+    // Convenience: defaults to SampledRead at the pass's main stage. Use the explicit .read(res,
+    // Access, stage) form for anything else (a buffer's StorageRead, vertex/index/indirect fetch,
+    // task/mesh-stage reads, storage-image reads). Brief 16 M7: takes a raw resource_id (Handle<*> retired).
+    PassSpec& reads(string::gpu::resource_id r) { add_read(r, Access::SampledRead, main_stage(building_.kind), false); return *this; }
     PassSpec& read(string::gpu::resource_id r, Access a, VkPipelineStageFlags2 s) { add_read(r, a, s, false); return *this; }
 
     // --- requires (essential: a disabled producer transitively skips THIS pass too) --------------
-    PassSpec& requires_(ImageHandle h)  { add_read(h.id, Access::SampledRead, main_stage(building_.kind), true); return *this; }
-    PassSpec& requires_(BufferHandle h) { add_read(h.id, Access::StorageRead, main_stage(building_.kind), true); return *this; }
+    PassSpec& requires_(string::gpu::resource_id r) { add_read(r, Access::SampledRead, main_stage(building_.kind), true); return *this; }
     PassSpec& require(string::gpu::resource_id r, Access a, VkPipelineStageFlags2 s) { add_read(r, a, s, true); return *this; }
 
     // --- writes ----------------------------------------------------------------------------------
-    PassSpec& writes(ImageHandle h)  { building_.writes.push_back({ h.id, Access::StorageImageWrite, main_stage(building_.kind) }); return *this; }
-    PassSpec& writes(BufferHandle h) { building_.writes.push_back({ h.id, Access::StorageWrite, main_stage(building_.kind) }); return *this; }
+    PassSpec& writes(string::gpu::resource_id r) { building_.writes.push_back({ r, Access::StorageImageWrite, main_stage(building_.kind) }); return *this; }
     PassSpec& write(string::gpu::resource_id r, Access a, VkPipelineStageFlags2 s) { building_.writes.push_back({ r, a, s }); return *this; }
 
     // --- attachments (raster) --------------------------------------------------------------------
-    PassSpec& color(ImageHandle h) { building_.writes.push_back({ h.id, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT }); return *this; }
-    PassSpec& depth(ImageHandle h) { building_.writes.push_back({ h.id, Access::DepthWrite, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT }); return *this; }
+    PassSpec& color(string::gpu::resource_id r) { building_.writes.push_back({ r, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT }); return *this; }
+    PassSpec& depth(string::gpu::resource_id r) { building_.writes.push_back({ r, Access::DepthWrite, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT }); return *this; }
 
     // --- gating ----------------------------------------------------------------------------------
     PassSpec& toggle(EnablePredicate pred) { building_.enabled = std::move(pred); return *this; }
     PassSpec& toggle(const bool* flag) { building_.enabled = [flag] { return *flag; }; return *this; }
+
+    // --- runtime surface + I/O authoring ---------------------------------------------------------
+    // Bind the pass's full runtime surface (callbacks + flags + live-usage pointers) — the executor
+    // drives passes through this, not a Pass* virtual. `use()` authors an already-declared
+    // ResourceUsage for the planner (routing to reads/writes by is_write); the executor reads the
+    // LIVE usages via exec.usages, so per-frame-slot buffer variation needs no re-author.
+    PassSpec& exec(PassExec e) { building_.exec = std::move(e); return *this; }
+    PassSpec& use(const ResourceUsage& u)
+    {
+        // Brief 16: the planner keys on the usage's stable LOGICAL identity (u.key() — the handle for
+        // registry-backed resources, else the raw id). Physical resolution is the executor's job at
+        // execute (u.resolve()); the graph orders by logical identity.
+        if (is_write(u.access)) building_.writes.push_back({ u.key(), u.access, u.stage });
+        else                    building_.reads.push_back({ u.key(), u.access, u.stage, /*required=*/false });
+        return *this;
+    }
+
+    // --- fluent runtime-surface authoring (the endgame: the app declares each pass's nature here,
+    //     retiring the Pass flag-virtuals) ---------------------------------------------------------
+    // Nature flags: computeOnly() runs standalone in the group loop after the resolve (post chain);
+    // prepass() runs record_compute in the frame-top prepass and forms no group (IBL/GTAO).
+    PassSpec& computeOnly() { building_.exec.compute_only = true; return *this; }
+    PassSpec& prepass()     { building_.exec.prepass_only = true; return *this; }
+    // The draw / compute-only body, and the frame-top prepass-compute body.
+    PassSpec& record(RecordFn fn)          { building_.exec.record = std::move(fn); return *this; }
+    PassSpec& prepassCompute(ComputeFn fn) { building_.exec.record_compute = std::move(fn); return *this; }
+    // The dependency-free async chain: dynamic gate + body + the (live) usages it produces/consumes.
+    PassSpec& async(QueryFn has, RecordFn rec, UsagesFn usages)
+    {
+        building_.exec.has_async = std::move(has);
+        building_.exec.record_async = std::move(rec);
+        building_.exec.async_usages = std::move(usages);
+        return *this;
+    }
+    // Brief 16: bind the pass's usage GETTER (replaces the retired usagesFrom(&pass->usages) raw
+    // pointer). Authors the current usages into the planner NOW by their LOGICAL key() (for the
+    // toposort — run at recompile) AND stores the getter so the executor reads them fresh each frame
+    // and resolves the per-frame physical via ResourceUsage::resolve(). The graph reads through the
+    // getter's interface; it never holds a pointer into a pass's internals.
+    PassSpec& usages(UsagesFn get)
+    {
+        for (const ResourceUsage& u : get()) use(u);
+        building_.exec.usages = std::move(get);
+        return *this;
+    }
+
+    // Terminal: append the built pass to the graph (defined out-of-line — FrameGraph is incomplete here).
+    void finish();
 
     // --- finalize (append to the graph). raster()/compute() are terminal. ------------------------
     void raster(RecordFn fn);
@@ -183,22 +268,36 @@ public:
     // and the future execution wiring, which will resolve these to physical backing).
     static constexpr string::gpu::resource_id TRANSIENT_BASE = (string::gpu::resource_id{1} << 48);
 
-    // Mint a transient logical handle. (Descriptor/allocation is a follow-on milestone; `name` is
-    // retained for the future introspection API.)
-    ImageHandle image(const std::string& /*name*/)  { return ImageHandle{ next_transient_++ }; }
-    BufferHandle buffer(const std::string& /*name*/) { return BufferHandle{ next_transient_++ }; }
+    // Mint a transient logical id (Brief 16 M7: a raw resource_id — Handle<*> retired). `name` is
+    // retained for the future introspection API. image()/buffer() are the same mint now (the graph
+    // keys by id, not kind); both are kept so authoring reads intent-fully.
+    string::gpu::resource_id image(const std::string& /*name*/)  { return next_transient_++; }
+    string::gpu::resource_id buffer(const std::string& /*name*/) { return next_transient_++; }
 
     // Import an externally-owned resource by its existing id (e.g. COLOR_TARGET, a persistent
     // buffer, a streamed texture) — the graph treats it as an always-available input it never
     // produces.
-    ImageHandle import_image(string::gpu::resource_id id)  { return ImageHandle{ id }; }
-    BufferHandle import_buffer(string::gpu::resource_id id) { return BufferHandle{ id }; }
+    string::gpu::resource_id import_image(string::gpu::resource_id id)  { return id; }
+    string::gpu::resource_id import_buffer(string::gpu::resource_id id) { return id; }
 
     PassSpec pass(const std::string& name) { return PassSpec(*this, name); }
 
     // Enable/disable + graceful-degrade + lowering + toposort. Pure; no GPU. See the .cpp-less
     // definition below (kept inline so this stays header-only for the first increment).
     CompiledFrame compile() const;
+
+    // Brief 11 M4 introspection (read seam for brief 14): enumerate every AUTHORED pass with its
+    // metadata + live enabled state (BEFORE the toggle-drop, so disabled passes still appear). Pure;
+    // evaluates each toggle predicate now. Order = authoring order.
+    std::vector<PassInfo> passes() const
+    {
+        std::vector<PassInfo> out;
+        out.reserve(passes_.size());
+        for (const FgPass& p : passes_)
+            out.push_back({ p.name, p.kind, p.exec.compute_only, p.exec.prepass_only,
+                            !p.enabled || p.enabled() });
+        return out;
+    }
 
 private:
     friend class PassSpec;
@@ -208,14 +307,21 @@ private:
 inline void PassSpec::raster(RecordFn fn)
 {
     building_.kind = PassKind::Raster;
-    building_.record = std::move(fn);
+    building_.record = fn;
+    building_.exec.record = std::move(fn);
     graph_.add(std::move(building_));
 }
 
 inline void PassSpec::compute(RecordFn fn)
 {
     building_.kind = PassKind::Compute;
-    building_.record = std::move(fn);
+    building_.record = fn;
+    building_.exec.record = std::move(fn);
+    graph_.add(std::move(building_));
+}
+
+inline void PassSpec::finish()
+{
     graph_.add(std::move(building_));
 }
 
@@ -272,7 +378,7 @@ inline CompiledFrame FrameGraph::compile() const
     // Lower surviving passes onto the existing planner. Fallback reads (optional, producer
     // disabled) are recorded separately and EXCLUDED from the planner usages so they forge no
     // ordering edge against a resource nothing produces this frame.
-    GraphBuilder builder;
+    PlanBuilder builder;
     std::vector<std::vector<string::gpu::resource_id>> fallback_reads(n);
     std::vector<uint32_t> lowered_index;   // planner pass index -> original pass index
     for (uint32_t i = 0; i < n; ++i)
@@ -311,7 +417,7 @@ inline CompiledFrame FrameGraph::compile() const
         cp.kind = p.kind;
         cp.usages = frame.plan.passes[planner_idx].usages;
         cp.fallback_reads = fallback_reads[orig];
-        cp.record = &p.record;
+        cp.exec = p.exec;   // by value — callbacks close over the stable pass objects (no dangling)
         frame.passes.push_back(std::move(cp));
     }
     return frame;

@@ -42,50 +42,56 @@ void GeometryPass::ensure_hiz(uint16_t current_frame)
 
     const uint32_t mips = static_cast<uint32_t>(std::floor(std::log2(std::max(base_w, base_h)))) + 1;
 
+    // Retire the old per-frame VIEWS + bindless SLOTS first (they reference the current physicals,
+    // which recreate_per_frame_image is about to free).
     for (uint32_t f = 0; f < frames_in_flight_; ++f)
     {
         HizPyramid& hz = hiz_[f];
-        // Retire the old pyramid's slots/views/image.
         for (uint32_t s : hz.mip_storage_slots) descriptor_table_.unbind_storage_view(s);
         for (VkImageView v : hz.mip_views) vkDestroyImageView(device_.get_device(), v, nullptr);
-        if (hz.image != 0)
-        {
-            descriptor_table_.unbind(hz.image, string::gpu::descriptor_type::TEXTURE);
-            allocator_.destroy_resource(hz.image);
-        }
-        if (hz.depth != 0)
-        {
-            descriptor_table_.unbind(hz.depth, string::gpu::descriptor_type::TEXTURE);
-            allocator_.destroy_resource(hz.depth);
-        }
-        hz = HizPyramid{};
+        if (hz.image != 0) descriptor_table_.unbind(hz.image, string::gpu::descriptor_type::TEXTURE);
+        if (hz.depth != 0) descriptor_table_.unbind(hz.depth, string::gpu::descriptor_type::TEXTURE);
+    }
 
+    // Brief 16 M7 (#1): (re)allocate the depth + pyramid image RINGS via the registry (allocation
+    // authority + owns/frees them). First call creates; a resize recreates in place.
+    const string::gpu::image_info depth_info{
+        .extent = { screen_size.width, screen_size.height, 1 },
+        .format = VK_FORMAT_D32_SFLOAT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    };
+    const string::gpu::image_info pyramid_info{
+        .extent = { base_w, base_h, 1 },
+        .format = VK_FORMAT_R32_SFLOAT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+        .mip_levels = mips,
+    };
+    if (hiz_depth_ring_.valid()) resources->recreate_per_frame_image(hiz_depth_ring_, depth_info);
+    else                         hiz_depth_ring_ = resources->create_per_frame_image(depth_info, frames_in_flight_);
+    if (hiz_pyramid_ring_.valid()) resources->recreate_per_frame_image(hiz_pyramid_ring_, pyramid_info);
+    else                           hiz_pyramid_ring_ = resources->create_per_frame_image(pyramid_info, frames_in_flight_);
+
+    for (uint32_t f = 0; f < frames_in_flight_; ++f)
+    {
+        HizPyramid& hz = hiz_[f];
+        hz = HizPyramid{};
         hz.mips = mips;
         hz.size = glm::uvec2(base_w, base_h);
 
-        // Single-sample D32 depth for the camera prepass the pyramid reduces from (full screen res).
-        hz.depth = allocator_.create_resource(string::gpu::image_info{
-            .extent = { screen_size.width, screen_size.height, 1 },
-            .format = VK_FORMAT_D32_SFLOAT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-            .aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            .allocation_flags = {},
-        });
+        // Single-sample D32 depth (registry-owned) for the camera prepass the pyramid reduces from.
+        hz.depth = resources->physical(hiz_depth_ring_, f);
         descriptor_table_.bind(hz.depth, string::gpu::descriptor_type::TEXTURE);
         hz.depth_slot = descriptor_table_.get_binding_slot(hz.depth, string::gpu::descriptor_type::TEXTURE);
         descriptor_table_.update_texture(hz.depth_slot, allocator_.get_image(hz.depth).view, hiz_sampler_);
-        hz.image = allocator_.create_resource(string::gpu::image_info{
-            .extent = { base_w, base_h, 1 },
-            .format = VK_FORMAT_R32_SFLOAT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-            .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            .allocation_flags = {},
-            .mip_levels = mips,
-        });
+        hz.image = resources->physical(hiz_pyramid_ring_, f);
         const string::gpu::allocated_image& img = allocator_.get_image(hz.image);
 
         // Whole-chain sampled slot (for SampleLevel in the task shader).
@@ -122,57 +128,64 @@ void GeometryPass::ensure_gtao()
     if (gtao_raw_ != 0 && size == gtao_size_) return;
     gtao_size_ = size;
 
-    const auto drop_image = [&](string::gpu::resource_id& id) {
-        if (id == 0) return;
-        descriptor_table_.unbind(id, string::gpu::descriptor_type::TEXTURE);
-        allocator_.destroy_resource(id);
-        id = 0;
-    };
+    // Retire the old bindless slots (the registry frees the physicals via recreate below).
     if (gtao_raw_storage_slot_ != UINT32_MAX)
         descriptor_table_.unbind_storage_view(gtao_raw_storage_slot_);
     for (uint32_t s : gtao_final_storage_slots_) descriptor_table_.unbind_storage_view(s);
+    if (gtao_raw_ != 0) descriptor_table_.unbind(gtao_raw_, string::gpu::descriptor_type::TEXTURE);
+    for (string::gpu::resource_id id : gtao_final_)
+        if (id != 0) descriptor_table_.unbind(id, string::gpu::descriptor_type::TEXTURE);
     gtao_final_storage_slots_.clear();
     gtao_final_sampled_slots_.clear();
-    drop_image(gtao_raw_);
-    for (string::gpu::resource_id& id : gtao_final_) drop_image(id);
     gtao_final_.assign(frames_in_flight_, 0);
     gtao_final_ready_.assign(frames_in_flight_, 0);
     gtao_raw_initialized_ = false;
 
-    const auto make_target = [&](uint32_t& sampled_slot, uint32_t& storage_slot) {
-        // RGBA16F, not RGBA8: 8-bit visibility quantizes into wide soft bands on smooth
-        // slowly-curving receivers (the Sponza vaults — 1/255 vis steps multiply straight into
-        // the ambient term). Half-res 16F is ~4 B/px extra; the bent normal rides along at the
-        // higher precision for free.
-        const string::gpu::resource_id id = allocator_.create_resource(string::gpu::image_info{
-            .extent = { size.x, size.y, 1 },
-            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-            .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            .allocation_flags = {},
-        });
+    // Brief 16 M7 (#1): (re)allocate the raw (shared, 1-deep) + final (per-frame) image rings via
+    // the registry. RGBA16F, not RGBA8: 8-bit visibility quantizes into wide soft bands on smooth
+    // slowly-curving receivers (the Sponza vaults). Half-res 16F is ~4 B/px extra; the bent normal
+    // rides along at the higher precision for free.
+    const string::gpu::image_info gtao_info{
+        .extent = { size.x, size.y, 1 },
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    };
+    if (gtao_raw_ring_.valid()) resources->recreate_per_frame_image(gtao_raw_ring_, gtao_info);
+    else                        gtao_raw_ring_ = resources->create_per_frame_image(gtao_info, 1);
+    if (gtao_final_ring_.valid()) resources->recreate_per_frame_image(gtao_final_ring_, gtao_info);
+    else                          gtao_final_ring_ = resources->create_per_frame_image(gtao_info, frames_in_flight_);
+
+    const auto bind_target = [&](string::gpu::resource_id id, uint32_t& sampled_slot, uint32_t& storage_slot) {
         const string::gpu::allocated_image& img = allocator_.get_image(id);
         descriptor_table_.bind(id, string::gpu::descriptor_type::TEXTURE);
         sampled_slot = descriptor_table_.get_binding_slot(id, string::gpu::descriptor_type::TEXTURE);
         descriptor_table_.update_texture(sampled_slot, img.view, gtao_sampler_);
         storage_slot = descriptor_table_.bind_storage_view(img.view);
-        return id;
     };
-    gtao_raw_ = make_target(gtao_raw_sampled_slot_, gtao_raw_storage_slot_);
+    gtao_raw_ = resources->physical(gtao_raw_ring_, 0);
+    bind_target(gtao_raw_, gtao_raw_sampled_slot_, gtao_raw_storage_slot_);
     gtao_final_sampled_slots_.resize(frames_in_flight_);
     gtao_final_storage_slots_.resize(frames_in_flight_);
     for (uint32_t f = 0; f < frames_in_flight_; ++f)
-        gtao_final_[f] = make_target(gtao_final_sampled_slots_[f], gtao_final_storage_slots_[f]);
+    {
+        gtao_final_[f] = resources->physical(gtao_final_ring_, f);
+        bind_target(gtao_final_[f], gtao_final_sampled_slots_[f], gtao_final_storage_slots_[f]);
+    }
     STRING_LOG_INFO("[gtao] half-res targets {}x{} (raw + {} final slots)", size.x, size.y,
                     frames_in_flight_);
 }
 
-void GeometryPass::record_gtao(VkCommandBuffer cb, uint16_t current_frame)
+void GeometryPass::record_gtao(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     const uint16_t prev = (current_frame + frames_in_flight_ - 1) % frames_in_flight_;
     if (prev >= hiz_.size() || hiz_[prev].depth == 0 || gtao_raw_ == 0) return;
+    // Brief 16: GTAO is dense barrier + vku::transition_image + dispatch raw Vulkan — use the recorder's
+    // vk() escape for the transition/barrier tail; the clean dispatches below go through verbs.
+    VkCommandBuffer cb = recorder.vk();
     const HizPyramid& hz = hiz_[prev];
     const string::gpu::allocated_image& depth = allocator_.get_image(hz.depth);
     const string::gpu::allocated_image& raw = allocator_.get_image(gtao_raw_);

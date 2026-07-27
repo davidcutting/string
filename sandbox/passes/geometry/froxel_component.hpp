@@ -3,10 +3,11 @@
 #include <cstdint>
 #include <vector>
 
+#include <string/gpu/command_recorder.hpp>
 #include <string/gpu/resource.hpp>
 #include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/shader_program.hpp>
-#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/engine_context.hpp>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -55,9 +56,13 @@ struct FroxelParams
 // GeometryPass Phase-1 component (brief 11).
 class FroxelComponent
 {
-    string::gpu::resource_allocator* allocator_ = nullptr;
+    // Brief 16 M2: the froxel index ring is a registry-owned PerFrame buffer now (was a hand-managed
+    // [frame] vector over the allocator). Allocated at the deterministic resize point + resolved
+    // through the registry, so its address is valid from frame 0 regardless of pass update order —
+    // the crash-class fix.
+    string::gpu::ResourceRegistry* resources_ = nullptr;
+    string::gpu::buffer froxel_buffer_;
     string::gpu::shader_program* program_ = nullptr;
-    std::vector<string::gpu::resource_id> buffers_;   // per frame in flight (device-local)
     uint32_t tiles_x_ = 0;
     uint32_t tiles_y_ = 0;
     uint32_t count_ = 0;
@@ -67,23 +72,26 @@ class FroxelComponent
 public:
     // Registers froxel_cull.slang and reserves the per-frame buffer slots (allocation deferred to
     // ensure_capacity() once the screen size is known).
-    void init(String::PassContext& context, uint32_t frames_in_flight);
+    void init(String::engine_context& context, uint32_t frames_in_flight);
     // (Re)allocate the per-frame index buffers for the current screen if it grew.
     void ensure_capacity(VkExtent2D screen);
     // Bind + dispatch the binning compute for `frame`.
-    void record(VkCommandBuffer command_buffer, uint16_t frame, const FroxelParams& params);
+    void record(string::gpu::command_recorder& recorder, uint16_t frame, const FroxelParams& params);
     // Free the index buffers (the pipeline is torn down by the GeometryPass destructor).
     void destroy();
 
-    bool has_work() const { return program_ != nullptr && count_ > 0 && !buffers_.empty(); }
+    bool has_work() const { return program_ != nullptr && count_ > 0 && froxel_buffer_.valid(); }
     bool active(uint16_t frame) const
     {
-        return program_ != nullptr && count_ > 0 && frame < buffers_.size() && buffers_[frame] != 0;
+        return program_ != nullptr && count_ > 0 && froxel_buffer_.valid();
     }
     string::gpu::resource_id buffer(uint16_t frame) const
     {
-        return frame < buffers_.size() ? buffers_[frame] : 0;
+        return froxel_buffer_.valid() ? resources_->physical(froxel_buffer_, frame) : 0;
     }
+    // Brief 16: the LOGICAL froxel index-buffer handle (the async pass declares this; the executor
+    // resolves the per-frame physical). Invalid until ensure_capacity() has allocated the ring.
+    string::gpu::buffer handle() const { return froxel_buffer_; }
     VkDeviceAddress froxels_address(uint16_t frame) const;   // 0 when the slot has no buffer
     uint32_t tiles_x() const { return tiles_x_; }
     uint32_t tiles_y() const { return tiles_y_; }

@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include <string/gpu/resource.hpp>
+#include <string/gpu/resource_registry.hpp>
 
 #include <volk.h>
 
@@ -10,7 +11,7 @@ namespace String
 {
 
 // How a pass uses a resource. This is the single typed vocabulary shared by the executable
-// passes (Pass::usages) and the render-graph planner (render_graph.hpp): a future graph uses
+// passes (Pass::usages) and the render-graph planner (graph_plan.hpp): a future graph uses
 // it to order passes and — via access_scope() — to derive sync2 barriers between them.
 //
 // The Access category fixes the *access mask* and *image layout* a use implies (the intrinsic,
@@ -128,13 +129,42 @@ constexpr AccessScope access_scope(Access access)
     return { 0, VK_IMAGE_LAYOUT_UNDEFINED };
 }
 
-// A single resource use declared by a pass: which resource, how it's accessed, and the
-// pipeline stage(s) at which this pass touches it.
+// A single resource use declared by a pass: how it's accessed, at which pipeline stage(s), and WHICH
+// resource — declared as a LOGICAL registry handle (brief 16: the graph is the single resolution
+// authority; the executor resolves the per-frame physical via resolve(), NOT the pass). A raw
+// `resource` id is still accepted for the not-yet-virtualized cases (renderer sentinels
+// COLOR/DEPTH/SWAPCHAIN_TARGET, persistent buffers, imported ids); exactly one of {buf, img, resource}
+// identifies the resource. This replaces the old pattern where each pass pre-resolved
+// resources->physical(handle, slot) into `resource` — resolution now lives in ONE place.
 struct ResourceUsage
 {
-    string::gpu::resource_id resource;
-    Access access;
-    VkPipelineStageFlags2 stage;
+    string::gpu::resource_id resource = 0;   // raw id (sentinels/persistent) when no handle is set
+    Access access = Access::SampledRead;
+    VkPipelineStageFlags2 stage = 0;
+    string::gpu::buffer buf{};               // logical PerFrame buffer handle (resolved per frame)
+    string::gpu::image  img{};               // logical PerFrame image handle (resolved per frame)
+
+    // The single EXECUTION resolution point: a logical handle -> this frame's physical id; else raw.
+    string::gpu::resource_id resolve(const string::gpu::ResourceRegistry& reg, std::uint32_t slot) const
+    {
+        if (buf.valid()) return reg.physical(buf, slot);
+        if (img.valid()) return reg.physical(img, slot);
+        return resource;
+    }
+
+    // The stable LOGICAL identity the planner keys on for ordering (producer->consumer edges +
+    // lifetimes). A handle's identity is the handle itself (stable across frames — the physical
+    // rotates but the logical resource is one thing), mapped into reserved id bands that never collide
+    // with allocator ids (small, from 0), the renderer sentinels (top of the space), or graph
+    // transients (1<<48). No physical resolution — that's resolve()'s job, at execute.
+    static constexpr string::gpu::resource_id BUFFER_HANDLE_BASE = string::gpu::resource_id{ 1 } << 50;
+    static constexpr string::gpu::resource_id IMAGE_HANDLE_BASE  = string::gpu::resource_id{ 1 } << 51;
+    string::gpu::resource_id key() const
+    {
+        if (buf.valid()) return BUFFER_HANDLE_BASE | buf.index;
+        if (img.valid()) return IMAGE_HANDLE_BASE | img.index;
+        return resource;
+    }
 };
 
 }  // namespace String

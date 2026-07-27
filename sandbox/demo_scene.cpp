@@ -15,6 +15,7 @@
 #include <string/core/font.hpp>
 #include <string/core/layout.hpp>
 #include <string/core/logger.hpp>
+#include <string/vulkan/frame_graph.hpp>
 #include "debug_cvars.hpp"
 #include "passes/debug_line_pass.hpp"
 #include "passes/geometry_pass.hpp"
@@ -29,6 +30,21 @@ namespace sandbox
 {
 namespace
 {
+
+// Brief 11 endgame: author a stateful pass's standard runtime surface onto the graph — its live
+// per-frame usages + record + optional prepass-compute bodies (both delegate to the pass object).
+// The caller adds nature flags fluently (.computeOnly()/.prepass()/.async()/.toggle()) then .finish().
+String::PassSpec author_pass(String::FrameGraph& fg, String::Pass* p)
+{
+    return fg.pass(std::string(p->debug_name()))
+        // Brief 16: declare the pass's usages via a getter (retires usagesFrom's raw member pointer);
+        // the usages carry logical handles, the executor resolves the per-frame physical.
+        .usages([p]() -> const std::vector<String::ResourceUsage>& { return p->usages; })
+        // Brief 16 M1: the executor hands a pass_context; the legacy Pass interface still takes
+        // (command_recorder&, frame), so unpack ctx here. Handle-native passes take ctx directly.
+        .record([p](string::gpu::pass_context& ctx) { p->record(ctx.rec, ctx.frame_slot); })
+        .prepassCompute([p](string::gpu::pass_context& ctx) { return p->record_compute(ctx.rec, ctx.frame_slot); });
+}
 
 std::vector<std::uint8_t> read_file(const std::filesystem::path& path)
 {
@@ -112,13 +128,101 @@ UIPass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::size_t na
     };
 }
 
+// Build the full geometry scene Setup around an already-constructed GeometryPass: the meshlet
+// subsystem's companion passes (froxel/ibl/gtao/sky/hiz/phase2) + debug lines + UI + post, plus the
+// fluent author that declares each pass's nature onto the graph. Shared by the lookdev + Sponza scenes.
+String::RenderPlan::Setup make_geometry_setup(
+    String::engine_context& ctx, std::unique_ptr<GeometryPass> geo,
+    std::shared_ptr<MeshOverlayStats> mesh_stats,
+    std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t nameplate_stress)
+{
+    GeometryPass* gp = geo.get();
+    auto froxel = std::make_unique<FroxelPass>(ctx, gp->scene());
+    auto ibl    = std::make_unique<IblPass>(ctx, gp->scene());
+    auto gtao   = std::make_unique<GtaoPass>(gp);
+    auto gi     = std::make_unique<GiPass>(gp);
+    auto sky    = std::make_unique<SkyPass>(ctx, gp->scene());
+    auto hiz    = std::make_unique<HizBuildPass>(gp);
+    auto phase2 = std::make_unique<GeometryPhase2Pass>(gp);
+    auto transp = std::make_unique<TransparencyPass>(gp);
+    auto shadow = std::make_unique<ShadowPass>(gp);
+    auto dbg    = std::make_unique<DebugLinePass>(ctx, mesh_stats);
+    auto ui     = std::make_unique<UIPass>(ctx, atlas, make_ui_author(mesh_stats, nameplate_stress));
+    auto post   = std::make_unique<PostProcessPass>(ctx);
+
+    FroxelPass* fx = froxel.get();
+    String::Pass* ib = ibl.get();  String::Pass* gt = gtao.get(); String::Pass* sk = sky.get();
+    String::Pass* gi_p = gi.get();
+    String::Pass* hz = hiz.get();  String::Pass* p2 = phase2.get();  String::Pass* sh = shadow.get();
+    String::Pass* tr = transp.get();
+    String::Pass* db = dbg.get();  String::Pass* uip = ui.get();   String::Pass* po = post.get();
+
+    // Ownership order == the per-frame update()/resize() LIFECYCLE order, which is load-bearing:
+    // FroxelPass::update() allocates the froxel index buffer, whose device address GeometryPass::update()
+    // then bakes into SceneData — so froxel (and the other producers) MUST update before geometry, or
+    // frame 0 bakes a null froxel address and the lit shader faults the GPU (DEVICE_LOST). This matches
+    // the graph author order below; it is NOT the same concern as the toposort. (Producers first.)
+    String::RenderPlan::Setup s;
+    s.passes.push_back(std::move(froxel));
+    s.passes.push_back(std::move(ibl));
+    s.passes.push_back(std::move(gtao));
+    s.passes.push_back(std::move(gi));
+    s.passes.push_back(std::move(sky));
+    s.passes.push_back(std::move(geo));
+    s.passes.push_back(std::move(hiz));
+    s.passes.push_back(std::move(phase2));
+    s.passes.push_back(std::move(transp));
+    s.passes.push_back(std::move(shadow));
+    s.passes.push_back(std::move(dbg));
+    s.passes.push_back(std::move(ui));
+    s.passes.push_back(std::move(post));
+
+    // The render graph, authored fluently — order = record order (the toposort preserves it). Nature is
+    // declared HERE, not via Pass virtuals: froxel is the async light-binning chain; ibl/gtao are
+    // frame-top prepass compute; hiz.build + post are compute-only; geometry.phase1 is toggleable.
+    s.author = [fx, ib, gt, gi_p, sk, gp, hz, p2, tr, sh, db, uip, po](String::FrameGraph& fg) {
+        author_pass(fg, fx).computeOnly()
+            .async([fx] { return fx->async_has_work(); },
+                   [fx](string::gpu::pass_context& ctx) { fx->record_async_compute(ctx.rec, ctx.frame_slot); },
+                   [fx]() -> const std::vector<String::ResourceUsage>& { return fx->async_usages; }).finish();
+        author_pass(fg, ib).prepass().finish();
+        // gtao / gi: prepass seams, toggleable through their feature cvars (r.gtao.enabled / r.gi) —
+        // off drops the pass AND SceneData already degrades (gtao_slot invalid / probe_gi 0).
+        author_pass(fg, gt).prepass().toggle([gt] { return gt->is_enabled(); }).finish();
+        // gi.probe: prepass compute seam over GeometryPass. Authored after ibl (relight reads this
+        // frame's SH) and before geometry+shadow (relight's shadow-map reads precede the shadow depth
+        // writes — the WAR execution edge). prepass() = frame-top compute, forms no render group.
+        author_pass(fg, gi_p).prepass().toggle([gi_p] { return gi_p->is_enabled(); }).finish();
+        // sky: r.pass.sky drops the background draw -> the MSAA clear shows behind the lit scene.
+        author_pass(fg, sk).toggle([sk] { return sk->is_enabled(); }).finish();
+        author_pass(fg, gp).toggle([gp] { return gp->is_enabled(); }).finish();
+        author_pass(fg, hz).computeOnly().finish();
+        author_pass(fg, p2).finish();
+        // transparency: joins phase2's reopened MSAA group as its LAST draw (same COLOR_TARGET, authored
+        // immediately after phase2 so it's consecutive — it must come BEFORE the prepass shadow seam or
+        // shadow's non-color usage would split the group between phase2 and transparency). r.pass.transparency
+        // drops it -> opaque geometry only.
+        author_pass(fg, tr).toggle([tr] { return tr->is_enabled(); }).finish();
+        // shadow.cascades: prepass compute seam over GeometryPass. Authored AFTER phase2 so its
+        // record_compute is ordered after geometry.phase1's (draw-cull/expand produced the per-cascade
+        // worklists it draws) while its record() no-ops — it must NOT sit between phase1 and phase2 or it
+        // would split the reopened MSAA group. prepass() = frame-top compute, forms no render group.
+        // r.pass.shadow drops it; SceneData cascade_count 0 (set in GeometryPass::update off the same
+        // cvar) makes the scene render unshadowed.
+        author_pass(fg, sh).prepass().toggle([sh] { return sh->is_enabled(); }).finish();
+        author_pass(fg, db).finish();
+        author_pass(fg, uip).finish();
+        author_pass(fg, po).computeOnly().finish();
+    };
+    return s;
+}
+
 }  // namespace
 
 String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
 {
     // The UI's SDF atlas is baked once, up front and shared: UIPass's per-frame layout measures
     // against it and draws text from it.
-    const auto t0 = std::chrono::steady_clock::now();
     const std::vector<std::uint8_t> ttf = read_file(resources_dir / "assets/fonts/DejaVuSans.ttf");
     // Dynamic (grow-on-demand, Unicode) SDF atlas: glyphs rasterise on first sight, baked at a large
     // reference size (crisp small text), player-name-safe. Replaces the baked ASCII atlas (brief 05).
@@ -138,13 +242,21 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
         const std::uint32_t anchor_count = np > 0 ? static_cast<std::uint32_t>(np) : 24u;
         const std::size_t np_budget = np > 0 ? static_cast<std::size_t>(np) : 0;  // 0 = draw all
 
-        plan.add<UIBackgroundPass>(ui_scene, anchor_count);
-        plan.add<UIPass>(atlas, make_ui_dev_author(ui_scene, np_budget, screen));
-
-        const auto t1 = std::chrono::steady_clock::now();
-        STRING_LOG_INFO("ui-dev scene: plan built in {} ms ({} synthetic anchors, screen '{}')",
-                        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count(),
-                        anchor_count, screen);
+        plan.configure([atlas, ui_scene, anchor_count, np_budget, screen](String::engine_context& ctx)
+                       -> String::RenderPlan::Setup {
+            auto bg = std::make_unique<UIBackgroundPass>(ctx, ui_scene, anchor_count);
+            auto ui = std::make_unique<UIPass>(ctx, atlas, make_ui_dev_author(ui_scene, np_budget, screen));
+            String::Pass* bgp = bg.get();
+            String::Pass* uip = ui.get();
+            String::RenderPlan::Setup s;
+            s.passes.push_back(std::move(bg));
+            s.passes.push_back(std::move(ui));
+            s.author = [bgp, uip](String::FrameGraph& fg) {
+                author_pass(fg, bgp).finish();   // background (+ synthetic anchors) into the scene target
+                author_pass(fg, uip).finish();   // UI overlay
+            };
+            return s;
+        });
         return plan;
     }
 
@@ -154,43 +266,35 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
         // white/mirror pair, generated in-process (no glTF load; near-instant startup). Same
         // GeometryPass, so sun/TOD scrub keys, the furnace CVar, IBL, shadows and all capture
         // levers work identically. Debug lines + UI ride along for the console/HUD.
-        auto mesh_stats = std::make_shared<MeshOverlayStats>();
         // Brief 09: the lookdev scene PINS MANUAL exposure by default (it is the EV100/material
         // calibration reference — auto-metering a sphere grid over grey would defeat that).
         // setenv with overwrite=0: an explicit STRING_EXPOSURE_AUTO from the user still wins.
         setenv("STRING_EXPOSURE_AUTO", "0", 0);
-        plan.add<GeometryPass>(std::vector<std::filesystem::path>{}, mesh_stats, /*lookdev=*/true);
-        plan.add<DebugLinePass>(mesh_stats);
-        plan.add<UIPass>(atlas, make_ui_author(mesh_stats, 0));
-        plan.add<PostProcessPass>();
-        const auto t1 = std::chrono::steady_clock::now();
-        STRING_LOG_INFO("lookdev scene: plan built in {} ms",
-                        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+        plan.configure([atlas](String::engine_context& ctx) -> String::RenderPlan::Setup {
+            auto mesh_stats = std::make_shared<MeshOverlayStats>();
+            auto geo = std::make_unique<GeometryPass>(ctx, std::vector<std::filesystem::path>{},
+                                                      mesh_stats, /*lookdev=*/true);
+            return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas, /*nameplate_stress=*/0);
+        });
         return plan;
     }
 
-    // Default: the full Sponza scene (which draws its own procedural sky background), then the single
-    // UI overlay last. Main + curtains + ivy share one world space and merge into a single draw set;
-    // the curtains exercise the brief-04 two-sided/blend material paths on real content.
-    auto mesh_stats = std::make_shared<MeshOverlayStats>();
-    plan.add<GeometryPass>(
-        std::vector<std::filesystem::path>{
-            "assets/sponza/main/NewSponza_Main_glTF_003.gltf",
-            "assets/sponza/curtains/NewSponza_Curtains_glTF.gltf",
-            "assets/sponza/ivy/NewSponza_IvyGrowth_glTF.gltf",
-        },
-        mesh_stats);
-    // Brief 06: immediate-mode debug lines (inspector AABB highlights, debug-draw test patterns)
-    // draw into the scene color after geometry, before the UI overlay. Shares geometry's camera
-    // snapshot via mesh_stats.
-    plan.add<DebugLinePass>(mesh_stats);
+    // Default: the full Sponza scene (which draws its own procedural sky background), then debug lines +
+    // the UI overlay + post. Main + curtains + ivy share one world space and merge into a single draw
+    // set; the curtains exercise the brief-04 two-sided/blend material paths on real content.
     const int np_stress = std::max(0, cv_ui_nameplates().get());
-    plan.add<UIPass>(atlas, make_ui_author(mesh_stats, static_cast<std::size_t>(np_stress)));
-    // Brief 09 post chain (compute-only pass; the renderer runs it after the last MSAA group's
-    // resolve, before the composite). Last in the plan so bloom/metering see the final HDR frame
-    // (including the UI overlay — the UI draws into the scene target pre-tonemap today; moving it
-    // post-composite is an open follow-up noted in the brief log).
-    plan.add<PostProcessPass>();
+    plan.configure([atlas, np_stress](String::engine_context& ctx) -> String::RenderPlan::Setup {
+        auto mesh_stats = std::make_shared<MeshOverlayStats>();
+        auto geo = std::make_unique<GeometryPass>(ctx,
+            std::vector<std::filesystem::path>{
+                "assets/sponza/main/NewSponza_Main_glTF_003.gltf",
+                "assets/sponza/curtains/NewSponza_Curtains_glTF.gltf",
+                "assets/sponza/ivy/NewSponza_IvyGrowth_glTF.gltf",
+            },
+            mesh_stats);
+        return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas,
+                                   static_cast<std::size_t>(np_stress));
+    });
     return plan;
 }
 

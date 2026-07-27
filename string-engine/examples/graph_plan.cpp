@@ -1,6 +1,6 @@
 // Render-graph planner example. The implementation lives in the library now
 // (src/vulkan/render_graph.cpp, brief 04e M2) — this example only demonstrates the API.
-#include <string/vulkan/render_graph.hpp>
+#include <string/vulkan/graph_plan.hpp>
 
 #include <print>
 
@@ -12,7 +12,7 @@ int main() {
     string::gpu::resource_id color_id   = 2;
     string::gpu::resource_id lightgrid_id = 3;
 
-    RenderGraph graph = GraphBuilder()
+    GraphPlan graph = PlanBuilder()
         .add_pass("depth_prepass")
             .use(depth_id, Access::DepthWrite, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT)
             .end_pass()

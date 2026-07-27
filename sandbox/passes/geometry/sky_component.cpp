@@ -8,7 +8,7 @@
 namespace sandbox
 {
 
-void SkyComponent::init(String::PassContext& context)
+void SkyComponent::init(String::engine_context& context)
 {
     // Procedural: no descriptor bindings, only a push constant — reflection reports zero sets and the
     // push-constant range. Built via the hot-reload registry (recompiles + swaps on save).
@@ -43,7 +43,7 @@ void SkyComponent::init(String::PassContext& context)
         });
 }
 
-void SkyComponent::record(VkCommandBuffer command_buffer, const SkyParams& params)
+void SkyComponent::record(string::gpu::command_recorder& recorder, const SkyParams& params)
 {
     const SkyPush sky_push{
         .inv_view_proj = glm::inverse(params.view_proj),
@@ -56,10 +56,10 @@ void SkyComponent::record(VkCommandBuffer command_buffer, const SkyParams& param
         .sun_intensity = params.sun_intensity,
     };
     const string::gpu::pipeline& sky_p = program_->current();
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_p.pipeline);
-    vkCmdPushConstants(command_buffer, sky_p.pipeline_layout,
-                       sky_p.push_constants.stageFlags, 0, sizeof(SkyPush), &sky_push);
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, sky_p.pipeline);
+    recorder.push_constants(sky_p.pipeline_layout,
+                            sky_p.push_constants.stageFlags, 0, sizeof(SkyPush), &sky_push);
+    recorder.draw(3, 1, 0, 0);
 }
 
 }  // namespace sandbox

@@ -5,7 +5,7 @@
 #include <string/gpu/device.hpp>
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/shader_program_registry.hpp>
-#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/engine_context.hpp>
 #include <string/vulkan/render_pass.hpp>
 
 #include <volk.h>
@@ -23,7 +23,7 @@ namespace sandbox
 class UIBackgroundPass final : public String::Pass
 {
 public:
-    UIBackgroundPass(String::PassContext& context, std::shared_ptr<UiScene> scene,
+    UIBackgroundPass(String::engine_context& context, std::shared_ptr<UiScene> scene,
                      std::uint32_t anchor_count);
     ~UIBackgroundPass() override;
 

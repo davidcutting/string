@@ -4,8 +4,21 @@
 namespace String
 {
 
+void ResourceStateTracker::seed(VkImage image, VkImageLayout layout,
+    VkPipelineStageFlags2 write_stage, VkAccessFlags2 write_access)
+{
+    ResourceState& s = images_[image];
+    s.layout = layout;
+    s.last_write_stage = write_stage;
+    s.last_write_access = write_access;
+    s.reader_stages = 0;
+    s.visible_stages = 0;
+    s.visible_access = 0;
+}
+
 void ResourceStateTracker::transition(VkCommandBuffer command_buffer, VkImage image,
-    VkImageAspectFlags aspect, Access access, VkPipelineStageFlags2 stage, bool discard)
+    VkImageAspectFlags aspect, Access access, VkPipelineStageFlags2 stage, bool discard,
+    uint32_t level_count)
 {
     ResourceState& current = images_[image];   // default: UNDEFINED, no prior access
     const AccessScope target = access_scope(access);
@@ -31,6 +44,7 @@ void ResourceStateTracker::transition(VkCommandBuffer command_buffer, VkImage im
             .dst_stage = stage,
             .dst_access = target.access,
             .aspect = aspect,
+            .level_count = level_count,
         });
         current.reader_stages |= stage;
         current.visible_stages |= stage;
@@ -51,6 +65,7 @@ void ResourceStateTracker::transition(VkCommandBuffer command_buffer, VkImage im
         .dst_stage = stage,
         .dst_access = target.access,
         .aspect = aspect,
+        .level_count = level_count,
     });
     current.layout = target.layout;
     current.last_write_stage = stage;

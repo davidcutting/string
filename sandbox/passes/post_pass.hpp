@@ -9,7 +9,7 @@
 #include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/vulkan/render_pass.hpp>
-#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/engine_context.hpp>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -61,7 +61,7 @@ class PostProcessPass final : public String::Pass
     string::gpu::device& device_;
     string::gpu::resource_allocator& allocator_;
     string::gpu::descriptor_table& descriptor_table_;
-    String::FrameScratch* scratch_ = nullptr;
+    string::gpu::FrameScratch* scratch_ = nullptr;
     uint16_t frames_in_flight_ = 1;
 
     // One post.slang, one pipeline per entry point (hot-reload registry).
@@ -100,11 +100,11 @@ class PostProcessPass final : public String::Pass
     bool verify_logged_ = false;
 
 public:
-    explicit PostProcessPass(String::PassContext& context);
+    explicit PostProcessPass(String::engine_context& context);
     virtual ~PostProcessPass() override;
 
     std::string_view debug_name() const override { return "post"; }
-    bool compute_only() const override { return true; }
+    // Nature (compute-only) declared fluently by the app when authoring the graph (brief 11 endgame).
 
     void bind_color_source(uint32_t sampled_slot, string::gpu::resource_id physical_id) override;
 

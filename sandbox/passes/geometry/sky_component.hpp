@@ -1,7 +1,8 @@
 #pragma once
 
+#include <string/gpu/command_recorder.hpp>
 #include <string/gpu/shader_program.hpp>
-#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/engine_context.hpp>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -47,9 +48,9 @@ class SkyComponent
 public:
     SkyComponent() = default;
     // Registers sky_shader.slang through the hot-reload registry (recompiles + swaps on save).
-    void init(String::PassContext& context);
+    void init(String::engine_context& context);
     // Binds the current pipeline, pushes the sky/sun state, draws the fullscreen triangle.
-    void record(VkCommandBuffer command_buffer, const SkyParams& params);
+    void record(string::gpu::command_recorder& recorder, const SkyParams& params);
     // The pipeline the GeometryPass destructor tears down (kept there so teardown order is unchanged).
     string::gpu::shader_program* program() const { return program_; }
 };

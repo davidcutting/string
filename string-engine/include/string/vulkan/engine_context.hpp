@@ -5,6 +5,7 @@
 
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource_allocator.hpp>
+#include <string/gpu/resource_registry.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/gpu/shader_program_registry.hpp>
 #include <string/vulkan/frame_scratch.hpp>
@@ -21,11 +22,15 @@ namespace String
 // frames are in flight. Passes receive this as their first constructor argument so the
 // application can declare *what* to draw (content) without touching *how* it's built (the GPU
 // context, which only exists inside the Renderer). See render_plan.hpp for how it's injected.
-struct PassContext
+struct engine_context
 {
     string::gpu::device& device;
     string::gpu::resource_allocator& allocator;
     string::gpu::descriptor_table& descriptor_table;
+    // Brief 16 Layer 1: the resource-virtualization hub. Passes declare their logical image/buffer
+    // handles here at construction (M1: the SceneData PerFrame ring) instead of hand-managing
+    // per-frame [frame] vectors of resource_ids; the registry owns the backing + resolves it per frame.
+    string::gpu::ResourceRegistry& resources;
     // Registry for hot-reloadable Slang pipelines: a pass calls create(source.slang, builder) to
     // get a shader_program whose pipeline recompiles + swaps on save (brief 01). The overlay pass
     // also reads its current_errors() to render compile diagnostics.
@@ -62,7 +67,7 @@ struct PassContext
     // during construction (returns a byte offset); the renderer materializes one buffer per
     // frame slot after all passes are built. Address at record time: scratch.buffer(slot) /
     // scratch.address(slot) + offset.
-    FrameScratch& scratch;
+    string::gpu::FrameScratch& scratch;
 };
 
 }  // namespace String

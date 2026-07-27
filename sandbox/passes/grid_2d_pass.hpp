@@ -5,7 +5,7 @@
 #include <vector>
 
 #include <string/vulkan/render_pass.hpp>
-#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/engine_context.hpp>
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/device.hpp>
 
@@ -42,7 +42,7 @@ class Grid2DPass final : public String::Pass
     string::gpu::pipeline pipeline_;
 
 public:
-    explicit Grid2DPass(String::PassContext& context);
+    explicit Grid2DPass(String::engine_context& context);
     virtual ~Grid2DPass() override;
 
     // Stable identity for tooling (Tracy zones, inspector). Brief 06.

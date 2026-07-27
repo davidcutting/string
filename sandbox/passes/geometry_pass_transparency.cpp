@@ -79,7 +79,7 @@ uint32_t GeometryPass::build_transparency_list(uint16_t current_frame)
     return count;
 }
 
-void GeometryPass::record_transparency(VkCommandBuffer cb, uint16_t current_frame, uint32_t count)
+void GeometryPass::record_transparency(string::gpu::command_recorder& recorder, uint16_t current_frame, uint32_t count)
 {
     if (count == 0 || !meshlet_transparent_program_) return;
     const string::gpu::pipeline& tp = meshlet_transparent_program_->current();
@@ -95,8 +95,8 @@ void GeometryPass::record_transparency(VkCommandBuffer cb, uint16_t current_fram
     push.mverts = allocator_.get_buffer(meshlet_vertices_).device_address;
     push.mtris = allocator_.get_buffer(meshlet_triangles_).device_address;
     push.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
-    push.scene = allocator_.get_buffer(scene_buffers_[current_frame]).device_address;
-    push.stats = allocator_.get_buffer(stats_buffers_[current_frame]).device_address;
+    push.scene = resources->address(scene_buffer_, current_frame);
+    push.stats = resources->address(stats_buffer_, current_frame);
     const VkDeviceAddress tbase = allocator_.get_buffer(transp_buffers_[current_frame]).device_address;
     push.records = tbase + transp_records_off_;   // compacted {draw_index, lod=0}, back-to-front order
     push.camera_pos = mesh_cull_frozen_ ? mesh_frozen_camera_pos_ : camera_.position();
@@ -116,12 +116,21 @@ void GeometryPass::record_transparency(VkCommandBuffer cb, uint16_t current_fram
 
     const VkBuffer buf = allocator_.get_buffer(transp_buffers_[current_frame]).buffer;
     VkDescriptorSet mset = descriptor_table_.get_set();
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline_layout, 0, 1, &mset, 0, nullptr);
-    vkCmdPushConstants(cb, tp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletPush), &push);
+    recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline);
+    recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline_layout, 0, 1, &mset, 0, nullptr);
+    recorder.push_constants(tp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletPush), &push);
     // Brief 04c (resolution b): one command per surviving transparent draw, in back-to-front order.
-    vkCmdDrawMeshTasksIndirectCountEXT(cb, buf, transp_commands_off_, buf, transp_count_off_,
-                                       cull_max_draws_, sizeof(uint32_t) * 3);
+    recorder.draw_mesh_tasks_indirect_count(buf, transp_commands_off_, buf, transp_count_off_,
+                                            cull_max_draws_, sizeof(uint32_t) * 3);
+}
+
+// Brief 11 M2: public entry point for the standalone TransparencyPass — builds this frame's sorted
+// list and draws it. Guards match the old in-group call sites (draw_count_>0 + meshlet path ready).
+void GeometryPass::record_transparency_pass(string::gpu::command_recorder& recorder, uint16_t current_frame)
+{
+    if (draw_count_ == 0 || !meshlet_program_ || !draw_info_mapped_) return;
+    const uint32_t count = build_transparency_list(current_frame);
+    record_transparency(recorder, current_frame, count);
 }
 
 }  // namespace sandbox

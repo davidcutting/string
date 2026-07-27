@@ -1,17 +1,47 @@
+#include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 #include <string/core/logger.hpp>
 #include <string/vulkan/frame_scratch.hpp>
 
-namespace String
+namespace string::gpu
 {
 
-VkDeviceSize FrameScratch::reserve(VkDeviceSize bytes, VkDeviceSize alignment)
+VkDeviceSize FrameScratch::reserve(VkDeviceSize bytes, VkDeviceSize alignment, ScratchLifetime life)
 {
     if (materialized())
         throw std::runtime_error("FrameScratch: reserve() after materialize()");
-    const VkDeviceSize offset = (size_ + alignment - 1) & ~(alignment - 1);
-    size_ = offset + bytes;
+
+    // Greedy interval-packing: place this region at the LOWEST aligned offset whose byte range
+    // [offset, offset+bytes) does not collide with any already-placed region whose LIFETIME overlaps
+    // this one's. Candidate offsets are 0 and the aligned end of every time-overlapping region — a
+    // classic first-fit over the union of "busy" byte intervals (only those live at the same time).
+    // When every region shares the default whole-frame lifetime, they all overlap, so the lowest
+    // non-colliding offset is always past all of them == the old bump allocator (byte-identical).
+    const auto align_up = [alignment](VkDeviceSize v) { return (v + alignment - 1) & ~(alignment - 1); };
+
+    std::vector<VkDeviceSize> candidates{ 0 };
+    for (const Region& r : regions_)
+        if (r.life.overlaps(life)) candidates.push_back(align_up(r.offset + r.size));
+    std::sort(candidates.begin(), candidates.end());
+
+    VkDeviceSize offset = 0;
+    for (const VkDeviceSize cand : candidates)
+    {
+        const VkDeviceSize start = align_up(cand);
+        bool collides = false;
+        for (const Region& r : regions_)
+        {
+            if (!r.life.overlaps(life)) continue;
+            // byte-range overlap of [start, start+bytes) vs [r.offset, r.offset+r.size)
+            if (start < r.offset + r.size && r.offset < start + bytes) { collides = true; break; }
+        }
+        if (!collides) { offset = start; break; }
+    }
+
+    regions_.push_back({ offset, bytes, life });
+    size_ = std::max(size_, offset + bytes);
     return offset;
 }
 
@@ -44,7 +74,8 @@ void FrameScratch::destroy(string::gpu::resource_allocator& allocator)
         allocator.destroy_resource(id);
     buffers_.clear();
     addresses_.clear();
+    regions_.clear();
     size_ = 0;
 }
 
-}  // namespace String
+}  // namespace string::gpu

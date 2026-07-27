@@ -4,7 +4,7 @@
 #include <vector>
 
 #include <string/vulkan/render_pass.hpp>
-#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/engine_context.hpp>
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource_allocator.hpp>
@@ -29,7 +29,7 @@ namespace sandbox
 class DebugLinePass final : public String::Pass
 {
 public:
-    DebugLinePass(String::PassContext& context, std::shared_ptr<const MeshOverlayStats> stats);
+    DebugLinePass(String::engine_context& context, std::shared_ptr<const MeshOverlayStats> stats);
     ~DebugLinePass() override;
 
     std::string_view debug_name() const override { return "debug_line"; }

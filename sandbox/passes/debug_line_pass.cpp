@@ -8,7 +8,7 @@ namespace sandbox
 {
 using namespace String;
 
-DebugLinePass::DebugLinePass(PassContext& context, std::shared_ptr<const MeshOverlayStats> stats)
+DebugLinePass::DebugLinePass(engine_context& context, std::shared_ptr<const MeshOverlayStats> stats)
 : device_(context.device), allocator_(context.allocator), stats_(std::move(stats)),
   frames_in_flight_(context.frames_in_flight)
 {
@@ -100,7 +100,6 @@ void DebugLinePass::upload(uint16_t frame,
 void DebugLinePass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     if (current_frame >= frames_in_flight_) return;
-    VkCommandBuffer cb = recorder.get_command_buffer();
 
     // Snapshot the frame's debug-draw ring under its lock, then upload into this frame's buffer.
     string::debug::DebugDrawContext& ctx = string::debug::context();
@@ -121,11 +120,11 @@ void DebugLinePass::record(string::gpu::command_recorder& recorder, uint16_t cur
 
     const auto draw = [&](const string::gpu::pipeline& p, VkDeviceSize offset, uint32_t count) {
         if (count == 0) return;
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
-        vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                           sizeof(glm::mat4), &view_proj);
-        vkCmdBindVertexBuffers(cb, 0, 1, &vb, &offset);
-        vkCmdDraw(cb, count, 1, 0, 0);
+        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+        recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                sizeof(glm::mat4), &view_proj);
+        recorder.bind_vertex_buffers(0, 1, &vb, &offset);
+        recorder.draw(count, 1, 0, 0);
     };
     draw(depth_pipeline_, depth_off, depth_counts_[current_frame]);
     draw(overlay_pipeline_, overlay_off, overlay_counts_[current_frame]);

@@ -11,13 +11,13 @@
 namespace sandbox
 {
 
-void FroxelComponent::init(String::PassContext& context, uint32_t frames_in_flight)
+void FroxelComponent::init(String::engine_context& context, uint32_t frames_in_flight)
 {
-    allocator_ = &context.allocator;
+    resources_ = &context.resources;
     frames_in_flight_ = frames_in_flight;
-    // Actual allocation is deferred to ensure_capacity() from update() once screen_size is known;
-    // leave the ids at 0 (created on first update).
-    buffers_.resize(frames_in_flight_);
+    // Actual allocation is deferred to ensure_capacity() (called from FroxelPass::resize() once the
+    // screen size is known — the deterministic point, before any per-frame update). The registry-owned
+    // PerFrame handle stays invalid until then.
 
     // Froxel light-binning compute pipeline (Slang, hot-reloadable).
     program_ = context.shader_registry.create(
@@ -49,7 +49,7 @@ void FroxelComponent::ensure_capacity(VkExtent2D screen)
     tiles_x_ = (screen.width + kFroxelTileSize - 1) / kFroxelTileSize;
     tiles_y_ = (screen.height + kFroxelTileSize - 1) / kFroxelTileSize;
     count_ = tiles_x_ * tiles_y_ * kFroxelDepthSlices;
-    if (count_ <= capacity_ && buffers_[0] != 0)
+    if (count_ <= capacity_ && froxel_buffer_.valid())
     {
         return;   // fits the existing allocation
     }
@@ -57,22 +57,20 @@ void FroxelComponent::ensure_capacity(VkExtent2D screen)
     // device-addressed buffers here is safe. Stride = [count, idx...] = 1 + max per froxel.
     const VkDeviceSize stride = (1 + kMaxLightsPerFroxel) * sizeof(uint32_t);
     const VkDeviceSize size = stride * count_;
-    for (uint32_t f = 0; f < frames_in_flight_; ++f)
-    {
-        if (buffers_[f] != 0) allocator_->destroy_resource(buffers_[f]);
-        buffers_[f] = allocator_->create_resource(string::gpu::buffer_info{
-            .size = size,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            .allocation_flags = {},
-        });
-    }
+    const string::gpu::buffer_info info{
+        .size = size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    };
+    if (froxel_buffer_.valid()) resources_->recreate_per_frame(froxel_buffer_, info);
+    else                        froxel_buffer_ = resources_->create_per_frame(info, frames_in_flight_);
     capacity_ = count_;
     STRING_LOG_INFO("[froxel] grid {}x{}x{} = {} froxels ({} MB/frame)", tiles_x_,
                     tiles_y_, kFroxelDepthSlices, count_, size / (1024 * 1024));
 }
 
-void FroxelComponent::record(VkCommandBuffer command_buffer, uint16_t frame, const FroxelParams& params)
+void FroxelComponent::record(string::gpu::command_recorder& recorder, uint16_t frame, const FroxelParams& params)
 {
     if (!active(frame)) return;
     const string::gpu::pipeline& fp = program_->current();
@@ -89,26 +87,24 @@ void FroxelComponent::record(VkCommandBuffer command_buffer, uint16_t frame, con
         .max_per_froxel = kMaxLightsPerFroxel,
         ._pad0 = 0, ._pad1 = 0,
         .lights = params.lights,
-        .froxels = allocator_->get_buffer(buffers_[frame]).device_address,
+        .froxels = resources_->address(froxel_buffer_, frame),
     };
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, fp.pipeline);
-    vkCmdPushConstants(command_buffer, fp.pipeline_layout, fp.push_constants.stageFlags,
-                       0, sizeof(FroxelPush), &fpush);
-    vkCmdDispatch(command_buffer, (tiles_x_ + 3) / 4, (tiles_y_ + 3) / 4,
-                  (kFroxelDepthSlices + 3) / 4);
+    recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, fp.pipeline);
+    recorder.push_constants(fp.pipeline_layout, fp.push_constants.stageFlags,
+                            0, sizeof(FroxelPush), &fpush);
+    recorder.dispatch((tiles_x_ + 3) / 4, (tiles_y_ + 3) / 4, (kFroxelDepthSlices + 3) / 4);
 }
 
 void FroxelComponent::destroy()
 {
-    if (!allocator_) return;
-    for (const string::gpu::resource_id b : buffers_)
-        if (b != 0) allocator_->destroy_resource(b);
+    // The froxel index ring is owned + freed by the ResourceRegistry now (brief 16 M2); nothing to
+    // free here. (The compute pipeline is torn down by the owning FroxelPass destructor.)
 }
 
 VkDeviceAddress FroxelComponent::froxels_address(uint16_t frame) const
 {
-    if (frame >= buffers_.size() || buffers_[frame] == 0) return 0;
-    return allocator_->get_buffer(buffers_[frame]).device_address;
+    if (!froxel_buffer_.valid()) return 0;
+    return resources_->address(froxel_buffer_, frame);
 }
 
 }  // namespace sandbox

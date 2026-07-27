@@ -21,7 +21,7 @@
 #include <string/debug_draw.hpp>
 #include <string/gpu/driver.hpp>
 #include <string/vulkan/renderer.hpp>
-#include <string/vulkan/render_graph.hpp>
+#include <string/vulkan/graph_plan.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource.hpp>
@@ -110,6 +110,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
 , transfer_batch_(device_, allocator_, graphics_queue_)
 , global_descriptor_table_(device_.get_device(), allocator_)
+, resources_(allocator_, global_descriptor_table_)
 // Shader hot-reload: a 1-thread pool (mtime scans + recompiles are light and serial), the watcher
 // polled each frame, and the Slang compiler with a content-hash cache under the shaders dir. The
 // shaders/ tree is the include/import search root.
@@ -191,6 +192,12 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         .samples = msaa_samples_,
     });
 
+    // Brief 16 M0: register the two stable render targets as `Imported` logical handles so their
+    // physical backing is resolved through the ResourceRegistry (see image_of/view_of). Re-pointed
+    // in handle_resize when these ids change.
+    color_target_ = resources_.import_image(color_attachment_);
+    depth_target_ = resources_.import_image(msaa_depth_);
+
     // Make the offscreen HDR target samplable by the composite pass via the bindless table.
     bind_composite_source();
 
@@ -206,10 +213,11 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     // asynchronously (a ring of command buffers on a timeline), so building passes doesn't
     // stall per upload; wait_idle() below drains it once before the first frame. transfer_batch_
     // is a persistent member (it keeps streaming after init), flushed per frame in begin_frame.
-    PassContext pass_context{
+    engine_context pass_context{
         device_,
         allocator_,
         global_descriptor_table_,
+        resources_,
         shader_registry_,
         transfer_batch_,
         window_->get_input(),
@@ -222,9 +230,15 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         // Address of the Tracy GPU ctx member (created later in init_gpu_profiler); passes store the
         // pointer and read it live at record time. Brief 06.
         &gpu_profiler_ctx_,
-        frame_scratch_,
+        resources_.transients(),
     };
-    scene_passes_ = plan.build(pass_context);
+    // Brief 11 endgame: the app constructs its passes AND returns a re-runnable fluent author lambda.
+    // The Renderer owns the passes (lifecycle) and re-runs the author on every graph recompile.
+    {
+        RenderPlan::Setup setup = plan.run(pass_context);
+        scene_passes_ = std::move(setup.passes);
+        scene_author_ = std::move(setup.author);
+    }
 
     // Brief 09: the passes exist now — notify the ones that consume the resolved HDR target
     // (bind_composite_source() already bound it into the table before plan.build ran).
@@ -237,7 +251,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 
     // Brief 04e M3: all passes have declared their per-frame scratch needs; back them with one
     // device-local arena per frame slot (logged as the VRAM consolidation number).
-    frame_scratch_.materialize(allocator_, frames_in_flight_);
+    resources_.materialize_transients(frames_in_flight_);
 
     // Composite resolves the offscreen HDR target to the swapchain: reads color_attachment_,
     // writes the screen. Declared here (composite_pass_ is renderer-built, not in the plan).
@@ -340,7 +354,7 @@ Renderer::~Renderer()
     allocator_.destroy_resource(msaa_depth_);
     allocator_.destroy_resource(msaa_color_);
     allocator_.destroy_resource(color_attachment_);
-    frame_scratch_.destroy(allocator_);
+    // The transient arena is owned + freed by the ResourceRegistry dtor now (brief 16 M5).
 }
 
 void Renderer::update()
@@ -451,11 +465,71 @@ void Renderer::begin_frame()
     // pacing throttle is the timeline wait above, not the acquire.
 }
 
+void Renderer::rebuild_execution_plan()
+{
+    // Brief 11 endgame: RE-AUTHOR the persistent FrameGraph from the app's fluent author (which declares
+    // each pass's I/O + flags + callbacks, referencing the constructed passes) plus the renderer-owned
+    // composite resolve, then compile (toposort + lifetime/aliasing + toggle survival). Runs on
+    // invalidation only (toggle flip / resize). The app author runs AFTER update() so usagesFrom() sees
+    // populated per-frame usages; the executor then drives the CompiledFrame's PassExec callbacks.
+    frame_graph_ = FrameGraph{};
+    if (scene_author_) scene_author_(frame_graph_);
+    // Composite resolve (offscreen HDR -> swapchain) is renderer-owned, authored last so it forms the
+    // final swapchain group.
+    frame_graph_.pass("composite")
+        .usages([this]() -> const std::vector<ResourceUsage>& { return composite_pass_.usages; })
+        .record([this](string::gpu::pass_context& ctx) { composite_pass_.record(ctx.rec, ctx.frame_slot); })
+        .finish();
+    compiled_frame_ = frame_graph_.compile();
+    graph_dirty_ = false;
+
+    // One-shot lifetime report (the planner's per-resource [first,last] topo span = the transient-
+    // aliasing input). One-shot across recompiles to avoid re-logging on every toggle/resize.
+    static bool logged_lifetimes = false;
+    if (!logged_lifetimes)
+    {
+        logged_lifetimes = true;
+        for (const auto& [id, lifetime] : compiled_frame_.plan.resource_lifetimes)
+            STRING_LOG_INFO("[graph] resource {}: passes [{}..{}] first_writer={}",
+                            id, lifetime.first.value_or(0), lifetime.last.value_or(0),
+                            lifetime.first_writer.has_value()
+                                ? static_cast<int64_t>(*lifetime.first_writer) : -1);
+    }
+}
+
+std::vector<Renderer::ResourceInfo> Renderer::resources() const
+{
+    // Brief 11 M4 introspection: every resource the compiled plan touches, with its topo lifetime
+    // span (the aliasing input the planner already computed). is_image is best-effort — the render-
+    // target sentinels + registry IMAGE handles (usage.key() sets IMAGE_HANDLE_BASE); buffers + raw
+    // ids read as non-image. The target visualizer (brief 14) filters on it.
+    std::vector<ResourceInfo> out;
+    out.reserve(compiled_frame_.plan.resource_lifetimes.size());
+    for (const auto& [id, lt] : compiled_frame_.plan.resource_lifetimes)
+    {
+        const bool is_image =
+            id == string::gpu::SWAPCHAIN_TARGET || id == string::gpu::COLOR_TARGET
+            || id == string::gpu::DEPTH_TARGET || (id & ResourceUsage::IMAGE_HANDLE_BASE) != 0;
+        out.push_back({ id, is_image, lt.first, lt.last, lt.first_writer });
+    }
+    return out;
+}
+
 void Renderer::record_frame()
 {
     STRING_PROFILE_SCOPE("record_frame")
     string::gpu::command_recorder& recorder = main_recorder(current_frame_);
     VkCommandBuffer command_buffer = recorder.begin();
+    // Brief 16 M1: the execute-time surface handed to every main-queue pass callback this frame
+    // (record / record_compute / inline-async). It resolves a pass's logical handles to this frame's
+    // physical backing (frame_slot = current_frame_).
+    string::gpu::pass_context frame_ctx{ recorder, resources_, static_cast<std::uint32_t>(current_frame_) };
+    // Brief 16: the executor is the SINGLE resource-resolution authority. A pass declares each usage
+    // with a LOGICAL registry handle (or a raw sentinel/persistent id); `res()` resolves it to this
+    // frame's physical id here — passes no longer pre-resolve resources->physical() into their usages.
+    const auto res = [&](const ResourceUsage& u) {
+        return u.resolve(resources_, static_cast<std::uint32_t>(current_frame_));
+    };
     const VkExtent2D extent = presenter_.get_extent();
 
     // Brief 06: reset this frame index's GPU-timestamp pool (and read back its previous cycle's
@@ -471,52 +545,33 @@ void Renderer::record_frame()
     };
     const VkRect2D scissor = { .offset = { 0, 0 }, .extent = extent };
 
-    // Brief 11 Phase 2 (M3): filter out disabled passes up front — they leave the graph, the
-    // execution order, and the written-resource set below. All-enabled = byte-identical (default).
-    std::vector<Pass*> active;
-    active.reserve(frame_passes_.size());
+    // Brief 11 step 1: the persistent frame plan. The FrameGraph is compiled ONCE (toposort +
+    // lifetimes) and cached; this frame re-records cheaply from execution_order_ instead of
+    // rebuilding the graph. Recompile only on invalidation — a per-pass enable/disable flip (the
+    // enabled-signature below changes) or a forced dirty (first frame / resize). The order is stable
+    // otherwise (resource ids don't vary across frames or resize), and ALL inter-pass barriers still
+    // derive from live pass->usages through resource_states_ — pass-declared usage remains the single
+    // source of truth for sync — so per-frame-slot buffer variation needs no re-plan.
+    uint64_t sig = 1469598103934665603ull;
     for (Pass* pass : frame_passes_)
-        if (pass->is_enabled()) active.push_back(pass);
-
-    // Brief 04e M2: the frame graph. Every frame the passes' declared ResourceUsages feed the
-    // planner; execution follows its (stable, authored-order-preserving) toposort, and ALL
-    // inter-pass barriers below derive from the same declarations through resource_states_ —
-    // pass-declared usage is the single source of truth for scheduling AND sync.
-    GraphBuilder graph_builder;
-    for (Pass* pass : active)
+        sig = (sig ^ (pass->is_enabled() ? 1u : 0u)) * 1099511628211ull;
+    if (graph_dirty_ || sig != enabled_signature_)
     {
-        PassBuilder pass_builder = graph_builder.add_pass(std::string(pass->debug_name()));
-        for (const ResourceUsage& usage : pass->usages)
-            pass_builder.use(usage.resource, usage.access, usage.stage);
-        pass_builder.end_pass();
+        enabled_signature_ = sig;
+        rebuild_execution_plan();
     }
-    const RenderGraph graph = graph_builder.build();
-    // Brief 04e M3: one-shot lifetime report — the planner's per-resource [first, last] topo
-    // positions are the transient-aliasing input. Two transients may share memory iff their
-    // spans are disjoint (plus the aliasing rules: acquire-from-UNDEFINED vs the previous
-    // tenant's scope, and never across frames-in-flight slots).
-    static bool logged_lifetimes = false;
-    if (!logged_lifetimes)
-    {
-        logged_lifetimes = true;
-        for (const auto& [id, lifetime] : graph.resource_lifetimes)
-            STRING_LOG_INFO("[graph] resource {}: passes [{}..{}] first_writer={}",
-                            id, lifetime.first.value_or(0), lifetime.last.value_or(0),
-                            lifetime.first_writer.has_value()
-                                ? static_cast<int64_t>(*lifetime.first_writer) : -1);
-    }
-    std::vector<Pass*> execution_order;
-    execution_order.reserve(active.size());
-    for (uint32_t index : graph.toposorted)
-        execution_order.push_back(active[index]);
+    // Brief 11 fluent migration: the executor drives the CompiledFrame's PassExec surface (callbacks +
+    // flags + live-usage pointers), NOT Pass* virtuals — the `source` bridge is retired. Each pass's
+    // live per-frame usages are read through cp.exec.usages (a stable pointer into the pass object).
+    const std::vector<CompiledPass>& order = compiled_frame_.passes;
 
-    // The set of resources the graph itself writes this frame (usages may change per frame —
-    // per-frame-slot buffers). Static uploaded inputs are never re-transitioned.
+    // The set of resources the graph itself writes this frame (usages may name per-frame-slot
+    // resources, so recomputed live each frame). Static uploaded inputs are never re-transitioned.
     written_resources_.clear();
-    for (const Pass* pass : active)
-        for (const ResourceUsage& usage : pass->usages)
+    for (const CompiledPass& cp : order)
+        for (const ResourceUsage& usage : cp.exec.usages())
             if (is_write(usage.access))
-                written_resources_.insert(usage.resource);
+                written_resources_.insert(res(usage));
 
     // A usage recorded during the compute prepass (record_compute) vs during the graphics groups
     // (record). The stage mask says which side of the frame it belongs to.
@@ -541,9 +596,9 @@ void Renderer::record_frame()
     // queue-family scoped.
     async_waits_.clear();
     {
-        std::vector<Pass*> async_passes;
-        for (Pass* pass : execution_order)
-            if (pass->has_async_compute()) async_passes.push_back(pass);
+        std::vector<const CompiledPass*> async_passes;
+        for (const CompiledPass& cp : order)
+            if (cp.exec.has_async && cp.exec.has_async()) async_passes.push_back(&cp);
         const bool place_async = !async_passes.empty() && async_lane_ != UINT32_MAX
                               && async_enabled_cvar().get();
         if (place_async)
@@ -555,19 +610,21 @@ void Renderer::record_frame()
                 submissions_.recorder(async_lane_, static_cast<uint32_t>(current_frame_));
             async_recorder.reset();
             VkCommandBuffer async_cb = async_recorder.begin();
+            string::gpu::pass_context async_pass_ctx{ async_recorder, resources_,
+                                                      static_cast<std::uint32_t>(current_frame_) };
             std::vector<VkBufferMemoryBarrier2> releases;
             std::vector<VkBufferMemoryBarrier2> acquires;
             VkPipelineStageFlags2 wait_stages = 0;
-            for (Pass* pass : async_passes)
+            for (const CompiledPass* cp : async_passes)
             {
                 {
                     STRING_PROFILE_GPU_ZONE_DYNAMIC(async_ctx, async_cb, "froxel-cull")
-                    pass->record_async_compute(async_recorder, static_cast<uint16_t>(current_frame_));
+                    cp->exec.record_async(async_pass_ctx);
                 }
-                for (const ResourceUsage& usage : pass->async_usages)
+                for (const ResourceUsage& usage : cp->exec.async_usages())
                 {
                     const AccessScope scope = access_scope(usage.access);
-                    const VkBuffer buffer = allocator_.get_buffer(usage.resource).buffer;
+                    const VkBuffer buffer = allocator_.get_buffer(res(usage)).buffer;
                     if (is_write(usage.access))
                     {
                         // Release half of the QFOT (the written contents must survive the
@@ -680,24 +737,24 @@ void Renderer::record_frame()
         else
         {
             // Inline degrade path: same chains, main queue, tracker-derived barriers.
-            for (Pass* pass : async_passes)
+            for (const CompiledPass* cp : async_passes)
             {
-                for (const ResourceUsage& usage : pass->async_usages)
+                for (const ResourceUsage& usage : cp->exec.async_usages())
                     if (is_write(usage.access))
-                        resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+                        resource_states_.buffer_access(res(usage), usage.access, usage.stage);
                 resource_states_.flush_buffers(command_buffer);
                 {
                     STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, "froxel-cull")
                     gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_),
-                                            std::string(pass->debug_name()) + " (async-inline)");
-                    pass->record_async_compute(recorder, static_cast<uint16_t>(current_frame_));
+                                            cp->name + " (async-inline)");
+                    cp->exec.record_async(frame_ctx);
                     gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
                 }
                 // The main-queue reads: noted now, flushed with the next barrier point (before
                 // any graphics group begins).
-                for (const ResourceUsage& usage : pass->async_usages)
+                for (const ResourceUsage& usage : cp->exec.async_usages())
                     if (!is_write(usage.access))
-                        resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+                        resource_states_.buffer_access(res(usage), usage.access, usage.stage);
             }
         }
     }
@@ -708,31 +765,33 @@ void Renderer::record_frame()
     // Brief 09: compute_only passes are excluded — they execute whole at their toposorted
     // position in the group loop below (post-processing must run AFTER the scene resolve),
     // and their declared usages are processed there, not here.
-    for (Pass* pass : execution_order)
+    for (const CompiledPass& cp : order)
     {
-        if (pass->compute_only()) continue;
-        for (const ResourceUsage& usage : pass->usages)
+        if (cp.exec.compute_only) continue;
+        for (const ResourceUsage& usage : cp.exec.usages())
             if (is_buffer_usage(usage) && is_compute_stage(usage.stage))
-                resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+                resource_states_.buffer_access(res(usage), usage.access, usage.stage);
         resource_states_.flush_buffers(command_buffer);
 
-        const std::string pass_name(pass->debug_name());
+        const std::string& pass_name = cp.name;
         STRING_PROFILE_SCOPE_DYNAMIC(pass_name.data(), pass_name.size())
         STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, pass_name.c_str())
         gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), pass_name + " (cs)");
-        pass->record_compute(recorder, static_cast<uint16_t>(current_frame_));
+        if (cp.exec.record_compute) cp.exec.record_compute(frame_ctx);
         gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
     }
 
     // The color / depth target a pass renders into (every frame pass writes exactly one color
     // target; string::gpu::SWAPCHAIN_TARGET means the screen).
-    const auto color_target_of = [](const Pass* pass) -> string::gpu::resource_id {
-        for (const ResourceUsage& usage : pass->usages)
+    // color/depth attachments are always renderer sentinels (COLOR/DEPTH/SWAPCHAIN_TARGET), never
+    // registry handles, so they carry a raw `resource` — no per-frame resolution needed here.
+    const auto color_target_of = [](const CompiledPass& cp) -> string::gpu::resource_id {
+        for (const ResourceUsage& usage : cp.exec.usages())
             if (usage.access == Access::ColorWrite) return usage.resource;
         return string::gpu::SWAPCHAIN_TARGET;
     };
-    const auto depth_target_of = [](const Pass* pass) -> std::optional<string::gpu::resource_id> {
-        for (const ResourceUsage& usage : pass->usages)
+    const auto depth_target_of = [](const CompiledPass& cp) -> std::optional<string::gpu::resource_id> {
+        for (const ResourceUsage& usage : cp.exec.usages())
             if (usage.access == Access::DepthWrite) return usage.resource;
         // Depth READS must also bind the depth image as an attachment: depth-tested/write-off
         // pipelines (debug lines) need it, and — critically — the reopened group that hosts a
@@ -741,7 +800,7 @@ void Renderer::record_frame()
         // draws ran with NO depth test at all: every disoccluded meshlet landed on top of the scene
         // (far geometry over near = persistent semi-transparent surfaces, popping under motion,
         // clean with HiZ off because single-pass never splits the group).
-        for (const ResourceUsage& usage : pass->usages)
+        for (const ResourceUsage& usage : cp.exec.usages())
             if (usage.access == Access::DepthRead) return usage.resource;
         return std::nullopt;
     };
@@ -779,9 +838,11 @@ void Renderer::record_frame()
 
     size_t start = 0;
     bool seen_msaa_group = false;   // has a COLOR_TARGET group already cleared the MSAA targets?
-    Pass* pending_after_between = nullptr;   // breaker whose phase-2 runs in the next (reopened) group
-    while (start < execution_order.size())
+    while (start < order.size())
     {
+        // Brief 11 step 3: prepass-only compute passes (IBL update, GTAO, ...) already ran in the
+        // frame-top compute prepass; they draw nothing and form no group, so skip them here.
+        if (order[start].exec.prepass_only) { ++start; continue; }
         // Brief 09: a compute_only pass executes standalone, OUTSIDE any rendering group, at its
         // toposorted position (the post chain runs here: after the last MSAA group's resolve into
         // COLOR_TARGET, before the composite group samples it). Its barriers derive from its
@@ -789,57 +850,69 @@ void Renderer::record_frame()
         // tracker (StorageImageWrite -> GENERAL covers the sample+storage-write mix), buffer
         // usages merge into one flushed memory barrier. Its own transient chains (bloom mips)
         // are intra-pass state with local barriers — the documented allowed class.
-        if (execution_order[start]->compute_only())
+        if (order[start].exec.compute_only)
         {
-            Pass* pass = execution_order[start];
+            const CompiledPass& cp = order[start];
             std::unordered_map<string::gpu::resource_id, ResourceUsage> compute_transitions;
-            for (const ResourceUsage& usage : pass->usages)
+            for (const ResourceUsage& usage : cp.exec.usages())
             {
                 if (is_buffer_usage(usage))
                 {
-                    resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+                    resource_states_.buffer_access(res(usage), usage.access, usage.stage);
                     continue;
                 }
-                if (!written_resources_.contains(usage.resource)) continue;
-                auto [it, inserted] = compute_transitions.try_emplace(usage.resource, usage);
+                // Transition graph-WRITTEN images (this pass's outputs) AND any already-TRACKED image
+                // it reads — e.g. hiz.build's SampledRead of the seeded hz.depth resolve target, which
+                // is not in written_resources_ (nothing declares it a write) but must derive its
+                // wait-on-resolve. Static uploaded inputs are neither written nor tracked -> skipped.
+                if (!written_resources_.contains(res(usage))
+                    && !resource_states_.is_tracked(image_of(res(usage)))) continue;
+                auto [it, inserted] = compute_transitions.try_emplace(res(usage), usage);
                 if (!inserted && is_write(usage.access) && !is_write(it->second.access))
                     it->second = usage;
             }
             for (const auto& [resource, usage] : compute_transitions)
+            {
+                const auto [aspect, mips] = image_meta(resource);
                 resource_states_.transition(command_buffer, image_of(resource),
-                    VK_IMAGE_ASPECT_COLOR_BIT, usage.access, usage.stage, /*discard=*/false);
+                    aspect, usage.access, usage.stage, /*discard=*/false, mips);
+            }
             resource_states_.flush_buffers(command_buffer);
 
-            const std::string pass_name(pass->debug_name());
+            const std::string& pass_name = cp.name;
             STRING_PROFILE_SCOPE_DYNAMIC(pass_name.data(), pass_name.size())
             STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, pass_name.c_str())
             gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), pass_name);
-            pass->record(recorder, static_cast<uint16_t>(current_frame_));
+            cp.exec.record(frame_ctx);
             gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
             ++start;
             continue;
         }
-        const string::gpu::resource_id group_color = color_target_of(execution_order[start]);
+        const string::gpu::resource_id group_color = color_target_of(order[start]);
         // First (and only) group targeting the screen: latch the swapchain image now, before the
         // group's transitions/attachment info dereference image_of/image_view_of(SWAPCHAIN_TARGET).
         if (group_color == string::gpu::SWAPCHAIN_TARGET) acquire_swapchain();
         std::optional<string::gpu::resource_id> group_depth;
         size_t end = start;
-        bool break_after = false;
-        while (end < execution_order.size() && color_target_of(execution_order[end]) == group_color)
+        while (end < order.size() && color_target_of(order[end]) == group_color)
         {
-            if (auto depth = depth_target_of(execution_order[end])) group_depth = depth;
-            const bool breaks = execution_order[end]->breaks_scene_group();
+            if (auto depth = depth_target_of(order[end])) group_depth = depth;
             ++end;
-            if (breaks) { break_after = true; break; }   // end this group right after the breaker
         }
 
         // Is this the LAST COLOR_TARGET (MSAA) group in the chain? Only the last one resolves; the
         // rest STORE their MSAA samples for the following group to LOAD. A group is the last MSAA
-        // group iff it writes COLOR_TARGET and the pass immediately after `end` does NOT.
+        // group iff no LATER pass also targets COLOR_TARGET. Brief 11 step 2: look PAST intervening
+        // compute_only passes — the HiZ build (geometry.phase1 -> hiz.build -> geometry.phase2) breaks
+        // group contiguity in execution_order, but the MSAA chain resumes at phase2 after it. Without
+        // this skip, phase1's group would see the compute-only hiz next, think it is last, and resolve
+        // color BEFORE phase2 draws — the disocclusion complement would be lost (04d class).
         const bool this_is_msaa = (group_color == string::gpu::COLOR_TARGET);
-        const bool next_is_msaa = this_is_msaa && end < execution_order.size()
-            && color_target_of(execution_order[end]) == string::gpu::COLOR_TARGET;
+        size_t next_color = end;
+        while (next_color < order.size() && order[next_color].exec.compute_only)
+            ++next_color;
+        const bool next_is_msaa = this_is_msaa && next_color < order.size()
+            && color_target_of(order[next_color]) == string::gpu::COLOR_TARGET;
         const bool msaa_is_first = this_is_msaa && !seen_msaa_group;   // clears vs loads
         const bool msaa_is_last = this_is_msaa && !next_is_msaa;       // resolves vs stores
         if (this_is_msaa) seen_msaa_group = true;
@@ -850,8 +923,8 @@ void Renderer::record_frame()
         // usage (scanned here) rather than the removed Pass::depth_resolve_target() hook. 0 = no resolve.
         string::gpu::resource_id depth_resolve = 0;
         for (size_t i = start; i < end; ++i)
-            for (const ResourceUsage& usage : execution_order[i]->usages)
-                if (usage.access == Access::DepthResolve) depth_resolve = usage.resource;
+            for (const ResourceUsage& usage : order[i].exec.usages())
+                if (usage.access == Access::DepthResolve) depth_resolve = res(usage);
 
         // Barriers: transition each graph-written image the group touches to the state its usage
         // needs (deduped per resource). Static uploaded inputs are skipped — they aren't in
@@ -860,7 +933,7 @@ void Renderer::record_frame()
         // from the tracker; writes discard the previous contents.
         std::unordered_map<string::gpu::resource_id, ResourceUsage> group_transitions;
         for (size_t i = start; i < end; ++i)
-            for (const ResourceUsage& usage : execution_order[i]->usages)
+            for (const ResourceUsage& usage : order[i].exec.usages())
             {
                 // Graphics-phase BUFFER usages (indirect worklists, task/fragment storage reads,
                 // the visibility bitfield's task-stage RMW): note them with the tracker so their
@@ -869,16 +942,16 @@ void Renderer::record_frame()
                 if (is_buffer_usage(usage))
                 {
                     if (!is_compute_stage(usage.stage))
-                        resource_states_.buffer_access(usage.resource, usage.access, usage.stage);
+                        resource_states_.buffer_access(res(usage), usage.access, usage.stage);
                     continue;
                 }
-                if (!written_resources_.contains(usage.resource)) continue;
+                if (!written_resources_.contains(res(usage))) continue;
                 // Writes take precedence: a group that both writes and reads a resource as an
                 // attachment must sit in the WRITE layout for the whole rendering (the group's
                 // attachment info uses ATTACHMENT_OPTIMAL; attachment reads are legal there). A
                 // read-usage last-wins here once put depth in READ_ONLY under a group whose
                 // rendering declared ATTACHMENT_OPTIMAL -> per-frame validation errors.
-                auto [it, inserted] = group_transitions.try_emplace(usage.resource, usage);
+                auto [it, inserted] = group_transitions.try_emplace(res(usage), usage);
                 if (!inserted && is_write(usage.access) && !is_write(it->second.access))
                     it->second = usage;
             }
@@ -906,8 +979,11 @@ void Renderer::record_frame()
             // already put msaa_depth_ back in DEPTH_ATTACHMENT after the min-resolve read.
             const bool load_depth = this_is_msaa && !msaa_is_first
                 && aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
+            // Brief 11 step 2b: transition every mip (e.g. geometry.phase2's SampledRead of the whole
+            // HiZ pyramid), not just mip 0 — image_meta resolves the chain length.
+            const uint32_t mips = image_meta(resource).second;
             resource_states_.transition(command_buffer, image_of(resource), aspect,
-                usage.access, usage.stage, /*discard=*/is_write(usage.access) && !load_depth);
+                usage.access, usage.stage, /*discard=*/is_write(usage.access) && !load_depth, mips);
         }
 
         // The scene group (COLOR_TARGET) is multisampled: passes render into msaa_color_ and it's
@@ -937,117 +1013,37 @@ void Renderer::record_frame()
         // bitfield's cross-frame task RMW).
         resource_states_.flush_buffers(command_buffer);
 
-        // Brief 04d MSAA chain: first group clears, later groups load; only the last resolves.
-        const VkAttachmentLoadOp msaa_color_load =
-            msaa_is_first ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
-        const VkAttachmentStoreOp msaa_color_store =
-            msaa_is_last ? VK_ATTACHMENT_STORE_OP_DONT_CARE   // resolved, MS samples not kept
-                         : VK_ATTACHMENT_STORE_OP_STORE;      // kept for the next MSAA group to load
-        const VkRenderingAttachmentInfo color_attachment_info = {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .pNext = nullptr,
-            .imageView = msaa_group ? allocator_.get_image(msaa_color_).view : image_view_of(group_color),
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            // Resolve the multisampled scene color into color_attachment_ only on the LAST MSAA group.
-            .resolveMode = (msaa_group && msaa_is_last) ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_NONE,
-            .resolveImageView = (msaa_group && msaa_is_last) ? image_view_of(group_color) : VK_NULL_HANDLE,
-            .resolveImageLayout = (msaa_group && msaa_is_last) ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-            .loadOp = msaa_group ? msaa_color_load : VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = msaa_group ? msaa_color_store : VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = { .color = {{ 0.0f, 0.0f, 0.0f, 0.0f }} },
-        };
-        // Depth: first MSAA group clears, later ones load the phase-1 depth. STORE it while more
-        // MSAA groups follow (phase-2 + transparency depth-test against it); the last may drop it.
-        const VkAttachmentLoadOp depth_load =
-            (msaa_group && !msaa_is_first) ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
-        const VkAttachmentStoreOp depth_store =
-            (msaa_group && !msaa_is_last) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        // Brief 04d: MIN depth resolve into the breaker's single-sample target (if any). Transition it
-        // to the depth-attachment (resolve dest) layout first; record_between() moves it to SHADER_READ.
-        // Vulkan resolve ops write in COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE (even a depth
-        // resolve), so this layout transition must be made available to that stage/access — else
-        // sync-validation flags a WRITE_AFTER_WRITE between the transition and the EndRendering resolve.
-        // Direct barrier (not the tracker's DepthWrite scope, which would name LATE_FRAGMENT_TESTS):
-        // record_between() manages hz.depth's subsequent transitions with its own hardcoded barriers,
-        // and it is re-discarded (UNDEFINED) here every frame, so the tracker need not track it.
-        if (depth_resolve != 0)
-            vku::transition_image(command_buffer, {
-                .image = image_of(depth_resolve),
-                .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,   // discard: prior contents not needed
-                .new_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,   // last used by the pyramid reduce
-                .src_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                .dst_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,  // the resolve write stage
-                .dst_access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
-            });
-        const VkRenderingAttachmentInfo depth_attachment_info = {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .pNext = nullptr,
-            .imageView = group_depth ? image_view_of(*group_depth) : VK_NULL_HANDLE,
-            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            .resolveMode = depth_resolve != 0 ? VK_RESOLVE_MODE_MIN_BIT : VK_RESOLVE_MODE_NONE,
-            .resolveImageView = depth_resolve != 0 ? image_view_of(depth_resolve) : VK_NULL_HANDLE,
-            .resolveImageLayout = depth_resolve != 0 ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-            .loadOp = depth_load,
-            .storeOp = depth_store,
-            // Reverse-Z: far plane is 0 (see the depth pipeline's GREATER_OR_EQUAL compare).
-            .clearValue = { .depthStencil = { 0.0f, 0 } },
-        };
-        const VkRenderingInfo rendering_info = {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .renderArea = {{ 0, 0 }, extent},
-            .layerCount = 1,
-            .viewMask = 0,
-            .colorAttachmentCount = 1,
-            .pColorAttachments = &color_attachment_info,
-            .pDepthAttachment = group_depth ? &depth_attachment_info : nullptr,
-            .pStencilAttachment = nullptr,
-        };
+        // Brief 16 M4 (framework-opens): the framework derives every attachment op from the group's
+        // lifetime facts + opens the render pass. (Step 2 already moved render-pass ownership to the
+        // executor; this centralizes the MSAA clear/load/store/resolve chain that was left inline here.)
+        open_group_rendering(command_buffer, group_color, group_depth, depth_resolve,
+            msaa_group, msaa_is_first, msaa_is_last, extent, viewport, scissor);
 
-        vkCmdBeginRendering(command_buffer, &rendering_info);
-        vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-        vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-
-        // Brief 04d: the previous group's breaker draws its phase-2 geometry here, into the reloaded
-        // MSAA targets, tested against the pyramid its record_between() just built — before this
-        // group's own passes.
-        if (pending_after_between)
-        {
-            const std::string an(pending_after_between->debug_name());
-            STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, "phase2")
-            gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), an + " (phase2)");
-            pending_after_between->record_after_between(recorder, static_cast<uint16_t>(current_frame_));
-            gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
-            pending_after_between = nullptr;
-        }
-
+        // Brief 11 step 2: geometry.phase1 / hiz.build / geometry.phase2 are ordinary registered
+        // passes now — phase2 records here as the first pass of the reopened MSAA group, hiz.build ran
+        // standalone as a compute_only pass between the two groups. The old breaks_scene_group /
+        // record_between / record_after_between / pending_after_between machinery is retired.
         for (size_t i = start; i < end; ++i)
         {
-            const std::string pass_name(execution_order[i]->debug_name());
+            const std::string& pass_name = order[i].name;
             STRING_PROFILE_SCOPE_DYNAMIC(pass_name.data(), pass_name.size())
             STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, pass_name.c_str())
             gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), pass_name);
-            execution_order[i]->record(recorder, static_cast<uint16_t>(current_frame_));
+            order[i].exec.record(frame_ctx);
             gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
         }
 
         vkCmdEndRendering(command_buffer);
 
-        // Brief 04d: the breaker's compute step (HiZ min-resolve + pyramid) runs here — OUTSIDE
-        // rendering, after phase-1's depth is stored, before phase-2's group reopens.
-        if (break_after)
-        {
-            Pass* breaker = execution_order[end - 1];
-            const std::string bn(breaker->debug_name());
-            STRING_PROFILE_GPU_ZONE_DYNAMIC(gpu_profiler_ctx_, command_buffer, "hiz-build")
-            gpu_timing_.write_begin(command_buffer, static_cast<uint32_t>(current_frame_), bn + " (between)");
-            breaker->record_between(recorder, static_cast<uint16_t>(current_frame_));
-            gpu_timing_.write_end(command_buffer, static_cast<uint32_t>(current_frame_));
-            pending_after_between = breaker;   // its phase-2 runs in the next group
-        }
+        // Brief 11 step 2b: this group just MIN-resolved its MSAA depth into `depth_resolve` (hz.depth)
+        // at EndRendering — a write in the COLOR_ATTACHMENT_OUTPUT stage the tracker can't observe.
+        // Seed it so the following hiz.build pass's SampledRead derives the correct wait-on-resolve
+        // (replacing record_hiz's old hand-rolled DEPTH_ATTACHMENT->SHADER_READ barrier).
+        if (depth_resolve != 0)
+            resource_states_.seed(image_of(depth_resolve),
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
         start = end;
     }
 
@@ -1065,13 +1061,93 @@ void Renderer::record_frame()
     recorder.end();
 }
 
+void Renderer::open_group_rendering(VkCommandBuffer command_buffer, string::gpu::resource_id group_color,
+    const std::optional<string::gpu::resource_id>& group_depth, string::gpu::resource_id depth_resolve,
+    bool msaa_group, bool msaa_is_first, bool msaa_is_last, VkExtent2D extent,
+    const VkViewport& viewport, const VkRect2D& scissor)
+{
+    // Brief 04d MSAA chain: first group clears, later groups load; only the last resolves.
+    const VkAttachmentLoadOp msaa_color_load =
+        msaa_is_first ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    const VkAttachmentStoreOp msaa_color_store =
+        msaa_is_last ? VK_ATTACHMENT_STORE_OP_DONT_CARE   // resolved, MS samples not kept
+                     : VK_ATTACHMENT_STORE_OP_STORE;      // kept for the next MSAA group to load
+    const VkRenderingAttachmentInfo color_attachment_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = msaa_group ? allocator_.get_image(msaa_color_).view : image_view_of(group_color),
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        // Resolve the multisampled scene color into color_attachment_ only on the LAST MSAA group.
+        .resolveMode = (msaa_group && msaa_is_last) ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_NONE,
+        .resolveImageView = (msaa_group && msaa_is_last) ? image_view_of(group_color) : VK_NULL_HANDLE,
+        .resolveImageLayout = (msaa_group && msaa_is_last) ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = msaa_group ? msaa_color_load : VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = msaa_group ? msaa_color_store : VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = { .color = {{ 0.0f, 0.0f, 0.0f, 0.0f }} },
+    };
+    // Depth: first MSAA group clears, later ones load the phase-1 depth. STORE it while more
+    // MSAA groups follow (phase-2 + transparency depth-test against it); the last may drop it.
+    const VkAttachmentLoadOp depth_load =
+        (msaa_group && !msaa_is_first) ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    const VkAttachmentStoreOp depth_store =
+        (msaa_group && !msaa_is_last) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    // Brief 04d: MIN depth resolve into the breaker's single-sample target (if any). Transition it
+    // to the depth-attachment (resolve dest) layout first; hiz.build moves it to SHADER_READ.
+    // Vulkan resolve ops write in COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_WRITE (even a depth
+    // resolve), so this layout transition must be made available to that stage/access — else
+    // sync-validation flags a WRITE_AFTER_WRITE between the transition and the EndRendering resolve.
+    // Direct barrier (not the tracker's DepthWrite scope, which would name LATE_FRAGMENT_TESTS):
+    // hiz.build manages hz.depth's subsequent transitions, and it is re-discarded (UNDEFINED) here
+    // every frame, so the tracker need not track it.
+    if (depth_resolve != 0)
+        vku::transition_image(command_buffer, {
+            .image = image_of(depth_resolve),
+            .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,   // discard: prior contents not needed
+            .new_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,   // last used by the pyramid reduce
+            .src_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .dst_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,  // the resolve write stage
+            .dst_access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+        });
+    const VkRenderingAttachmentInfo depth_attachment_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = group_depth ? image_view_of(*group_depth) : VK_NULL_HANDLE,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .resolveMode = depth_resolve != 0 ? VK_RESOLVE_MODE_MIN_BIT : VK_RESOLVE_MODE_NONE,
+        .resolveImageView = depth_resolve != 0 ? image_view_of(depth_resolve) : VK_NULL_HANDLE,
+        .resolveImageLayout = depth_resolve != 0 ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = depth_load,
+        .storeOp = depth_store,
+        // Reverse-Z: far plane is 0 (see the depth pipeline's GREATER_OR_EQUAL compare).
+        .clearValue = { .depthStencil = { 0.0f, 0 } },
+    };
+    const VkRenderingInfo rendering_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .renderArea = {{ 0, 0 }, extent},
+        .layerCount = 1,
+        .viewMask = 0,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &color_attachment_info,
+        .pDepthAttachment = group_depth ? &depth_attachment_info : nullptr,
+        .pStencilAttachment = nullptr,
+    };
+
+    vkCmdBeginRendering(command_buffer, &rendering_info);
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+}
+
 VkImage Renderer::image_of(string::gpu::resource_id target) const
 {
     switch (target)
     {
-        case string::gpu::SWAPCHAIN_TARGET: return acquired_image_;
-        case string::gpu::COLOR_TARGET:     return allocator_.get_image(color_attachment_).image;
-        case string::gpu::DEPTH_TARGET:     return allocator_.get_image(msaa_depth_).image;
+        case string::gpu::SWAPCHAIN_TARGET: return acquired_image_;   // late-latched, stays special (M0)
+        case string::gpu::COLOR_TARGET:     return allocator_.get_image(resources_.physical(color_target_)).image;
+        case string::gpu::DEPTH_TARGET:     return allocator_.get_image(resources_.physical(depth_target_)).image;
         default:               return allocator_.get_image(target).image;
     }
 }
@@ -1080,10 +1156,30 @@ VkImageView Renderer::image_view_of(string::gpu::resource_id target) const
 {
     switch (target)
     {
-        case string::gpu::SWAPCHAIN_TARGET: return acquired_image_view_;
-        case string::gpu::COLOR_TARGET:     return allocator_.get_image(color_attachment_).view;
-        case string::gpu::DEPTH_TARGET:     return allocator_.get_image(msaa_depth_).view;
+        case string::gpu::SWAPCHAIN_TARGET: return acquired_image_view_;   // late-latched (M0)
+        case string::gpu::COLOR_TARGET:     return resources_.view(color_target_);
+        case string::gpu::DEPTH_TARGET:     return resources_.view(depth_target_);
         default:               return allocator_.get_image(target).view;
+    }
+}
+
+std::pair<VkImageAspectFlags, uint32_t> Renderer::image_meta(string::gpu::resource_id target) const
+{
+    switch (target)
+    {
+        case string::gpu::SWAPCHAIN_TARGET: return { VK_IMAGE_ASPECT_COLOR_BIT, 1u };
+        case string::gpu::COLOR_TARGET:
+            return { VK_IMAGE_ASPECT_COLOR_BIT, allocator_.get_image(resources_.physical(color_target_)).mip_levels };
+        case string::gpu::DEPTH_TARGET:     return { VK_IMAGE_ASPECT_DEPTH_BIT, 1u };
+        default:
+        {
+            const string::gpu::allocated_image& img = allocator_.get_image(target);
+            const bool depth = img.format == VK_FORMAT_D32_SFLOAT
+                            || img.format == VK_FORMAT_D16_UNORM
+                            || img.format == VK_FORMAT_D24_UNORM_S8_UINT
+                            || img.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+            return { depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, img.mip_levels };
+        }
     }
 }
 
@@ -1340,6 +1436,10 @@ void Renderer::handle_resize(const String::View::Extent& extent)
     {
         pass->resize(vk_extent);
     }
+    // Brief 11 step 1: force a plan recompile next frame (defensive — resource ids are stable across
+    // resize so the toposort is unchanged, but keep the persistent plan honest against re-created
+    // targets and any pass whose usages track the extent).
+    graph_dirty_ = true;
 
     // Release the old HDR target's bindless slot before it is destroyed, then re-allocate.
     global_descriptor_table_.unbind(color_attachment_, string::gpu::descriptor_type::TEXTURE);
@@ -1385,6 +1485,12 @@ void Renderer::handle_resize(const String::View::Extent& extent)
         .allocation_flags = {},
         .samples = msaa_samples_,
     });
+
+    // Brief 16 M0: re-point the `Imported` handles at the recreated targets. Ids happen to be reused
+    // from the LIFO free-list today (so this is a no-op), but the registry must not depend on that —
+    // this is the `recreate_viewport` intent in miniature.
+    resources_.reimport(color_target_, color_attachment_);
+    resources_.reimport(depth_target_, msaa_depth_);
 
     // The swapchain images and attachments were just recreated — their old VkImage handles
     // (and tracked layouts) are stale.

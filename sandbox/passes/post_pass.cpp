@@ -38,7 +38,7 @@ struct ExposureOut
 
 }  // namespace
 
-PostProcessPass::PostProcessPass(String::PassContext& context)
+PostProcessPass::PostProcessPass(String::engine_context& context)
 : device_(context.device)
 , allocator_(context.allocator)
 , descriptor_table_(context.descriptor_table)
@@ -297,17 +297,17 @@ void PostProcessPass::update(float delta_time, uint16_t current_frame)
 void PostProcessPass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     if (bloom_image_ == 0) return;
-    VkCommandBuffer cb = recorder.get_command_buffer();
+    VkCommandBuffer cb = recorder.vk();   // escape: vku::transition_image + record_outline_slot take a raw cb
     VkDescriptorSet set = descriptor_table_.get_set();
 
     const auto dispatch = [&](string::gpu::shader_program* prog, const PostPush& push,
                               uint32_t gx, uint32_t gy) {
         const string::gpu::pipeline& p = prog->current();
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
-                                0, 1, &set, 0, nullptr);
-        vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(PostPush), &push);
-        vkCmdDispatch(cb, gx, gy, 1);
+        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+        recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
+                                      0, 1, &set, 0, nullptr);
+        recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(PostPush), &push);
+        recorder.dispatch(gx, gy, 1);
     };
     const auto barrier = [&] {
         const VkMemoryBarrier2 mb = {
@@ -323,7 +323,7 @@ void PostProcessPass::record(string::gpu::command_recorder& recorder, uint16_t c
         };
         const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
             .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-        vkCmdPipelineBarrier2(cb, &dep);
+        recorder.barrier(dep);
     };
 
     // Bloom chain lives permanently in GENERAL (07 cubemap pattern): one-time transition, then a

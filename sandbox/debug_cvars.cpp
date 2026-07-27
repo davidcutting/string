@@ -424,6 +424,26 @@ CVar<bool>& cv_pass_geometry()
     static CVar<bool> v{"r.pass.geometry", true, "toggle the geometry pass (brief 11 Phase 2 per-pass enable/disable)"};
     return v;
 }
+// Brief 11 M3: per-pass enable/disable for the decomposed geometry sub-passes. Off drops the pass from
+// the compiled graph AND the shared SceneData degrades gracefully (the term cancels) — shadow off ->
+// cascade_count 0 (unshadowed), sky off -> cleared background, transparency off -> no blended draws.
+// (GTAO + probe GI toggle through their existing feature cvars r.gtao.enabled / r.gi, which already
+// drive the SceneData degrade; the graph .toggle() just also drops the now-idle pass.)
+CVar<bool>& cv_pass_shadow()
+{
+    static CVar<bool> v{"r.pass.shadow", true, "toggle the shadow.cascades pass (off -> unshadowed lit scene)"};
+    return v;
+}
+CVar<bool>& cv_pass_sky()
+{
+    static CVar<bool> v{"r.pass.sky", true, "toggle the sky pass (off -> cleared background behind the scene)"};
+    return v;
+}
+CVar<bool>& cv_pass_transparency()
+{
+    static CVar<bool> v{"r.pass.transparency", true, "toggle the transparency pass (off -> opaque geometry only)"};
+    return v;
+}
 CVar<float>& cv_gi_spacing()
 {
     static CVar<float> v{"r.gi.spacing", 2.0f, "probe grid spacing in world meters (0 = auto)"};
@@ -524,6 +544,9 @@ void register_debug_cvars()
     cv_gi_probe_debug();
     cv_gi_debug();
     cv_pass_geometry();
+    cv_pass_shadow();
+    cv_pass_sky();
+    cv_pass_transparency();
     string::core::CVarRegistry::instance().apply_env();
 }
 

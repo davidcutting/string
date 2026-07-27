@@ -49,16 +49,17 @@ struct Pass
     // true if it recorded any compute work, so the renderer knows to barrier compute->draw.
     virtual bool record_compute(string::gpu::command_recorder& /*recorder*/, uint16_t /*current_frame*/) { return false; }
     virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) = 0;
-    void resize(VkExtent2D extent) { screen_size = extent; }
+    // Virtual so a pass can (re)allocate viewport-sized resources at the DETERMINISTIC resize point
+    // — init + window resize, both before any per-frame update() — instead of lazily in update()
+    // where allocation can race a consumer's read (brief 16 M2: the froxel ring). Override MUST call
+    // the base (or set screen_size) then do its screen-dependent work.
+    virtual void resize(VkExtent2D extent) { screen_size = extent; }
 
-    // --- Brief 09: compute-only frame passes -----------------------------------------------------
-    // A pass that records NO draws: its record() runs OUTSIDE any rendering group, at its toposorted
-    // position in the frame (post-processing between the scene resolve and the composite). The
-    // renderer derives its image transitions (StorageImageRead/Write -> GENERAL, SampledRead) and
-    // buffer barriers from `usages` at that point — same contract as attachment passes, different
-    // execution site. Its record_compute() is NOT called in the frame-top compute prepass (the
-    // whole pass already runs at a compute point).
-    virtual bool compute_only() const { return false; }
+    // Brief 11 endgame: the pass NATURE flags (compute-only / prepass-only / has-async) are NO LONGER
+    // Pass virtuals — the app declares each pass's nature FLUENTLY when it authors the render graph
+    // (FrameGraph PassSpec .computeOnly()/.prepass()/.async()). The Pass base carries only what every
+    // pass genuinely provides: record(), the optional record_compute()/record_async_compute() bodies,
+    // its live `usages`/`async_usages`, and the update()/resize()/bind_color_source() lifecycle.
 
     // Brief 09: the renderer re-binds the offscreen HDR color target into the bindless table at
     // init and on every resize, then notifies the passes that consume it (the post chain samples
@@ -77,30 +78,15 @@ struct Pass
     // derives the cross-lane timeline edge + queue-family ownership transfer (async placement)
     // or the plain tracker barriers (inline) from those declarations.
     std::vector<ResourceUsage> async_usages;
-    virtual bool has_async_compute() const { return false; }
+    // record_async_compute() is the async chain body (default no-op); the dynamic "has work this frame?"
+    // gate is declared fluently via PassSpec.async() (no has_async_compute() virtual on the base).
     virtual void record_async_compute(string::gpu::command_recorder& /*recorder*/, uint16_t /*current_frame*/) {}
 
-    // --- Brief 04d: two-phase occlusion support -------------------------------------------------
-    // A pass that must interleave a COMPUTE step between two sets of draws into the SAME MSAA scene
-    // targets (phase-1 opaque -> build HiZ pyramid -> phase-2 opaque) cannot dispatch that compute
-    // inside the renderer's single scene render pass. These hooks let the renderer break the scene
-    // render group after this pass, run the pass's compute step OUTSIDE rendering, then reopen the
-    // group PRESERVING (LOAD, not CLEAR) the MSAA color+depth this pass already wrote.
-    //
-    // breaks_scene_group(): true -> the renderer ends the scene render pass after this pass's
-    //   record(), calls record_between(), and the following scene group loads (does not clear) the
-    //   MSAA targets and defers the MSAA-color resolve to the LAST group.
-    virtual bool breaks_scene_group() const { return false; }
-    // record_between(): recorded OUTSIDE dynamic rendering, after the pre-break group's EndRendering
-    // and before the post-break group's BeginRendering. Compute + image barriers are legal here.
-    virtual void record_between(string::gpu::command_recorder& /*recorder*/, uint16_t /*current_frame*/) {}
-    // record_after_between(): recorded INSIDE the reopened (post-break) scene render group, before that
-    // group's own passes. This is where the breaker draws its phase-2 geometry into the reloaded MSAA
-    // targets (tested against the pyramid record_between just built). record() drew phase-1.
-    virtual void record_after_between(string::gpu::command_recorder& /*recorder*/, uint16_t /*current_frame*/) {}
-    // Brief 11 P2 (B1): depth_resolve_target() is RETIRED — the group's MSAA-depth resolve target is
-    // now named by a declared Access::DepthResolve usage the renderer scans for (resource_usage.hpp),
-    // not a per-pass virtual hook. (breaks_scene_group/record_between/record_after_between follow in B2.)
+    // Brief 11 step 2: the 04d two-phase hooks (breaks_scene_group / record_between /
+    // record_after_between) and depth_resolve_target (B1) are RETIRED. The two-phase occlusion path is
+    // three ordinary registered passes now — geometry.phase1 (raster), hiz.build (compute_only, runs
+    // standalone between the two MSAA groups), geometry.phase2 (raster into the reloaded MSAA group) —
+    // scheduled purely from their declared usages + the Access::DepthResolve marker. No special hooks.
 };
 
 // A pure-virtual destructor still needs a definition so derived passes can link.

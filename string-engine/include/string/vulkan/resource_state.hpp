@@ -48,9 +48,24 @@ public:
     // Record a barrier moving `image` to the layout + access that `access` requires at `stage`,
     // then update the tracked state. `discard` drops the current contents (source layout
     // UNDEFINED) — for targets that are fully cleared/overwritten each use. Emits nothing when
-    // the request is already satisfied (visible read, no hazard).
+    // the request is already satisfied (visible read, no hazard). `level_count` = mip levels to
+    // transition (default 1 = single-mip; pass the image's full mip count for a mip chain like the
+    // HiZ pyramid, which is uniform across mips at every pass boundary — intra-pass per-mip
+    // divergence during its own reduce is handled by that pass's local barriers, not the tracker).
     void transition(VkCommandBuffer command_buffer, VkImage image, VkImageAspectFlags aspect,
-                    Access access, VkPipelineStageFlags2 stage, bool discard = false);
+                    Access access, VkPipelineStageFlags2 stage, bool discard = false,
+                    uint32_t level_count = 1);
+
+    // Brief 11 step 2b: SEED a resource's state without emitting a barrier — for a write the tracker
+    // cannot observe through transition()/buffer_access(), namely a render-pass attachment RESOLVE
+    // (the two-phase MSAA depth -> hz.depth min-resolve executes at the group's EndRendering in the
+    // COLOR_ATTACHMENT_OUTPUT stage). After seeding, a later transition() derives the correct
+    // wait-on-resolve. Overwrites any prior tracked state for `image`.
+    void seed(VkImage image, VkImageLayout layout, VkPipelineStageFlags2 write_stage,
+              VkAccessFlags2 write_access);
+    // Is this image currently tracked (seeded or previously transitioned)? Lets the renderer skip
+    // static uploaded inputs (never tracked) while still transitioning seeded resolve targets.
+    bool is_tracked(VkImage image) const { return images_.count(image) != 0; }
 
     // Note a buffer access; accumulates any required global memory-barrier scopes into the
     // pending merge. Call flush_buffers() before the consuming commands are recorded.

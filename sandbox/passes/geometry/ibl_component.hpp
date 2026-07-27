@@ -6,9 +6,10 @@
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource.hpp>
+#include <string/gpu/command_recorder.hpp>
 #include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/shader_program.hpp>
-#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/engine_context.hpp>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -100,7 +101,7 @@ class IblComponent
 
 public:
     // Create the cubemaps / SH buffer / DFG LUT + the five ibl.slang compute pipelines.
-    void init(String::PassContext& context);
+    void init(String::engine_context& context);
     // Decide whether the chain must re-run this frame (sun moved past cos(0.1 deg), furnace flip,
     // first frame, or forced). Sets the internal pending flag consumed by needs_update().
     void begin_frame(const glm::vec3& sun_dir, bool furnace, bool force_every_frame);
@@ -110,7 +111,7 @@ public:
     }
     // Record the full capture -> mip -> SH + prefilter chain (one frame; DFG bake rides the first
     // call). Clears the pending flag and latches primed/captured state.
-    void record_update(VkCommandBuffer cb, const IblLighting& light);
+    void record_update(string::gpu::command_recorder& recorder, const IblLighting& light);
     // dbg.ibl_verify: read the DFG LUT + SH back and check against CPU references. Stalls; debug only.
     void run_verification(bool furnace);
     // Tear down the pipelines + resources (GeometryPass destructor calls this).

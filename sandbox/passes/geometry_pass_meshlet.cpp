@@ -29,7 +29,7 @@ namespace sandbox
 {
 using namespace String;
 
-void GeometryPass::build_meshlet_gpu(PassContext& context)
+void GeometryPass::build_meshlet_gpu(engine_context& context)
 {
     if (meshlet_model_.total_meshlets == 0) return;
 
@@ -145,18 +145,14 @@ void GeometryPass::build_meshlet_gpu(PassContext& context)
         allocator_.get_buffer(draw_info_buffer_).allocation_info.pMappedData);
     std::copy(meshlet_model_.draws.begin(), meshlet_model_.draws.end(), draw_info_mapped_);
 
-    // GPU-written stats, read back one frame late (host-visible ring).
-    stats_buffers_.resize(frames_in_flight_);
+    // GPU-written stats, read back one frame late (registry-owned PerFrame host-visible ring; brief 16 M3).
     stats_readback_.resize(frames_in_flight_);
-    for (uint32_t f = 0; f < frames_in_flight_; ++f)
-    {
-        stats_buffers_[f] = allocator_.create_resource(string::gpu::buffer_info{
-            .size = sizeof(GpuMeshStats),
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-            .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
-        });
-    }
+    stats_buffer_ = resources->create_per_frame(string::gpu::buffer_info{
+        .size = sizeof(GpuMeshStats),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+        .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+    }, frames_in_flight_);
 
     // --- Brief 04c (resolution b): GPU meshlet worklist buffers (per frame in flight). Each worklist
     // packs, at 16B-aligned regions: counts[max_draws] (uint), offsets[max_draws] (uint, scratch),
@@ -438,7 +434,7 @@ void GeometryPass::build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_
                     active_draw_count_, base_draw_count_, kCrowdGrid * kCrowdGrid);
 }
 
-void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, int cascade)
+void GeometryPass::record_draw_cull(string::gpu::command_recorder& recorder, uint16_t current_frame, int cascade)
 {
     // Brief 04c DRAW PHASE. cascade < 0: camera — writes the opaque + two-sided per-draw meshlet
     // counts (into wl_opaque/wl_twosided counts@0) + the shared draw_lod. cascade >= 0: that
@@ -484,7 +480,7 @@ void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, 
     cull.draw_lod = shadow
         ? shadow_base + wl_commands_off_   // shadow throwaway -> commands (fill overwrites)
         : draw_lod_address(current_frame);
-    cull.stats = allocator_.get_buffer(stats_buffers_[current_frame]).device_address;
+    cull.stats = resources->address(stats_buffer_, current_frame);
     cull.draw_count = active_draw_count_;
     cull.lod_enabled = lod_enabled_ ? 1u : 0u;
     cull.force_lod0 = 0u;                                       // (dead: brief 04d deleted the LOD0 prepass)
@@ -501,9 +497,9 @@ void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, 
         cull.shadow_center = cascade_center_[cascade];
         cull.shadow_radius = cascade_cull_radius_[cascade];
     }
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
-    vkCmdPushConstants(cb, cp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(DrawCullPush), &cull);
-    vkCmdDispatch(cb, (active_draw_count_ + 63) / 64, 1, 1);
+    recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
+    recorder.push_constants(cp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(DrawCullPush), &cull);
+    recorder.dispatch((active_draw_count_ + 63) / 64, 1, 1);
 
     // Counts + draw_lod must be visible to the expansion compute (storage read).
     const VkMemoryBarrier2 mb = {
@@ -515,10 +511,10 @@ void GeometryPass::record_draw_cull(VkCommandBuffer cb, uint16_t current_frame, 
     };
     const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
         .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-    vkCmdPipelineBarrier2(cb, &dep);
+    recorder.barrier(dep);
 }
 
-void GeometryPass::record_expand(VkCommandBuffer cb, const Worklist& wl, VkDeviceAddress draw_lod)
+void GeometryPass::record_expand(string::gpu::command_recorder& recorder, const Worklist& wl, VkDeviceAddress draw_lod)
 {
     const VkDeviceAddress base = allocator_.get_buffer(wl.buffer).device_address + wl.offset;
     ExpandPush push{};
@@ -543,14 +539,14 @@ void GeometryPass::record_expand(VkCommandBuffer cb, const Worklist& wl, VkDevic
         };
         const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
             .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-        vkCmdPipelineBarrier2(cb, &dep);
+        recorder.barrier(dep);
     };
 
     const auto dispatch = [&](string::gpu::shader_program* prog, uint32_t groups) {
         const string::gpu::pipeline& p = prog->current();
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-        vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ExpandPush), &push);
-        vkCmdDispatch(cb, groups, 1, 1);
+        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+        recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ExpandPush), &push);
+        recorder.dispatch(groups, 1, 1);
     };
 
     dispatch(expand_scan_blocks_program_, push.block_count);   // one workgroup per block
@@ -568,10 +564,10 @@ void GeometryPass::record_expand(VkCommandBuffer cb, const Worklist& wl, VkDevic
     };
     const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
         .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-    vkCmdPipelineBarrier2(cb, &dep);
+    recorder.barrier(dep);
 }
 
-void GeometryPass::record_meshlet_draws(VkCommandBuffer cb, const string::gpu::pipeline& p,
+void GeometryPass::record_meshlet_draws(string::gpu::command_recorder& recorder, const string::gpu::pipeline& p,
                                         uint16_t current_frame, const Worklist& wl, uint32_t phase)
 {
     const glm::mat4 vp = camera_.view_proj();
@@ -588,8 +584,8 @@ void GeometryPass::record_meshlet_draws(VkCommandBuffer cb, const string::gpu::p
     push.mverts = allocator_.get_buffer(meshlet_vertices_).device_address;
     push.mtris = allocator_.get_buffer(meshlet_triangles_).device_address;
     push.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
-    push.scene = allocator_.get_buffer(scene_buffers_[current_frame]).device_address;
-    push.stats = allocator_.get_buffer(stats_buffers_[current_frame]).device_address;
+    push.scene = resources->address(scene_buffer_, current_frame);
+    push.stats = resources->address(stats_buffer_, current_frame);
     push.records = base + wl_records_off_;
     // Frozen-aware eye: cone backface + HiZ nearest-point tests must use the SAME eye the frustum
     // froze from, or freeze-cull mixes live/frozen inputs (visible as bogus culling when flying).
@@ -608,26 +604,26 @@ void GeometryPass::record_meshlet_draws(VkCommandBuffer cb, const string::gpu::p
     push.freeze_bits = mesh_cull_frozen_ ? 1u : 0u;
     const VkBuffer buf = allocator_.get_buffer(wl.buffer).buffer;
 
-    vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletPush), &push);
-    vkCmdDrawMeshTasksIndirectCountEXT(cb, buf, wl.offset + wl_commands_off_, buf, wl.offset + wl_count_off_,
-                                       cull_max_draws_, sizeof(uint32_t) * 3);
+    recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletPush), &push);
+    recorder.draw_mesh_tasks_indirect_count(buf, wl.offset + wl_commands_off_, buf, wl.offset + wl_count_off_,
+                                            cull_max_draws_, sizeof(uint32_t) * 3);
 }
 
-void GeometryPass::record_opaque_phase(VkCommandBuffer command_buffer, uint16_t current_frame, uint32_t phase)
+void GeometryPass::record_opaque_phase(string::gpu::command_recorder& recorder, uint16_t current_frame, uint32_t phase)
 {
     const string::gpu::pipeline& mp = meshlet_program_->current();
     VkDescriptorSet mset = descriptor_table_.get_set();
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mp.pipeline);
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            mp.pipeline_layout, 0, 1, &mset, 0, nullptr);
-    record_meshlet_draws(command_buffer, mp, current_frame, wl_opaque_[current_frame], phase);
+    recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, mp.pipeline);
+    recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  mp.pipeline_layout, 0, 1, &mset, 0, nullptr);
+    record_meshlet_draws(recorder, mp, current_frame, wl_opaque_[current_frame], phase);
     if (meshlet_twosided_program_)
     {
         const string::gpu::pipeline& tp = meshlet_twosided_program_->current();
-        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline);
-        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                tp.pipeline_layout, 0, 1, &mset, 0, nullptr);
-        record_meshlet_draws(command_buffer, tp, current_frame, wl_twosided_[current_frame], phase);
+        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline);
+        recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      tp.pipeline_layout, 0, 1, &mset, 0, nullptr);
+        record_meshlet_draws(recorder, tp, current_frame, wl_twosided_[current_frame], phase);
     }
 }
 

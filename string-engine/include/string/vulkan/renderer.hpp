@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <vector>
 #include <unordered_set>
 #include <string/vulkan/frame.hpp>
@@ -11,12 +12,14 @@
 #include <string/gpu/submission.hpp>
 #include <string/gpu/resource.hpp>
 #include <string/gpu/resource_allocator.hpp>
+#include <string/gpu/resource_registry.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/vulkan/resource_state.hpp>
 #include <string/vulkan/frame_scratch.hpp>
 #include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/render_plan.hpp>
-#include <string/vulkan/pass_context.hpp>
+#include <string/vulkan/frame_graph.hpp>
+#include <string/vulkan/engine_context.hpp>
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/vulkan/passes/composite_pass.hpp>
 #include <string/vulkan/gpu_profiler.hpp>
@@ -49,7 +52,7 @@ class Renderer
     static constexpr uint32_t frames_in_flight_ = 3;
     ApplicationInfo application_info_;
     std::shared_ptr<Window> window_;
-    // Remappable action layer over the window's polled Input, handed to passes via PassContext.
+    // Remappable action layer over the window's polled Input, handed to passes via engine_context.
     // Declared right after window_ so its default initializer sees an initialized window_.
     InputMap input_map_{ window_->get_input() };
     string::gpu::driver driver_;
@@ -75,6 +78,11 @@ class Renderer
     // borrows, so its constructor sees them initialized.
     TransferBatch transfer_batch_;
     string::gpu::descriptor_table global_descriptor_table_;
+    // Brief 16 Layer 1: the resource-virtualization hub (logical image/buffer -> physical). M0 wraps
+    // the allocator + descriptor_table and holds the renderer's stable render targets as `Imported`
+    // handles; image_of/view_of resolve the two stable sentinels through it. Declared after the
+    // allocator + descriptor_table it borrows.
+    string::gpu::ResourceRegistry resources_;
     // Shader hot-reload plumbing (brief 01). shader_jobs_ is a small pool for off-thread mtime
     // scans + Slang recompiles; the watcher polls it each frame; the compiler is the in-process
     // Slang session (SPIR-V + reflection with a content-hash disk cache); the registry owns every
@@ -86,9 +94,9 @@ class Renderer
     string::gpu::shader_program_registry shader_registry_;
     // Derives the frame's image-layout barriers from tracked state (see begin/end_rendering).
     ResourceStateTracker resource_states_;
-    // Brief 04e M3: per-frame-slot transient scratch arena (passes reserve during construction,
-    // materialized after plan.build). Also the transient-aliasing arena — see frame_scratch.hpp.
-    FrameScratch frame_scratch_;
+    // Brief 16 M5: the per-frame-slot transient scratch arena is OWNED by the ResourceRegistry now
+    // (the transient authority) — reach it via resources_.transients(). Passes reserve during
+    // construction; the renderer materializes it after plan.build (resources_.materialize_transients).
     CompositePass composite_pass_;
     // Ordered passes that draw into the offscreen HDR target (color_attachment_), recorded
     // between begin_rendering() and end_rendering(). composite_pass_ is the fixed resolve
@@ -101,6 +109,21 @@ class Renderer
     // re-transitioned.
     std::vector<Pass*> frame_passes_;
     std::unordered_set<string::gpu::resource_id> written_resources_;
+    // Brief 11 step 1: the persistent frame plan. frame_passes_ are authored into a FrameGraph and
+    // compiled ONCE; record_frame re-records cheaply from the cached toposort each frame instead of
+    // rebuilding the graph. Recompiled only on invalidation — a per-pass enable/disable flip (the
+    // enabled-signature changes) or a resize (defensive; ids are stable so the order is too). The
+    // executor drives each pass through CompiledPass::source; barriers still derive from live
+    // pass->usages, so per-frame-slot buffer variation needs no recompile.
+    // Brief 11 endgame: the app's fluent graph author (declares each pass's I/O + flags + callbacks),
+    // re-run on every recompile; the persistent FrameGraph it authors into; the compiled output the
+    // executor drives (PassExec callbacks, not Pass*).
+    std::function<void(FrameGraph&)> scene_author_;
+    FrameGraph frame_graph_;
+    CompiledFrame compiled_frame_;
+    bool graph_dirty_ = true;              // force a recompile (first frame, resize)
+    uint64_t enabled_signature_ = 0;       // hash of frame_passes_ enabled-states; change -> recompile
+    void rebuild_execution_plan();         // author frame_passes_ -> FrameGraph -> compile -> cache
     // Frame pacing timeline = the main lane's timeline semaphore (submissions_ owns it). Cached
     // here because every begin/end_frame touches it.
     VkSemaphore frame_semaphore_ = VK_NULL_HANDLE;
@@ -126,7 +149,7 @@ class Renderer
 
     // Tracy GPU profiling contexts, ONE PER SUBMISSION LANE (brief 04e M1: multi-queue overlap
     // must be visible in traces), indexed like submissions_' lanes and named after them.
-    // gpu_profiler_ctx_ aliases the main lane's context (the one passes receive via PassContext).
+    // gpu_profiler_ctx_ aliases the main lane's context (the one passes receive via engine_context).
     // Null / no-op when -Dtracy is off. Created after the lane recorders are up (each context
     // needs a probe command buffer on ITS queue) and destroyed in the dtor.
     std::vector<STRING_PROFILE_GPU_CONTEXT_TYPE> lane_profiler_ctxs_;
@@ -151,6 +174,22 @@ public:
     // Read-only handle to the per-pass GPU timing so a HUD/tooling layer can render it.
     const GpuProfiler& gpu_timing() const { return gpu_timing_; }
 
+    // Brief 11 M4 — introspection (the read seam brief 14's render-debug panel consumes). Engine-side,
+    // generic, pure reads over the persistent plan. Pass timing pairs by name via gpu_timing().stats().
+    // Enumerate every AUTHORED pass (incl. currently-toggled-off ones) with metadata + live enabled.
+    std::vector<PassInfo> passes() const { return frame_graph_.passes(); }
+    // A resource the compiled plan touches, with its topo lifetime span. `is_image` is best-effort
+    // (render-target sentinels + registry image handles); the target visualizer filters on it.
+    struct ResourceInfo
+    {
+        string::gpu::resource_id id = 0;
+        bool is_image = false;
+        std::optional<uint32_t> first_pass;    // first toposorted pass index that touches it
+        std::optional<uint32_t> last_pass;
+        std::optional<uint32_t> first_writer;  // first pass that WRITES it (nullopt = external input)
+    };
+    std::vector<ResourceInfo> resources() const;
+
     void update();
 
     void begin_frame();
@@ -165,15 +204,36 @@ private:
     string::gpu::resource_id msaa_color_;         // multisampled scene color target
     string::gpu::resource_id msaa_depth_;         // multisampled scene depth target
 
+    // Brief 16 M0: the two STABLE render targets, held as `Imported` logical handles. COLOR_TARGET
+    // resolves through color_target_ (-> color_attachment_), DEPTH_TARGET through depth_target_
+    // (-> msaa_depth_). Re-pointed in handle_resize when the physical ids change. The swapchain stays
+    // a special late-latched case through M0 (see acquire_swapchain / image_of).
+    string::gpu::image color_target_;
+    string::gpu::image depth_target_;
+
     // Records the whole frame's render work: groups frame_passes_ into render-pass instances by
     // their color target, derives every image barrier from the passes' declared usages (via
     // resource_states_), and transitions the swapchain to present. Replaces the old
     // begin_rendering/end_rendering scaffold.
     void record_frame();
+    // Brief 16 M4 (framework-opens): open a group's dynamic-rendering instance. The framework (not the
+    // passes) DERIVES every attachment's load/store/resolve from the group's lifetime facts — first
+    // writer clears (else loads), last-before-resolve resolves (else stores), a declared depth-resolve
+    // target min-resolves — then records vkCmdBeginRendering + viewport/scissor. Centralizes the MSAA
+    // clear/load/store/resolve chain that step 2 left inline in record_frame's group loop. Barriers are
+    // derived separately (in the group loop) BEFORE this call; this only opens the render pass.
+    void open_group_rendering(VkCommandBuffer command_buffer, string::gpu::resource_id group_color,
+        const std::optional<string::gpu::resource_id>& group_depth, string::gpu::resource_id depth_resolve,
+        bool msaa_group, bool msaa_is_first, bool msaa_is_last, VkExtent2D extent,
+        const VkViewport& viewport, const VkRect2D& scissor);
     // The VkImage / VkImageView backing a target string::gpu::resource_id; string::gpu::SWAPCHAIN_TARGET resolves to the
     // frame's acquired swapchain image.
     VkImage image_of(string::gpu::resource_id target) const;
     VkImageView image_view_of(string::gpu::resource_id target) const;
+    // Brief 11 step 2b: aspect + mip count for a graph resource (resolving the sentinels image_of
+    // maps), so the tracker transitions the correct aspect (depth vs color) and every mip of a chain
+    // like the HiZ pyramid — not just mip 0 (ImageTransition defaults to a single level).
+    std::pair<VkImageAspectFlags, uint32_t> image_meta(string::gpu::resource_id target) const;
 
     void handle_resize(const String::View::Extent& extent);
 

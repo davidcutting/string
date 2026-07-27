@@ -6,7 +6,7 @@ namespace sandbox
 {
 using namespace String;
 
-Grid2DPass::Grid2DPass(PassContext& context)
+Grid2DPass::Grid2DPass(engine_context& context)
 : device_(context.device)
 {
     grid_2d_push_constant_range_ = {
@@ -49,7 +49,6 @@ Grid2DPass::~Grid2DPass()
 void Grid2DPass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     (void)current_frame;
-    VkCommandBuffer& command_buffer = recorder.get_command_buffer();
 
     Grid2DParams params = {
         .background_color = {0.0f, 0.0f, 0.0f, 0.0f},
@@ -68,16 +67,15 @@ void Grid2DPass::record(string::gpu::command_recorder& recorder, uint16_t curren
         .show_axes = 1.0f
     };
 
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.pipeline);
-    vkCmdPushConstants(
-        command_buffer,
+    recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.pipeline);
+    recorder.push_constants(
         pipeline_.pipeline_layout,
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         0,
         sizeof(params),
         &params
     );
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    recorder.draw(3, 1, 0, 0);
 }
 
 }

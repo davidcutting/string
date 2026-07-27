@@ -9,7 +9,7 @@ using namespace String;
 namespace
 {
 // A no-op body; these tests exercise compile()'s ordering/enable/fallback logic, not recording.
-RecordFn nop() { return [](string::gpu::command_recorder&, std::uint16_t) {}; }
+RecordFn nop() { return [](string::gpu::pass_context&) {}; }
 
 bool has(const std::vector<string::gpu::resource_id>& v, string::gpu::resource_id r)
 {
@@ -25,16 +25,16 @@ const CompiledPass* find_pass(const CompiledFrame& f, std::string_view name)
 }  // namespace
 
 // All passes enabled: the fluent layer lowers to the same stable topo order the planner produces
-// for the classic depth -> cull -> shade chain (parity with render_graph_test's expectation).
+// for the classic depth -> cull -> shade chain (parity with graph_plan_test's expectation).
 TEST(FrameGraphTest, AllEnabledLowersToStableOrder)
 {
     FrameGraph fg;
-    ImageHandle depth = fg.image("depth");
-    BufferHandle grid = fg.buffer("lightgrid");
-    ImageHandle color = fg.image("color");
+    auto depth = fg.image("depth");
+    auto grid = fg.buffer("lightgrid");
+    auto color = fg.image("color");
 
     fg.pass("depth").depth(depth).raster(nop());
-    fg.pass("cull").read(depth.id, Access::DepthRead, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+    fg.pass("cull").read(depth, Access::DepthRead, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
                    .writes(grid).compute(nop());
     fg.pass("shade").reads(grid).color(color).raster(nop());
 
@@ -51,9 +51,40 @@ TEST(FrameGraphTest, AllEnabledLowersToStableOrder)
 TEST(FrameGraphTest, NoToggleMeansAlwaysEnabled)
 {
     FrameGraph fg;
-    ImageHandle color = fg.image("color");
+    auto color = fg.image("color");
     fg.pass("only").color(color).raster(nop());
     EXPECT_EQ(fg.compile().passes.size(), 1u);
+}
+
+// Brief 11 M4 introspection (read seam for brief 14): passes() enumerates EVERY authored pass with
+// its metadata + LIVE enabled state, in authoring order — including a currently-toggled-off pass,
+// which compile() drops but a debug pass panel must still list (to show its off checkbox).
+TEST(FrameGraphTest, IntrospectionListsAuthoredPassesIncludingDisabled)
+{
+    FrameGraph fg;
+    auto color = fg.image("color");
+    bool shadows_on = true;
+    fg.pass("shadow").computeOnly().toggle([&] { return shadows_on; }).compute(nop());
+    fg.pass("main").color(color).raster(nop());
+
+    auto ps = fg.passes();
+    ASSERT_EQ(ps.size(), 2u);
+    EXPECT_EQ(ps[0].name, "shadow");
+    EXPECT_EQ(ps[0].kind, PassKind::Compute);
+    EXPECT_TRUE(ps[0].compute_only);
+    EXPECT_TRUE(ps[0].enabled);
+    EXPECT_EQ(ps[1].name, "main");
+    EXPECT_EQ(ps[1].kind, PassKind::Raster);
+    EXPECT_FALSE(ps[1].compute_only);
+    EXPECT_TRUE(ps[1].enabled);
+
+    // Toggle the producer off: introspection still SEES it (marked disabled) while compile() drops it.
+    shadows_on = false;
+    auto off = fg.passes();
+    ASSERT_EQ(off.size(), 2u);         // still enumerated
+    EXPECT_FALSE(off[0].enabled);      // ...but reported disabled
+    EXPECT_TRUE(off[1].enabled);
+    EXPECT_EQ(fg.compile().passes.size(), 1u);   // the compiled plan drops the disabled producer
 }
 
 // Disabling a PRODUCER does not skip its OPTIONAL consumer: the consumer survives and the read is
@@ -63,13 +94,13 @@ TEST(FrameGraphTest, DisabledProducerGivesOptionalConsumerAFallback)
 {
     bool cull_enabled = false;
     FrameGraph fg;
-    ImageHandle depth = fg.image("depth");
-    BufferHandle grid = fg.buffer("lightgrid");
-    ImageHandle color = fg.image("color");
+    auto depth = fg.image("depth");
+    auto grid = fg.buffer("lightgrid");
+    auto color = fg.image("color");
 
     fg.pass("depth").depth(depth).raster(nop());
     fg.pass("cull").toggle(&cull_enabled)
-                   .read(depth.id, Access::DepthRead, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+                   .read(depth, Access::DepthRead, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
                    .writes(grid).compute(nop());
     fg.pass("shade").reads(grid).color(color).raster(nop());  // optional read of grid
 
@@ -78,10 +109,10 @@ TEST(FrameGraphTest, DisabledProducerGivesOptionalConsumerAFallback)
     EXPECT_FALSE(find_pass(f, "cull"));
     const CompiledPass* shade = find_pass(f, "shade");
     ASSERT_TRUE(shade);
-    EXPECT_TRUE(has(shade->fallback_reads, grid.id));   // grid falls back to neutral
+    EXPECT_TRUE(has(shade->fallback_reads, grid));   // grid falls back to neutral
     // The fallback read must NOT appear as a real usage (no ordering edge against an unproduced
     // resource).
-    for (const auto& u : shade->usages) EXPECT_NE(u.resource, grid.id);
+    for (const auto& u : shade->usages) EXPECT_NE(u.resource, grid);
 }
 
 // A .requires() read of a disabled producer transitively skips the consumer too (no sensible
@@ -90,8 +121,8 @@ TEST(FrameGraphTest, RequiredReadOfDisabledProducerCascades)
 {
     bool cull_enabled = false;
     FrameGraph fg;
-    BufferHandle grid = fg.buffer("lightgrid");
-    ImageHandle color = fg.image("color");
+    auto grid = fg.buffer("lightgrid");
+    auto color = fg.image("color");
 
     fg.pass("cull").toggle(&cull_enabled).writes(grid).compute(nop());
     fg.pass("shade").requires_(grid).color(color).raster(nop());  // grid is essential
@@ -105,9 +136,9 @@ TEST(FrameGraphTest, RequiredCascadeIsTransitive)
 {
     bool a_enabled = false;
     FrameGraph fg;
-    BufferHandle ra = fg.buffer("a_out");
-    BufferHandle rb = fg.buffer("b_out");
-    ImageHandle color = fg.image("color");
+    auto ra = fg.buffer("a_out");
+    auto rb = fg.buffer("b_out");
+    auto color = fg.image("color");
 
     fg.pass("A").toggle(&a_enabled).writes(ra).compute(nop());
     fg.pass("B").requires_(ra).writes(rb).compute(nop());
@@ -121,8 +152,8 @@ TEST(FrameGraphTest, RequiredCascadeIsTransitive)
 TEST(FrameGraphTest, ExternalInputIsNeverAFallback)
 {
     FrameGraph fg;
-    BufferHandle external = fg.import_buffer(4242);   // nothing writes this
-    ImageHandle color = fg.image("color");
+    auto external = fg.import_buffer(4242);   // nothing writes this
+    auto color = fg.image("color");
 
     fg.pass("shade").reads(external).color(color).raster(nop());
 
@@ -131,7 +162,7 @@ TEST(FrameGraphTest, ExternalInputIsNeverAFallback)
     EXPECT_TRUE(f.passes[0].fallback_reads.empty());
     // external input still appears as a real usage.
     bool seen = false;
-    for (const auto& u : f.passes[0].usages) seen |= (u.resource == external.id);
+    for (const auto& u : f.passes[0].usages) seen |= (u.resource == external);
     EXPECT_TRUE(seen);
 }
 
@@ -141,8 +172,8 @@ TEST(FrameGraphTest, ReenablingProducerRestoresConsumerEdge)
 {
     bool cull_enabled = false;
     FrameGraph fg;
-    BufferHandle grid = fg.buffer("lightgrid");
-    ImageHandle color = fg.image("color");
+    auto grid = fg.buffer("lightgrid");
+    auto color = fg.image("color");
     fg.pass("cull").toggle(&cull_enabled).writes(grid).compute(nop());
     fg.pass("shade").reads(grid).color(color).raster(nop());
 

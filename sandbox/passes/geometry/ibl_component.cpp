@@ -18,7 +18,7 @@
 namespace sandbox
 {
 
-void IblComponent::init(String::PassContext& context)
+void IblComponent::init(String::engine_context& context)
 {
     device_ = &context.device;
     allocator_ = &context.allocator;
@@ -160,17 +160,18 @@ void IblComponent::begin_frame(const glm::vec3& sun_dir, bool furnace, bool forc
 // chain): everything is produced and consumed by this pass; the SH buffer's fragment-read edge is
 // graph-declared (usages) and the final memory barrier makes the image writes visible to the
 // fragment stage.
-void IblComponent::record_update(VkCommandBuffer cb, const IblLighting& light)
+void IblComponent::record_update(string::gpu::command_recorder& recorder, const IblLighting& light)
 {
+    VkCommandBuffer cb = recorder.vk();   // escape for the vku::transition_image calls in the mip/copy tail
     VkDescriptorSet set = table_->get_set();
     const auto dispatch = [&](string::gpu::shader_program* prog, const IblPush& push,
                               uint32_t gx, uint32_t gy, uint32_t gz) {
         const string::gpu::pipeline& p = prog->current();
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
-                                0, 1, &set, 0, nullptr);
-        vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(IblPush), &push);
-        vkCmdDispatch(cb, gx, gy, gz);
+        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+        recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
+                                      0, 1, &set, 0, nullptr);
+        recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(IblPush), &push);
+        recorder.dispatch(gx, gy, gz);
     };
     const auto compute_barrier = [&](VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
         const VkMemoryBarrier2 mb = {
@@ -182,7 +183,7 @@ void IblComponent::record_update(VkCommandBuffer cb, const IblLighting& light)
         };
         const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
             .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-        vkCmdPipelineBarrier2(cb, &dep);
+        recorder.barrier(dep);
     };
 
     IblPush push{};

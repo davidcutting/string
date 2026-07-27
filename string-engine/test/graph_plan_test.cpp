@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <string/vulkan/render_graph.hpp>
+#include <string/vulkan/graph_plan.hpp>
 
 using namespace String;
 
@@ -15,7 +15,7 @@ constexpr string::gpu::resource_id kGrid = 3;
 // renderer's byte-parity gates rely on stable scheduling (brief 04e M2).
 TEST(RenderGraphTest, StableToposortPreservesAuthoredOrder)
 {
-    RenderGraph graph = GraphBuilder()
+    GraphPlan graph = PlanBuilder()
         .add_pass("depth")
             .use(kDepth, Access::DepthWrite, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT)
             .end_pass()
@@ -36,7 +36,7 @@ TEST(RenderGraphTest, StableToposortPreservesAuthoredOrder)
 // Independent passes keep declaration order (smallest-index-first tie break).
 TEST(RenderGraphTest, IndependentPassesKeepDeclarationOrder)
 {
-    RenderGraph graph = GraphBuilder()
+    GraphPlan graph = PlanBuilder()
         .add_pass("a").use(kDepth, Access::DepthWrite, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT).end_pass()
         .add_pass("b").use(kColor, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT).end_pass()
         .add_pass("c").use(kGrid, Access::StorageWrite, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT).end_pass()
@@ -50,7 +50,7 @@ TEST(RenderGraphTest, IndependentPassesKeepDeclarationOrder)
 // still reads must be ordered, not accidental).
 TEST(RenderGraphTest, WarEdgeOrdersReaderBeforeLaterWriter)
 {
-    RenderGraph graph = GraphBuilder()
+    GraphPlan graph = PlanBuilder()
         .add_pass("writer1").use(kColor, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT).end_pass()
         .add_pass("reader").use(kColor, Access::SampledRead, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT).end_pass()
         .add_pass("writer2").use(kColor, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT).end_pass()
@@ -66,7 +66,7 @@ TEST(RenderGraphTest, WarEdgeOrdersReaderBeforeLaterWriter)
 // compute stage AND its draw stages) is a single writer — it must not forge a self-edge/"cycle".
 TEST(RenderGraphTest, MultipleWritesFromOnePassAreNotACycle)
 {
-    RenderGraph graph = GraphBuilder()
+    GraphPlan graph = PlanBuilder()
         .add_pass("geometry")
             .use(kGrid, Access::StorageWrite, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
             .use(kGrid, Access::StorageWrite, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT)
@@ -81,7 +81,7 @@ TEST(RenderGraphTest, MultipleWritesFromOnePassAreNotACycle)
 
 TEST(RenderGraphTest, LifetimesSpanFirstToLastUse)
 {
-    RenderGraph graph = GraphBuilder()
+    GraphPlan graph = PlanBuilder()
         .add_pass("depth").use(kDepth, Access::DepthWrite, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT).end_pass()
         .add_pass("mid").use(kColor, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT).end_pass()
         .add_pass("late").use(kDepth, Access::DepthRead, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT).end_pass()

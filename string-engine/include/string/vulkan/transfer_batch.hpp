@@ -28,7 +28,7 @@ namespace String
 // Uploads run on the graphics queue: the image TRANSFER_DST -> SHADER_READ barrier uses a
 // FRAGMENT_SHADER destination stage (graphics-only), and sharing the queue family with the
 // later sampling avoids a queue-ownership transfer. Passes record their uploads during
-// construction (via PassContext); the renderer drains once with wait_idle() before the first
+// construction (via engine_context); the renderer drains once with wait_idle() before the first
 // frame.
 class TransferBatch
 {

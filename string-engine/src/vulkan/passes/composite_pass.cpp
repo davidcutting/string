@@ -458,19 +458,17 @@ void CompositePass::update(float delta_time, uint16_t current_frame)
 void CompositePass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     (void)current_frame;
-    VkCommandBuffer command_buffer = recorder.get_command_buffer();
     const string::gpu::pipeline& p = program_->current();
 
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+    recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+    recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
         p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
     // { source_slot, exposure, lut_slot, lut_size } — exposure scales the HDR into the LUT's
     // shaper domain; the LUT applies grading + the output transform (see composite.slang).
     struct { uint32_t source_slot; float exposure; uint32_t lut_slot; uint32_t lut_size; }
         push{ source_slot_, exposure_scale(), lut_slot_, lut_size_ };
-    vkCmdPushConstants(command_buffer, p.pipeline_layout,
-        p.push_constants.stageFlags, 0, sizeof(push), &push);
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    recorder.push_constants(p.pipeline_layout, p.push_constants.stageFlags, 0, sizeof(push), &push);
+    recorder.draw(3, 1, 0, 0);
 }
 
 }  // namespace String

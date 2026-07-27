@@ -111,7 +111,7 @@ void GeometryPass::fit_probe_volume()
                     irrad_w, irrad_h, vis_w, vis_h, mb);
 }
 
-void GeometryPass::create_probe_resources(PassContext& context)
+void GeometryPass::create_probe_resources(engine_context& context)
 {
     fit_probe_volume();
     if (!probe_volume_.valid) return;
@@ -384,11 +384,12 @@ static_assert(offsetof(ProbeCapturePush, offset) == 96);
 // linear distance) then collapse it into that probe's octahedral capture + visibility atlases, and
 // classify it (inside-geometry probes -> INACTIVE). probe_captured_ latches once the cursor wraps;
 // the atlases are STATIC thereafter (only relight re-runs).
-void GeometryPass::record_probe_capture(VkCommandBuffer cb)
+void GeometryPass::record_probe_capture(string::gpu::command_recorder& recorder)
 {
     if (!probe_volume_.valid || probe_clear_program_ == nullptr || probe_capture_raster_program_ == nullptr
         || probe_collapse_program_ == nullptr || draw_info_mapped_ == nullptr)
         return;
+    VkCommandBuffer cb = recorder.vk();   // probe capture is raster+compute+barrier raw Vulkan (vk() escape)
     VkDescriptorSet set = descriptor_table_.get_set();
     const uint32_t total = probe_volume_.total();
     const float far_distance = glm::length(scene_aabb_max_ - scene_aabb_min_);
@@ -647,11 +648,12 @@ void GeometryPass::record_probe_capture(VkCommandBuffer cb)
 // kRelightConvergePasses full passes (each pass propagates the bounce one step; the hysteresis EMA
 // settles to h^N), then relight goes idle (~0 static cost). Under TOD animation the trigger re-arms
 // every frame, so the volume tracks the sun continuously.
-void GeometryPass::record_probe_relight(VkCommandBuffer cb, uint16_t current_frame)
+void GeometryPass::record_probe_relight(string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
-    if (!probe_volume_.valid || probe_relight_program_ == nullptr || ibl_.sh_buffer() == 0
-        || current_frame >= scene_buffers_.size() || scene_buffers_[current_frame] == 0)
+    if (!probe_volume_.valid || probe_relight_program_ == nullptr || ibl->sh_buffer() == 0
+        || !scene_buffer_.valid() || current_frame >= frames_in_flight_)
         return;
+    VkCommandBuffer cb = recorder.vk();   // probe relight = compute + barriers raw Vulkan (vk() escape)
     VkDescriptorSet set = descriptor_table_.get_set();
 
     // RAW: relight reads the sky-SH buffer at COMPUTE. The IBL chain (recorded just before, same CB)
@@ -706,10 +708,10 @@ void GeometryPass::record_probe_relight(VkCommandBuffer cb, uint16_t current_fra
     push.first_frame = probe_primed_ ? 0u : 1u;
     push.probe_base = base;
     push.probe_count = count;
-    push.sh = ibl_.sh_address();
+    push.sh = ibl->sh_address();
     push.active = allocator_.get_buffer(probe_active_).device_address;
     push.offsets = allocator_.get_buffer(probe_offset_).device_address;
-    push.scene = allocator_.get_buffer(scene_buffers_[current_frame]).device_address;
+    push.scene = resources->address(scene_buffer_, current_frame);
 
     const string::gpu::pipeline& p = probe_relight_program_->current();
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
@@ -749,9 +751,10 @@ void GeometryPass::record_probe_relight(VkCommandBuffer cb, uint16_t current_fra
 
 // Instanced probe-debug spheres, drawn into the (already-open) scene MSAA render pass after opaque
 // geometry (depth-tested). One instance per probe; the sphere is procedural (no vertex buffer).
-void GeometryPass::record_probe_debug(VkCommandBuffer cb)
+void GeometryPass::record_probe_debug(string::gpu::command_recorder& recorder)
 {
     if (!probe_volume_.valid || probe_debug_program_ == nullptr || probe_debug_mode_ == 0) return;
+    VkCommandBuffer cb = recorder.vk();   // instanced probe-debug raster raw Vulkan (vk() escape)
     VkDescriptorSet set = descriptor_table_.get_set();
     const string::gpu::pipeline& p = probe_debug_program_->current();
 

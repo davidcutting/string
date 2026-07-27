@@ -235,7 +235,7 @@ void UIPass::make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight,
     }
 }
 
-UIPass::UIPass(PassContext& context, std::shared_ptr<string::dynamic_font_atlas> atlas, Author author)
+UIPass::UIPass(engine_context& context, std::shared_ptr<string::dynamic_font_atlas> atlas, Author author)
 : device_(context.device)
 , allocator_(context.allocator)
 , descriptor_table_(context.descriptor_table)
@@ -603,7 +603,7 @@ bool UIPass::record_compute(string::gpu::command_recorder& recorder, uint16_t cu
     const string::gpu::allocated_buffer& staging = allocator_.get_buffer(atlas_staging_[current_frame]);
     std::memcpy(staging.allocation_info.pMappedData, atlas_->pixels(), atlas_upload_bytes_);
 
-    VkCommandBuffer cb = recorder.get_command_buffer();
+    VkCommandBuffer cb = recorder.vk();   // escape: vku::transition_image below takes a raw cb
     const VkImage image = allocator_.get_image(atlas_image_).image;
 
     // SHADER_READ (or UNDEFINED, but we uploaded the seed) -> TRANSFER_DST.
@@ -625,7 +625,7 @@ bool UIPass::record_compute(string::gpu::command_recorder& recorder, uint16_t cu
         .imageOffset = { 0, 0, 0 },
         .imageExtent = { atlas_->atlas_w(), atlas_->atlas_h(), 1 },
     };
-    vkCmdCopyBufferToImage(cb, staging.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    recorder.copy_buffer_to_image(staging.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     // TRANSFER_DST -> SHADER_READ for the color pass's text draw.
     String::vku::transition_image(cb, {
@@ -646,8 +646,6 @@ void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_fr
     {
         return;
     }
-    VkCommandBuffer command_buffer = recorder.get_command_buffer();
-
     // Feel instrumentation (M5): a click authored this frame is recorded this frame (immediate mode),
     // so this is the CPU-side click->visible-response latency. GPU present adds ~1 frame on top.
     if (click_pending_)
@@ -675,27 +673,27 @@ void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_fr
 
     const auto draw_shapes = [&](std::uint32_t first, std::uint32_t count) {
         if (count == 0) return;
-        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shape_p.pipeline);
-        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, shape_p.pipeline);
+        recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
             shape_p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
         const ShapePush push{
             { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
             sr.slot, first, inv_exposure };
-        vkCmdPushConstants(command_buffer, shape_p.pipeline_layout, shape_p.push_constants.stageFlags,
+        recorder.push_constants(shape_p.pipeline_layout, shape_p.push_constants.stageFlags,
             0, sizeof(ShapePush), &push);
-        vkCmdDraw(command_buffer, 6, count, 0, 0);
+        recorder.draw(6, count, 0, 0);
     };
     const auto draw_text = [&](std::uint32_t first, std::uint32_t count) {
         if (count == 0) return;
-        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, text_p.pipeline);
-        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, text_p.pipeline);
+        recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
             text_p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
         const TextPush push{
             { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
             gr.slot, atlas_slot_, first, inv_exposure };
-        vkCmdPushConstants(command_buffer, text_p.pipeline_layout,
+        recorder.push_constants(text_p.pipeline_layout,
             text_p.push_constants.stageFlags, 0, sizeof(TextPush), &push);
-        vkCmdDraw(command_buffer, 6, count, 0, 0);
+        recorder.draw(6, count, 0, 0);
     };
 
     draw_shapes(0, sr.split);

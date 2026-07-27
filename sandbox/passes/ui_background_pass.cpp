@@ -8,7 +8,7 @@ namespace sandbox
 {
 using namespace String;
 
-UIBackgroundPass::UIBackgroundPass(PassContext& context, std::shared_ptr<UiScene> scene,
+UIBackgroundPass::UIBackgroundPass(engine_context& context, std::shared_ptr<UiScene> scene,
                                    std::uint32_t anchor_count)
 : device_(context.device)
 , scene_(std::move(scene))
@@ -67,15 +67,13 @@ void UIBackgroundPass::update(float delta_time, uint16_t /*current_frame*/)
 
 void UIBackgroundPass::record(string::gpu::command_recorder& recorder, uint16_t /*current_frame*/)
 {
-    VkCommandBuffer command_buffer = recorder.get_command_buffer();
     const string::gpu::pipeline& p = program_->current();
 
     const Push push{
         { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) }, time_, 0.0f };
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
-    vkCmdPushConstants(command_buffer, p.pipeline_layout, p.push_constants.stageFlags,
-                       0, sizeof(Push), &push);
-    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+    recorder.push_constants(p.pipeline_layout, p.push_constants.stageFlags, 0, sizeof(Push), &push);
+    recorder.draw(3, 1, 0, 0);
 }
 
 }  // namespace sandbox

@@ -1,4 +1,4 @@
-#include <string/vulkan/render_graph.hpp>
+#include <string/vulkan/graph_plan.hpp>
 
 #include <algorithm>
 #include <queue>
@@ -10,11 +10,11 @@ namespace String
 {
 
 // Brief 04e M2: the planner implementation moved from the (unbuilt) example into the library —
-// the renderer now builds a RenderGraph from the frame passes' declared usages every frame and
+// the renderer now builds a GraphPlan from the frame passes' declared usages every frame and
 // executes in its toposorted order, so declared dependencies are the single source of truth for
 // scheduling (and, via the tracker, barriers).
 
-PassBuilder::PassBuilder(GraphBuilder& graph_builder, const std::string& name)
+PassBuilder::PassBuilder(PlanBuilder& graph_builder, const std::string& name)
 : parent_(graph_builder)
 , building_(name)
 {
@@ -27,25 +27,25 @@ auto PassBuilder::use(string::gpu::resource_id resource, Access access, VkPipeli
     return *this;
 }
 
-auto PassBuilder::end_pass() -> GraphBuilder&
+auto PassBuilder::end_pass() -> PlanBuilder&
 {
     parent_.finish_pass(std::move(building_));
     return parent_;
 }
 
-auto GraphBuilder::add_pass(const std::string& name) -> PassBuilder
+auto PlanBuilder::add_pass(const std::string& name) -> PassBuilder
 {
     return PassBuilder(*this, name);
 }
 
-void GraphBuilder::finish_pass(PassNode&& pass)
+void PlanBuilder::finish_pass(PassNode&& pass)
 {
     passes_.push_back(std::move(pass));
 }
 
-auto GraphBuilder::build() -> RenderGraph
+auto PlanBuilder::build() -> GraphPlan
 {
-    RenderGraph graph;
+    GraphPlan graph;
     graph.passes = std::move(passes_);
     const uint32_t num_passes = static_cast<uint32_t>(graph.passes.size());
     graph.adjacency.assign(num_passes, {});

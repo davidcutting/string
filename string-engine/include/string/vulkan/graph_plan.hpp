@@ -12,7 +12,7 @@
 namespace String
 {
 
-class GraphBuilder;
+class PlanBuilder;
 
 struct ResourceLifetime
 {
@@ -30,7 +30,7 @@ struct PassNode
     std::vector<ResourceUsage> usages;
 };
 
-struct RenderGraph
+struct GraphPlan
 {
     std::vector<PassNode> passes;
     std::vector<std::vector<uint32_t>> adjacency;
@@ -40,24 +40,24 @@ struct RenderGraph
 
 class PassBuilder
 {
-    GraphBuilder& parent_;
+    PlanBuilder& parent_;
     PassNode building_;
 public:
-    explicit PassBuilder(GraphBuilder& graph_builder, const std::string& name);
+    explicit PassBuilder(PlanBuilder& graph_builder, const std::string& name);
 
     // Declare a resource use. Read vs write is derived from the Access (is_write).
     auto use(string::gpu::resource_id resource, Access access, VkPipelineStageFlags2 stage) -> PassBuilder&;
 
-    auto end_pass() -> GraphBuilder&;
+    auto end_pass() -> PlanBuilder&;
 };
 
-class GraphBuilder
+class PlanBuilder
 {
     std::vector<PassNode> passes_;
 public:
     auto add_pass(const std::string& name) -> PassBuilder;
 
-    auto build() -> RenderGraph;
+    auto build() -> GraphPlan;
 private:
     friend PassBuilder;
     void finish_pass(PassNode&& pass);

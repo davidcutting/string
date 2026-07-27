@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <string/gpu/resource.hpp>
+#include <string/gpu/resource_registry.hpp>
 #include <string/scene/camera.hpp>
 #include <string/vulkan/frame_scratch.hpp>
 
@@ -19,6 +20,9 @@
 
 namespace sandbox
 {
+
+class FroxelComponent;   // owned by FroxelPass (brief 11 step 3); GeometryScene holds a non-owning ptr.
+class IblComponent;      // owned by IblPass (brief 11 step 3); GeometryScene holds a non-owning ptr.
 
 // CVar-able lighting/shadow/froxel quality constants, grouped so a future CVar system binds them in
 // one place (per the brief's "as CVars" intent).
@@ -98,25 +102,37 @@ struct GeometryScene
     bool lookdev_ = false;                   // material-probe scene (STRING_SCENE=lookdev)
 
     // --- Forward+ lighting: per-frame SceneData ring + local lights ------------------------------
+    // Brief 16 M1: the resource-virtualization hub (set from engine_context in the GeometryPass ctor).
+    // The per-frame SceneData ring + (M3) the light/stats rings are registry-owned handles resolved
+    // through this per frame, replacing the hand-managed [frame] vectors of resource_ids.
+    string::gpu::ResourceRegistry* resources = nullptr;
     // Per-frame SceneData SSBO (device-addressed, persistent-mapped ring): all the lighting/shadow/
-    // froxel state the lit shader reads that overflows the push constant.
-    std::vector<string::gpu::resource_id> scene_buffers_;
-    std::vector<void*> scene_mapped_;
+    // froxel state the lit shader reads that overflows the push constant. Now a PerFrame registry
+    // buffer — resolve the address/mapped pointer via resources->{address,mapped}(scene_buffer_, slot).
+    string::gpu::buffer scene_buffer_;
     // Dynamic local lights (point + spot). Uploaded to a per-frame SSBO ring so the stress scene can
     // animate them CPU-side each frame.
     std::vector<GpuLight> lights_;
-    std::vector<string::gpu::resource_id> light_buffers_;
-    std::vector<void*> light_mapped_;
+    // Brief 16 M3: registry-owned PerFrame ring (was light_buffers_/light_mapped_ [frame] vectors).
+    string::gpu::buffer light_buffer_;
+    bool lights_enabled_ = true;   // L toggles the local-light stress set (shared: SceneData + froxel)
+    // Brief 11 step 3: the froxel light-binning is its own FroxelPass now; it publishes its component
+    // here (non-owning) so GeometryPass can read the froxel grid dims + buffer address for SceneData.
+    FroxelComponent* froxel = nullptr;
+    // Brief 11 step 3: the dynamic sky IBL is its own IblPass (prepass compute); published here so
+    // GeometryPass reads the SH address + shading slots for SceneData, and probe GI reads the SH.
+    IblComponent* ibl = nullptr;
 
     // --- Culling stats + frame infrastructure ----------------------------------------------------
     uint32_t frames_in_flight_ = 1;
-    // GPU-written per-frame stats, read back one frame later for the UI overlay + log line. One
-    // buffer per frame-in-flight (host-visible) so the readback doesn't stall the GPU.
-    std::vector<string::gpu::resource_id> stats_buffers_;
+    // GPU-written per-frame stats, read back one frame later for the UI overlay + log line. A
+    // registry-owned PerFrame host-visible ring (brief 16 M3; was stats_buffers_) so the readback
+    // doesn't stall the GPU.
+    string::gpu::buffer stats_buffer_;
     std::vector<GpuMeshStats> stats_readback_;         // last read stats per frame slot
     GpuMeshStats stats_latest_{};                       // most recent, for the UI accessor
     // Brief 04e M3: per-frame transient buffers reserve into the renderer's scratch arena.
-    String::FrameScratch* scratch_ = nullptr;
+    string::gpu::FrameScratch* scratch_ = nullptr;
     bool scratch_bound_ = false;
     // Shared overlay state written each frame for the UI (stats + which path is active), so the UI
     // author (built separately in the RenderPlan) can display it without a direct pass pointer.
