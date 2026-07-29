@@ -1,24 +1,25 @@
 #pragma once
 
 #include <string/core/layout.hpp>
+#include <string/ui/theme.hpp>
 
 namespace sandbox::ui
 {
 
-// Flat/vector visual language palette (brief 05). sRGB 8-bit; the overlay converts to linear on the
-// way to the HDR target. Centralised so every screen/widget reads the same theme.
+// The app's palette (brief 12 M0c, L3). The ENGINE owns the theme TYPE (`string::ui::Theme`:
+// surfaces, content colours, metrics, motion transitions); the APP owns the VALUES. Brief 05
+// shipped these as bare `constexpr` constants, which an element tree can neither inherit from nor
+// override per element — both of which the brief-12 conventions require.
+//
+// One instance, read through `theme()`. The surface/content values are the brief-05 flat/vector
+// palette unchanged (sRGB 8-bit; the overlay converts to linear on the way to the HDR target).
+[[nodiscard]] const string::ui::Theme& theme();
+
+// Game vocabulary — MEANING, not interaction — stays app-side, by the same line brief 12 draws for
+// widgets: item rarity, health/cast fills, hostile/friendly. An engine theme has no business
+// knowing what "epic" is.
 namespace col
 {
-inline constexpr string::color panel      { 26, 28, 42, 235 };
-inline constexpr string::color panel_alt  { 20, 22, 34, 235 };
-inline constexpr string::color stroke     { 70, 74, 100, 255 };
-inline constexpr string::color stroke_hi  { 137, 180, 250, 255 };
-inline constexpr string::color text       { 205, 214, 244, 255 };
-inline constexpr string::color text_dim   { 140, 147, 175, 255 };
-inline constexpr string::color accent     { 137, 180, 250, 255 };  // blue
-inline constexpr string::color accent_warm{ 249, 226, 175, 255 };  // yellow
-inline constexpr string::color good       { 166, 227, 161, 255 };  // green
-inline constexpr string::color bad        { 243, 139, 168, 255 };  // red/pink
 inline constexpr string::color hp_fill    { 166, 227, 161, 255 };
 inline constexpr string::color hp_bg      { 40, 44, 52, 220 };
 inline constexpr string::color cast_fill  { 249, 226, 175, 255 };

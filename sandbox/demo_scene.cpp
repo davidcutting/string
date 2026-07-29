@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -66,7 +67,7 @@ UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats
 {
     return [mesh_stats,
             np_driver = UiSceneDriver(static_cast<std::uint32_t>(nameplate_stress)),
-            np_scene = UiScene{}, np_scratch = ui::ScreenScratch{}, nameplate_stress,
+            np_scene = UiScene{}, motion = ui::Motion{}, fluent = std::optional<ui::Ui>{}, nameplate_stress,
             panels = ui::DebugPanels{}](
                string::layout_builder& b, const UIPass::UiContext& ctx) mutable {
         // Optional synthetic nameplate stress OVER the Sponza scene (STRING_UI_NAMEPLATES): the same
@@ -74,8 +75,13 @@ UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats
         // 05 perf: report frametime with the stress in BOTH scenes).
         if (nameplate_stress > 0)
         {
-            np_driver.update(ctx.delta_time, 1920, 1080, np_scene);
-            ui::author_nameplates(b, np_scene, np_scratch, nameplate_stress);
+            np_driver.update(ctx.ui.dt, 1920, 1080, np_scene);
+            // Closure-lived, not stack-lived: the arena it owns backs the nameplate text views for
+            // the rest of the frame (see the lifetime note on Ui).
+            if (!fluent) fluent.emplace(b, ctx.ui, motion, ui::theme());
+            fluent->begin_frame();
+            ui::author_nameplates(*fluent, np_scene, nameplate_stress);
+            fluent->end_frame();
         }
 
         // Brief 06: debug surfaces (console + profiler HUD + inspector), toggled at runtime
@@ -95,32 +101,36 @@ UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats
 UIPass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::size_t nameplate_budget,
                                   std::string screen)
 {
-    return [scene, nameplate_budget, screen, scratch = ui::ScreenScratch{}, motion = ui::Motion{},
+    return [scene, nameplate_budget, screen, motion = ui::Motion{}, fluent = std::optional<ui::Ui>{},
             state = ui::ScreenState{}, panels = ui::DebugPanels{}](
                string::layout_builder& b, const UIPass::UiContext& ctx) mutable {
-        const ui::Interaction it = ui::Interaction::from(ctx);
-        motion.begin_frame(ctx.delta_time);
-        state.tick(ctx.delta_time);
-        scratch.lines.clear();
+        // The Ui lives in the CLOSURE, not on the stack: it owns the frame string arena and the
+        // layout tree holds non-owning views into it, so it must outlive authoring — through layout
+        // and record. Constructed on the first frame (the builder and interaction it binds are
+        // stable members of UIPass, so the references stay valid for the run).
+        if (!fluent) fluent.emplace(b, ctx.ui, motion, ui::theme());
+        ui::Ui& u = *fluent;
+        u.begin_frame();
+        state.tick(ctx.ui.dt);
 
         const bool all = screen == "all";
         std::size_t np_count = 0;
 
         if (all || screen == "nameplates")
         {
-            ui::author_nameplates(b, *scene, scratch, nameplate_budget);
+            ui::author_nameplates(u, *scene, nameplate_budget);
             np_count = nameplate_budget == 0 ? scene->anchors.size()
                                              : std::min(nameplate_budget, scene->anchors.size());
         }
         if (all || screen == "inventory")
-            ui::author_inventory(b, motion, it, scratch);
+            ui::author_inventory(u);
         if (all || screen == "actionbar")
-            ui::author_actionbar(b, motion, it, state, scratch);
+            ui::author_actionbar(u, state);
         if (all || screen == "chat")
-            ui::author_chat_pings(b, motion, it, *scene, state, scratch);
+            ui::author_chat_pings(u, *scene, state);
 
-        ui::author_status_panel(b, *scene, scratch, screen, np_count);
-        motion.end_frame();
+        ui::author_status_panel(u, *scene, state, screen, np_count);
+        u.end_frame();
 
         // Brief 06 debug surfaces work in the ui-dev sandbox too (console/HUD; inspector shows "no
         // scene" since there's no geometry). Lets tooling be iterated in STRING_SCENE=ui.

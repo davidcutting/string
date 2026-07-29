@@ -2,14 +2,18 @@
 #include <array>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "ui_pass.hpp"
 #include "overlay_common.hpp"
+#include "debug_cvars.hpp"
 
+#include <string/core/layout_dump.hpp>
 #include <string/core/logger.hpp>
 #include <string/core/text_measurer.hpp>
 #include <string/gpu/pipeline_builder.hpp>
@@ -419,6 +423,87 @@ void UIPass::author_error_overlay()
     builder_.end();
 }
 
+// THE ONE CROSSING (brief 12 M0b). Translates platform input into engine UI vocabulary — the only
+// place in the codebase that does. Host conventions live HERE, not in the engine: what counts as a
+// stick flick, which gamepad button activates, whether the cursor is captured. The engine gets
+// de-edged intent and nothing else, which is what keeps `string::ui` platform-free and testable.
+string::ui::interaction_input UIPass::populate_interaction(float delta_time)
+{
+    string::ui::interaction_input in;
+    const glm::vec2 mouse = input_.mouse_position();
+    in.cursor_x = mouse.x;
+    in.cursor_y = mouse.y;
+    in.ui_mode = !input_.mouse_captured();
+    in.primary_down = input_.mouse_button_down(MouseButton::LEFT);
+    in.primary_pressed = input_.mouse_button_pressed(MouseButton::LEFT);
+    in.primary_released = prev_click_ && !in.primary_down;
+    prev_click_ = in.primary_down;
+    in.activate = input_.gamepad_pressed(String::GamepadButton::A);
+    in.dt = delta_time;
+    in.screen = { static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.width, 0xFFFF)),
+                  static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.height, 0xFFFF)) };
+
+    // Directional focus-nav intent: d-pad, or a left-stick flick rearmed when the stick recentres
+    // (so a held stick navigates once, like a d-pad). De-edging is the host's job.
+    if (input_.gamepad_pressed(String::GamepadButton::LEFT))  in.nav_x = -1;
+    if (input_.gamepad_pressed(String::GamepadButton::RIGHT)) in.nav_x = 1;
+    if (input_.gamepad_pressed(String::GamepadButton::UP))    in.nav_y = -1;
+    if (input_.gamepad_pressed(String::GamepadButton::DOWN))  in.nav_y = 1;
+    const float sx = input_.gamepad_axis(String::GamepadAxis::LEFT_X);
+    const float sy = input_.gamepad_axis(String::GamepadAxis::LEFT_Y);
+    constexpr float kStick = 0.6f;
+    if (in.nav_x == 0 && in.nav_y == 0 && stick_armed_)
+    {
+        if (sx < -kStick) in.nav_x = -1;
+        else if (sx > kStick) in.nav_x = 1;
+        else if (sy < -kStick) in.nav_y = -1;
+        else if (sy > kStick) in.nav_y = 1;
+        if (in.nav_x != 0 || in.nav_y != 0) stick_armed_ = false;
+    }
+    if (std::abs(sx) < 0.3f && std::abs(sy) < 0.3f)
+        stick_armed_ = true;
+
+    return in;
+}
+
+// The engine REQUESTS a mode; the host grants it. Kept out of the resolvers deliberately: capture is
+// a platform decision, and `string::ui` must not know that a window or a cursor exists.
+void UIPass::apply_mode_requests()
+{
+    if (interaction_.wants_game_mode) input_.set_capture_requested(true);
+    if (interaction_.wants_ui_mode) input_.set_capture_requested(false);
+}
+
+// Brief 12 M0a. Writes the positioned tree once, on the configured frame, when dbg.ui.dump names a
+// path. Deliberately dumb: no exit, no capture coupling — the harness bounds the run with `timeout`
+// exactly like tools/capture.sh does, which keeps this out of the renderer's shutdown path.
+void UIPass::maybe_dump_layout()
+{
+    const std::string& path = cv_ui_dump().get();
+    if (path.empty()) return;
+
+    const std::uint64_t want = static_cast<std::uint64_t>(std::max(0, cv_ui_dump_frame().get()));
+    if (dump_written_ || ui_frames_ != want) return;
+    dump_written_ = true;
+
+    // The label carries the screen so a dump is self-identifying once it is sitting in a directory
+    // of them; it lives in the header only, never in the node lines.
+    std::string label = cv_ui_screen().get();
+    label += " frame=";
+    label += std::to_string(ui_frames_);
+
+    const std::string text = string::dump_layout(builder_, label);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+    {
+        STRING_LOG_WARN("[ui-dump] could not open '{}'", path);
+        return;
+    }
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    STRING_LOG_INFO("[ui-dump] wrote {} ({} nodes, frame {})", path, builder_.nodes().size(),
+                    ui_frames_);
+}
+
 void UIPass::update(float delta_time, uint16_t current_frame)
 {
     if (screen_size.width == 0 || screen_size.height == 0 || current_frame >= shape_ring_.size())
@@ -426,16 +511,14 @@ void UIPass::update(float delta_time, uint16_t current_frame)
         return;  // not sized yet
     }
 
-    // A press edge in UI mode (cursor free) on the hovered element, resolved BEFORE authoring so the
-    // author sees this frame's click for press feedback / activation. Focus is resolved after layout.
-    // Gamepad: the A/South button activates the currently-focused element (controller-first UI).
-    const bool ui_mode = !input_.mouse_captured();
-    const bool click = ui_mode && input_.mouse_button_pressed(MouseButton::LEFT);
-    const bool pad_activate = input_.gamepad_pressed(String::GamepadButton::A);
-    const std::uint64_t pressed_this_frame =
-        click ? hovered_id_ : (pad_activate ? focused_id_ : 0);
+    // Interaction, part 1 (pre-author): resolve this frame's press/activation from LAST frame's
+    // hover/focus, and advance drag state — so the author sees the click on the frame it happens
+    // (press feedback) even though hover can only be resolved against a laid-out tree. The rules
+    // live in the engine (string::ui); this pass only supplies the raw signals.
+    const string::ui::interaction_input in = populate_interaction(delta_time);
+    string::ui::begin_interaction(interaction_, in);
     // Feel instrumentation: stamp the click so record() can report click->record latency this frame.
-    if ((click && hovered_id_ != 0) || (pad_activate && focused_id_ != 0))
+    if (interaction_.pressed != 0)
     {
         click_time_ = std::chrono::steady_clock::now();
         click_pending_ = true;
@@ -447,12 +530,18 @@ void UIPass::update(float delta_time, uint16_t current_frame)
     builder_.clear();
     builder_.begin(string::format{ .padding = { 12, 12, 12, 12 }, .gap = 8,
                                    .direction = string::direction::VERTICAL });
-    author_(builder_, UiContext{ input_, hovered_id_, focused_id_, delta_time, pressed_this_frame });
+    author_(builder_, UiContext{ input_, interaction_ });
     author_error_overlay();
     const string::dimension available{
         static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.width, 0xFFFF)),
         static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.height, 0xFFFF)) };
     builder_.end(available, string::dynamic_text_measurer{ atlas_.get(), builder_.text_runs() });
+
+    // Brief 12 M0a — the layout-tree dump gate. Taken HERE: after layout resolves (so boxes are
+    // final) and before packing (which is a lossy projection onto the GPU rings). One dump per run,
+    // on a fixed frame, so the harness can diff two runs across a facade change.
+    maybe_dump_layout();
+    ++ui_frames_;
 
     // Pack shapes and glyphs from the one tree into this frame's ring buffers: main layer first,
     // then the overlay (topmost) layer — record() draws main shapes -> main text -> overlay shapes
@@ -504,89 +593,12 @@ void UIPass::update(float delta_time, uint16_t current_frame)
         ui_cpu_samples_ = 0;
     }
 
-    // Hit-test the cursor against this frame's layout for hover, and resolve focus / mode.
-    const glm::vec2 mouse = input_.mouse_position();
-    const string::layout_node* hit = builder_.hit_test(
-        static_cast<std::uint16_t>(std::clamp(mouse.x, 0.0f, 65535.0f)),
-        static_cast<std::uint16_t>(std::clamp(mouse.y, 0.0f, 65535.0f)));
-    hovered_id_ = hit != nullptr ? hit->element.id.hash : 0;
-
-    if (input_.mouse_captured())
-    {
-        focused_id_ = 0;  // game mode (mouse-look): nothing in the UI is focused
-    }
-    else if (input_.mouse_button_pressed(MouseButton::LEFT))
-    {
-        // UI mode: a click focuses the element under the cursor; a click on empty UI space falls
-        // through to request game mode (so the UI gets first dibs on the click).
-        if (hovered_id_ != 0)
-        {
-            focused_id_ = hovered_id_;
-        }
-        else
-        {
-            input_.set_capture_requested(true);
-            focused_id_ = 0;
-        }
-    }
-
-    // --- Gamepad directional focus navigation (brief 05: controller-first) ---
-    // On a d-pad / left-stick edge, move focus to the nearest focusable node (non-zero id) in that
-    // direction, scored by directional distance + lateral penalty. Also enters UI mode on any nav so
-    // a controller can drive the UI without touching the mouse.
-    int nav_x = 0, nav_y = 0;
-    if (input_.gamepad_pressed(String::GamepadButton::LEFT))  nav_x = -1;
-    if (input_.gamepad_pressed(String::GamepadButton::RIGHT)) nav_x = 1;
-    if (input_.gamepad_pressed(String::GamepadButton::UP))    nav_y = -1;
-    if (input_.gamepad_pressed(String::GamepadButton::DOWN))  nav_y = 1;
-    // Left-stick flick (rearmed when it recenters) so a stick can navigate like a d-pad.
-    const float sx = input_.gamepad_axis(String::GamepadAxis::LEFT_X);
-    const float sy = input_.gamepad_axis(String::GamepadAxis::LEFT_Y);
-    constexpr float kStick = 0.6f;
-    if (nav_x == 0 && nav_y == 0 && stick_armed_)
-    {
-        if (sx < -kStick) nav_x = -1;
-        else if (sx > kStick) nav_x = 1;
-        else if (sy < -kStick) nav_y = -1;
-        else if (sy > kStick) nav_y = 1;
-        if (nav_x != 0 || nav_y != 0) stick_armed_ = false;
-    }
-    if (std::abs(sx) < 0.3f && std::abs(sy) < 0.3f)
-        stick_armed_ = true;
-
-    if (nav_x != 0 || nav_y != 0)
-    {
-        input_.set_capture_requested(false);  // any nav intent means the player wants the UI
-        // Current focus centre (or screen centre if nothing focused yet).
-        const string::layout_node* cur = focused_id_ != 0 ? builder_.find(focused_id_) : nullptr;
-        float cx = cur ? cur->box.x + cur->box.dimension.width * 0.5f : screen_size.width * 0.5f;
-        float cy = cur ? cur->box.y + cur->box.dimension.height * 0.5f : screen_size.height * 0.5f;
-
-        std::uint64_t best = 0;
-        float best_score = 1e18f;
-        for (const string::layout_node& n : builder_.nodes())
-        {
-            if (n.element.id.hash == 0 || n.element.id.hash == focused_id_)
-                continue;  // only focusable (id'd) nodes; skip self
-            const float nx = n.box.x + n.box.dimension.width * 0.5f;
-            const float ny = n.box.y + n.box.dimension.height * 0.5f;
-            const float dx = nx - cx;
-            const float dy = ny - cy;
-            // Must lie in the requested half-plane.
-            const float along = dx * nav_x + dy * nav_y;
-            if (along <= 1.0f)
-                continue;
-            const float lateral = std::abs(dx * nav_y) + std::abs(dy * nav_x);
-            const float score = along + lateral * 2.0f;  // prefer aligned + close
-            if (score < best_score)
-            {
-                best_score = score;
-                best = n.element.id.hash;
-            }
-        }
-        if (best != 0)
-            focused_id_ = best;
-    }
+    // Interaction, part 2 (post-layout): hover needs a laid-out tree. Hit-test, focus resolution
+    // and gamepad focus-nav are ALL engine rules now (string::ui) — deleted from this pass rather
+    // than wrapped. The pass keeps only what is genuinely the host's: producing the raw signals
+    // above, and applying the mode requests below (capture is a platform decision).
+    string::ui::resolve_interaction(interaction_, in, builder_);
+    apply_mode_requests();
 }
 
 bool UIPass::record_compute(string::gpu::command_recorder& recorder, uint16_t current_frame)

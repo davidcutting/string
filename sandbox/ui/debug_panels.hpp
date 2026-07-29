@@ -21,8 +21,18 @@ namespace sandbox::ui
 // Input::text_capture so gameplay input is suppressed). The HUD/inspector are CVar+key toggled.
 //
 // Kept together because they share persistent state (open flags, the console's edit line/history)
-// and one frame-persistent string scratch (ScreenScratch's deque — layout text_runs are non-owning
+// and one frame-persistent string scratch (PanelScratch's deque — layout text_runs are non-owning
 // views, so every add_text string must live here, never a local).
+// Frame-persistent string storage for the brief-06 debug surfaces. These are NOT brief-05 screens:
+// briefs 14/15 rewrite the debug panels wholesale onto the fluent facade, so re-expressing them
+// through it now would be work thrown away. Same deque invariant as before — push_back must never
+// relocate earlier strings, because layout text_runs are non-owning views.
+struct PanelScratch
+{
+    std::deque<std::string> lines;
+    std::uint64_t frame = 0;
+};
+
 class DebugPanels
 {
 public:
@@ -47,7 +57,7 @@ private:
     bool console_open_ = false;
     std::string input_;               // current console edit line
 
-    ScreenScratch scratch_;           // frame-persistent string storage (deque; non-owning views)
+    PanelScratch scratch_;           // frame-persistent string storage (see PanelScratch)
     Motion motion_;
 
     // Inspector selection/scroll state.

@@ -698,7 +698,7 @@ constexpr void layout_builder::position(uint32_t index, uint16_t origin_x, uint1
     {
         switch (node.format.justify)
         {
-            case justification::START:                                                break;
+            case justification::START:                                                 break;
             case justification::CENTER:  leading = leftover / 2;                       break;
             case justification::END:     leading = leftover;                           break;
             case justification::SPACE_BETWEEN:

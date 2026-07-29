@@ -5,11 +5,14 @@
 
 #include <string/core/layout.hpp>
 
-namespace sandbox::ui
+// UI motion (promoted to the engine in brief 12 M0b; originally sandbox/ui/motion.hpp, brief 05).
+// Engine-side because the panel layer above it — dock drags, resize handles, tab transitions —
+// needs it, and because it has no app knowledge: it is a state table keyed by element id.
+namespace string::ui
 {
 
-// Easing curves for declared transitions (brief 05 motion system). SPRING is handled specially by
-// the animation table (velocity-based), the rest are pure f(t) on t in [0,1].
+// Easing curves for declared transitions. SPRING is handled specially by the animation table
+// (velocity-based), the rest are pure f(t) on t in [0,1].
 enum class Curve : std::uint8_t
 {
     LINEAR,
@@ -32,12 +35,12 @@ struct Transition
 // closed-form t-curve; the table integrates it, so this returns t for SPRING (unused there).
 float ease(Curve curve, float t);
 
-// Engine-side animation state table (brief 05): the layout tree is rebuilt every frame, so per-
-// element animated values are keyed by a stable (element id, property) hash and interpolated toward
-// the author's declared target here. The author asks for the CURRENT value to apply to the element
-// this frame; over frames it glides to the target with the declared duration/curve.
+// Animation state table: the layout tree is rebuilt every frame, so per-element animated values are
+// keyed by a stable (element id, property) hash and interpolated toward the author's declared
+// target here. The author asks for the CURRENT value to apply to the element this frame; over
+// frames it glides to the target with the declared duration/curve.
 //
-//   float a = motion.animate(make_id("panel").hash, Prop::OpacityA, focused ? 255 : 120, {0.2f});
+//   float a = motion.animate(make_id("panel").hash, Prop::A, focused ? 255 : 120, {0.2f});
 //   panel.color.a = uint8_t(a);
 //
 // One Motion lives in the author closure (persists across frames). Entries untouched for a frame are
@@ -60,7 +63,11 @@ public:
 
     // Convenience: animate a color's four channels toward `target` with one transition. Returns the
     // eased colour to assign. `id` should be the element's stable id hash.
-    string::color animate_color(std::uint64_t id, string::color target, const Transition& t);
+    color animate_color(std::uint64_t id, color target, const Transition& t);
+
+    // Live entry count — for tests and the debug inspector (brief 14): a leaking author shows up
+    // here as a count that climbs without bound.
+    [[nodiscard]] std::size_t live_count() const noexcept { return entries_.size(); }
 
 private:
     struct Entry
@@ -80,4 +87,4 @@ private:
     float dt_ = 0.0f;
 };
 
-}  // namespace sandbox::ui
+}  // namespace string::ui

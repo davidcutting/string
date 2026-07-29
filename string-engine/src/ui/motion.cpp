@@ -1,9 +1,9 @@
-#include "ui/motion.hpp"
+#include <string/ui/motion.hpp>
 
 #include <algorithm>
 #include <cmath>
 
-namespace sandbox::ui
+namespace string::ui
 {
 
 float ease(Curve curve, float t)
@@ -92,14 +92,14 @@ float Motion::animate(std::uint64_t id, Prop prop, float target, const Transitio
     return e.current;
 }
 
-string::color Motion::animate_color(std::uint64_t id, string::color target, const Transition& t)
+color Motion::animate_color(std::uint64_t id, color target, const Transition& t)
 {
     const float r = animate(id, Prop::R, target.r, t);
     const float g = animate(id, Prop::G, target.g, t);
     const float b = animate(id, Prop::B, target.b, t);
     const float a = animate(id, Prop::A, target.a, t);
     auto u8 = [](float v) { return static_cast<std::uint8_t>(std::clamp(v, 0.0f, 255.0f)); };
-    return string::color{ u8(r), u8(g), u8(b), u8(a) };
+    return color{ u8(r), u8(g), u8(b), u8(a) };
 }
 
-}  // namespace sandbox::ui
+}  // namespace string::ui

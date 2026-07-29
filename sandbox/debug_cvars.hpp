@@ -51,6 +51,11 @@ string::core::CVar<std::string>& cv_scene();        // dbg.scene           <- ST
 string::core::CVar<int32_t>& cv_ui_nameplates();    // dbg.ui.nameplates   <- STRING_UI_NAMEPLATES
 // Which mock screen the ui-dev scene shows: nameplates | inventory | actionbar | chat | all.
 string::core::CVar<std::string>& cv_ui_screen();    // dbg.ui.screen       <- STRING_UI_SCREEN
+// Brief 12 M0a — layout-tree dump gate. Path to write the positioned tree to ("" = off), and the
+// frame it is taken on. Pair with STRING_FIXED_DT so dt-driven authors (cooldowns, the status
+// panel's frame counter) resolve identically on both sides of a change. See tools/ui_dump.sh.
+string::core::CVar<std::string>& cv_ui_dump();      // dbg.ui.dump         <- STRING_UI_DUMP
+string::core::CVar<int32_t>& cv_ui_dump_frame();    // dbg.ui.dump_frame   <- STRING_UI_DUMP_FRAME
 
 // --- PBR / IBL (brief 07) ---------------------------------------------------------------------
 // White-furnace test: uniform white environment, sun + local lights off, albedo forced white,

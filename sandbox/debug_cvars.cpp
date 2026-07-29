@@ -273,6 +273,25 @@ CVar<std::string>& cv_ui_screen()
     return v;
 }
 
+CVar<std::string>& cv_ui_dump()
+{
+    static CVar<std::string> v{"dbg.ui.dump", "",
+                               "brief-12 M0a: write the positioned layout tree to this path "
+                               "(\"\" = off); pair with STRING_FIXED_DT for a diffable dump"};
+    static const bool a = [] { v.add_alias("ui_dump"); return true; }();
+    (void)a;
+    return v;
+}
+
+CVar<int32_t>& cv_ui_dump_frame()
+{
+    static CVar<int32_t> v{"dbg.ui.dump_frame", 120,
+                           "brief-12 M0a: the frame the layout dump is taken on"};
+    static const bool a = [] { v.add_alias("ui_dump_frame"); return true; }();
+    (void)a;
+    return v;
+}
+
 // --- Post-processing (brief 09) ------------------------------------------------------------------
 CVar<bool>& cv_bloom_enabled()
 {
@@ -503,6 +522,8 @@ void register_debug_cvars()
     cv_scene();
     cv_ui_nameplates();
     cv_ui_screen();
+    cv_ui_dump();
+    cv_ui_dump_frame();
     cv_furnace();
     cv_ibl_verify();
     cv_ibl_every_frame();

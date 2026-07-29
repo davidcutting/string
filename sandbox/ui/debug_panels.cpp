@@ -26,7 +26,7 @@ using string::grow;
 namespace
 {
 // A short formatted line kept in the scratch deque so its view survives layout+record.
-const std::string& stash(ScreenScratch& s, std::string line)
+const std::string& stash(PanelScratch& s, std::string line)
 {
     s.lines.push_back(std::move(line));
     return s.lines.back();
@@ -36,11 +36,11 @@ string::color line_color(ConsoleLine::Kind k)
 {
     switch (k)
     {
-        case ConsoleLine::Kind::Ok:    return col::good;
-        case ConsoleLine::Kind::Warn:  return col::accent_warm;
-        case ConsoleLine::Kind::Error: return col::bad;
-        case ConsoleLine::Kind::Echo:  return col::accent;
-        default:                       return col::text;
+        case ConsoleLine::Kind::Ok:    return theme().good;
+        case ConsoleLine::Kind::Warn:  return theme().accent_warm;
+        case ConsoleLine::Kind::Error: return theme().bad;
+        case ConsoleLine::Kind::Echo:  return theme().accent;
+        default:                       return theme().text;
     }
 }
 
@@ -48,12 +48,12 @@ string::color severity_color(String::LogLevel lvl)
 {
     switch (lvl)
     {
-        case String::LogLevel::WARN:     return col::accent_warm;
+        case String::LogLevel::WARN:     return theme().accent_warm;
         case String::LogLevel::ERROR:
-        case String::LogLevel::CRITICAL: return col::bad;
+        case String::LogLevel::CRITICAL: return theme().bad;
         case String::LogLevel::DEBUG:
-        case String::LogLevel::TRACE:    return col::text_dim;
-        default:                         return col::text;
+        case String::LogLevel::TRACE:    return theme().text_dim;
+        default:                         return theme().text;
     }
 }
 }  // namespace
@@ -65,7 +65,7 @@ void DebugPanels::update_and_author(string::layout_builder& b, const UIPass::UiC
 {
     ++scratch_.frame;
     scratch_.lines.clear();
-    motion_.begin_frame(ctx.delta_time);
+    motion_.begin_frame(ctx.ui.dt);
 
     handle_toggles(ctx);
 
@@ -180,8 +180,8 @@ void DebugPanels::author_console(string::layout_builder& b)
     panel.float_x = 16;
     panel.float_y = 16;
     // Fully opaque: the console overlays arbitrary scene/UI content and must stay readable.
-    panel.color = { col::panel_alt.r, col::panel_alt.g, col::panel_alt.b, 255 };
-    panel.stroke_color = col::stroke_hi;
+    panel.color = { theme().panel_alt.r, theme().panel_alt.g, theme().panel_alt.b, 255 };
+    panel.stroke_color = theme().stroke_hi;
     panel.stroke_width = 2;
     panel.radius = 10;
     panel.shape = shape::ROUNDED_RECTANGLE;
@@ -190,7 +190,7 @@ void DebugPanels::author_console(string::layout_builder& b)
     b.begin(panel, format{ .padding = { 10, 10, 10, 10 }, .gap = 3, .direction = direction::VERTICAL });
 
     element title{};
-    title.color = col::accent;
+    title.color = theme().accent;
     title.sizing = size_fit();
     b.add_text(title, stash(scratch_, "CONSOLE  (` close · Tab complete · Up/Down history · Enter run · F4 logs)"), 18);
 
@@ -210,7 +210,7 @@ void DebugPanels::author_console(string::layout_builder& b)
     // Edit line with a blinking-ish caret.
     element edit{};
     edit.id = make_id("dbg_console_edit");
-    edit.color = col::accent_warm;
+    edit.color = theme().accent_warm;
     edit.sizing = { fixed(740), fit() };
     b.add_text(edit, stash(scratch_, "> " + input_ + "_"), 18);
 
@@ -231,8 +231,8 @@ void DebugPanels::author_logs(string::layout_builder& b)
     panel.overlay = true;   // topmost layer: debug surfaces cover scene UI text AND shapes
     panel.float_x = 16;
     panel.float_y = console_open_ ? 400 : 16;   // stacks under the console when both are open
-    panel.color = { col::panel_alt.r, col::panel_alt.g, col::panel_alt.b, 255 };
-    panel.stroke_color = col::stroke_hi;
+    panel.color = { theme().panel_alt.r, theme().panel_alt.g, theme().panel_alt.b, 255 };
+    panel.stroke_color = theme().stroke_hi;
     panel.stroke_width = 2;
     panel.radius = 10;
     panel.shape = shape::ROUNDED_RECTANGLE;
@@ -241,7 +241,7 @@ void DebugPanels::author_logs(string::layout_builder& b)
     b.begin(panel, format{ .padding = { 10, 10, 10, 10 }, .gap = 3, .direction = direction::VERTICAL });
 
     element title{};
-    title.color = col::accent;
+    title.color = theme().accent;
     title.sizing = size_fit();
     b.add_text(title, stash(scratch_, "LOGS  (newest first · F4 close)"), 18);
 
@@ -255,7 +255,7 @@ void DebugPanels::author_logs(string::layout_builder& b)
         // panel height is constant from the first frame.
         const bool have = i < log.size();
         const auto& ln = log[have ? log.size() - 1 - i : 0];
-        row.color = have ? severity_color(ln.level) : col::text_dim;
+        row.color = have ? severity_color(ln.level) : theme().text_dim;
         row.sizing = { grow(0, 740), fit() };   // grow (not fixed) width: single line, clipped
         b.add_text(row, stash(scratch_, have ? ln.text : std::string{ " " }), 15);
     }
@@ -273,8 +273,8 @@ void DebugPanels::author_hud(string::layout_builder& b, const MeshOverlayStats* 
     panel.float_y = static_cast<uint16_t>(
         16 + (console_open_ ? 384 : 0) + (cv_logs_enabled().get() ? 384 : 0) +
         (!console_open_ && !cv_logs_enabled().get() ? 174 : 0));
-    panel.color = col::panel;
-    panel.stroke_color = col::stroke;
+    panel.color = theme().panel;
+    panel.stroke_color = theme().stroke;
     panel.stroke_width = 2;
     panel.radius = 10;
     panel.shape = shape::ROUNDED_RECTANGLE;
@@ -283,7 +283,7 @@ void DebugPanels::author_hud(string::layout_builder& b, const MeshOverlayStats* 
     b.begin(panel, format{ .padding = { 10, 10, 10, 10 }, .gap = 3, .direction = direction::VERTICAL });
 
     element title{};
-    title.color = col::accent;
+    title.color = theme().accent;
     title.sizing = size_fit();
     b.add_text(title, stash(scratch_, "PROFILER HUD"), 18);
 
@@ -296,13 +296,13 @@ void DebugPanels::author_hud(string::layout_builder& b, const MeshOverlayStats* 
         for (const auto& s : ps)
         {
             element row{};
-            row.color = col::text;
+            row.color = theme().text;
             row.sizing = { fixed(280), fit() };
             std::snprintf(buf, sizeof(buf), "%-16s %6.3f ms", s.name.c_str(), s.avg_ms);
             b.add_text(row, stash(scratch_, buf), 15);
         }
         element total{};
-        total.color = col::good;
+        total.color = theme().good;
         total.sizing = size_fit();
         std::snprintf(buf, sizeof(buf), "GPU total       %6.3f ms", prof->total_avg_ms());
         b.add_text(total, stash(scratch_, buf), 16);
@@ -310,7 +310,7 @@ void DebugPanels::author_hud(string::layout_builder& b, const MeshOverlayStats* 
     else
     {
         element row{};
-        row.color = col::text_dim;
+        row.color = theme().text_dim;
         row.sizing = size_fit();
         b.add_text(row, stash(scratch_, "gpu timing unavailable"), 15);
     }
@@ -326,7 +326,7 @@ void DebugPanels::author_hud(string::layout_builder& b, const MeshOverlayStats* 
         };
         const auto add = [&](std::string t) {
             element row{};
-            row.color = col::text_dim;
+            row.color = theme().text_dim;
             row.sizing = { fixed(280), fit() };
             b.add_text(row, stash(scratch_, std::move(t)), 15);
         };
@@ -354,8 +354,8 @@ void DebugPanels::author_inspector(string::layout_builder& b, const UIPass::UiCo
     panel.overlay = true;   // topmost layer: debug surfaces cover scene UI text AND shapes
     panel.float_x = 340;
     panel.float_y = 16;
-    panel.color = col::panel;
-    panel.stroke_color = col::stroke;
+    panel.color = theme().panel;
+    panel.stroke_color = theme().stroke;
     panel.stroke_width = 2;
     panel.radius = 10;
     panel.shape = shape::ROUNDED_RECTANGLE;
@@ -364,14 +364,14 @@ void DebugPanels::author_inspector(string::layout_builder& b, const UIPass::UiCo
     b.begin(panel, format{ .padding = { 10, 10, 10, 10 }, .gap = 2, .direction = direction::VERTICAL });
 
     element title{};
-    title.color = col::accent;
+    title.color = theme().accent;
     title.sizing = size_fit();
     b.add_text(title, stash(scratch_, "SCENE / DRAW INSPECTOR"), 18);
 
     if (!mesh_stats || mesh_stats->draws.empty())
     {
         element row{};
-        row.color = col::text_dim;
+        row.color = theme().text_dim;
         row.sizing = size_fit();
         b.add_text(row, stash(scratch_, "no scene loaded"), 15);
         b.end();
@@ -380,7 +380,7 @@ void DebugPanels::author_inspector(string::layout_builder& b, const UIPass::UiCo
 
     const int isolate = cv_isolate_draw().get();
     element hdr{};
-    hdr.color = col::text_dim;
+    hdr.color = theme().text_dim;
     hdr.sizing = size_fit();
     b.add_text(hdr, stash(scratch_, "idx  meshlets lod res   (hover to highlight, isolate="
                                     + std::to_string(isolate) + ")"), 14);
@@ -399,9 +399,9 @@ void DebugPanels::author_inspector(string::layout_builder& b, const UIPass::UiCo
         const std::string row_id = "dbg_draw_" + std::to_string(r);
         element row{};
         row.id = make_id(stash(scratch_, row_id).c_str());  // id name must outlive layout (scratch)
-        const bool hot = ctx.hovered == row.id.hash;
+        const bool hot = ctx.ui.hovered == row.id.hash;
         const bool sel = r == selected_draw_ || r == isolate;
-        row.color = sel ? col::accent : (hot ? col::accent_warm : col::text);
+        row.color = sel ? theme().accent : (hot ? theme().accent_warm : theme().text);
         row.sizing = { fixed(340), fit() };
         char buf[128];
         std::snprintf(buf, sizeof(buf), "%-4d %8u %3u %s",
@@ -420,7 +420,7 @@ void DebugPanels::author_inspector(string::layout_builder& b, const UIPass::UiCo
 
     // Lights list header + a few rows.
     element lhdr{};
-    lhdr.color = col::text_dim;
+    lhdr.color = theme().text_dim;
     lhdr.sizing = size_fit();
     b.add_text(lhdr, stash(scratch_, "lights: " + std::to_string(mesh_stats->lights.size())), 14);
     const int lmax = std::min<int>(6, int(mesh_stats->lights.size()));
@@ -428,7 +428,7 @@ void DebugPanels::author_inspector(string::layout_builder& b, const UIPass::UiCo
     {
         const InspectorLight& L = mesh_stats->lights[i];
         element row{};
-        row.color = col::text;
+        row.color = theme().text;
         row.sizing = { fixed(340), fit() };
         char buf[128];
         std::snprintf(buf, sizeof(buf), "L%-2d (%.1f,%.1f,%.1f) r=%.1f %s",

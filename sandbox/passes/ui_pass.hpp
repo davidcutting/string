@@ -10,6 +10,7 @@
 #include <string/core/dynamic_font.hpp>
 #include <string/core/font.hpp>
 #include <string/core/layout.hpp>
+#include <string/ui/interaction.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/gpu/device.hpp>
 #include <string/gpu/pipeline.hpp>
@@ -46,10 +47,10 @@ public:
         // Non-const so a modal surface (the debug console) can set Input::text_capture to suppress
         // gameplay input while it is open. Read-only for every other author.
         String::Input& input;
-        std::uint64_t hovered;  // id.hash under the cursor (as of last frame's layout); 0 = none
-        std::uint64_t focused;  // id.hash of the focused element; 0 = none
-        float delta_time = 0.0f;  // seconds since last frame, for the author's motion/animation table
-        std::uint64_t pressed = 0;  // id.hash clicked (pressed edge) this frame in UI mode; 0 = none
+        // Resolved interaction (brief 12 M0b): hovered/focused/pressed ids, drag state, dt. Owned by
+        // the engine (`string::ui`) — the pass PRODUCES it and hands it over, it does not define it.
+        // Replaces the loose fields this struct used to duplicate.
+        const string::ui::interaction& ui;
     };
     // Authors the frame's UI into a builder already opened at a screen-filling root container.
     using Author = std::function<void(string::layout_builder&, const UiContext&)>;
@@ -102,10 +103,19 @@ private:
     // the registry holds the diagnostics; the pass draws them over the UI until the next success.
     string::gpu::shader_program_registry& shader_registry_;
     string::layout_builder builder_;
-    std::uint64_t hovered_id_ = 0;
-    std::uint64_t focused_id_ = 0;
+    // Brief 12 M0b: the pass no longer OWNS interaction state — it owns the engine's value type and
+    // the single crossing that fills it. Everything the UI reads lives in `interaction_`.
+    string::ui::interaction interaction_{};
     bool prev_click_ = false;  // for left-button edge detection in UI mode
     bool stick_armed_ = true;  // gamepad left-stick recentred since last focus-nav flick
+
+    // THE ONE CROSSING (brief 12 M0b, load-bearing): the only place sandbox translates platform
+    // input into engine UI vocabulary. Option (3) — engine owns a `ui::host` — is then "move this
+    // function", not a redesign. Do not spread `String::Input` reads into other UI code.
+    string::ui::interaction_input populate_interaction(float delta_time);
+    // Applies the engine's mode REQUESTS (click on empty space -> game, focus-nav -> UI) back to
+    // the platform. Separate from the resolvers because capture is the host's decision, not theirs.
+    void apply_mode_requests();
     // Feel instrumentation (brief 05 M5): timestamp a UI click in update() and, in record() of the
     // SAME frame (the immediate-mode author reflects the click that frame), log the click->record
     // latency. Reports the numbers the brief asks for; gated so it's quiet unless a click happened.
@@ -138,6 +148,13 @@ private:
     bool atlas_uploaded_ = false;
 
     bool warned_overflow_ = false;
+
+    // Brief 12 M0a — layout-tree dump gate (dbg.ui.dump / dbg.ui.dump_frame). `ui_frames_` counts
+    // AUTHORED frames, not frames-in-flight: the dump must name a specific authored tree, and
+    // `current_frame` is a ring slot that repeats.
+    std::uint64_t ui_frames_ = 0;
+    bool dump_written_ = false;
+    void maybe_dump_layout();
 
     // Persistent backing for the compile-error overlay's text (add_text takes non-owning views, so
     // the strings must outlive layout + record). Rebuilt each frame from the registry's diagnostics.
