@@ -56,29 +56,37 @@ float effective_radius(const string::element& e, float w, float h)
     return 0.0f;
 }
 
-// Pack the non-text nodes of a laid-out tree into GPU shapes (text nodes are drawn as glyphs).
-// Per-node "topmost layer" flags, inherited down the tree (an overlay panel's children are overlay
-// too). Parents always precede children in the node pool, so one forward pass resolves inheritance.
-std::vector<std::uint8_t> overlay_flags(std::span<const string::layout_node> nodes)
+// Per-node DRAW-BATCH KEY: (overlay << 8) | z, both inherited from the nearest ancestor that
+// declares them. Nodes are in pre-order so a parent is always resolved before its children.
+//
+// This is the single ordering authority for the UI: record() draws each distinct key's shapes AND
+// text before moving to the next, and `string::ui::hit_test_layered` compares the same key. Two
+// draw streams (shapes, glyphs) is exactly why the key has to exist — without batching per key, all
+// shapes precede all text, so a lower panel's TEXT lands on top of a raised panel's BACKGROUND.
+std::vector<std::uint16_t> layer_keys(std::span<const string::layout_node> nodes)
 {
-    std::vector<std::uint8_t> flags(nodes.size(), 0);
+    std::vector<std::uint16_t> keys(nodes.size(), 0);
     for (std::size_t i = 0; i < nodes.size(); ++i)
     {
         const string::layout_node& n = nodes[i];
-        flags[i] = (n.element.overlay || (!n.is_root() && flags[n.parent])) ? 1 : 0;
+        const std::uint16_t inherited = n.is_root() ? 0 : keys[n.parent];
+        const std::uint16_t overlay = (n.element.overlay || (inherited & 0x100)) ? 0x100 : 0;
+        // z is inherited only when this node does not declare its own.
+        const std::uint16_t z = n.element.z != 0 ? n.element.z : (inherited & 0xFF);
+        keys[i] = static_cast<std::uint16_t>(overlay | z);
     }
-    return flags;
+    return keys;
 }
 
 std::vector<GpuShape> pack_shapes(std::span<const string::layout_node> nodes,
-                                  std::span<const std::uint8_t> flags, bool overlay_layer)
+                                  std::span<const std::uint16_t> keys, std::uint16_t layer)
 {
     std::vector<GpuShape> shapes;
     shapes.reserve(nodes.size());
     for (std::size_t ni = 0; ni < nodes.size(); ++ni)
     {
         const string::layout_node& n = nodes[ni];
-        if ((flags[ni] != 0) != overlay_layer)
+        if (keys[ni] != layer)
         {
             continue;  // wrong layer: overlay content packs after ALL main content
         }
@@ -125,13 +133,13 @@ struct TextPush
 std::vector<GpuGlyph> shape_glyphs(string::dynamic_font_atlas& atlas,
                                    std::span<const string::layout_node> nodes,
                                    std::span<const string::text_run> texts,
-                                   std::span<const std::uint8_t> flags, bool overlay_layer)
+                                   std::span<const std::uint16_t> keys, std::uint16_t layer)
 {
     std::vector<GpuGlyph> glyphs;
     for (std::size_t ni = 0; ni < nodes.size(); ++ni)
     {
         const string::layout_node& n = nodes[ni];
-        if ((flags[ni] != 0) != overlay_layer)
+        if (keys[ni] != layer)
         {
             continue;  // wrong layer: overlay text packs (and draws) after all main text
         }
@@ -239,12 +247,14 @@ void UIPass::make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight,
     }
 }
 
-UIPass::UIPass(engine_context& context, std::shared_ptr<string::dynamic_font_atlas> atlas, Author author)
+UIPass::UIPass(engine_context& context, std::shared_ptr<string::dynamic_font_atlas> atlas,
+               Author author, PostLayout post_layout)
 : device_(context.device)
 , allocator_(context.allocator)
 , descriptor_table_(context.descriptor_table)
 , atlas_(std::move(atlas))
 , author_(std::move(author))
+, post_layout_(std::move(post_layout))
 , input_(context.input)
 , shader_registry_(context.shader_registry)
 {
@@ -300,6 +310,7 @@ UIPass::UIPass(engine_context& context, std::shared_ptr<string::dynamic_font_atl
     // --- Per-frame ring buffers: shapes + glyphs ---
     make_ring(shape_ring_, context.frames_in_flight, kMaxShapes, sizeof(GpuShape));
     make_ring(glyph_ring_, context.frames_in_flight, kMaxGlyphs, sizeof(GpuGlyph));
+    batches_.resize(context.frames_in_flight);
     descriptor_set_ = descriptor_table_.get_set();
 
     usages = {
@@ -537,29 +548,45 @@ void UIPass::update(float delta_time, uint16_t current_frame)
         static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.height, 0xFFFF)) };
     builder_.end(available, string::dynamic_text_measurer{ atlas_.get(), builder_.text_runs() });
 
+    // The one post-layout seam (brief 12 M2c): resolved sizes exist only now, and a workspace needs
+    // them to convert a splitter drag into a sizing change. Reads only.
+    if (post_layout_) post_layout_(builder_);
+
     // Brief 12 M0a — the layout-tree dump gate. Taken HERE: after layout resolves (so boxes are
     // final) and before packing (which is a lossy projection onto the GPU rings). One dump per run,
     // on a fixed frame, so the harness can diff two runs across a facade change.
     maybe_dump_layout();
     ++ui_frames_;
 
-    // Pack shapes and glyphs from the one tree into this frame's ring buffers: main layer first,
-    // then the overlay (topmost) layer — record() draws main shapes -> main text -> overlay shapes
-    // -> overlay text, so a modal surface covers the scene UI's text as well as its shapes.
-    const std::vector<std::uint8_t> flags = overlay_flags(builder_.nodes());
-    std::vector<GpuShape> shapes = pack_shapes(builder_.nodes(), flags, false);
-    const std::size_t shapes_main = shapes.size();
+    // Pack shapes and glyphs from the one tree into this frame's ring buffers, ONE BATCH PER
+    // DISTINCT LAYER KEY in ascending order (main content first, then each overlay z). record()
+    // draws a batch's shapes then its text before moving to the next, so a raised panel's
+    // background covers a lower panel's TEXT — which two globally-ordered draw streams cannot do.
+    //
+    // Almost every UI has exactly two keys (main + overlay z=0), which reproduces the previous
+    // shapes/text/shapes/text sequence exactly; z only costs draw calls when it is actually used.
+    const std::vector<std::uint16_t> keys = layer_keys(builder_.nodes());
+    std::vector<std::uint16_t> layers(keys.begin(), keys.end());
+    std::sort(layers.begin(), layers.end());
+    layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+
+    std::vector<GpuShape> shapes;
+    std::vector<GpuGlyph> glyphs;
+    std::vector<DrawBatch>& batches = batches_[current_frame];
+    batches.clear();
+    for (const std::uint16_t layer : layers)
     {
-        const std::vector<GpuShape> over = pack_shapes(builder_.nodes(), flags, true);
-        shapes.insert(shapes.end(), over.begin(), over.end());
-    }
-    std::vector<GpuGlyph> glyphs = shape_glyphs(*atlas_, builder_.nodes(), builder_.text_runs(),
-                                                flags, false);
-    const std::size_t glyphs_main = glyphs.size();
-    {
-        const std::vector<GpuGlyph> over =
-            shape_glyphs(*atlas_, builder_.nodes(), builder_.text_runs(), flags, true);
-        glyphs.insert(glyphs.end(), over.begin(), over.end());
+        const std::vector<GpuShape> s = pack_shapes(builder_.nodes(), keys, layer);
+        const std::vector<GpuGlyph> g =
+            shape_glyphs(*atlas_, builder_.nodes(), builder_.text_runs(), keys, layer);
+        if (s.empty() && g.empty())
+            continue;
+        batches.push_back(DrawBatch{ static_cast<std::uint32_t>(shapes.size()),
+                                     static_cast<std::uint32_t>(s.size()),
+                                     static_cast<std::uint32_t>(glyphs.size()),
+                                     static_cast<std::uint32_t>(g.size()) });
+        shapes.insert(shapes.end(), s.begin(), s.end());
+        glyphs.insert(glyphs.end(), g.begin(), g.end());
     }
     if ((shapes.size() > kMaxShapes || glyphs.size() > kMaxGlyphs) && !warned_overflow_)
     {
@@ -569,12 +596,21 @@ void UIPass::update(float delta_time, uint16_t current_frame)
     }
     Ring& sr = shape_ring_[current_frame];
     sr.count = static_cast<std::uint32_t>(std::min<std::size_t>(shapes.size(), kMaxShapes));
-    sr.split = static_cast<std::uint32_t>(std::min<std::size_t>(shapes_main, sr.count));
     std::memcpy(sr.mapped, shapes.data(), sr.count * sizeof(GpuShape));
     Ring& gr = glyph_ring_[current_frame];
     gr.count = static_cast<std::uint32_t>(std::min<std::size_t>(glyphs.size(), kMaxGlyphs));
-    gr.split = static_cast<std::uint32_t>(std::min<std::size_t>(glyphs_main, gr.count));
     std::memcpy(gr.mapped, glyphs.data(), gr.count * sizeof(GpuGlyph));
+
+    // Clamp the batch ranges to what actually fit. Without this an overflowing frame would draw
+    // from indices past the ring's contents — truncation must drop whole tail batches, not read
+    // stale memory.
+    for (DrawBatch& b : batches)
+    {
+        b.shape_count = b.shape_first >= sr.count
+                            ? 0u : std::min(b.shape_count, sr.count - b.shape_first);
+        b.glyph_count = b.glyph_first >= gr.count
+                            ? 0u : std::min(b.glyph_count, gr.count - b.glyph_first);
+    }
 
     // UI CPU cost (author + layout + shape/glyph pack) — the "UI cost visible standalone" number the
     // brief asks for. Rolling avg logged every 300 frames so the 500-nameplate stress can be read off
@@ -708,10 +744,13 @@ void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_fr
         recorder.draw(6, count, 0, 0);
     };
 
-    draw_shapes(0, sr.split);
-    draw_text(0, gr.split);
-    draw_shapes(sr.split, sr.count - sr.split);
-    draw_text(gr.split, gr.count - gr.split);
+    // One shapes-then-text pair per layer, in ascending key order. This is what makes a raised
+    // panel cover a lower panel's text as well as its background.
+    for (const DrawBatch& b : batches_[current_frame])
+    {
+        draw_shapes(b.shape_first, b.shape_count);
+        draw_text(b.glyph_first, b.glyph_count);
+    }
 }
 
 }  // namespace sandbox

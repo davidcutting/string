@@ -54,11 +54,15 @@ public:
     };
     // Authors the frame's UI into a builder already opened at a screen-filling root container.
     using Author = std::function<void(string::layout_builder&, const UiContext&)>;
+    // Runs AFTER layout resolves, before packing. The one post-layout seam: a workspace needs its
+    // resolved region sizes to turn a splitter drag into a sizing change, and those do not exist at
+    // authoring time. Deliberately narrow — it reads sizes, it does not author.
+    using PostLayout = std::function<void(const string::layout_builder&)>;
 
     // `atlas` is the dynamic (grow-on-demand, Unicode) SDF glyph atlas — shared, mutated as new
     // glyphs are seen. `author` declares the whole UI (shapes + text) each frame.
     UIPass(String::engine_context& context, std::shared_ptr<string::dynamic_font_atlas> atlas,
-           Author author);
+           Author author, PostLayout post_layout = {});
     ~UIPass() override;
 
     UIPass(const UIPass&) = delete;
@@ -86,7 +90,16 @@ private:
         std::uint32_t slot = 0;
         void* mapped = nullptr;
         std::uint32_t count = 0;
-        std::uint32_t split = 0;  // count of MAIN-layer entries; [split, count) is the overlay layer
+    };
+    // One draw pair per layer key (see layer_keys in the .cpp). Ranges into the shape and glyph
+    // rings; record() draws a batch's shapes then its text before moving to the next, so a raised
+    // panel covers a lower one's TEXT and not just its background.
+    struct DrawBatch
+    {
+        std::uint32_t shape_first = 0;
+        std::uint32_t shape_count = 0;
+        std::uint32_t glyph_first = 0;
+        std::uint32_t glyph_count = 0;
     };
     // Create `frames_in_flight` mapped storage buffers of `capacity * stride` bytes, bound bindless.
     void make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight, std::uint32_t capacity,
@@ -98,6 +111,7 @@ private:
 
     std::shared_ptr<string::dynamic_font_atlas> atlas_;
     Author author_;
+    PostLayout post_layout_;
     String::Input& input_;  // non-const: the pass requests game/UI capture mode
     // Read each frame for the shader-compile error overlay (brief 01, M4): when a hot-reload fails,
     // the registry holds the diagnostics; the pass draws them over the UI until the next success.
@@ -136,6 +150,7 @@ private:
     // Text overlay (glyph SDF sampling the atlas): text_shader.slang.
     string::gpu::shader_program* text_program_ = nullptr;
     std::vector<Ring> glyph_ring_;
+    std::vector<std::vector<DrawBatch>> batches_;   // per frame-in-flight, parallel to the rings
     string::gpu::resource_id atlas_image_ = 0;
     VkSampler atlas_sampler_ = VK_NULL_HANDLE;
     std::uint32_t atlas_slot_ = 0;

@@ -33,7 +33,8 @@ struct Rig
     interaction state{};
     Motion motion;
     Theme theme{};
-    Ui ui{ builder, state, motion, theme };
+    PanelStore panels;
+    Ui ui{ builder, state, motion, theme, panels };
 };
 }  // namespace
 
@@ -46,8 +47,12 @@ TEST(UiFacadeTest, NameIsIdentityAndIndependentOfLabel)
     Rig r;
     r.ui.begin_frame();
     {
-        Element a = r.ui.label("hp_value", "100");
-        Element b = r.ui.label("mp_value", "100");
+        // Held by value (the factory returns a prvalue), then configured — the modifiers return a
+        // reference, so chaining them into an `Element` variable would be a copy, which is deleted.
+        Element a = r.ui.element("hp_value");
+        Element b = r.ui.element("mp_value");
+        a.text("100");
+        b.text("100");
         EXPECT_NE(a.id_hash(), b.id_hash());
         EXPECT_EQ(a.id_hash(), make_id("hp_value").hash);
     }
@@ -60,9 +65,9 @@ TEST(UiFacadeTest, ContentClosureNestsChildren)
 {
     Rig r;
     r.ui.begin_frame();
-    r.ui.panel("root").content([](Ui& u) {
-        u.label("a", "one");
-        u.label("b", "two");
+    r.ui.element("root").themed().content([](Ui& u) {
+        u.element("a").text("one");
+        u.element("b").text("two");
     });
     r.builder.end(dimension{ 400, 300 });
     r.ui.end_frame();
@@ -81,7 +86,7 @@ TEST(UiFacadeTest, LeafEmitsOnScopeExit)
 {
     Rig r;
     r.ui.begin_frame();
-    r.ui.panel("root").content([](Ui& u) { u.element("leaf").fixed(10, 10); });
+    r.ui.element("root").themed().content([](Ui& u) { u.element("leaf").fixed(10, 10); });
     r.builder.end(dimension{ 100, 100 });
     r.ui.end_frame();
     EXPECT_NE(r.builder.find(make_id("leaf").hash), nullptr);
@@ -95,9 +100,9 @@ TEST(UiFacadeTest, LabelSurvivesATemporaryString)
 {
     Rig r;
     r.ui.begin_frame();
-    r.ui.panel("root").content([](Ui& u) {
+    r.ui.element("root").themed().content([](Ui& u) {
         for (int i = 0; i < 64; ++i)
-            u.label(u.own("row" + std::to_string(i)), "frame " + std::to_string(i));
+            u.element(u.own("row" + std::to_string(i))).text("frame " + std::to_string(i));
     });
     r.builder.end(dimension{ 400, 900 });
 
@@ -197,8 +202,8 @@ TEST(UiFacadeTest, ElementsInheritThemeAndOverridePerElement)
     r.theme.panel = color{ 1, 2, 3, 4 };
     r.theme.radius = 7;
     r.ui.begin_frame();
-    r.ui.panel("themed").content([](Ui& u) {
-        u.panel("overridden").color(color{ 9, 9, 9, 9 }).content([](Ui&) {});
+    r.ui.element("themed").themed().content([](Ui& u) {
+        u.element("overridden").themed().color(color{ 9, 9, 9, 9 }).content([](Ui&) {});
     });
     r.builder.end(dimension{ 200, 200 });
     r.ui.end_frame();
@@ -283,12 +288,13 @@ TEST(UiFacadeTest, FacadeReproducesRawBuilderTreeExactly)
     layout_builder fluent;
     interaction state{};
     Motion motion;
-    Ui ui{ fluent, state, motion, theme };
+    PanelStore panels;
+    Ui ui{ fluent, state, motion, theme, panels };
     ui.begin_frame();
     fluent.begin(format{ .direction = direction::VERTICAL });
-    ui.panel("status").radius(12).pad(12).gap(4).column().content([&](Ui& u) {
+    ui.element("status").themed().radius(12).pad(12).gap(4).column().content([&](Ui& u) {
         for (std::size_t i = 0; i < 4; ++i)
-            u.label("status_row", lines[i])
+            u.element("status_row").text(lines[i])
              .color(i == 0 ? theme.accent : theme.text)
              .font(i == 0 ? 26 : 20);
     });

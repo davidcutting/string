@@ -10,28 +10,34 @@ const layout_node* hit_test_layered(const layout_builder& builder, uint16_t x, u
 {
     const std::span<const layout_node> nodes = builder.nodes();
 
-    // The overlay flag is inherited by a subtree, but only the node that declares it carries the
-    // bit — so resolve it by walking to the root, the same way the renderer's overlay_flags does.
-    auto is_overlay = [&](const layout_node& n) {
+    // `overlay` and `z` are both inherited by a subtree, but only the node that declares them
+    // carries the value — so resolve by walking to the root, the same way the renderer resolves its
+    // draw-batching key. THIS MUST MATCH THE RENDERER'S KEY: draw order is (overlay, z, tree order),
+    // so if the hit test used anything else the panel you see on top would not be the one that gets
+    // the click.
+    auto layer_key = [&](const layout_node& n) {
+        unsigned overlay = 0;
+        unsigned z = 0;
         for (const layout_node* p = &n; p != nullptr;)
         {
-            if (p->element.overlay) return true;
+            if (p->element.overlay) overlay = 1;
+            if (z == 0) z = p->element.z;   // nearest ancestor-or-self that declares one wins
             p = p->is_root() ? nullptr : &nodes[p->parent];
         }
-        return false;
+        return (overlay << 8) | z;
     };
 
-    // Last hit wins within a layer (painter order); the overlay layer beats the main layer outright
-    // because the renderer draws all overlay content after all main content.
+    // Last hit wins within a layer (painter order); a higher layer beats a lower one outright,
+    // because the renderer draws each layer's shapes AND text before moving to the next.
     const layout_node* hit = nullptr;
-    bool hit_overlay = false;
+    unsigned hit_key = 0;
     for (const layout_node& n : nodes)
     {
         if (!n.box.contains(x, y)) continue;
-        const bool over = is_overlay(n);
-        if (hit != nullptr && hit_overlay && !over) continue;   // main can never beat overlay
+        const unsigned key = layer_key(n);
+        if (hit != nullptr && key < hit_key) continue;   // a lower layer can never win
         hit = &n;
-        hit_overlay = over;
+        hit_key = key;
     }
 
     // An id-less top node (e.g. a button's label painted over it) is not interactive itself —
@@ -86,6 +92,7 @@ void begin_interaction(interaction& state, const interaction_input& in) noexcept
     state.cursor_x = in.cursor_x;
     state.cursor_y = in.cursor_y;
     state.dt = in.dt;
+    state.screen = in.screen;
 
     // A press edge in UI mode activates whatever was hovered as of last frame's layout; the gamepad
     // south button activates the focused element instead (controller-first).

@@ -76,14 +76,14 @@ bool button(Ui& u, std::string_view id_name, std::string_view label, uint16_t fo
 void progress_bar(Ui& u, uint16_t w, uint16_t h, float frac, color fill, color track)
 {
     frac = std::clamp(frac, 0.0f, 1.0f);
-    u.box()
+    u.element()
         .color(track)
         .radius(h / 2)
         .shape(shape::ROUNDED_RECTANGLE)
         .fixed(w, h)
         .row()
         .content([&](Ui& u2) {
-            u2.box()
+            u2.element()
                 .color(fill)
                 .radius(h / 2)
                 .shape(shape::ROUNDED_RECTANGLE)
@@ -94,7 +94,7 @@ void progress_bar(Ui& u, uint16_t w, uint16_t h, float frac, color fill, color t
 void tooltip(Ui& u, uint16_t x, uint16_t y, std::string_view title, color title_col,
              const std::string* body_lines, std::size_t body_count, uint16_t wrap_px)
 {
-    u.box()
+    u.element()
         .floating(x, y)
         .color(theme().panel)
         .stroke(theme().stroke_hi, 2)

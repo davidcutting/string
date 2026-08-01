@@ -65,6 +65,7 @@ inline const char* dump_mode(size_mode m)
     case size_mode::FIT:   return "fit";
     case size_mode::FIXED: return "fixed";
     case size_mode::GROW:  return "grow";
+    case size_mode::PERCENT: return "pct";
     }
     return "?";
 }
@@ -238,6 +239,13 @@ inline void dump_color(std::string& out, const color& c)
             out += " float=-";
         }
         out += n.element.overlay ? " overlay=1" : " overlay=-";
+        // Emitted only when set, like `sweep`: a field that is zero for every pre-existing author
+        // would otherwise rewrite every baseline for a feature they do not use.
+        if (n.element.z != 0)
+        {
+            std::snprintf(buf, sizeof buf, " z=%u", static_cast<unsigned>(n.element.z));
+            out += buf;
+        }
         if (n.element.sweep != 0)
         {
             std::snprintf(buf, sizeof buf, " sweep=%u", static_cast<unsigned>(n.element.sweep));

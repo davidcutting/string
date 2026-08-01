@@ -120,9 +120,10 @@ enum class shape : uint8_t
 // How an element resolves its size on a single axis.
 enum class size_mode : uint8_t
 {
-    FIT,    // shrink-wrap: content (measured, or children) size, floored by `value`
-    FIXED,  // exactly `value` — never grows or shrinks
-    GROW,   // start at content size, then expand to fill leftover (and shrink on overflow)
+    FIT,      // shrink-wrap: content (measured, or children) size, floored by `value`
+    FIXED,    // exactly `value` — never grows or shrinks
+    GROW,     // start at content size, then expand to fill leftover (and shrink on overflow)
+    PERCENT,  // `value` per-mille of the space left after definite-size siblings — IGNORES content
 };
 
 struct axis_sizing
@@ -131,6 +132,13 @@ struct axis_sizing
     uint16_t value = 0;         // the size when FIXED (and the floor for a FIT leaf)
     uint16_t min = 0;           // hard floor (also the floor when shrinking on overflow)
     uint16_t max = 0xFFFF;
+    // GROW only: share of the surplus, RELATIVE to the other growers in the same container. Equal
+    // weights split evenly, so the default of 1 is exactly the unweighted behaviour.
+    //
+    // This is what lets a container express a PROPORTION ("70/30") rather than "share equally" —
+    // which a dock splitter fundamentally needs, and which no combination of min/max can say without
+    // already knowing the container's resolved size.
+    uint16_t weight = 1;
 };
 
 struct sizing
@@ -145,6 +153,28 @@ struct sizing
 [[nodiscard]] constexpr axis_sizing grow(uint16_t min = 0, uint16_t max = 0xFFFF) noexcept
 {
     return { size_mode::GROW, 0, min, max };
+}
+// GROW with a relative share of the surplus. `grow_weighted(7)` beside `grow_weighted(3)` splits
+// 70/30. A weight of 0 is clamped to 1: a grower that can never receive anything is a silent
+// layout hole, and FIXED/FIT already express "do not grow".
+[[nodiscard]] constexpr axis_sizing grow_weighted(uint16_t weight, uint16_t min = 0,
+                                                  uint16_t max = 0xFFFF) noexcept
+{
+    return { size_mode::GROW, 0, min, max, weight == 0 ? uint16_t{ 1 } : weight };
+}
+// A share of the container, in PER-MILLE, independent of content size.
+//
+// This is the primitive a resizable split needs, and it is NOT expressible with GROW: a GROW child
+// starts at its CONTENT size and only shares the SURPLUS, so converting a resolved pixel size into a
+// weight and back does not round-trip — a dock splitter built on weights jumps the moment it is
+// touched, because the content base is not part of the ratio. PERCENT ignores content entirely, so
+// pixels <-> proportion is exact in both directions.
+//
+// Main-axis only: on the cross axis it behaves as FIT.
+[[nodiscard]] constexpr axis_sizing percent(uint16_t per_mille, uint16_t min = 0,
+                                            uint16_t max = 0xFFFF) noexcept
+{
+    return { size_mode::PERCENT, per_mille, min, max };
 }
 [[nodiscard]] constexpr sizing size_fixed(uint16_t w, uint16_t h) noexcept { return { fixed(w), fixed(h) }; }
 [[nodiscard]] constexpr sizing size_grow() noexcept { return { grow(), grow() }; }
@@ -178,6 +208,16 @@ struct element
     // scene UI's text as well as its shapes (shapes and glyphs are separate draw streams, so tree
     // order alone cannot put a later shape over an earlier node's text). Layout ignores it.
     bool overlay = false;
+    // Front-to-back order WITHIN a layer (inherited by the subtree, like `overlay`; higher = in
+    // front). Layout ignores it — it is a DRAW-BATCHING key, and it exists for the same reason
+    // `overlay` does: shapes and glyphs are separate draw streams, so a renderer that emits all
+    // shapes then all text cannot put a raised panel's background over a lower panel's TEXT. Each
+    // distinct z becomes its own shapes-then-text batch, so anything sharing a z still batches
+    // together and z only costs draw calls when it is actually used.
+    //
+    // Convention (sandbox): floating panels take 1..N from their front-to-back order; modal debug
+    // surfaces (console, HUD) sit at a reserved high value so they stay above panels.
+    uint8_t z = 0;
     // Radial cooldown-sweep fraction (0 = none/ready, 255 = fully on cooldown). A renderer that
     // supports it (the UI overlay's shape shader) dims the not-yet-elapsed clockwise wedge — the
     // ability/cooldown affordance games use. Purely visual; layout ignores it.
@@ -568,6 +608,50 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
             return horizontal ? nodes_[c].element.sizing.width : nodes_[c].element.sizing.height;
         };
 
+        // PERCENT resolves FIRST and ignores content: each such child takes its per-mille share of
+        // the space left over once definite-size siblings (and the gaps) are accounted for. Doing
+        // this before `used` is computed is what makes it independent of content — which is the
+        // whole point, and the reason a splitter written in percentages round-trips exactly.
+        {
+            int definite = 0;
+            int flow_children = 0;
+            bool any_percent = false;
+            for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
+            {
+                if (nodes_[c].element.floating) continue;
+                ++flow_children;
+                if (main_sizing(c).mode == size_mode::PERCENT) any_percent = true;
+                else definite += main_of(c);
+            }
+            if (any_percent)
+            {
+                if (flow_children > 1) definite += node.format.gap * (flow_children - 1);
+                const int avail = std::max(0, inner_main - definite);
+                // Track the last percent child so it absorbs the rounding remainder; without this a
+                // 565/435 split of an odd extent leaves a stray pixel gap at the seam.
+                int assigned = 0;
+                int total_pm = 0;
+                uint32_t last = layout_node::none;
+                for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
+                {
+                    if (nodes_[c].element.floating || main_sizing(c).mode != size_mode::PERCENT) continue;
+                    total_pm += main_sizing(c).value;
+                    last = c;
+                }
+                for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
+                {
+                    if (nodes_[c].element.floating || main_sizing(c).mode != size_mode::PERCENT) continue;
+                    const axis_sizing& s = main_sizing(c);
+                    int v = (total_pm > 0) ? avail * s.value / 1000 : 0;
+                    if (c == last && total_pm >= 1000)
+                        v = avail - assigned;   // the remainder, so the children tile exactly
+                    v = std::clamp(v, static_cast<int>(s.min), static_cast<int>(s.max));
+                    set_main(c, v);
+                    assigned += v;
+                }
+            }
+        }
+
         int used = 0;
         int child_count = 0;
         for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
@@ -582,17 +666,25 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
 
         int leftover = inner_main - used;
 
-        // Grow: hand surplus to GROW children (up to their max).
+        // Grow: hand surplus to GROW children (up to their max), in proportion to their weights.
+        // Weights default to 1, so equal weights reproduce the old even split exactly.
+        //
+        // Still a LOOP rather than one weighted division, because a child that hits its `max` must
+        // return its unused share to the others — one pass would strand that surplus. Each pass
+        // recomputes the weight total over only those children that can still take more.
         while (leftover > 0)
         {
-            int growers = 0;
+            int total_weight = 0;
             for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
                 if (!nodes_[c].element.floating && main_sizing(c).mode == size_mode::GROW && main_of(c) < main_sizing(c).max)
-                    ++growers;
-            if (growers == 0)
+                    total_weight += std::max<int>(1, main_sizing(c).weight);
+            if (total_weight == 0)
                 break;
 
-            const int share = std::max(1, leftover / growers);
+            // Snapshot the surplus for this pass. Shares MUST be computed against a fixed total —
+            // using the running `leftover` would hand each child a slice of what its earlier
+            // siblings left behind, quietly biasing the split towards the first child.
+            const int pass_leftover = leftover;
             bool progressed = false;
             for (uint32_t c = node.first_child; c != layout_node::none && leftover > 0; c = nodes_[c].next_sibling)
             {
@@ -601,6 +693,10 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
                 const int room = static_cast<int>(main_sizing(c).max) - main_of(c);
                 if (room <= 0)
                     continue;
+                // max(1, ...) keeps the loop progressing when the weighted share rounds to zero;
+                // without it a wide container with many growers could stall with leftover > 0.
+                const int w = std::max<int>(1, main_sizing(c).weight);
+                const int share = std::max(1, pass_leftover * w / total_weight);
                 const int add = std::min({ share, room, leftover });
                 set_main(c, main_of(c) + add);
                 leftover -= add;

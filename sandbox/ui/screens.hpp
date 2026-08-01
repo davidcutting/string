@@ -51,6 +51,27 @@ void author_actionbar(Ui& u, ScreenState& state);
 // (4) Quick-chat / tactical-ping radial menu (mouse + gamepad) + ping feed + world ping markers.
 void author_chat_pings(Ui& u, const UiScene& scene, ScreenState& state);
 
+// (5) Brief 12 M1: floating panels — drag by the title bar, resize by the corner grip.
+// Deliberately its OWN screen and NOT part of "all", so the five brief-05 layout-dump baselines
+// stay byte-identical through M1.
+void author_panels(Ui& u, ScreenState& state);
+
+// (6) Brief 12 M2c: the workspace — cards arranged into split regions with tab bars. Drag a
+// splitter to resize; click a tab to switch card. Its own screen so the five brief-05 baselines
+// stay byte-identical.
+//
+// Card identities are CONSTANTS, so a typo is a compile error rather than a card that silently
+// never appears. `make_id` is constexpr, so these cost nothing at runtime.
+inline constexpr string::id kCardStats = string::make_id("ws_stats");
+inline constexpr string::id kCardTree  = string::make_id("ws_tree");
+inline constexpr string::id kCardLog   = string::make_id("ws_log");
+inline constexpr string::id kCardProps = string::make_id("ws_props");
+
+// Seeds the default arrangement. A SEED, not a static relationship: in a real app this runs only
+// when there is nothing saved, and the user owns the layout from then on.
+void seed_workspace(string::ui::Workspace& ws);
+void author_workspace(Ui& u, string::ui::Workspace& ws, ScreenState& state);
+
 // A small always-on status panel (frame counter, anchor/nameplate count, active screen).
 void author_status_panel(Ui& u, const UiScene& scene, ScreenState& state,
                          std::string_view screen_name, std::size_t nameplate_count);

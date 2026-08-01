@@ -12,6 +12,11 @@
 
 namespace sandbox::ui
 {
+// Draw/hit layer for the brief-06 debug surfaces (console, HUD, inspector, log). Floating panels
+// take z 1..N from their front-to-back order, so debug surfaces sit above ANY of them — they are
+// modal tooling, not part of the panel stack, and must never be buried by raising a panel.
+constexpr std::uint8_t kDebugZ = 250;
+
 using string::element;
 using string::format;
 using string::shape;
@@ -177,6 +182,7 @@ void DebugPanels::author_console(string::layout_builder& b)
     panel.id = make_id("dbg_console");
     panel.floating = true;
     panel.overlay = true;   // topmost layer: debug surfaces cover scene UI text AND shapes
+    panel.z = kDebugZ;      // above floating panels, which take 1..N from their front-to-back order
     panel.float_x = 16;
     panel.float_y = 16;
     // Fully opaque: the console overlays arbitrary scene/UI content and must stay readable.
@@ -229,6 +235,7 @@ void DebugPanels::author_logs(string::layout_builder& b)
     panel.id = make_id("dbg_logs");
     panel.floating = true;
     panel.overlay = true;   // topmost layer: debug surfaces cover scene UI text AND shapes
+    panel.z = kDebugZ;      // above floating panels, which take 1..N from their front-to-back order
     panel.float_x = 16;
     panel.float_y = console_open_ ? 400 : 16;   // stacks under the console when both are open
     panel.color = { theme().panel_alt.r, theme().panel_alt.g, theme().panel_alt.b, 255 };
@@ -268,6 +275,7 @@ void DebugPanels::author_hud(string::layout_builder& b, const MeshOverlayStats* 
     panel.id = make_id("dbg_hud");
     panel.floating = true;
     panel.overlay = true;   // topmost layer: debug surfaces cover scene UI text AND shapes
+    panel.z = kDebugZ;      // above floating panels, which take 1..N from their front-to-back order
     // Top-left column stacking: below the console and/or log panel when they're open.
     panel.float_x = 16;
     panel.float_y = static_cast<uint16_t>(
@@ -352,6 +360,7 @@ void DebugPanels::author_inspector(string::layout_builder& b, const UIPass::UiCo
     panel.id = make_id("dbg_inspector");
     panel.floating = true;
     panel.overlay = true;   // topmost layer: debug surfaces cover scene UI text AND shapes
+    panel.z = kDebugZ;      // above floating panels, which take 1..N from their front-to-back order
     panel.float_x = 340;
     panel.float_y = 16;
     panel.color = theme().panel;

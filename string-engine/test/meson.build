@@ -7,6 +7,8 @@ test_files = [
     'layout_dump_test.cpp',
     'ui_interaction_test.cpp',
     'ui_facade_test.cpp',
+    'ui_panel_test.cpp',
+    'ui_workspace_test.cpp',
     'resource_usage_test.cpp',
     'residency_manager_test.cpp',
     'font_test.cpp',

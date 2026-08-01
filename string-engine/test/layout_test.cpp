@@ -2,6 +2,8 @@
 
 #include <string/core/layout.hpp>
 
+#include <utility>
+
 using namespace string;
 using namespace string::literals;
 
@@ -298,4 +300,182 @@ TEST(Layout, IdHashIsFnv1a)
 {
     EXPECT_EQ("panel"_id.hash, fnv1a("panel"));
     EXPECT_EQ(make_id("panel").hash, fnv1a("panel"));
+}
+
+// --- Weighted GROW (brief 12 M2a) ---------------------------------------------------------------
+// Split ratios need PROPORTIONAL sizing: no combination of min/max can express "70/30" without
+// already knowing the container's resolved size, which an author does not have.
+
+namespace
+{
+// Two weighted growers in a fixed-width row; returns their resolved widths.
+std::pair<int, int> split_widths(std::uint16_t wa, std::uint16_t wb, std::uint16_t total)
+{
+    string::layout_builder b;
+    string::element root{};
+    root.sizing = string::size_fixed(total, 40);
+    b.begin(root, string::format{ .direction = string::direction::HORIZONTAL });
+    {
+        string::element a{};
+        a.id = string::make_id("a");
+        a.sizing = { string::grow_weighted(wa), string::grow() };
+        b.add_element(a);
+        string::element c{};
+        c.id = string::make_id("b");
+        c.sizing = { string::grow_weighted(wb), string::grow() };
+        b.add_element(c);
+    }
+    b.end(string::dimension{ total, 40 });
+    return { b.find(string::make_id("a").hash)->box.dimension.width,
+             b.find(string::make_id("b").hash)->box.dimension.width };
+}
+}  // namespace
+
+TEST(LayoutTest, EqualWeightsReproduceTheEvenSplit)
+{
+    const auto [a, c] = split_widths(1, 1, 400);
+    EXPECT_EQ(a, 200);
+    EXPECT_EQ(c, 200);
+}
+
+TEST(LayoutTest, WeightsSplitSurplusInProportion)
+{
+    const auto [a, c] = split_widths(7, 3, 1000);
+    EXPECT_NEAR(a, 700, 2);
+    EXPECT_NEAR(c, 300, 2);
+    EXPECT_EQ(a + c, 1000);   // no surplus stranded
+}
+
+TEST(LayoutTest, WeightOrderDoesNotBiasTheSplit)
+{
+    // The mirrored weights must mirror the result. This is what fails if shares are computed
+    // against the RUNNING leftover instead of a per-pass snapshot: the first child takes too much
+    // either way, so 7/3 and 3/7 would not be symmetric.
+    const auto [a1, b1] = split_widths(7, 3, 1000);
+    const auto [a2, b2] = split_widths(3, 7, 1000);
+    EXPECT_NEAR(a1, b2, 2);
+    EXPECT_NEAR(b1, a2, 2);
+}
+
+TEST(LayoutTest, ZeroWeightIsTreatedAsOne)
+{
+    // A grower that could never receive anything is a silent layout hole; FIXED/FIT already say
+    // "do not grow".
+    const auto [a, c] = split_widths(0, 1, 400);
+    EXPECT_EQ(a, 200);
+    EXPECT_EQ(c, 200);
+}
+
+TEST(LayoutTest, WeightedGrowStillRespectsMaxAndRedistributes)
+{
+    string::layout_builder b;
+    string::element root{};
+    root.sizing = string::size_fixed(1000, 40);
+    b.begin(root, string::format{ .direction = string::direction::HORIZONTAL });
+    {
+        string::element a{};
+        a.id = string::make_id("capped");
+        a.sizing = { string::grow_weighted(7, 0, 100), string::grow() };   // wants 700, capped at 100
+        b.add_element(a);
+        string::element c{};
+        c.id = string::make_id("rest");
+        c.sizing = { string::grow_weighted(3), string::grow() };
+        b.add_element(c);
+    }
+    b.end(string::dimension{ 1000, 40 });
+
+    // The capped child's unused share must flow to the other, not be stranded — which is why the
+    // distribution is a loop rather than a single weighted division.
+    EXPECT_EQ(b.find(string::make_id("capped").hash)->box.dimension.width, 100);
+    EXPECT_EQ(b.find(string::make_id("rest").hash)->box.dimension.width, 900);
+}
+
+// --- PERCENT sizing (brief 12 M2c fix) -----------------------------------------------------------
+// The primitive a resizable split needs. GROW cannot do this job: it starts at CONTENT size and only
+// shares the SURPLUS, so pixels -> ratio -> pixels does not round-trip and a splitter jumps on click.
+
+TEST(LayoutTest, PercentIgnoresContentSize)
+{
+    string::layout_builder b;
+    string::element root{};
+    root.sizing = string::size_fixed(1000, 100);
+    b.begin(root, string::format{ .direction = string::direction::HORIZONTAL });
+    {
+        // Deliberately different content sizes: percent must ignore them entirely.
+        string::element a{};
+        a.id = string::make_id("a");
+        a.sizing = { string::percent(700), string::grow() };
+        b.begin(a, string::format{});
+        {
+            string::element filler{};
+            filler.sizing = string::size_fixed(400, 20);
+            b.add_element(filler);
+        }
+        b.end();
+
+        string::element c{};
+        c.id = string::make_id("b");
+        c.sizing = { string::percent(300), string::grow() };
+        b.add_element(c);
+    }
+    b.end(string::dimension{ 1000, 100 });
+
+    EXPECT_EQ(b.find(string::make_id("a").hash)->box.dimension.width, 700);
+    EXPECT_EQ(b.find(string::make_id("b").hash)->box.dimension.width, 300);
+}
+
+// Percent shares what is left AFTER definite siblings — which is exactly the splitter case: two
+// regions either side of a fixed-width grip.
+TEST(LayoutTest, PercentSharesTheSpaceLeftByDefiniteSiblings)
+{
+    string::layout_builder b;
+    string::element root{};
+    root.sizing = string::size_fixed(806, 100);
+    b.begin(root, string::format{ .direction = string::direction::HORIZONTAL });
+    {
+        string::element a{};
+        a.id = string::make_id("a");
+        a.sizing = { string::percent(500), string::grow() };
+        b.add_element(a);
+
+        string::element grip{};
+        grip.sizing = string::size_fixed(6, 100);   // the splitter
+        b.add_element(grip);
+
+        string::element c{};
+        c.id = string::make_id("b");
+        c.sizing = { string::percent(500), string::grow() };
+        b.add_element(c);
+    }
+    b.end(string::dimension{ 806, 100 });
+
+    const int wa = b.find(string::make_id("a").hash)->box.dimension.width;
+    const int wb = b.find(string::make_id("b").hash)->box.dimension.width;
+    EXPECT_EQ(wa, 400);
+    EXPECT_EQ(wb, 400);
+    EXPECT_EQ(wa + wb + 6, 806);   // tiles exactly, no stray pixel at the seam
+}
+
+// The rounding remainder goes to the last percent child, so an odd split still tiles exactly.
+TEST(LayoutTest, PercentTilesExactlyOnOddSplits)
+{
+    string::layout_builder b;
+    string::element root{};
+    root.sizing = string::size_fixed(999, 100);
+    b.begin(root, string::format{ .direction = string::direction::HORIZONTAL });
+    {
+        string::element a{};
+        a.id = string::make_id("a");
+        a.sizing = { string::percent(565), string::grow() };
+        b.add_element(a);
+        string::element c{};
+        c.id = string::make_id("b");
+        c.sizing = { string::percent(435), string::grow() };
+        b.add_element(c);
+    }
+    b.end(string::dimension{ 999, 100 });
+
+    const int wa = b.find(string::make_id("a").hash)->box.dimension.width;
+    const int wb = b.find(string::make_id("b").hash)->box.dimension.width;
+    EXPECT_EQ(wa + wb, 999);
 }

@@ -58,6 +58,9 @@ struct interaction
     float cursor_x = 0.0f;
     float cursor_y = 0.0f;
     float dt = 0.0f;
+    // Carried through from the input so layers above (panel clamping) don't need a second channel
+    // for it. Still a plain value — `dimension` is POD.
+    dimension screen{};
 
     // Mode REQUESTS back to the host (a click on empty UI space wants game mode; any focus-nav
     // intent wants UI mode). Requests, not actions: the host owns capture. Cleared each frame.

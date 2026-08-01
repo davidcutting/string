@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <string>
 
 #include "ui/theme.hpp"
 
@@ -18,7 +19,7 @@ namespace
 void bar(Ui& u, uint16_t x, uint16_t y, uint16_t w, uint16_t h, float frac, color bg, color fill)
 {
     frac = std::clamp(frac, 0.0f, 1.0f);
-    u.box()
+    u.element()
         .floating(x, y)
         .color(bg)
         .radius(h / 2)
@@ -26,7 +27,7 @@ void bar(Ui& u, uint16_t x, uint16_t y, uint16_t w, uint16_t h, float frac, colo
         .fixed(w, h)
         .row()
         .content([&](Ui& u2) {
-            u2.box()
+            u2.element()
                 .color(fill)
                 .radius(h / 2)
                 .shape(shape::ROUNDED_RECTANGLE)
@@ -86,12 +87,89 @@ void author_nameplates(Ui& u, const UiScene& scene, std::size_t budget)
     }
 }
 
+// (5) Floating panels (brief 12 M1). Three panels, deliberately overlapping at their default
+// positions so click-to-raise is visible: pressing a buried one — its chrome OR a widget inside it —
+// brings it to the front, and the raise takes effect on the next frame.
+//
+// MINIMUM SIZES ARE THE AUTHOR'S JOB, deliberately. The engine's floor is a plain constant that
+// knows nothing about content, so a panel can otherwise be resized smaller than what it holds. The
+// alternative — deriving the floor from the measured content — would need a post-layout writeback
+// into PanelStore, which buys a new frame-ordering constraint (the bug class that produced the
+// froxel device-lost crash and the ensure_hiz VUID) and mixes derived data into a store that
+// currently means "where the user dragged it". Not worth it, because it is interim work: once text
+// wrap and scrolling exist, "smaller than its contents" stops being a defect and becomes the case
+// scrolling is FOR. Until then the failure is visible and local — glyphs clip to their own node box
+// (ui_pass.cpp), so a bad minimum truncates text inside the panel rather than spilling over
+// anything. See docs/briefs/12-ui-panels.md, "Overflow policy".
+void author_panels(Ui& u, ScreenState& state)
+{
+    u.panel("panel_stats")
+        .title("Stats")
+        // Widest line is 191px + 24px body padding; 4 rows + gaps + the 38px title bar ≈ 166px.
+        .limits({ 220.0f, 170.0f, 48.0f })
+        .initial({ 60.0f, 90.0f, 320.0f, 220.0f })
+        .content([&](Ui& u2) {
+            u2.text(u2.own("frame " + std::to_string(state.frame)));
+            u2.text(u2.own("time  " + std::to_string(static_cast<int>(state.time)) + "s"));
+            u2.text("drag the title bar").color(theme().text_dim);
+            u2.text("resize from the corner").color(theme().text_dim);
+        });
+
+    u.panel("panel_controls")
+        .title("Controls")
+        // The caption row is 216px wide; the two buttons stack to ≈166px with the title bar.
+        .limits({ 240.0f, 170.0f, 48.0f })
+        .initial({ 300.0f, 220.0f, 300.0f, 200.0f })
+        .content([&](Ui& u2) {
+            u2.text("buttons still work inside a panel").color(theme().text_dim).font(16);
+            u2.button("panel_btn_a").content([](Ui& u3) { u3.text("Alpha"); });
+            u2.button("panel_btn_b").content([](Ui& u3) { u3.text("Beta"); });
+        });
+
+    // The clamp demo: its content really does fit in 160x96 (127x82), so this floor is honest and
+    // dragging the grip inward stops exactly at a size the panel can still display.
+    u.panel("panel_tiny")
+        .title("Tiny")
+        .initial({ 560.0f, 120.0f, 200.0f, 140.0f })
+        .limits({ 160.0f, 96.0f, 48.0f })
+        .content([&](Ui& u2) { u2.text("min 160x96").color(theme().text_dim); });
+}
+
+void seed_workspace(string::ui::Workspace& ws)
+{
+    using namespace string::ui;
+    ws.dock(kCardTree.hash, left());                                  // becomes the root
+    ws.dock(kCardStats.hash, left(fixed(240)).locked());              // fixed strip, edge not draggable
+    ws.dock(kCardLog.hash, bottom_of(kCardTree.hash, percent(500)));
+    ws.dock(kCardProps.hash, tab_with(kCardLog.hash));                // shares Log's panel as a tab
+}
+
+void author_workspace(Ui& u, string::ui::Workspace& ws, ScreenState& state)
+{
+    u.workspace(ws).content([&](Ui& u2) {
+        u2.card(kCardStats).title("Stats").content([&](Ui& u3) {
+            u3.text(u3.own("frame " + std::to_string(state.frame)));
+            u3.text("this strip is locked").color(theme().text_dim);
+        });
+        u2.card(kCardTree).title("Tree").content([&](Ui& u3) {
+            for (int i = 0; i < 4; ++i)
+                u3.text(u3.own("node " + std::to_string(i))).color(theme().text_dim);
+        });
+        u2.card(kCardLog).title("Log").content([&](Ui& u3) {
+            u3.text("drag the splitter above").color(theme().text_dim);
+        });
+        u2.card(kCardProps).title("Props").content([&](Ui& u3) {
+            u3.text("tabbed with Log").color(theme().text_dim);
+        });
+    });
+}
+
 void author_status_panel(Ui& u, const UiScene& scene, ScreenState& state,
                          std::string_view screen_name, std::size_t nameplate_count)
 {
     ++state.frame;
 
-    u.box()
+    u.element()
         .color(theme().panel)
         .stroke(theme().stroke, 2)
         .radius(12)
@@ -129,7 +207,7 @@ void author_inventory(Ui& u)
     std::string hovered_item;
     color hovered_rarity = theme().text;
 
-    u.box()
+    u.element()
         .floating(40, 120)
         .color(theme().panel)
         .stroke(theme().stroke, 2)
@@ -142,10 +220,10 @@ void author_inventory(Ui& u)
             u2.text("Inventory").color(theme().text).font(24);
 
             // 6 columns x 4 rows grid.
-            u2.box().gap(8).column().content([&](Ui& u3) {
+            u2.element().gap(8).column().content([&](Ui& u3) {
                 for (int row = 0; row < 4; ++row)
                 {
-                    u3.box().gap(8).row().content([&](Ui& u4) {
+                    u3.element().gap(8).row().content([&](Ui& u4) {
                         for (int cx = 0; cx < 6; ++cx)
                         {
                             const int idx = row * 6 + cx;
@@ -190,7 +268,7 @@ void author_actionbar(Ui& u, ScreenState& state)
     const std::size_t slots = 8;
 
     // Bottom-centred bar (floating).
-    u.box()
+    u.element()
         .floating(200, 700)
         .color(theme().panel)
         .stroke(theme().stroke, 2)
@@ -208,7 +286,7 @@ void author_actionbar(Ui& u, ScreenState& state)
                 const auto cid = make_id(id_name).hash;
 
                 // Slot column: keybind on top, icon cell below.
-                u2.box().gap(3).align(alignment::CENTER).column().content([&](Ui& u3) {
+                u2.element().gap(3).align(alignment::CENTER).column().content([&](Ui& u3) {
                     u3.text(keys[i]).color(theme().text_dim).font(16);
 
                     const std::string_view label = u3.own(std::string(abils[i]).substr(0, 3));
@@ -246,7 +324,7 @@ void author_chat_pings(Ui& u, const UiScene& scene, ScreenState& state)
     const float radius = 120.0f;
 
     // Centre hub.
-    u.box()
+    u.element()
         .floating(static_cast<uint16_t>(cx - 34), static_cast<uint16_t>(cy - 34))
         .color(theme().panel)
         .stroke(theme().stroke_hi, 2)
@@ -260,7 +338,7 @@ void author_chat_pings(Ui& u, const UiScene& scene, ScreenState& state)
         const float wy = cy + std::sin(ang) * radius - 24;
         const bool sel = (i == state.radial_sel);
 
-        u.box()
+        u.element()
             .floating(static_cast<uint16_t>(std::max(0.0f, wx)),
                       static_cast<uint16_t>(std::max(0.0f, wy)))
             .color(sel ? color{ 45, 52, 78, 240 } : theme().panel_alt)
@@ -284,7 +362,7 @@ void author_chat_pings(Ui& u, const UiScene& scene, ScreenState& state)
         float depth;
         if (!scene.project(scene.anchors[i].world, px, depth))
             continue;
-        u.box()
+        u.element()
             .floating(static_cast<uint16_t>(std::max(0.0f, px.x - 10)),
                       static_cast<uint16_t>(std::max(0.0f, px.y - 10)))
             .color(theme().accent_warm)
@@ -294,7 +372,7 @@ void author_chat_pings(Ui& u, const UiScene& scene, ScreenState& state)
     }
 
     // Ping feed (top-right).
-    u.box()
+    u.element()
         .floating(static_cast<uint16_t>(std::max(0.0f, scene.screen.x - 240)), 120)
         .color(theme().panel)
         .stroke(theme().stroke, 2)

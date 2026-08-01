@@ -164,6 +164,8 @@ core_src = [
     'src/ui/motion.cpp',
     'src/ui/interaction.cpp',
     'src/ui/ui.cpp',
+    'src/ui/panel.cpp',
+    'src/ui/workspace.cpp',
     'src/platform/input_map.cpp',
     'src/scene/camera.cpp',
     'src/vulkan/renderer.cpp',
