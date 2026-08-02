@@ -62,13 +62,29 @@ std::vector<std::uint8_t> read_file(const std::filesystem::path& path)
 // only mutates the field while it is focused. Modal: mouse-look capture = game (WASD/look to the
 // camera); Esc frees the cursor for UI (hover, click-to-focus, type); a click on empty space
 // re-captures. All dynamic strings live in the closure UIPass holds, so their views stay valid.
+// The `Ui` is handed in as a shared slot rather than captured privately so the POST-LAYOUT hook can
+// reach the same instance: `Ui::observe()` caches the boxes widgets asked to measure, and sizes only
+// exist after layout. Same seam, and same reason, as `Workspace::observe`.
+using SharedUi = std::shared_ptr<std::optional<ui::Ui>>;
+
+// Post-layout hook for an author built around `fluent`. Null-safe on the first frame, when the Ui has
+// not been constructed yet (it needs the builder and interaction references the author receives).
+UIPass::PostLayout make_ui_observer(SharedUi fluent,
+                                    std::shared_ptr<string::ui::Workspace> ws = nullptr)
+{
+    return [fluent, ws](const string::layout_builder& b) {
+        if (ws) ws->observe(b);
+        if (*fluent) (*fluent)->observe();
+    };
+}
+
 UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats,
-                              std::size_t nameplate_stress)
+                              std::size_t nameplate_stress, SharedUi fluent)
 {
     return [mesh_stats,
             np_driver = UiSceneDriver(static_cast<std::uint32_t>(nameplate_stress)),
             np_scene = UiScene{}, motion = ui::Motion{}, ui_panels = string::ui::PanelStore{},
-            fluent = std::optional<ui::Ui>{}, nameplate_stress,
+            fluent = std::move(fluent), nameplate_stress,
             panels = ui::DebugPanels{}](
                string::layout_builder& b, const UIPass::UiContext& ctx) mutable {
         // Optional synthetic nameplate stress OVER the Sponza scene (STRING_UI_NAMEPLATES): the same
@@ -79,10 +95,11 @@ UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats
             np_driver.update(ctx.ui.dt, 1920, 1080, np_scene);
             // Closure-lived, not stack-lived: the arena it owns backs the nameplate text views for
             // the rest of the frame (see the lifetime note on Ui).
-            if (!fluent) fluent.emplace(b, ctx.ui, motion, ui::theme(), ui_panels);
-            fluent->begin_frame();
-            ui::author_nameplates(*fluent, np_scene, nameplate_stress);
-            fluent->end_frame();
+            if (!*fluent) fluent->emplace(b, ctx.ui, motion, ui::theme(), ui_panels);
+            ui::Ui& u = **fluent;
+            u.begin_frame();
+            ui::author_nameplates(u, np_scene, nameplate_stress);
+            u.end_frame();
         }
 
         // Brief 06: debug surfaces (console + profiler HUD + inspector), toggled at runtime
@@ -101,18 +118,18 @@ UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats
 // hover/focus/text-field interaction is still exercised here.
 UIPass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::size_t nameplate_budget,
                                   std::string screen,
-                                  std::shared_ptr<string::ui::Workspace> ws)
+                                  std::shared_ptr<string::ui::Workspace> ws, SharedUi fluent)
 {
     return [scene, nameplate_budget, screen, ws, motion = ui::Motion{}, ui_panels = string::ui::PanelStore{},
-            fluent = std::optional<ui::Ui>{},
+            fluent = std::move(fluent),
             state = ui::ScreenState{}, panels = ui::DebugPanels{}](
                string::layout_builder& b, const UIPass::UiContext& ctx) mutable {
         // The Ui lives in the CLOSURE, not on the stack: it owns the frame string arena and the
         // layout tree holds non-owning views into it, so it must outlive authoring — through layout
         // and record. Constructed on the first frame (the builder and interaction it binds are
         // stable members of UIPass, so the references stay valid for the run).
-        if (!fluent) fluent.emplace(b, ctx.ui, motion, ui::theme(), ui_panels);
-        ui::Ui& u = *fluent;
+        if (!*fluent) fluent->emplace(b, ctx.ui, motion, ui::theme(), ui_panels);
+        ui::Ui& u = **fluent;
         u.begin_frame();
         state.tick(ctx.ui.dt);
 
@@ -136,9 +153,15 @@ UIPass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::size_t na
             ui::author_panels(u, state);
         if (screen == "workspace" && ws)
             ui::author_workspace(u, *ws, state);
+        if (screen == "widgets")
+            ui::author_widgets(u, state);
 
         ui::author_status_panel(u, *scene, state, screen, np_count);
         u.end_frame();
+
+        // The engine REQUESTS text capture (a focused field wants the keystrokes); the host grants
+        // it, because capture is a platform decision — the same split as the game/UI mode requests.
+        ctx.input.set_text_capture(u.wants_text_capture());
 
         // Brief 06 debug surfaces work in the ui-dev sandbox too (console/HUD; inspector shows "no
         // scene" since there's no geometry). Lets tooling be iterated in STRING_SCENE=ui.
@@ -165,7 +188,10 @@ String::RenderPlan::Setup make_geometry_setup(
     auto transp = std::make_unique<TransparencyPass>(gp);
     auto shadow = std::make_unique<ShadowPass>(gp);
     auto dbg    = std::make_unique<DebugLinePass>(ctx, mesh_stats);
-    auto ui     = std::make_unique<UIPass>(ctx, atlas, make_ui_author(mesh_stats, nameplate_stress));
+    auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
+    auto ui     = std::make_unique<UIPass>(ctx, atlas,
+                                           make_ui_author(mesh_stats, nameplate_stress, ui_slot),
+                                           make_ui_observer(ui_slot));
     auto post   = std::make_unique<PostProcessPass>(ctx);
 
     FroxelPass* fx = froxel.get();
@@ -268,9 +294,10 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
             auto ws = std::make_shared<string::ui::Workspace>();
             if (screen == "workspace")
                 ui::seed_workspace(*ws);
+            auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
             auto ui = std::make_unique<UIPass>(
-                ctx, atlas, make_ui_dev_author(ui_scene, np_budget, screen, ws),
-                [ws](const string::layout_builder& b) { ws->observe(b); });
+                ctx, atlas, make_ui_dev_author(ui_scene, np_budget, screen, ws, ui_slot),
+                make_ui_observer(ui_slot, ws));
             String::Pass* bgp = bg.get();
             String::Pass* uip = ui.get();
             String::RenderPlan::Setup s;

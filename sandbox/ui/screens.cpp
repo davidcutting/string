@@ -7,6 +7,8 @@
 
 #include "ui/theme.hpp"
 
+#include <string/ui/widgets.hpp>
+
 namespace sandbox::ui
 {
 using namespace string;
@@ -126,6 +128,24 @@ void author_panels(Ui& u, ScreenState& state)
             u2.button("panel_btn_b").content([](Ui& u3) { u3.text("Beta"); });
         });
 
+    // Text wrap, in the case it exists for: a paragraph in a GROW box, whose width is not decided
+    // until the layout's width pass has run — so it re-flows as you drag the panel's edge. A
+    // fixed-width text element has wrapped since long before `.wrap()`; this is the one that could
+    // not.
+    u.panel("panel_notes")
+        .title("Notes")
+        .initial({ 300.0f, 90.0f, 280.0f, 180.0f })
+        .limits({ 140.0f, 120.0f, 48.0f })
+        .content([&](Ui& u2) {
+            u2.element()
+              .text("Drag the right edge and this paragraph re-flows: it takes whatever width the "
+                    "layout gives it and asks for the height its lines need.")
+              .color(theme().text_dim)
+              .font(16)
+              .wrap()
+              .width(grow());
+        });
+
     // The clamp demo: its content really does fit in 160x96 (127x82), so this floor is honest and
     // dragging the grip inward stops exactly at a size the panel can still display.
     u.panel("panel_tiny")
@@ -162,6 +182,142 @@ void author_workspace(Ui& u, string::ui::Workspace& ws, ScreenState& state)
             u3.text("tabbed with Log").color(theme().text_dim);
         });
     });
+}
+
+void author_widgets(Ui& u, ScreenState& state)
+{
+    using namespace string::ui;
+    static const std::string_view kQuality[] = { "Low", "Medium", "High", "Ultra" };
+
+    u.panel("widgets_panel")
+        .title("Widget kit")
+        .initial({ 60.0f, 100.0f, 620.0f, 440.0f })
+        .limits({ 260.0f, 220.0f, 48.0f })
+        .content([&](Ui& u2) {
+
+            checkbox(u2, "w_wireframe", bind(state, &ScreenState::w_wireframe))
+                .label("Wireframe");
+
+            // Deliberately two checkboxes sharing a LABEL but NOT a name or a binding: names are
+            // identity, labels are not. (An earlier draft bound both to the same field, so they
+            // moved together and read as an identity bug — the opposite of the point.)
+            checkbox(u2, "w_cull", bind(state, &ScreenState::w_cull)).label("Cull");
+
+            slider(u2, "w_speed", bind(state, &ScreenState::w_speed))
+                .label("Speed")
+                .range(0.0f, 20.0f)
+                .width(150)
+                .precision(2);
+
+            drag_value(u2, "w_fine", bind(state, &ScreenState::w_fine))
+                .label("Fine")
+                .range(0.0f, 1.0f)
+                .precision(3);
+
+            combo(u2, "w_quality", bind(state, &ScreenState::w_quality))
+                .label("Quality")
+                .options(kQuality);
+
+            text_field(u2, "w_name", bind(state, &ScreenState::w_name))
+                .label("Name")
+                .placeholder("type here")
+                .width(160);
+
+            static const std::string_view kTabs[] = { "Basics", "Colour" };
+            tabs(u2, "w_tab", bind(state, &ScreenState::w_tab))
+                .options(kTabs)
+                .content([&](Ui& u3) {
+                    if (state.w_tab == 0)
+                    {
+                        u3.text("Speed jumps to where you click; Fine is a relative scrub")
+                          .color(theme().text_dim)
+                          .font(16);
+                    }
+                    else
+                    {
+                        color_picker(u3, "w_tint", bind(state, &ScreenState::w_tint))
+                            .label("Tint")
+                            .alpha(true);
+                    }
+                });
+
+            // A deliberately large table: only the visible rows are built, so this costs the same
+            // as a 12-row one. That is the claim virtualization makes, on screen.
+            static const table_column kTableCols[] = {
+                { "Index", 70 }, { "Name", 110 }, { "Value", 70 } };
+            collapsible(u2, "w_table").label("Table (5000 rows)").open(false).content([&](Ui& u3) {
+                table(u3, "w_tbl")
+                    .columns(kTableCols)
+                    .visible_rows(8)
+                    .selected(bind(state, &ScreenState::w_row))
+                    .on_sort([&](std::size_t c, bool asc) {
+                        state.w_sort_col = c;
+                        state.w_sort_asc = asc;
+                    })
+                    .rows(5000, [&](Ui& u4, std::size_t row, std::size_t col) {
+                        const std::size_t r =
+                            state.w_sort_asc ? row : (5000 - 1 - row);   // the AUTHOR sorts
+                        if (col == 0) u4.text(u4.own(std::to_string(r))).font(16);
+                        else if (col == 1) u4.text(u4.own("item " + std::to_string(r % 97))).font(16);
+                        else u4.text(u4.own(std::to_string((r * 37) % 1000))).font(16);
+                    });
+            });
+
+            // A synthetic hierarchy whose keys encode the path, so children are derivable with no
+            // storage — the adapter never needs the tree to own anything.
+            static const std::uint64_t kTreeRoots[] = { 1, 2, 3 };
+            collapsible(u2, "w_tree").label("Tree").open(false).content([&](Ui& u3) {
+                tree(u3, "w_tr")
+                    .roots(kTreeRoots)
+                    .children([](std::uint64_t k) { return k < 100 ? std::size_t{ 3 } : std::size_t{ 0 }; },
+                             [](std::uint64_t k, std::size_t i) { return k * 10 + i + 1; })
+                    .visible_rows(8)
+                    .selected(bind(state, &ScreenState::w_node))
+                    .nodes([&](Ui& u4, std::uint64_t key, std::size_t depth) {
+                        u4.text(u4.own((depth == 0 ? "group " : depth == 1 ? "item " : "leaf ") +
+                                       std::to_string(key)))
+                          .font(16);
+                    });
+            });
+
+            // A miniature DAG in the shape brief 14 will use: passes as nodes, dependencies as edges.
+            static const std::uint64_t kGKeys[] = { 1, 2, 3, 4, 5 };
+            static const graph_edge kGEdges[] = {
+                { 1, 2 }, { 1, 3 }, { 2, 4 }, { 3, 4 }, { 4, 5 } };
+            static const char* kGNames[] = { "depth", "gtao", "shadow", "lighting", "post" };
+            collapsible(u2, "w_graph").label("Graph").open(false).content([&](Ui& u3) {
+                graph(u3, "w_g")
+                    .size(540, 200)
+                    .node_size(90, 30)
+                    .spacing(40, 14)
+                    .edges(kGEdges)
+                    .selected(bind(state, &ScreenState::w_gnode))
+                    .nodes(kGKeys, [&](Ui& u4, std::uint64_t key) {
+                        u4.text(kGNames[key - 1]).font(16);
+                    });
+            });
+
+            // The general case the table and tree solve narrowly: content that is not uniform rows,
+            // so it cannot be virtualized — it is all built and CLIPPED. Mixed widgets inside, to
+            // show that scrolled content stays fully interactive (and stops being clickable exactly
+            // where it stops being visible).
+            collapsible(u2, "w_scroll").label("Scroll area").open(false).content([&](Ui& u3) {
+                scroll_area(u3, "w_sc").size(300, 140).content([&](Ui& u4) {
+                    u4.text("Wheel over this box, or drag the bar.")
+                      .color(theme().text_dim)
+                      .font(16);
+                    checkbox(u4, "w_sc_a", bind(state, &ScreenState::w_wireframe)).label("Wireframe");
+                    for (int i = 0; i < 14; ++i)
+                        u4.text(u4.own("row " + std::to_string(i))).font(18);
+                    checkbox(u4, "w_sc_b", bind(state, &ScreenState::w_cull)).label("Cull (at the end)");
+                });
+            });
+
+            collapsible(u2, "w_advanced").label("Advanced").open(false).content([&](Ui& u3) {
+                u3.text("a folded section emits nothing at all").color(theme().text_dim).font(16);
+                checkbox(u3, "w_adv_flag", bind(state, &ScreenState::w_cull)).label("Linked to Cull");
+            });
+        });
 }
 
 void author_status_panel(Ui& u, const UiScene& scene, ScreenState& state,

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include <string/core/layout.hpp>
@@ -112,6 +113,10 @@ public:
     // this point do we know which we have. Transparent text is never what anyone meant.
     Element& text(std::string_view content);
     Element& font(std::uint16_t px);
+    // Word-wrap this element's text to whatever width the layout gives it, taking as many lines as
+    // that needs. Opt-in: see layout.hpp — wrapping changes an element's height, so it is never
+    // applied to text that did not ask for it.
+    Element& wrap();
 
     // --- Visuals (default to the theme; these override just this element) -----------------------
     Element& color(string::color c);
@@ -144,9 +149,21 @@ public:
     Element& justify(justification j);
 
     // --- Placement ------------------------------------------------------------------------------
-    Element& floating(std::uint16_t x, std::uint16_t y);
+    // Signed: an anchor left of or above the origin is a real position for scrolled and panned
+    // content. See bounding_box in layout.hpp.
+    Element& floating(int x, int y);
     Element& overlay();
+    // Position within the PARENT rather than the root — for a container that computes its own
+    // children's coordinates (see layout.hpp). Pairs with floating(x, y).
+    Element& local();
     Element& z(std::uint8_t level);   // front-to-back order within the layer; higher = in front
+    // Clip this element's subtree to its own box. See layout.hpp — this is what lets a scrolled or
+    // panned container cut its content off mid-way instead of culling whole children at the edge.
+    Element& clip();
+    // Route the mouse wheel to this element while the cursor is anywhere in its subtree. See
+    // layout.hpp — the container declares it, the hit test resolves it, and the widget reads
+    // `interaction::wheel_for(id)`.
+    Element& wheel();
 
     // --- Events (callback-first; poll is sugar over the same primitive) -------------------------
     Element& on_click(std::function<void()> fn);
@@ -347,6 +364,38 @@ public:
 
     [[nodiscard]] PanelStore& panels() { return panels_; }
 
+    // Per-widget persistent scratch, keyed by the widget's stable id: a combo's open/closed flag, a
+    // drag-value's value-at-press. Widgets are rebuilt every frame, so anything that must outlive
+    // the rebuild needs a home, and `Ui` is the one object that already persists across frames.
+    //
+    // Deliberately one weak type rather than a typed store per widget: this holds a handful of
+    // scalars, and a `variant`/type-erased store would be more machinery than the problem.
+    [[nodiscard]] double& widget_state(std::uint64_t id, double initial = 0.0);
+
+    // --- Post-layout box observation ---------------------------------------------------------
+    // Registers `id` for observation and returns the box layout gave it LAST frame — empty until it
+    // has been laid out once.
+    //
+    // This is the sanctioned form of the thing `interaction::hovered_box` deliberately is not: an
+    // OPT-IN, per-id cache rather than a map of every element. A widget needs this when it must know
+    // its own extent CONTINUOUSLY rather than while the pointer is on it — a scroll area clamping to
+    // its content height is the case that forced it, since content height is exactly what the layout
+    // computes and the author does not know.
+    //
+    // ONE FRAME STALE, unavoidably: sizes exist only after layout, and the widget that needs them is
+    // rebuilt before it. That is fine for an EXTENT (it changes when content changes, not per frame)
+    // and would not be for a position the pointer chases — which is what hovered_box is for.
+    [[nodiscard]] bounding_box observed_box(std::uint64_t id);
+    // Host seam, called AFTER layout resolves: caches the boxes of the registered ids. Same seam as
+    // `Workspace::observe`, and for the same reason.
+    void observe();
+
+    // A focused text field asks for keystrokes to stop reaching gameplay. A REQUEST, not an action:
+    // capture is the host's decision, exactly as with the game/UI mode requests on `interaction`.
+    // Cleared each frame, so it is true only while something actually wants it.
+    void request_text_capture() noexcept { text_capture_ = true; }
+    [[nodiscard]] bool wants_text_capture() const noexcept { return text_capture_; }
+
 private:
     friend class Element;
     friend class Panel;
@@ -376,6 +425,10 @@ private:
     };
     std::vector<CardDecl> cards_;
     bool declaring_cards_ = false;
+
+    std::unordered_map<std::uint64_t, double> widget_state_;
+    std::unordered_map<std::uint64_t, bounding_box> observed_;
+    bool text_capture_ = false;
 
     friend class Card;
     friend class WorkspaceView;

@@ -27,6 +27,18 @@ const layout_node* hit_test_layered(const layout_builder& builder, uint16_t x, u
         return (overlay << 8) | z;
     };
 
+    // A node is only hittable where its ancestors' clip regions allow. Without this, content
+    // scrolled out of a clipped view stays clickable — invisible but still taking presses, which is
+    // the worst kind of bug to diagnose because there is nothing on screen to point at.
+    auto visible_at = [&](const layout_node& n) {
+        for (const layout_node* p = &n; p != nullptr;)
+        {
+            if (p->element.clip && !p->box.contains(x, y)) return false;
+            p = p->is_root() ? nullptr : &nodes[p->parent];
+        }
+        return true;
+    };
+
     // Last hit wins within a layer (painter order); a higher layer beats a lower one outright,
     // because the renderer draws each layer's shapes AND text before moving to the next.
     const layout_node* hit = nullptr;
@@ -36,6 +48,7 @@ const layout_node* hit_test_layered(const layout_builder& builder, uint16_t x, u
         if (!n.box.contains(x, y)) continue;
         const unsigned key = layer_key(n);
         if (hit != nullptr && key < hit_key) continue;   // a lower layer can never win
+        if (!visible_at(n)) continue;
         hit = &n;
         hit_key = key;
     }
@@ -93,6 +106,10 @@ void begin_interaction(interaction& state, const interaction_input& in) noexcept
     state.cursor_y = in.cursor_y;
     state.dt = in.dt;
     state.screen = in.screen;
+    state.typed_text = in.typed_text;
+    state.backspace = in.backspace;
+    state.submit = in.submit;
+    state.scroll_y = in.scroll_y;
 
     // A press edge in UI mode activates whatever was hovered as of last frame's layout; the gamepad
     // south button activates the focused element instead (controller-first).
@@ -137,13 +154,45 @@ void resolve_interaction(interaction& state, const interaction_input& in,
     if (state.active != 0)
     {
         state.hovered = state.active;
+        // The drag owner may be nowhere near the cursor by now, so look it up by id rather than by
+        // position — that is the whole point of pointer capture.
+        const layout_node* owner = builder.find(state.active);
+        if (owner != nullptr) state.hovered_box = owner->box;
     }
-    else
+    const layout_node* hit = nullptr;
+    if (state.active == 0)
     {
-        const layout_node* hit = hit_test_layered(
+        hit = hit_test_layered(
             builder, static_cast<std::uint16_t>(std::clamp(in.cursor_x, 0.0f, 65535.0f)),
             static_cast<std::uint16_t>(std::clamp(in.cursor_y, 0.0f, 65535.0f)));
         state.hovered = hit != nullptr ? hit->element.id.hash : 0;
+        state.hovered_box = hit != nullptr ? hit->box : bounding_box{};
+    }
+
+    // --- Wheel routing. Walk from the hit node to the nearest ancestor-or-self that declared
+    // `element.wheel`, so the INNERMOST scrollable under the cursor wins.
+    //
+    // Resolved EVERY frame, not only when notches arrive, and that is load-bearing: the notches are
+    // read by `begin_interaction` at the top of a frame, while the tree they must be resolved against
+    // is only laid out at the end of the previous one. Gating this on `in.scroll_y` looks like an
+    // optimisation and is actually an off-by-one-frame — the wheel would need two consecutive
+    // notched frames to move anything. This is `hovered`'s staleness, and no more.
+    //
+    // The drag owner takes the wheel while a drag is in flight, for the same reason it takes hover:
+    // a gesture that has captured the pointer should not have input stolen by whatever it flew over.
+    state.wheel = 0;
+    {
+        const std::span<const layout_node> nodes = builder.nodes();
+        const layout_node* from = state.active != 0 ? builder.find(state.active) : hit;
+        for (const layout_node* n = from; n != nullptr;)
+        {
+            if (n->element.wheel && n->element.id.hash != 0)
+            {
+                state.wheel = n->element.id.hash;
+                break;
+            }
+            n = n->is_root() ? nullptr : &nodes[n->parent];
+        }
     }
 
     if (!in.ui_mode)

@@ -1,0 +1,46 @@
+{
+    "rdocCaptureSettings": 1,
+    "settings": {
+        "autoStart": false,
+        "commandLine": "",
+        "environment": [
+            {
+                "separator": "Platform style",
+                "type": "Set",
+                "value": "/tmp/string-res-rdoc.6brUAf",
+                "variable": "STRING_RESOURCES_DIR"
+            },
+            {
+                "separator": "Platform style",
+                "type": "Set",
+                "value": "0",
+                "variable": "STRING_LIGHTS"
+            },
+            {
+                "separator": "Platform style",
+                "type": "Set",
+                "value": "9,4.5,0,3.1416,0.05",
+                "variable": "STRING_CAM"
+            }
+        ],
+        "executable": "/nix/store/509fab1hfgc8rmkgyw285ikx4dkd64rr-string-demo-0.0.1/bin/string_demo",
+        "inject": false,
+        "numQueuedFrames": 0,
+        "options": {
+            "allowFullscreen": true,
+            "allowVSync": true,
+            "apiValidation": false,
+            "captureAllCmdLists": false,
+            "captureCallstacks": false,
+            "captureCallstacksOnlyDraws": false,
+            "debugOutputMute": true,
+            "delayForDebugger": 0,
+            "hookIntoChildren": true,
+            "refAllResources": false,
+            "softMemoryLimit": 0,
+            "verifyBufferAccess": false
+        },
+        "queuedFrameCap": 0,
+        "workingDir": "/home/dcutting/code/cpp/string"
+    }
+}

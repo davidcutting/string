@@ -214,6 +214,12 @@ public:
     // new_frame(). Backspace/enter/etc. are not here — read those via key_pressed().
     std::string_view typed_text() const { return typed_text_; }
 
+    // Mouse wheel movement THIS FRAME, in notches (positive = away from the user / scroll up).
+    // Accumulated because several wheel events can arrive between frames, and cleared in new_frame
+    // like typed text — both are per-frame EVENTS rather than state, so a consumer that misses a
+    // frame should miss the input rather than see it twice.
+    float scroll_y() const { return scroll_y_; }
+
     // --- Gamepad (brief 05: controller-first UI) ---
     bool gamepad_connected() const { return gamepad_connected_; }
     bool gamepad_down(GamepadButton b) const { return pad_buttons_[static_cast<std::size_t>(b)]; }
@@ -248,6 +254,7 @@ public:
     void set_mouse_position(glm::vec2 position) { mouse_position_ = position; }
     void set_mouse_captured(bool captured) { mouse_captured_ = captured; }
     void add_typed_text(std::string_view utf8) { typed_text_ += utf8; }
+    void add_scroll(float y) { scroll_y_ += y; }
     // Called at the top of each window update, *before* polling events: snapshots the current
     // key/button state as "previous" (so pressed/released can detect this frame's edges) and
     // resets the per-frame accumulators (mouse delta, typed text).
@@ -258,6 +265,7 @@ public:
         prev_pad_buttons_ = pad_buttons_;
         mouse_delta_ = glm::vec2(0.0f);
         typed_text_.clear();
+        scroll_y_ = 0.0f;
     }
 
 private:
@@ -273,6 +281,7 @@ private:
     bool capture_requested_ = true;   // start in game mode (mouse-look)
     bool text_capture_ = false;       // brief 06: modal console open -> suppress InputMap actions
     std::string typed_text_;
+    float scroll_y_ = 0.0f;
 
     static constexpr std::size_t PAD_BUTTONS = static_cast<std::size_t>(GamepadButton::COUNT);
     static constexpr std::size_t PAD_AXES = static_cast<std::size_t>(GamepadAxis::COUNT);

@@ -210,16 +210,95 @@ TEST(Layout, ViewportFillsRoot)
     EXPECT_EQ(n[1].box.dimension.width, 100);
 }
 
+namespace
+{
+// A measurer is three operations now, not one callable — see the `measurer` concept: the unwrapped
+// size, the shrink floor (widest word), and the height once wrapped to a given width. This stand-in
+// says 30x12 of content made of 10-wide words, needing one 12px line per 30px of width.
+struct stub_measure
+{
+    dimension operator()(const element&) const noexcept { return { 30, 12 }; }
+    std::uint16_t min_width(const element&) const noexcept { return 10; }
+    std::uint16_t height_at(const element&, std::uint16_t w) const noexcept
+    {
+        return static_cast<std::uint16_t>(12 * (w > 0 ? std::max(1, (30 + w - 1) / w) : 1));
+    }
+};
+}  // namespace
+
 TEST(Layout, MeasurementHookSizesLeaves)
 {
     layout_builder b;
     b.begin(format{ .direction = direction::VERTICAL })
          .add_element(box(size_fit()))
-     .end([](const element&) -> dimension { return { 30, 12 }; });
+     .end(stub_measure{});
 
     const auto n = b.nodes();
     EXPECT_EQ(n[1].box.dimension.width, 30);
     EXPECT_EQ(n[1].box.dimension.height, 12);
+}
+
+// --- Text wrap ---------------------------------------------------------------------------------
+
+// The seam between the two flex passes: width is final, so the height can be asked for at that
+// width, and the answer propagates up to a FIT parent.
+TEST(Layout, WrapTakesItsHeightFromTheResolvedWidth)
+{
+    element text = box(sizing{ grow(), fit() });
+    text.wrap = true;
+
+    layout_builder b;
+    b.begin(format{ .direction = direction::VERTICAL })
+         .add_element(text)
+     .end(dimension{ 10, 200 }, stub_measure{});   // 10 wide -> three lines of 12
+
+    const auto n = b.nodes();
+    EXPECT_EQ(n[1].box.dimension.width, 10);
+    EXPECT_EQ(n[1].box.dimension.height, 36);
+}
+
+TEST(Layout, WrapHeightReachesAFitAncestor)
+{
+    element text = box(sizing{ grow(), fit() });
+    text.wrap = true;
+
+    layout_builder b;
+    b.begin(format{ .direction = direction::VERTICAL })
+         .begin(box(sizing{ fixed(15), fit() }), format{ .direction = direction::VERTICAL })
+             .add_element(text)
+         .end()
+     .end(dimension{ 300, 300 }, stub_measure{});
+
+    const auto n = b.nodes();
+    EXPECT_EQ(n[2].box.dimension.height, 24) << "two lines at width 15";
+    EXPECT_EQ(n[1].box.dimension.height, 24) << "the FIT container must grow with its wrapped child";
+}
+
+// Shrink must not squeeze a wrapping element past its widest word — below that, wrapping cannot
+// produce a line that fits and the renderer is forced to break a word in half.
+TEST(Layout, WrapFloorsShrinkAtTheWidestWord)
+{
+    element text = box(sizing{ grow(), fit() });
+    text.wrap = true;
+
+    layout_builder b;
+    b.begin(format{ .direction = direction::HORIZONTAL })
+         .add_element(text)
+         .add_element(box(sizing{ fixed(295), fit() }))   // hogs the row, forcing a shrink
+     .end(dimension{ 300, 100 }, stub_measure{});
+
+    EXPECT_GE(b.nodes()[1].box.dimension.width, 10) << "the widest word is the floor";
+}
+
+// The unwrapped path must be untouched: same tree without the flag keeps its one-line height.
+TEST(Layout, WrapIsOptIn)
+{
+    layout_builder b;
+    b.begin(format{ .direction = direction::VERTICAL })
+         .add_element(box(sizing{ grow(), fit() }))
+     .end(dimension{ 10, 200 }, stub_measure{});
+
+    EXPECT_EQ(b.nodes()[1].box.dimension.height, 12);
 }
 
 // --- id lookup / hit-testing -------------------------------------------------------------
@@ -478,4 +557,143 @@ TEST(LayoutTest, PercentTilesExactlyOnOddSplits)
     const int wa = b.find(string::make_id("a").hash)->box.dimension.width;
     const int wb = b.find(string::make_id("b").hash)->box.dimension.width;
     EXPECT_EQ(wa + wb, 999);
+}
+
+// --- Parent-relative floating (brief 13 M4) -------------------------------------------------------
+// Root-space floating suits world-anchored UI, but a container that computes its children's
+// positions in its OWN coordinates (a graph canvas) would otherwise have to discover where it landed
+// on screen — reading geometry back for something layout can just do.
+
+TEST(LayoutTest, LocalFloatingIsRelativeToTheParentContentBox)
+{
+    string::layout_builder b;
+    string::element root{};
+    root.sizing = string::size_fixed(400, 300);
+    b.begin(root, string::format{ .direction = string::direction::VERTICAL });
+    {
+        string::element panel{};
+        panel.id = string::make_id("panel");
+        panel.sizing = string::size_fixed(200, 150);
+        b.begin(panel, string::format{ .padding = { 10, 0, 20, 0 } });
+        {
+            string::element node{};
+            node.id = string::make_id("node");
+            node.sizing = string::size_fixed(20, 20);
+            node.floating = true;
+            node.float_local = true;
+            node.float_x = 30;
+            node.float_y = 40;
+            b.add_element(node);
+        }
+        b.end();
+    }
+    b.end(string::dimension{ 400, 300 });
+
+    const string::layout_node* p = b.find(string::make_id("panel").hash);
+    const string::layout_node* n = b.find(string::make_id("node").hash);
+    ASSERT_NE(p, nullptr);
+    ASSERT_NE(n, nullptr);
+    // Parent origin + its padding + the anchor.
+    EXPECT_EQ(n->box.x, p->box.x + 10 + 30);
+    EXPECT_EQ(n->box.y, p->box.y + 20 + 40);
+}
+
+TEST(LayoutTest, RootFloatingIsUnchangedByTheNewFlag)
+{
+    string::layout_builder b;
+    string::element root{};
+    root.sizing = string::size_fixed(400, 300);
+    b.begin(root, string::format{ .direction = string::direction::VERTICAL });
+    {
+        string::element panel{};
+        panel.sizing = string::size_fixed(200, 150);
+        b.begin(panel, string::format{ .padding = { 10, 0, 20, 0 } });
+        {
+            string::element node{};
+            node.id = string::make_id("node");
+            node.sizing = string::size_fixed(20, 20);
+            node.floating = true;   // float_local left false
+            node.float_x = 30;
+            node.float_y = 40;
+            b.add_element(node);
+        }
+        b.end();
+    }
+    b.end(string::dimension{ 400, 300 });
+
+    const string::layout_node* n = b.find(string::make_id("node").hash);
+    ASSERT_NE(n, nullptr);
+    EXPECT_EQ(n->box.x, 30) << "root-space anchors must be untouched";
+    EXPECT_EQ(n->box.y, 40);
+}
+
+// --- Signed positions (brief 13 follow-up) --------------------------------------------------------
+// Content genuinely lives above and left of the origin: a scrolled view draws earlier rows above the
+// viewport, a panned canvas draws earlier columns to the left. Unsigned coordinates made those
+// positions unrepresentable, so such content could only be culled at the edge, never clipped.
+
+TEST(LayoutTest, ANegativeAnchorIsRepresented)
+{
+    string::layout_builder b;
+    string::element root{};
+    root.sizing = string::size_fixed(400, 300);
+    b.begin(root, string::format{ .direction = string::direction::VERTICAL });
+    {
+        string::element n{};
+        n.id = string::make_id("above");
+        n.sizing = string::size_fixed(40, 40);
+        n.floating = true;
+        n.float_x = -30;
+        n.float_y = -20;
+        b.add_element(n);
+    }
+    b.end(string::dimension{ 400, 300 });
+
+    const string::layout_node* n = b.find(string::make_id("above").hash);
+    ASSERT_NE(n, nullptr);
+    EXPECT_EQ(n->box.x, -30) << "a negative anchor must survive, not clamp to the edge";
+    EXPECT_EQ(n->box.y, -20);
+}
+
+// Hit-testing must not treat a negative position as enormous — the classic unsigned-underflow bug.
+TEST(LayoutTest, HitTestingHandlesNegativePositions)
+{
+    string::bounding_box box{ -50, -20, { 100, 60 } };
+    EXPECT_TRUE(box.contains(0, 0));
+    EXPECT_TRUE(box.contains(-49, -19));
+    EXPECT_FALSE(box.contains(-51, 0));
+    EXPECT_FALSE(box.contains(60, 0));
+}
+
+// A child positioned locally inside a scrolled parent lands where the arithmetic says, including
+// when that is off the parent's top-left.
+TEST(LayoutTest, LocalAnchorsMayBeNegativeToo)
+{
+    string::layout_builder b;
+    string::element root{};
+    root.sizing = string::size_fixed(400, 300);
+    b.begin(root, string::format{ .direction = string::direction::VERTICAL });
+    {
+        string::element panel{};
+        panel.id = string::make_id("view");
+        panel.sizing = string::size_fixed(200, 150);
+        b.begin(panel, string::format{});
+        {
+            string::element row{};
+            row.id = string::make_id("scrolled");
+            row.sizing = string::size_fixed(180, 20);
+            row.floating = true;
+            row.float_local = true;
+            row.float_y = -40;   // scrolled above the viewport
+            b.add_element(row);
+        }
+        b.end();
+    }
+    b.end(string::dimension{ 400, 300 });
+
+    const string::layout_node* v = b.find(string::make_id("view").hash);
+    const string::layout_node* s = b.find(string::make_id("scrolled").hash);
+    ASSERT_NE(v, nullptr);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->box.y, v->box.y - 40);
 }

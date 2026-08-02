@@ -78,35 +78,57 @@ std::vector<std::uint16_t> layer_keys(std::span<const string::layout_node> nodes
     return keys;
 }
 
-std::vector<GpuShape> pack_shapes(std::span<const string::layout_node> nodes,
-                                  std::span<const std::uint16_t> keys, std::uint16_t layer)
+// The clip region a node draws within: the intersection of every `clip` ancestor's box. An empty
+// region means the node is entirely scrolled/panned out and draws nothing.
+struct clip_rect
 {
-    std::vector<GpuShape> shapes;
-    shapes.reserve(nodes.size());
-    for (std::size_t ni = 0; ni < nodes.size(); ++ni)
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    bool operator==(const clip_rect&) const = default;
+    [[nodiscard]] bool empty() const { return x1 <= x0 || y1 <= y0; }
+};
+
+std::vector<clip_rect> clip_rects(std::span<const string::layout_node> nodes, string::dimension screen)
+{
+    const clip_rect full{ 0, 0, screen.width, screen.height };
+    std::vector<clip_rect> out(nodes.size(), full);
+    for (std::size_t i = 0; i < nodes.size(); ++i)
     {
-        const string::layout_node& n = nodes[ni];
-        if (keys[ni] != layer)
+        const string::layout_node& n = nodes[i];
+        clip_rect c = n.is_root() ? full : out[n.parent];
+        if (n.element.clip)
         {
-            continue;  // wrong layer: overlay content packs after ALL main content
+            // INTERSECT, never replace: a clipped child of a clipped parent shows only where both
+            // allow, or an inner view could paint outside the outer one that contains it.
+            c.x0 = std::max(c.x0, static_cast<int>(n.box.x));
+            c.y0 = std::max(c.y0, static_cast<int>(n.box.y));
+            c.x1 = std::min(c.x1, static_cast<int>(n.box.x) + n.box.dimension.width);
+            c.y1 = std::min(c.y1, static_cast<int>(n.box.y) + n.box.dimension.height);
         }
-        if (n.element.text != 0)
-        {
-            continue;  // text node -> glyphs, not a rect
-        }
+        out[i] = c;
+    }
+    return out;
+}
+
+// One node -> one shape. Per-node rather than per-layer now that batching is run-length over CLIP
+// REGIONS as well as layers: a batch ends wherever the clip changes, which can be mid-layer, so the
+// packer has to be able to stop anywhere.
+bool shape_of(const string::layout_node& n, GpuShape& out)
+{
+    if (n.element.text != 0) return false;   // text node -> glyphs, not a rect
+    {
         const float w = static_cast<float>(n.box.dimension.width);
         const float h = static_cast<float>(n.box.dimension.height);
         const std::array<float, 4> fill = to_linear(n.element.color);
         const std::array<float, 4> stroke = to_linear(n.element.stroke_color);
-        shapes.push_back(GpuShape{
+        out = GpuShape{
             { static_cast<float>(n.box.x), static_cast<float>(n.box.y), w, h },
             { fill[0], fill[1], fill[2], fill[3] },
             { stroke[0], stroke[1], stroke[2], stroke[3] },
             { effective_radius(n.element, w, h), static_cast<float>(n.element.stroke_width),
               n.element.sweep / 255.0f, 0.0f },
-        });
+        };
     }
-    return shapes;
+    return true;
 }
 
 // --- Glyphs (SDF text); matches `struct Glyph` in shaders/text_shader.vert --------------------
@@ -130,23 +152,11 @@ struct TextPush
 // applies kerning, honours '\n' and word-wraps to the node's box width, and clips glyphs outside the
 // node box (so scroll regions / narrow tooltips don't spill). MUST match dynamic_text_measurer so the
 // laid-out box fits the drawn glyphs.
-std::vector<GpuGlyph> shape_glyphs(string::dynamic_font_atlas& atlas,
-                                   std::span<const string::layout_node> nodes,
-                                   std::span<const string::text_run> texts,
-                                   std::span<const std::uint16_t> keys, std::uint16_t layer)
+void append_glyphs(string::dynamic_font_atlas& atlas, const string::layout_node& n,
+                   std::span<const string::text_run> texts, std::vector<GpuGlyph>& glyphs)
 {
-    std::vector<GpuGlyph> glyphs;
-    for (std::size_t ni = 0; ni < nodes.size(); ++ni)
+    if (n.element.text == 0 || n.element.text >= texts.size()) return;
     {
-        const string::layout_node& n = nodes[ni];
-        if (keys[ni] != layer)
-        {
-            continue;  // wrong layer: overlay text packs (and draws) after all main text
-        }
-        if (n.element.text == 0 || n.element.text >= texts.size())
-        {
-            continue;
-        }
         const std::array<float, 4> color = to_linear(n.element.color);
         const string::text_run& run = texts[n.element.text];
         const std::string_view str = run.str;
@@ -158,11 +168,15 @@ std::vector<GpuGlyph> shape_glyphs(string::dynamic_font_atlas& atlas,
         const float clip_x1 = origin_x + n.box.dimension.width;
         const float clip_y0 = static_cast<float>(n.box.y);
         const float clip_y1 = clip_y0 + n.box.dimension.height;
-        // Wrap contract shared with dynamic_text_measurer: word-wrap ONLY fixed-width elements
-        // (to their fixed width == box width); everything else is one unwrapped line, clipped.
-        // Identical algorithm + identical whole-pixel advance rounding, or wrapped text draws a
-        // different line count than the measured box reserves and overdraws neighbouring rows.
-        const bool do_wrap = n.element.sizing.width.mode == string::size_mode::FIXED;
+        // Wrap contract shared with dynamic_text_measurer: word-wrap elements that opted in with
+        // `.wrap()`, plus fixed-width elements (whose width was always predictable at measure time,
+        // so they have wrapped since before the opt-in existed). Everything else is one unwrapped
+        // line, clipped. Identical algorithm + identical whole-pixel advance rounding, or wrapped
+        // text draws a different line count than the measured box reserves and overdraws the rows
+        // below it. BOTH cases wrap to the FINAL BOX WIDTH, which is why the opt-in needed nothing
+        // here beyond widening the gate — the layout is what had to learn a new trick.
+        const bool do_wrap = n.element.wrap ||
+                             n.element.sizing.width.mode == string::size_mode::FIXED;
         const float wrap = static_cast<float>(n.box.dimension.width);
 
         float pen_x = origin_x;
@@ -172,6 +186,7 @@ std::vector<GpuGlyph> shape_glyphs(string::dynamic_font_atlas& atlas,
         std::size_t i = 0;
         while (i < str.size())
         {
+            const std::size_t at = i;
             const std::uint32_t cp = string::utf8_next(str, i);
             if (cp == '\n')
             {
@@ -191,14 +206,21 @@ std::vector<GpuGlyph> shape_glyphs(string::dynamic_font_atlas& atlas,
                 continue;
             }
             const float line_w = pen_x - origin_x;
-            if (do_wrap && line_w + adv > wrap && line_w > 0 &&
-                (word_w == 0 || word_w == line_w))
+            if (do_wrap && line_w > 0)
             {
-                // word_w==0: wrap the fresh word to the next line (space-boundary wrap).
-                // word_w==line_w: a single word longer than the line — hard-break it.
-                pen_x = origin_x;
-                word_w = 0;
-                baseline_y += atlas.line_height() * s;
+                // MUST match dynamic_text_measurer::shape() exactly — same two questions, same
+                // order. At a word start, whether the WHOLE word fits (asking about this glyph alone
+                // is character wrap, and leaves the tail of a word hanging out of the box); mid-word,
+                // a hard break only when the word already occupies the entire line.
+                const bool brk = word_w == 0
+                    ? line_w + string::measure_word(atlas, str, at, s, prev) > wrap
+                    : (word_w == line_w && line_w + adv > wrap);
+                if (brk)
+                {
+                    pen_x = origin_x;
+                    word_w = 0;
+                    baseline_y += atlas.line_height() * s;
+                }
             }
             if (g.w > 0 && g.h > 0)
             {
@@ -223,7 +245,6 @@ std::vector<GpuGlyph> shape_glyphs(string::dynamic_font_atlas& atlas,
             prev = cp;
         }
     }
-    return glyphs;
 }
 
 }  // namespace
@@ -474,6 +495,14 @@ string::ui::interaction_input UIPass::populate_interaction(float delta_time)
     if (std::abs(sx) < 0.3f && std::abs(sy) < 0.3f)
         stick_armed_ = true;
 
+    // --- Text entry. Composed characters come from the platform's per-frame buffer (layout, shift
+    // and IME already applied); backspace and enter are key EDGES, which `key_pressed` already
+    // de-edges. The view is consumed the same frame, so it never outlives the buffer.
+    in.typed_text = input_.typed_text();
+    in.backspace = input_.key_pressed(String::KeyCode::BACKSPACE);
+    in.submit = input_.key_pressed(String::KeyCode::ENTER);
+    in.scroll_y = input_.scroll_y();
+
     return in;
 }
 
@@ -566,6 +595,7 @@ void UIPass::update(float delta_time, uint16_t current_frame)
     // Almost every UI has exactly two keys (main + overlay z=0), which reproduces the previous
     // shapes/text/shapes/text sequence exactly; z only costs draw calls when it is actually used.
     const std::vector<std::uint16_t> keys = layer_keys(builder_.nodes());
+    const std::vector<clip_rect> clips = clip_rects(builder_.nodes(), available);
     std::vector<std::uint16_t> layers(keys.begin(), keys.end());
     std::sort(layers.begin(), layers.end());
     layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
@@ -574,19 +604,45 @@ void UIPass::update(float delta_time, uint16_t current_frame)
     std::vector<GpuGlyph> glyphs;
     std::vector<DrawBatch>& batches = batches_[current_frame];
     batches.clear();
+
+    // Within a layer, nodes are walked in TREE ORDER and a batch ends wherever the clip region
+    // changes — RUN-LENGTH, not group-by. Grouping every node sharing a clip would reorder draws
+    // within the layer and break painter order, which is the one thing the layer batching exists to
+    // preserve.
+    const auto flush = [&](std::size_t s0, std::size_t g0, const clip_rect& c) {
+        if (shapes.size() == s0 && glyphs.size() == g0) return;
+        batches.push_back(DrawBatch{ static_cast<std::uint32_t>(s0),
+                                     static_cast<std::uint32_t>(shapes.size() - s0),
+                                     static_cast<std::uint32_t>(g0),
+                                     static_cast<std::uint32_t>(glyphs.size() - g0),
+                                     c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0 });
+    };
+
     for (const std::uint16_t layer : layers)
     {
-        const std::vector<GpuShape> s = pack_shapes(builder_.nodes(), keys, layer);
-        const std::vector<GpuGlyph> g =
-            shape_glyphs(*atlas_, builder_.nodes(), builder_.text_runs(), keys, layer);
-        if (s.empty() && g.empty())
-            continue;
-        batches.push_back(DrawBatch{ static_cast<std::uint32_t>(shapes.size()),
-                                     static_cast<std::uint32_t>(s.size()),
-                                     static_cast<std::uint32_t>(glyphs.size()),
-                                     static_cast<std::uint32_t>(g.size()) });
-        shapes.insert(shapes.end(), s.begin(), s.end());
-        glyphs.insert(glyphs.end(), g.begin(), g.end());
+        bool have = false;
+        clip_rect current{};
+        std::size_t s0 = shapes.size();
+        std::size_t g0 = glyphs.size();
+        for (std::size_t ni = 0; ni < builder_.nodes().size(); ++ni)
+        {
+            if (keys[ni] != layer) continue;
+            const clip_rect& c = clips[ni];
+            if (c.empty()) continue;   // fully scrolled out: nothing to draw at all
+            if (!have) { current = c; have = true; }
+            else if (!(c == current))
+            {
+                flush(s0, g0, current);
+                s0 = shapes.size();
+                g0 = glyphs.size();
+                current = c;
+            }
+            const string::layout_node& n = builder_.nodes()[ni];
+            GpuShape sh{};
+            if (shape_of(n, sh)) shapes.push_back(sh);
+            else append_glyphs(*atlas_, n, builder_.text_runs(), glyphs);
+        }
+        if (have) flush(s0, g0, current);
     }
     if ((shapes.size() > kMaxShapes || glyphs.size() > kMaxGlyphs) && !warned_overflow_)
     {
@@ -748,6 +804,16 @@ void UIPass::record(string::gpu::command_recorder& recorder, uint16_t current_fr
     // panel cover a lower panel's text as well as its background.
     for (const DrawBatch& b : batches_[current_frame])
     {
+        // Scissor is dynamic state on both pipelines, so a clip region costs one extra command per
+        // batch and no pipeline churn. Clamped to the framebuffer: Vulkan rejects a negative offset,
+        // and a clip region CAN legitimately start off-screen now that layout positions are signed.
+        const int cx = std::max(0, b.clip_x);
+        const int cy = std::max(0, b.clip_y);
+        const int cw = std::min<int>(b.clip_w - (cx - b.clip_x), static_cast<int>(screen_size.width) - cx);
+        const int ch = std::min<int>(b.clip_h - (cy - b.clip_y), static_cast<int>(screen_size.height) - cy);
+        if (cw <= 0 || ch <= 0) continue;
+        recorder.set_scissor(VkRect2D{ { cx, cy },
+                                      { static_cast<std::uint32_t>(cw), static_cast<std::uint32_t>(ch) } });
         draw_shapes(b.shape_first, b.shape_count);
         draw_text(b.glyph_first, b.glyph_count);
     }

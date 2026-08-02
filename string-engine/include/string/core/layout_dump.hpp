@@ -191,8 +191,8 @@ inline void dump_color(std::string& out, const color& c)
 
         // Resolved geometry — the single most valuable field: this is what "sizing resolution
         // silently changed" looks like in a diff.
-        std::snprintf(buf, sizeof buf, " box=%u,%u,%ux%u", static_cast<unsigned>(n.box.x),
-                      static_cast<unsigned>(n.box.y),
+        std::snprintf(buf, sizeof buf, " box=%d,%d,%ux%u", static_cast<int>(n.box.x),
+                      static_cast<int>(n.box.y),
                       static_cast<unsigned>(n.box.dimension.width),
                       static_cast<unsigned>(n.box.dimension.height));
         out += buf;
@@ -229,9 +229,12 @@ inline void dump_color(std::string& out, const color& c)
         // Flags that change placement or draw order.
         if (n.element.floating)
         {
-            std::snprintf(buf, sizeof buf, " float=%u,%u",
-                          static_cast<unsigned>(n.element.float_x),
-                          static_cast<unsigned>(n.element.float_y));
+            // The `L` marks a PARENT-relative anchor: the same numbers mean a different position
+            // depending on this flag, so a dump without it would be ambiguous.
+            std::snprintf(buf, sizeof buf, " float=%d,%d%s",
+                          static_cast<int>(n.element.float_x),
+                          static_cast<int>(n.element.float_y),
+                          n.element.float_local ? "L" : "");
             out += buf;
         }
         else
@@ -239,6 +242,9 @@ inline void dump_color(std::string& out, const color& c)
             out += " float=-";
         }
         out += n.element.overlay ? " overlay=1" : " overlay=-";
+        if (n.element.clip) out += " clip=1";
+        if (n.element.wheel) out += " wheel=1";
+        if (n.element.wrap) out += " wrap=1";
         // Emitted only when set, like `sweep`: a field that is zero for every pre-existing author
         // would otherwise rewrite every baseline for a feature they do not use.
         if (n.element.z != 0)

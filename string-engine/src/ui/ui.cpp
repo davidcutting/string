@@ -11,9 +11,13 @@ namespace
 
 // The layout tree addresses in integer pixels while a panel rect is float (sub-pixel drag). Round
 // once, here, so the two never disagree about where an edge is.
-[[nodiscard]] std::uint16_t px(float v) noexcept
+//
+// SIGNED: this used to clamp at zero, which silently snapped a panel dragged past the left or top
+// edge back to the border instead of letting it slide — `update_panel` deliberately allows a panel
+// to sit partly off-screen (it keeps a strip reachable), so clamping here fought that.
+[[nodiscard]] int px(float v) noexcept
 {
-    return static_cast<std::uint16_t>(std::clamp(std::lround(v), 0L, 65535L));
+    return static_cast<int>(std::clamp(std::lround(v), -32768L, 32767L));
 }
 
 }  // namespace
@@ -25,6 +29,7 @@ void Ui::begin_frame()
     // The arena is per-frame: every view handed out last frame dies here, which is exactly when the
     // layout tree that referenced them is rebuilt.
     arena_.clear();
+    text_capture_ = false;   // re-asserted each frame by whichever field is focused
     motion_.begin_frame(interaction_.dt);
 }
 
@@ -311,16 +316,20 @@ Element& Element::pad(string::padding p) { format_.padding = p; return *this; }
 Element& Element::align(alignment a) { format_.alignment = a; return *this; }
 Element& Element::justify(justification j) { format_.justify = j; return *this; }
 
-Element& Element::floating(std::uint16_t x, std::uint16_t y)
+Element& Element::floating(int x, int y)
 {
     element_.floating = true;
-    element_.float_x = x;
-    element_.float_y = y;
+    element_.float_x = detail::to_i16(x);
+    element_.float_y = detail::to_i16(y);
     return *this;
 }
 
 Element& Element::overlay() { element_.overlay = true; return *this; }
+Element& Element::local() { element_.float_local = true; return *this; }
 Element& Element::z(std::uint8_t level) { element_.z = level; return *this; }
+Element& Element::clip() { element_.clip = true; return *this; }
+Element& Element::wheel() { element_.wheel = true; return *this; }
+Element& Element::wrap() { element_.wrap = true; return *this; }
 
 Element& Element::on_click(std::function<void()> fn)
 {
@@ -402,6 +411,34 @@ void Ui::emit_card(std::uint64_t hash)
 }
 
 Card Ui::card(std::uint64_t hash) { return Card(*this, hash); }
+
+double& Ui::widget_state(std::uint64_t id, double initial)
+{
+    const auto it = widget_state_.find(id);
+    if (it != widget_state_.end()) return it->second;
+    return widget_state_.emplace(id, initial).first->second;
+}
+
+bounding_box Ui::observed_box(std::uint64_t id)
+{
+    // Registering on READ is what keeps this opt-in without a separate register call: an id nobody
+    // asks about is never cached, and the first ask costs one empty box.
+    const auto it = observed_.find(id);
+    if (it != observed_.end()) return it->second;
+    observed_.emplace(id, bounding_box{});
+    return bounding_box{};
+}
+
+void Ui::observe()
+{
+    if (observed_.empty()) return;
+    for (const layout_node& n : builder_.nodes())
+    {
+        if (n.element.id.hash == 0) continue;   // id-less nodes are not addressable
+        const auto it = observed_.find(n.element.id.hash);
+        if (it != observed_.end()) it->second = n.box;
+    }
+}
 
 WorkspaceView Ui::workspace(Workspace& ws) { return WorkspaceView(*this, ws); }
 

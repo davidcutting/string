@@ -31,6 +31,21 @@ struct ScreenState
     // Ping feed: recent world-anchored pings (index into scene anchors + age).
     struct Ping { std::size_t anchor = 0; float age = 0.0f; int kind = 0; };
     std::vector<Ping> pings;
+    // Brief 13 M0a widget demo state.
+    bool w_wireframe = false;
+    bool w_cull = false;
+    float w_fine = 0.5f;
+    std::string w_name = "Sponza";
+    int w_tab = 0;
+    int w_row = -1;
+    std::size_t w_sort_col = 0;
+    std::uint64_t w_node = 0;
+    std::uint64_t w_gnode = 0;
+    bool w_sort_asc = true;
+    string::color w_tint{ 137, 180, 250, 255 };
+    float w_speed = 5.0f;
+    int w_quality = 1;
+
     bool radial_open = false;           // quick-chat / ping radial menu visible
     int radial_sel = 0;                 // controller-first: currently highlighted wedge
 
@@ -71,6 +86,9 @@ inline constexpr string::id kCardProps = string::make_id("ws_props");
 // when there is nothing saved, and the user owns the layout from then on.
 void seed_workspace(string::ui::Workspace& ws);
 void author_workspace(Ui& u, string::ui::Workspace& ws, ScreenState& state);
+
+// (7) Brief 13 M0a: the engine widget kit — checkbox, drag-value, combo.
+void author_widgets(Ui& u, ScreenState& state);
 
 // A small always-on status panel (frame counter, anchor/nameplate count, active screen).
 void author_status_panel(Ui& u, const UiScene& scene, ScreenState& state,

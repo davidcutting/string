@@ -100,6 +100,11 @@ private:
         std::uint32_t shape_count = 0;
         std::uint32_t glyph_first = 0;
         std::uint32_t glyph_count = 0;
+        // Scissor region for this batch, in pixels. Set before the batch draws.
+        int clip_x = 0;
+        int clip_y = 0;
+        int clip_w = 0;
+        int clip_h = 0;
     };
     // Create `frames_in_flight` mapped storage buffers of `capacity * stride` bytes, bound bindless.
     void make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight, std::uint32_t capacity,

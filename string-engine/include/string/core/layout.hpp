@@ -21,11 +21,20 @@ struct dimension
 
 struct bounding_box
 {
-    uint16_t x;
-    uint16_t y;
+    // SIGNED position, UNSIGNED size.
+    //
+    // Content genuinely lives left of and above the origin: a scrolled view draws its earlier rows
+    // above the viewport, and a panned canvas draws its earlier columns to the left. With unsigned
+    // coordinates those positions are unrepresentable, so such content can only be CULLED at the
+    // edge rather than clipped — which is why a panned graph pops instead of sliding off.
+    //
+    // Sizes stay unsigned: a negative extent is meaningless, and keeping `dimension` as-is means the
+    // sizing vocabulary is untouched.
+    int16_t x;
+    int16_t y;
     dimension dimension;
 
-    [[nodiscard]] constexpr bool contains(uint16_t px, uint16_t py) const noexcept
+    [[nodiscard]] constexpr bool contains(int px, int py) const noexcept
     {
         return px >= x && px < x + dimension.width
             && py >= y && py < y + dimension.height;
@@ -201,8 +210,18 @@ struct element
     // world-anchored UI (nameplates, ping markers, tooltips, radial menus) needs; without it every
     // node is packed into the flow. Default off: existing layouts are unchanged.
     bool floating = false;
-    uint16_t float_x = 0;
-    uint16_t float_y = 0;
+    // Signed, for the same reason the box is: an anchor left of or above the origin is a real
+    // position for scrolled and panned content, not an error to clamp away.
+    int16_t float_x = 0;
+    int16_t float_y = 0;
+    // Interpret (float_x, float_y) relative to the PARENT's content origin instead of the root.
+    //
+    // Root space is right for world-anchored UI (a nameplate knows a screen position), but useless
+    // for a container that computes its children's positions in its OWN coordinates — a graph canvas
+    // laying out nodes, for instance. Without this, such a widget would have to learn where it
+    // landed on screen, which means reading geometry back after layout for something the layout
+    // engine can simply do.
+    bool float_local = false;
     // Topmost render layer (inherited by the subtree): the renderer draws overlay content — shapes
     // AND text — after ALL non-overlay content, so a modal surface (debug console, HUD) covers the
     // scene UI's text as well as its shapes (shapes and glyphs are separate draw streams, so tree
@@ -218,6 +237,33 @@ struct element
     // Convention (sandbox): floating panels take 1..N from their front-to-back order; modal debug
     // surfaces (console, HUD) sit at a reserved high value so they stay above panels.
     uint8_t z = 0;
+    // Clip this node's SUBTREE to this node's box.
+    //
+    // Shapes are otherwise unclipped — only glyphs clip, and only to their own text node — so a
+    // scrolled or panned container has no way to show part of its content: it can cull whole
+    // children at the edge (which pops) but never cut one off mid-way. The renderer turns this into
+    // a scissor rect, so it costs a draw-call split at each distinct clip region rather than any
+    // per-element work.
+    //
+    // Nested clips INTERSECT: a clipped child of a clipped parent shows only where both allow.
+    bool clip = false;
+    // This node consumes the mouse wheel.
+    //
+    // Layout ignores it; it exists so the HIT TEST can answer "which container should the wheel go
+    // to", which is a question only the tree can answer. Text follows FOCUS, but scrolling follows
+    // the POINTER, and the pointer usually lands on a leaf (a table row, a graph node) rather than on
+    // the container that actually scrolls. Marking the container lets the hit test walk up from the
+    // leaf to the nearest marked ancestor, so the INNERMOST scrollable under the cursor wins and a
+    // list inside a list behaves the way every other UI does.
+    bool wheel = false;
+    // Word-wrap this element's text to the width LAYOUT gives it, and take the height its lines
+    // need. OPT-IN, deliberately: wrapping changes an element's height, so making it the default
+    // would silently re-flow every existing screen.
+    //
+    // Note what this is not: a fixed-width text element already wraps (its width is known before
+    // layout, so the measurer can predict it). This is for the case that needs the layout's answer —
+    // text in a GROW or PERCENT box, where the width is not decided until the width pass has run.
+    bool wrap = false;
     // Radial cooldown-sweep fraction (0 = none/ready, 255 = fully on cooldown). A renderer that
     // supports it (the UI overlay's shape shader) dims the not-yet-elapsed clockwise wedge — the
     // ability/cooldown affordance games use. Purely visual; layout ignores it.
@@ -249,15 +295,34 @@ struct renderable_element
     bounding_box bounding_box;
 };
 
-// A measurer returns the intrinsic content size of a leaf element (e.g. a text run). Anything
-// invocable as dimension(const element&) qualifies.
+// A measurer sizes a leaf element (e.g. a text run) for the layout.
+//
+// THREE OPERATIONS, and the split is what makes wrapping possible at all:
+//   * `m(e)`                 — the UNWRAPPED intrinsic size. Known before layout.
+//   * `m.min_width(e)`       — the narrowest width the content can be squeezed to without
+//                              overflowing: for wrapping text, the widest single WORD. Also known
+//                              before layout, which is the point — it lets the width pass treat a
+//                              wrapping element as an ordinary shrinkable box.
+//   * `m.height_at(e, w)`    — the height the content occupies once wrapped to width `w`. This one
+//                              can only be asked AFTER the width is resolved.
+//
+// The circularity people expect here (height needs width, width needs height) does not actually
+// exist: WIDTH NEVER DEPENDS ON HEIGHT. So the passes are ordered — resolve width, wrap, then
+// resolve height — and no iteration is needed. Only the third operation runs mid-layout, and only
+// for elements that opted in with `element.wrap`.
 template <typename M>
-concept measurer = std::invocable<M&, const element&>;
+concept measurer = requires(M& m, const element& e, uint16_t w) {
+    { m(e) } -> std::convertible_to<dimension>;
+    { m.min_width(e) } -> std::convertible_to<uint16_t>;
+    { m.height_at(e, w) } -> std::convertible_to<uint16_t>;
+};
 
 // The default: no intrinsic content (leaves fall back to their FIXED value / FIT floor).
 struct no_measure
 {
     constexpr dimension operator()(const element&) const noexcept { return { 0, 0 }; }
+    constexpr uint16_t min_width(const element&) const noexcept { return 0; }
+    constexpr uint16_t height_at(const element&, uint16_t) const noexcept { return 0; }
 };
 
 // Intrusive tree links (first-child / next-sibling) as 32-bit indices into a contiguous
@@ -319,6 +384,13 @@ constexpr uint16_t to_u16(int value) noexcept
     return static_cast<uint16_t>(std::clamp(value, 0, 0xFFFF));
 }
 
+// Positions clamp to the SIGNED range: content above or left of the origin is legitimate (scrolled
+// rows, panned columns), so clamping those to zero would pile everything against the edge.
+constexpr int16_t to_i16(int value) noexcept
+{
+    return static_cast<int16_t>(std::clamp(value, -32768, 32767));
+}
+
 constexpr int main_axis_padding(const format& f) noexcept
 {
     return f.direction == direction::HORIZONTAL
@@ -369,6 +441,10 @@ class layout_builder
     std::vector<uint32_t> open_;
     // Text side-table; index 0 is a reserved "no text" sentinel, so element.text is 1-based.
     std::vector<text_run> texts_{ text_run{} };
+    // Set when any element opts into wrapping. A tree with none skips the wrap seam entirely, so a
+    // screen that never asks for wrapping cannot be re-flowed by it — which is what makes this
+    // feature safe to land under existing layouts.
+    bool any_wrap_ = false;
 
 public:
     // Open a container. `element` is its own visual/sizing; `format` lays out its children.
@@ -461,6 +537,7 @@ public:
         open_.clear();
         texts_.clear();
         texts_.emplace_back();  // restore the index-0 "no text" sentinel
+        any_wrap_ = false;
     }
 
 private:
@@ -468,8 +545,11 @@ private:
     constexpr void close(bool has_available, dimension available, Measure& measure);
     template <measurer Measure>
     constexpr void fit_sizing(uint32_t index, Measure& measure);
-    constexpr void flex_sizing(uint32_t index) noexcept;
-    constexpr void position(uint32_t index, uint16_t origin_x, uint16_t origin_y) noexcept;
+    constexpr void flex_sizing(uint32_t index, bool x_axis) noexcept;
+    template <measurer Measure>
+    constexpr void wrap_heights(uint32_t index, Measure& measure);
+    constexpr void refit_heights(uint32_t index, bool skip_self) noexcept;
+    constexpr void position(uint32_t index, int origin_x, int origin_y) noexcept;
 };
 
 constexpr auto layout_builder::begin(const element& element, const format& format) -> layout_builder&
@@ -478,6 +558,7 @@ constexpr auto layout_builder::begin(const element& element, const format& forma
     layout_node& node = nodes_.emplace_back();
     node.element = element;
     node.format = format;
+    any_wrap_ = any_wrap_ || element.wrap;   // containers may opt in too; both entry points set it
 
     if (!open_.empty())
         layout_node::link(nodes_, open_.back(), index);
@@ -497,6 +578,7 @@ constexpr auto layout_builder::add_element(const element& element) -> layout_bui
 {
     const uint32_t index = static_cast<uint32_t>(nodes_.size());
     nodes_.emplace_back().element = element;
+    any_wrap_ = any_wrap_ || element.wrap;
 
     if (!open_.empty())
         layout_node::link(nodes_, open_.back(), index);
@@ -528,8 +610,73 @@ constexpr void layout_builder::close(bool has_available, dimension available, Me
     fit_sizing(index, measure);
     if (has_available)
         nodes_[index].box.dimension = { detail::to_u16(available.width), detail::to_u16(available.height) };
-    flex_sizing(index);
+
+    // WIDTH, then WRAP, then HEIGHT. The two flex passes are the same code parameterised by axis;
+    // running them separately is what buys a seam in the middle where widths are final and heights
+    // are not yet committed. Without a wrapping element in the tree the seam does nothing, and
+    // `any_wrap_` skips it outright so the common frame pays only the split.
+    flex_sizing(index, /*x_axis=*/true);
+    if (any_wrap_)
+    {
+        wrap_heights(index, measure);
+        // A wrapped child that grew taller has to push its ancestors' content heights back up, or a
+        // FIT container keeps the one-line height the first pass gave it and its siblings overlap.
+        // The root is exempt when it was forced to a viewport: `available` is a statement, not a
+        // measurement.
+        refit_heights(index, has_available);
+    }
+    flex_sizing(index, /*x_axis=*/false);
     position(index, 0, 0);
+}
+
+// Between the two flex passes: give every opted-in element the height its text needs at the width
+// the width pass just settled on.
+template <measurer Measure>
+constexpr void layout_builder::wrap_heights(uint32_t index, Measure& measure)
+{
+    layout_node& node = nodes_[index];
+    if (node.element.wrap)
+    {
+        const uint16_t h = measure.height_at(node.element, node.box.dimension.width);
+        node.box.dimension.height =
+            detail::to_u16(detail::resolve_axis(node.element.sizing.height, h));
+    }
+    for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
+        wrap_heights(c, measure);
+}
+
+// Bottom-up re-fit of the HEIGHT axis only, after wrapping changed leaf heights. Mirrors the height
+// half of fit_sizing exactly — sum along a vertical main axis, max across a horizontal one.
+constexpr void layout_builder::refit_heights(uint32_t index, bool skip_self) noexcept
+{
+    layout_node& node = nodes_[index];
+    if (node.first_child == layout_node::none)
+        return;
+
+    for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
+        refit_heights(c, false);
+
+    if (skip_self)
+        return;
+
+    const bool horizontal = node.format.direction == direction::HORIZONTAL;
+    int content = 0;
+    int child_count = 0;
+    for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
+    {
+        if (nodes_[c].element.floating)
+            continue;  // out of flow, exactly as in fit_sizing
+        const int h = nodes_[c].box.dimension.height;
+        if (horizontal) content = std::max(content, h);
+        else            content += h;
+        ++child_count;
+    }
+    if (!horizontal && child_count > 1)
+        content += node.format.gap * (child_count - 1);
+    content += node.format.padding.top + node.format.padding.bottom;   // vertical padding either way
+
+    node.box.dimension.height =
+        detail::to_u16(detail::resolve_axis(node.element.sizing.height, content));
 }
 
 // Pass 1 (bottom-up): size each node to its content. A leaf's content is its measured
@@ -543,6 +690,15 @@ constexpr void layout_builder::fit_sizing(uint32_t index, Measure& measure)
     if (node.first_child == layout_node::none)
     {
         const dimension content = measure(node.element);
+        // A wrapping element cannot be squeezed narrower than its widest WORD without breaking that
+        // word mid-way. Raising the shrink floor here — on the node's own copy of the sizing, not the
+        // author's declaration — is what lets the width pass treat it as an ordinary shrinkable box
+        // and still produce a width the text can actually be laid out at.
+        if (node.element.wrap)
+        {
+            const uint16_t floor_px = measure.min_width(node.element);
+            node.element.sizing.width.min = std::max(node.element.sizing.width.min, floor_px);
+        }
         node.box.dimension.width = detail::to_u16(detail::resolve_axis(node.element.sizing.width, content.width));
         node.box.dimension.height = detail::to_u16(detail::resolve_axis(node.element.sizing.height, content.height));
         return;
@@ -581,16 +737,25 @@ constexpr void layout_builder::fit_sizing(uint32_t index, Measure& measure)
     node.box.dimension.height = detail::to_u16(horizontal ? cross_size : main_size);
 }
 
-// Pass 2 (top-down): reconcile children with the container's main-axis inner size. Positive
-// leftover grows GROW children; a deficit shrinks non-FIXED children down to their `min`.
-// Cross-axis GROW children stretch to fill. Then recurse. Allocation-free.
-constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
+// Pass 2 (top-down), ONE AXIS PER CALL: reconcile children with the container's main-axis inner
+// size. Positive leftover grows GROW children; a deficit shrinks non-FIXED children down to their
+// `min`. Cross-axis GROW children stretch to fill. Then recurse. Allocation-free.
+//
+// A container touches X in exactly one of two ways: it DISTRIBUTES along X if it is horizontal (X is
+// its main axis), and it STRETCHES along X if it is vertical (X is its cross axis). Never both. So
+// splitting the pass by axis is a gate on which of the two blocks runs, not a reorganisation — and
+// the top-down order within each axis is unchanged, which is why the split on its own moves nothing.
+//
+// The two passes are genuinely independent: the width pass reads only widths and the height pass only
+// heights. That is what lets text wrapping sit between them.
+constexpr void layout_builder::flex_sizing(uint32_t index, bool x_axis) noexcept
 {
     layout_node& node = nodes_[index];
 
     if (node.first_child != layout_node::none)
     {
         const bool horizontal = node.format.direction == direction::HORIZONTAL;
+        const bool distribute = horizontal == x_axis;   // else this axis is the container's cross
 
         const int inner_main = std::max(0,
             (horizontal ? node.box.dimension.width : node.box.dimension.height) - detail::main_axis_padding(node.format));
@@ -608,6 +773,8 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
             return horizontal ? nodes_[c].element.sizing.width : nodes_[c].element.sizing.height;
         };
 
+        if (distribute)
+        {
         // PERCENT resolves FIRST and ignores content: each such child takes its per-mille share of
         // the space left over once definite-size siblings (and the gaps) are accounted for. Doing
         // this before `used` is computed is what makes it independent of content — which is the
@@ -734,32 +901,35 @@ constexpr void layout_builder::flex_sizing(uint32_t index) noexcept
             if (!progressed)
                 break;
         }
-
-        // Cross axis: GROW children stretch to fill the container.
-        for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
+        }
+        else
         {
-            if (nodes_[c].element.floating)
-                continue;
-            const axis_sizing& cross = horizontal ? nodes_[c].element.sizing.height : nodes_[c].element.sizing.width;
-            if (cross.mode != size_mode::GROW)
-                continue;
-            const int v = std::clamp(inner_cross, static_cast<int>(cross.min), static_cast<int>(cross.max));
-            if (horizontal) nodes_[c].box.dimension.height = detail::to_u16(v);
-            else            nodes_[c].box.dimension.width = detail::to_u16(v);
+            // Cross axis: GROW children stretch to fill the container.
+            for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
+            {
+                if (nodes_[c].element.floating)
+                    continue;
+                const axis_sizing& cross = horizontal ? nodes_[c].element.sizing.height : nodes_[c].element.sizing.width;
+                if (cross.mode != size_mode::GROW)
+                    continue;
+                const int v = std::clamp(inner_cross, static_cast<int>(cross.min), static_cast<int>(cross.max));
+                if (horizontal) nodes_[c].box.dimension.height = detail::to_u16(v);
+                else            nodes_[c].box.dimension.width = detail::to_u16(v);
+            }
         }
     }
 
     for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
-        flex_sizing(c);
+        flex_sizing(c, x_axis);
 }
 
 // Pass 3 (top-down): assign each node a position. Children advance along the main axis
 // (leftover distributed per `justify`) and are offset on the cross axis per `alignment`.
-constexpr void layout_builder::position(uint32_t index, uint16_t origin_x, uint16_t origin_y) noexcept
+constexpr void layout_builder::position(uint32_t index, int origin_x, int origin_y) noexcept
 {
     layout_node& node = nodes_[index];
-    node.box.x = origin_x;
-    node.box.y = origin_y;
+    node.box.x = detail::to_i16(origin_x);
+    node.box.y = detail::to_i16(origin_y);
 
     if (node.first_child == layout_node::none)
         return;
@@ -814,10 +984,17 @@ constexpr void layout_builder::position(uint32_t index, uint16_t origin_x, uint1
     int cursor = leading;
     for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
     {
-        // Overlay child: place its subtree at its absolute anchor (root space) and skip the flow.
+        // Overlay child: place its subtree at its absolute anchor and skip the flow. The anchor is
+        // root space by default, or relative to this container's content box when `float_local`.
         if (nodes_[c].element.floating)
         {
-            position(c, nodes_[c].element.float_x, nodes_[c].element.float_y);
+            const int ax = nodes_[c].element.float_local
+                               ? origin_x + node.format.padding.left + nodes_[c].element.float_x
+                               : nodes_[c].element.float_x;
+            const int ay = nodes_[c].element.float_local
+                               ? origin_y + node.format.padding.top + nodes_[c].element.float_y
+                               : nodes_[c].element.float_y;
+            position(c, ax, ay);
             continue;
         }
         const dimension d = nodes_[c].box.dimension;
@@ -1051,6 +1228,23 @@ consteval bool layout_shrink_self_test()
 
 static_assert(layout_shrink_self_test(), "layout: shrink self-test failed");
 
+namespace detail
+{
+// A stand-in measurer for the self-tests. 30x12 of content whose "words" are 10 wide, and which
+// needs one 12px line per 30px of width — enough shape to prove the wrap seam runs without pulling a
+// font atlas into a consteval context.
+struct self_test_measure
+{
+    constexpr dimension operator()(const element&) const noexcept { return { 30, 12 }; }
+    constexpr uint16_t min_width(const element&) const noexcept { return 10; }
+    constexpr uint16_t height_at(const element&, uint16_t w) const noexcept
+    {
+        const int lines = w > 0 ? std::max(1, (30 + w - 1) / w) : 1;
+        return static_cast<uint16_t>(12 * lines);
+    }
+};
+}  // namespace detail
+
 // Content-measurement hook: a FIT leaf sizes to its measured content.
 consteval bool layout_measure_self_test()
 {
@@ -1060,13 +1254,51 @@ consteval bool layout_measure_self_test()
     layout_builder builder;
     builder.begin(format{ .direction = direction::VERTICAL })
                .add_element(text)
-           .end([](const element&) -> dimension { return { 30, 12 }; });
+           .end(detail::self_test_measure{});
 
     const auto nodes = builder.nodes();
     return nodes[1].box.dimension.width == 30 && nodes[1].box.dimension.height == 12;
 }
 
 static_assert(layout_measure_self_test(), "layout: measure self-test failed");
+
+// Text wrap: an opted-in element takes the height its lines need at the width the WIDTH pass gave
+// it, and that height propagates to its FIT parent. Both halves matter — without the propagation a
+// container keeps the one-line height and its children overlap.
+consteval bool layout_wrap_self_test()
+{
+    element text{};
+    text.sizing = sizing{ fixed(15), fit() };   // 30 of content at width 15 == two lines
+    text.wrap = true;
+
+    layout_builder builder;
+    builder.begin(format{ .direction = direction::VERTICAL })
+               .add_element(text)
+           .end(detail::self_test_measure{});
+
+    const auto nodes = builder.nodes();
+    return nodes[1].box.dimension.height == 24    // the wrapped leaf
+        && nodes[0].box.dimension.height == 24;   // ...and its parent grew with it
+}
+
+static_assert(layout_wrap_self_test(), "layout: wrap self-test failed");
+
+// The opt-in is load-bearing: the identical tree WITHOUT `.wrap()` must keep its unwrapped height,
+// or every existing screen silently re-flows.
+consteval bool layout_wrap_is_opt_in_self_test()
+{
+    element text{};
+    text.sizing = sizing{ fixed(15), fit() };
+
+    layout_builder builder;
+    builder.begin(format{ .direction = direction::VERTICAL })
+               .add_element(text)
+           .end(detail::self_test_measure{});
+
+    return builder.nodes()[1].box.dimension.height == 12;
+}
+
+static_assert(layout_wrap_is_opt_in_self_test(), "layout: wrap opt-in self-test failed");
 
 // RAII scope guard closes the container without an explicit end().
 consteval bool layout_scope_self_test()

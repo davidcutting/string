@@ -346,6 +346,12 @@ void Window::update(entt::dispatcher& dispatcher)
                 input_.set_mouse_position({ event.motion.x, event.motion.y });
                 break;
             }
+            case SDL_EVENT_MOUSE_WHEEL:
+                // SDL already normalises direction; `y` is notches, fractional on precision wheels
+                // and trackpads.
+                input_.add_scroll(event.wheel.y);
+                break;
+
             case SDL_EVENT_TEXT_INPUT:
             {
                 // Composed Unicode text (UTF-8), for text fields. SDL text input is started at
