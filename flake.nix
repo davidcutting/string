@@ -120,7 +120,7 @@
 
           # Build with debug info (nixpkgs' meson hook defaults to --buildtype=plain, which
           # drops -g) and keep it in the binary, so gdb has line numbers + locals.
-          mesonBuildType = "debug";
+          mesonBuildType = "debugoptimized";
           # cmake is present only so Meson can read fastgltf's cmake config; don't let its
           # setup hook take over the configure phase from Meson.
           dontUseCmakeConfigure = true;
@@ -160,7 +160,7 @@
           # WSI is an option of the engine subproject, so it is namespaced.
           mesonFlags = [ "-Dstring-core:wsi=sdl" ];
 
-          mesonBuildType = "debug";
+          mesonBuildType = "debugoptimized";
           dontUseCmakeConfigure = true;
           dontStrip = true;
           hardeningDisable = [ "fortify" ];

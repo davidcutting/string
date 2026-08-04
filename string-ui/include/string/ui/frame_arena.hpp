@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <format>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -37,6 +38,25 @@ public:
         return { dst, s.size() };
     }
 
+    // Format straight into the arena. `arena.format("frame {}", n)` replaces
+    // `arena.own("frame " + std::to_string(n))`, which built TWO `std::string` temporaries — one for
+    // the number, one for the concatenation — heap-allocated both, copied the result in here, and
+    // freed them again, every frame, per label.
+    //
+    // Formatting into a stack buffer and copying once is deliberately preferred over
+    // `formatted_size` + `format_to`, which avoids the copy but walks the format string and the
+    // arguments TWICE. UI labels are short; a 256-byte frame is free and one pass beats two. Longer
+    // output than that falls back to an exact `std::format`, which allocates — correct, and rare
+    // enough not to matter.
+    template <typename... Args>
+    [[nodiscard]] std::string_view format(std::format_string<Args...> fmt, Args&&... args)
+    {
+        char buf[256];
+        const auto r = std::format_to_n(buf, sizeof buf, fmt, std::forward<Args>(args)...);
+        const auto n = static_cast<std::size_t>(r.size);
+        if (n <= sizeof buf) return own(std::string_view{ buf, n });
+        return own(std::string_view{ std::format(fmt, std::forward<Args>(args)...) });
+    }
 
     // Drops every view handed out, KEEPING the blocks for the next frame.
     void clear() noexcept

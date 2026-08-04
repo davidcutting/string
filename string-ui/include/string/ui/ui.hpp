@@ -399,6 +399,14 @@ public:
     // Straight into the arena — no intermediate std::string. This is the path `Element::text` takes,
     // so it is on every text node in the kit.
     [[nodiscard]] std::string_view own(std::string_view s) { return arena_.own(s); }
+    // The preferred way to write a label with a value in it: `u.format("frame {}", n)` rather than
+    // `u.own("frame " + std::to_string(n))`. Same result, no `std::string` built and thrown away on
+    // the way — see FrameArena::format.
+    template <typename... Args>
+    [[nodiscard]] std::string_view format(std::format_string<Args...> fmt, Args&&... args)
+    {
+        return arena_.format(fmt, std::forward<Args>(args)...);
+    }
 
 
     [[nodiscard]] const Theme& theme() const { return theme_; }

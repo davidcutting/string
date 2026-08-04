@@ -28,6 +28,48 @@
 namespace string::render
 {
 
+// The scissor region a node draws within: the intersection of every `clip` ancestor's box, in SCREEN
+// space. An empty region means the node is entirely scrolled/panned out and draws nothing.
+//
+// Here rather than in the .cpp only so the pass can hold a persistent buffer of them (brief 12c
+// M2a); it is the packer's type and nothing outside the packer should need it.
+struct clip_rect
+{
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    bool operator==(const clip_rect&) const = default;
+    [[nodiscard]] bool empty() const { return x1 <= x0 || y1 <= y0; }
+};
+
+// The three GPU instance streams the packer emits, each matching a `struct` in its shader:
+// `Shape` in ui_shader, `Glyph` in text_shader, `Image` in image_shader. Here rather than in the
+// .cpp because the pass RETAINS them per surface across frames (brief 12c M2b).
+//
+// All three carry ABSOLUTE screen coordinates in `rect.xy`, which is what makes retention work: a
+// surface that only MOVED is its retained stream with a placement delta added to those two floats,
+// never a re-emission. Placement is integral, so a glyph's whole-pixel rounding survives the shift
+// exactly — round(o + d + g) == round(o + g) + d for integral d, and that identity is the reason
+// the translate is a legal substitute for re-packing rather than an approximation of it.
+struct GpuShape
+{
+    float rect[4];    // pos.xy, size.xy (px)
+    float fill[4];    // linear rgba
+    float stroke[4];  // linear rgba
+    float params[4];  // corner_radius, stroke_width, sweep, _
+};
+struct GpuGlyph
+{
+    float rect[4];   // x, y, w, h (px)
+    float uv[4];     // u0, v0, u1, v1
+    float color[4];  // linear rgba
+};
+struct GpuImage
+{
+    float rect[4];              // pos.xy, size.xy (px)
+    float range[4];             // range_min, range_max, mip, false_colour
+    std::uint32_t params[4];    // texture slot, channel mask, _, _
+    float tint[4];              // linear rgba multiplier
+};
+
 // The one UI overlay pass: rounded-rect shapes AND SDF text, both from a SINGLE per-frame layout
 // tree. The application supplies an authoring callback run every frame; the pass lays it out (with
 // a font measurer), packs the rect/container nodes into a shape buffer and the text nodes into a
@@ -166,6 +208,24 @@ private:
     std::int64_t ui_cpu_us_accum_ = 0;
     std::int64_t ui_cpu_us_peak_ = 0;
     int ui_cpu_samples_ = 0;
+    // Per-PHASE breakdown of the same total (brief 12c M0). The combined number above says the UI
+    // costs N ms; it cannot say which of the four things to attack, and 12b's milestones removed
+    // enough that the answer changed. Authoring and packing are the two that still run
+    // unconditionally every frame, so they are what brief 12c is scoped against.
+    std::int64_t ui_author_us_accum_ = 0;
+    std::int64_t ui_layout_us_accum_ = 0;
+    std::int64_t ui_pack_us_accum_ = 0;
+    // Prep (batch keys + clip regions) split out of pack: it is the part retention still has to pay
+    // even when a surface is clean, so it needs its own number (brief 12c M2a).
+    std::int64_t ui_prep_us_accum_ = 0;
+    std::int64_t ui_upload_us_accum_ = 0;
+
+    // Packing scratch, PERSISTENT so a steady-state frame allocates nothing (brief 12c M2a). These
+    // are two node-sized arrays and a two-entry layer set that were rebuilt from scratch every
+    // frame; at nameplate scale that was a measurable share of packing on its own.
+    std::vector<std::uint16_t> pack_keys_;
+    std::vector<clip_rect> pack_clips_;
+    std::vector<std::uint16_t> pack_layers_;
 
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
 

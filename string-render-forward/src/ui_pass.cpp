@@ -31,14 +31,7 @@ static constexpr ::String::ActionId kUiContext = ::String::action_id("ctx.ui");
 namespace
 {
 
-// --- Shapes (rounded-rect SDF); matches `struct Shape` in shaders/ui_shader.vert -------------
-struct GpuShape
-{
-    float rect[4];    // pos.xy, size.xy (px)
-    float fill[4];    // linear rgba
-    float stroke[4];  // linear rgba
-    float params[4];  // corner_radius, stroke_width, _, _
-};
+// GpuShape / GpuGlyph / GpuImage now live in the header — the pass retains them (12c M2b).
 struct ShapePush
 {
     float screen_size[2];
@@ -60,64 +53,59 @@ float effective_radius(const ::string::element& e, float w, float h)
     return 0.0f;
 }
 
-// Per-node DRAW-BATCH KEY: (overlay << 8) | z, both inherited from the nearest ancestor that
-// declares them. Nodes are in pre-order so a parent is always resolved before its children.
+// Everything packing needs to know per node BEFORE it emits anything: the draw-batch key and the
+// scissor region. One pre-order walk over persistent scratch (brief 12c M2a).
 //
-// This is the single ordering authority for the UI: record() draws each distinct key's shapes AND
+// DRAW-BATCH KEY: (overlay << 8) | z, both inherited from the nearest ancestor that declares them.
+// This is the single ordering authority for the UI — record() draws each distinct key's shapes AND
 // text before moving to the next, and `::string::ui::hit_test_layered` compares the same key. Two
-// draw streams (shapes, glyphs) is exactly why the key has to exist — without batching per key, all
+// draw streams (shapes, glyphs) is exactly why the key has to exist: without batching per key, all
 // shapes precede all text, so a lower panel's TEXT lands on top of a raised panel's BACKGROUND.
-std::vector<std::uint16_t> layer_keys(std::span<const ::string::layout_node> nodes)
-{
-    std::vector<std::uint16_t> keys(nodes.size(), 0);
-    for (std::size_t i = 0; i < nodes.size(); ++i)
-    {
-        const ::string::layout_node& n = nodes[i];
-        const std::uint16_t inherited = n.is_root() ? 0 : keys[n.parent];
-        // A subtree cannot sink below the layer it was placed on, so the MAX of declared and
-        // inherited wins — same rule the single overlay bit had, generalised to an ordered list.
-        const std::uint16_t declared = static_cast<std::uint16_t>(n.element.layer) << 8;
-        const std::uint16_t layer = std::max<std::uint16_t>(declared, inherited & 0xFF00);
-        // z is inherited only when this node does not declare its own.
-        const std::uint16_t z = n.element.z != 0 ? n.element.z : (inherited & 0xFF);
-        keys[i] = static_cast<std::uint16_t>(layer | z);
-    }
-    return keys;
-}
-
-// The clip region a node draws within: the intersection of every `clip` ancestor's box. An empty
-// region means the node is entirely scrolled/panned out and draws nothing.
-struct clip_rect
-{
-    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    bool operator==(const clip_rect&) const = default;
-    [[nodiscard]] bool empty() const { return x1 <= x0 || y1 <= y0; }
-};
-
-std::vector<clip_rect> clip_rects(const ::string::layout_builder& builder, ::string::dimension screen)
+//
+// CLIP: the intersection of every `clip` ancestor's box. Empty = entirely scrolled out, draws
+// nothing.
+//
+// Both were separate full walks that each allocated a node-sized vector every frame, and the layer
+// set was found by copying all N keys and std::sort-ing them — an O(N log N) sort to discover the
+// two or three distinct values a real UI uses. Both derivations depend only on the PARENT and
+// nodes are in pre-order, so one walk resolves both and collects the set as it goes.
+void prep_pack(const ::string::layout_builder& builder, ::string::dimension screen,
+               std::vector<std::uint16_t>& keys, std::vector<clip_rect>& clips,
+               std::vector<std::uint16_t>& layers)
 {
     const std::span<const ::string::layout_node> nodes = builder.nodes();
     const clip_rect full{ 0, 0, screen.width, screen.height };
-    std::vector<clip_rect> out(nodes.size(), full);
+    keys.assign(nodes.size(), 0);
+    clips.assign(nodes.size(), full);
+    layers.clear();
+
     for (std::size_t i = 0; i < nodes.size(); ++i)
     {
         const ::string::layout_node& n = nodes[i];
-        clip_rect c = n.is_root() ? full : out[n.parent];
+
+        const std::uint16_t inherited = n.is_root() ? 0 : keys[n.parent];
+        const std::uint16_t declared = static_cast<std::uint16_t>(n.element.layer) << 8;
+        const std::uint16_t layer = std::max<std::uint16_t>(declared, inherited & 0xFF00);
+        const std::uint16_t z = n.element.z != 0 ? n.element.z : (inherited & 0xFF);
+        const std::uint16_t key = static_cast<std::uint16_t>(layer | z);
+        keys[i] = key;
+
+        // Linear insert into a set that is two or three entries long in every real UI — cheaper than
+        // any container with a hash, and it keeps `layers` sorted so the draw order below is right.
+        if (std::find(layers.begin(), layers.end(), key) == layers.end())
+            layers.insert(std::upper_bound(layers.begin(), layers.end(), key), key);
+
+        clip_rect c = n.is_root() ? full : clips[n.parent];
         if (n.element.clip)
         {
-            // Screen space: a scissor rect names a framebuffer region, so a clipping node inside a
-            // placed surface has to be resolved through that placement first.
             const ::string::bounding_box b = builder.screen_box(n);
-            // INTERSECT, never replace: a clipped child of a clipped parent shows only where both
-            // allow, or an inner view could paint outside the outer one that contains it.
             c.x0 = std::max(c.x0, static_cast<int>(b.x));
             c.y0 = std::max(c.y0, static_cast<int>(b.y));
             c.x1 = std::min(c.x1, static_cast<int>(b.x) + b.dimension.width);
             c.y1 = std::min(c.y1, static_cast<int>(b.y) + b.dimension.height);
         }
-        out[i] = c;
+        clips[i] = c;
     }
-    return out;
 }
 
 // One node -> one shape. Per-node rather than per-layer now that batching is run-length over CLIP
@@ -142,13 +130,6 @@ bool shape_of(const ::string::layout_node& n, const ::string::bounding_box& box,
     return true;
 }
 
-// --- Glyphs (SDF text); matches `struct Glyph` in shaders/text_shader.vert --------------------
-struct GpuGlyph
-{
-    float rect[4];   // x, y, w, h (px)
-    float uv[4];     // u0, v0, u1, v1
-    float color[4];  // linear rgba
-};
 struct TextPush
 {
     float screen_size[2];
@@ -159,13 +140,6 @@ struct TextPush
 };
 
 // --- Images (brief 14 M4): a texture blit with inspection controls ----------------------------
-struct GpuImage
-{
-    float rect[4];              // pos.xy, size.xy (px)
-    float range[4];             // range_min, range_max, mip, false_colour
-    std::uint32_t params[4];    // texture slot, channel mask, _, _
-    float tint[4];              // linear rgba multiplier
-};
 struct ImagePush
 {
     float screen_size[2];
@@ -654,6 +628,9 @@ void UIPass::update(float delta_time, uint16_t current_frame)
                                    .direction = ::string::direction::VERTICAL });
     author_(builder_, UiContext{ input_, input_map_, interaction_ });
     author_error_overlay();
+    // Phase seam (brief 12c M0): everything above is AUTHORING — running the closures and emitting
+    // nodes. It is what brief 12c exists to skip, and it runs unconditionally today.
+    const auto ui_t_author = std::chrono::steady_clock::now();
     const ::string::dimension available{
         static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.width, 0xFFFF)),
         static_cast<std::uint16_t>(std::min<std::uint32_t>(screen_size.height, 0xFFFF)) };
@@ -674,6 +651,7 @@ void UIPass::update(float delta_time, uint16_t current_frame)
     // The one post-layout seam (brief 12 M2c): resolved sizes exist only now, and a workspace needs
     // them to convert a splitter drag into a sizing change. Reads only.
     if (post_layout_) post_layout_(builder_);
+    const auto ui_t_layout = std::chrono::steady_clock::now();
 
     // Brief 12 M0a — the layout-tree dump gate. Taken HERE: after layout resolves (so boxes are
     // final) and before packing (which is a lossy projection onto the GPU rings). One dump per run,
@@ -688,11 +666,12 @@ void UIPass::update(float delta_time, uint16_t current_frame)
     //
     // Almost every UI has exactly two keys (main + overlay z=0), which reproduces the previous
     // shapes/text/shapes/text sequence exactly; z only costs draw calls when it is actually used.
-    const std::vector<std::uint16_t> keys = layer_keys(builder_.nodes());
-    const std::vector<clip_rect> clips = clip_rects(builder_, available);
-    std::vector<std::uint16_t> layers(keys.begin(), keys.end());
-    std::sort(layers.begin(), layers.end());
-    layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+    prep_pack(builder_, available, pack_keys_, pack_clips_, pack_layers_);
+    const std::vector<std::uint16_t>& keys = pack_keys_;
+    const std::vector<clip_rect>& clips = pack_clips_;
+    const std::vector<std::uint16_t>& layers = pack_layers_;
+
+    const auto ui_t_prep = std::chrono::steady_clock::now();
 
     std::vector<GpuShape> shapes;
     std::vector<GpuGlyph> glyphs;
@@ -736,6 +715,7 @@ void UIPass::update(float delta_time, uint16_t current_frame)
                 i0 = images.size();
                 current = c;
             }
+
             const ::string::layout_node& n = builder_.nodes()[ni];
             // Resolved once here, not three times below: this is the ONE point where a node's
             // surface-local box becomes the framebuffer rect every stream draws into.
@@ -749,6 +729,11 @@ void UIPass::update(float delta_time, uint16_t current_frame)
         }
         if (have) flush(s0, g0, i0, current);
     }
+    // Phase seam: everything from `layer_keys` to here is PACKING — projecting the tree onto the
+    // three GPU streams. Like authoring it runs unconditionally, and whether it is worth retaining
+    // is the question M0 exists to answer.
+    const auto ui_t_pack = std::chrono::steady_clock::now();
+
     if ((shapes.size() > kMaxShapes || glyphs.size() > kMaxGlyphs || images.size() > kMaxImages)
         && !warned_overflow_)
     {
@@ -782,18 +767,37 @@ void UIPass::update(float delta_time, uint16_t current_frame)
     // UI CPU cost (author + layout + shape/glyph pack) — the "UI cost visible standalone" number the
     // brief asks for. Rolling avg logged every 300 frames so the 500-nameplate stress can be read off
     // the log without Tracy. STRING_PROFILE zones (brief 06) still wrap this for -Dtracy runs.
-    const auto ui_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           std::chrono::steady_clock::now() - ui_t0).count();
+    const auto ui_t_end = std::chrono::steady_clock::now();
+    const auto us = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    const auto ui_us = us(ui_t0, ui_t_end);
     ui_cpu_us_accum_ += ui_us;
     ui_cpu_us_peak_ = std::max<std::int64_t>(ui_cpu_us_peak_, ui_us);
+    ui_author_us_accum_ += us(ui_t0, ui_t_author);
+    ui_layout_us_accum_ += us(ui_t_author, ui_t_layout);
+    ui_pack_us_accum_ += us(ui_t_layout, ui_t_pack);
+    ui_upload_us_accum_ += us(ui_t_pack, ui_t_end);
+    ui_prep_us_accum_ += us(ui_t_layout, ui_t_prep);
     if (++ui_cpu_samples_ >= 300)
     {
-        STRING_LOG_INFO("[ui-cpu] avg {:.3f} ms, peak {:.3f} ms ({} shapes / {} glyphs)",
+        constexpr double kN = 300.0 * 1000.0;   // samples -> ms
+        STRING_LOG_INFO("[ui-cpu] avg {:.3f} ms, peak {:.3f} ms ({} shapes / {} glyphs) | "
+                        "author {:.3f} layout {:.3f} pack {:.3f} (prep {:.3f}) upload {:.3f} ms "
+                        "({} nodes, {} surfaces, {} skipped)",
                         (ui_cpu_us_accum_ / 300.0) / 1000.0, ui_cpu_us_peak_ / 1000.0,
-                        sr.count, gr.count);
+                        sr.count, gr.count, ui_author_us_accum_ / kN, ui_layout_us_accum_ / kN,
+                        ui_pack_us_accum_ / kN, ui_prep_us_accum_ / kN, ui_upload_us_accum_ / kN,
+                        builder_.nodes().size(), builder_.surfaces().size(),
+                        builder_.skipped_count());
         ui_cpu_us_accum_ = 0;
         ui_cpu_us_peak_ = 0;
         ui_cpu_samples_ = 0;
+        ui_author_us_accum_ = 0;
+        ui_layout_us_accum_ = 0;
+        ui_pack_us_accum_ = 0;
+        ui_prep_us_accum_ = 0;
+        ui_upload_us_accum_ = 0;
     }
 
     // Interaction, part 2 (post-layout): hover needs a laid-out tree. Hit-test, focus resolution

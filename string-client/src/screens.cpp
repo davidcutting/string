@@ -111,8 +111,8 @@ void author_panels(Ui& u, ScreenState& state)
         .limits({ 220.0f, 170.0f })
         .initial({ 60.0f, 90.0f, 320.0f, 220.0f })
         .content([&](Ui& u2) {
-            u2.text(u2.own("frame " + std::to_string(state.frame)));
-            u2.text(u2.own("time  " + std::to_string(static_cast<int>(state.time)) + "s"));
+            u2.text(u2.format("frame {}", state.frame));
+            u2.text(u2.format("time  {}s", static_cast<int>(state.time)));
             u2.text("drag the title bar").color(theme().text_dim);
             u2.text("resize from the corner").color(theme().text_dim);
         });
@@ -168,12 +168,12 @@ void author_workspace(Ui& u, ::string::ui::Workspace& ws, ScreenState& state)
 {
     u.workspace(ws).content([&](Ui& u2) {
         u2.card(kCardStats).title("Stats").content([&](Ui& u3) {
-            u3.text(u3.own("frame " + std::to_string(state.frame)));
+            u3.text(u3.format("frame {}", state.frame));
             u3.text("this strip is locked").color(theme().text_dim);
         });
         u2.card(kCardTree).title("Tree").content([&](Ui& u3) {
             for (int i = 0; i < 4; ++i)
-                u3.text(u3.own("node " + std::to_string(i))).color(theme().text_dim);
+                u3.text(u3.format("node {}", i)).color(theme().text_dim);
         });
         u2.card(kCardLog).title("Log").content([&](Ui& u3) {
             u3.text("drag the splitter above").color(theme().text_dim);
@@ -257,9 +257,9 @@ void author_widgets(Ui& u, ScreenState& state)
                     .rows(5000, [&](Ui& u4, std::size_t row, std::size_t col) {
                         const std::size_t r =
                             state.w_sort_asc ? row : (5000 - 1 - row);   // the AUTHOR sorts
-                        if (col == 0) u4.text(u4.own(std::to_string(r))).font(16);
-                        else if (col == 1) u4.text(u4.own("item " + std::to_string(r % 97))).font(16);
-                        else u4.text(u4.own(std::to_string((r * 37) % 1000))).font(16);
+                        if (col == 0) u4.text(u4.format("{}", r)).font(16);
+                        else if (col == 1) u4.text(u4.format("item {}", r % 97)).font(16);
+                        else u4.text(u4.format("{}", (r * 37) % 1000)).font(16);
                     });
             });
 
@@ -274,8 +274,7 @@ void author_widgets(Ui& u, ScreenState& state)
                     .visible_rows(8)
                     .selected(bind(state, &ScreenState::w_node))
                     .nodes([&](Ui& u4, std::uint64_t key, std::size_t depth) {
-                        u4.text(u4.own((depth == 0 ? "group " : depth == 1 ? "item " : "leaf ") +
-                                       std::to_string(key)))
+                        u4.text(u4.format("{}{}", depth == 0 ? "group " : depth == 1 ? "item " : "leaf ", key))
                           .font(16);
                     });
             });
@@ -308,7 +307,7 @@ void author_widgets(Ui& u, ScreenState& state)
                       .font(16);
                     checkbox(u4, "w_sc_a", bind(state, &ScreenState::w_wireframe)).label("Wireframe");
                     for (int i = 0; i < 14; ++i)
-                        u4.text(u4.own("row " + std::to_string(i))).font(18);
+                        u4.text(u4.format("row {}", i)).font(18);
                     checkbox(u4, "w_sc_b", bind(state, &ScreenState::w_cull)).label("Cull (at the end)");
                 });
             });
@@ -335,10 +334,9 @@ void author_status_panel(Ui& u, const UiScene& scene, ScreenState& state,
         .column()
         .content([&](Ui& u2) {
             u2.text("String UI sandbox").color(theme().accent).font(26);
-            u2.text(u2.own("frame " + std::to_string(state.frame))).color(theme().text).font(20);
-            u2.text(u2.own("screen: " + std::string(screen_name))).color(theme().text).font(20);
-            u2.text(u2.own("anchors: " + std::to_string(scene.anchors.size()) +
-                           "   nameplates: " + std::to_string(nameplate_count)))
+            u2.text(u2.format("frame {}", state.frame)).color(theme().text).font(20);
+            u2.text(u2.format("screen: {}", screen_name)).color(theme().text).font(20);
+            u2.text(u2.format("anchors: {}   nameplates: {}", scene.anchors.size(), nameplate_count))
                 .color(theme().text)
                 .font(20);
         });
@@ -383,9 +381,9 @@ void author_inventory(Ui& u)
                         for (int cx = 0; cx < 6; ++cx)
                         {
                             const int idx = row * 6 + cx;
-                            const std::string_view id_name = u4.own("inv_" + std::to_string(idx));
+                            const std::string_view id_name = u4.format("inv_{}", idx);
                             const std::string_view label =
-                                u4.own(std::string(item_names[idx % 12]).substr(0, 4));
+                                u4.own(std::string_view{ item_names[idx % 12] }.substr(0, 4));
                             const auto cid = make_id(id_name).hash;
                             const color rar = rarities[idx % 6];
                             icon_cell(u4, id_name, label, rar, 56);
@@ -438,14 +436,14 @@ void author_actionbar(Ui& u, ScreenState& state)
             {
                 const float cd_frac =
                     state.cd_total[i] > 0.0f ? state.cooldowns[i] / state.cd_total[i] : 0.0f;
-                const std::string_view id_name = u2.own("act_" + std::to_string(i));
+                const std::string_view id_name = u2.format("act_{}", i);
                 const auto cid = make_id(id_name).hash;
 
                 // Slot column: keybind on top, icon cell below.
                 u2.element().gap(3).align(alignment::CENTER).column().content([&](Ui& u3) {
                     u3.text(keys[i]).color(theme().text_dim).font(16);
 
-                    const std::string_view label = u3.own(std::string(abils[i]).substr(0, 3));
+                    const std::string_view label = u3.own(std::string_view{ abils[i] }.substr(0, 3));
                     const color border = (i == 6) ? col::rarity_legendary : theme().stroke;
                     // Proc glow: pulse the "Ult" slot border when proc_glow active.
                     const color glow_border =

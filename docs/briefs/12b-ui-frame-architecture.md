@@ -1,6 +1,17 @@
 # Brief 12b — UI surfaces + layers: the shaping cache, placement, and clean-surface skip
 
-Status: **DRAFT / for discussion** (written 2026-08-03, from a design review with the user of an
+> **EVERY TIMING IN THIS BRIEF IS FROM A `-O0` BUILD.** `packages.demo` set
+> `mesonBuildType = "debug"` until 2026-08-04; meson makes that `-O0`. An optimized build is ~7x
+> faster across the board (the realistic shell is 0.033ms total, not 0.234ms). The ALGORITHMIC wins
+> here are real at any optimization level — skipping layout for a clean surface does less work
+> whatever the compiler does — but the MAGNITUDES and percentages below must not be quoted. See the
+> stop-note at the top of `12c-retained-regions.md`.
+
+Status: **COMPLETE — M0, M0b, M1, M2, M3 all landed and gated 2026-08-03.** What remains is not in
+this brief: authoring is now the dominant frame cost and no 12b milestone addresses it (measured —
+the facade is ~2% of it, ~51% is app-side per-entity string caching, ~47% is irreducible node
+emission). Attacking that last 47% is brief 12's deferred M4 retained-on-immediate, for which
+M0-M3 are the load-bearing prerequisites. (Originally written as DRAFT / for discussion, 2026-08-03, from a design review with the user of an
 external retained-mode arena proposal against the shipped string-ui core; vocabulary reworked with
 the user 2026-08-03). Inherits the UI API conventions locked in `12-ui-panels.md` (names /
 callbacks / handle-binding / closures / Clay-sizing / central theme / retained-mode seam) —
@@ -240,7 +251,36 @@ draw-side halving. Gate: byte-identical UI captures (this is a pure optimization
 regression test still green, benchmark delta recorded in this brief, cache gtests
 (hit/miss/eviction/wrap-width keying).
 
-### M0b — `Transition.delay` (micro; standalone like M0)
+### M0b — `Transition.delay` — **DONE** (2026-08-03)
+
+`Transition` gains `delay` (seconds, default 0). The value HOLDS at its current until the delay
+elapses, then eases over `duration` with `curve`.
+
+Two decisions worth recording, because both are places the obvious implementation is wrong:
+
+- **The hold is armed when the TARGET CHANGES**, not per-entry and not per-frame. Arming every frame
+  would freeze the value forever; arming once per entry would make the second state change instant.
+  Writing a new target mid-hold RESTARTS it, which is what "the clock starts when the target is
+  written" has to mean for a state that changes its mind (hover on, then off).
+- **Arming is guarded on `delay > 0`, not on the target alone.** An author animating toward a
+  continuously-varying target would otherwise re-arm every frame and never move at all. With the
+  guard that failure is only reachable by explicitly asking for a delay — and at the default of 0 not
+  one of the new branches is taken, which is what makes delay=0 identical rather than merely close.
+
+When a hold expires part-way through a frame the REMAINDER is eased, not dropped — otherwise two
+entries staggered by less than a frame finish on the same frame, which is the one thing stagger
+must not do. Both integrators (ease and SPRING) use the remainder.
+
+Stagger needs no API, as specified: `{.delay = i * 0.03f}` in the authoring loop.
+
+Gate: six Motion gtests — hold-then-ease with exact frame counts; three staggered entries complete in
+delay order; a new target mid-hold restarts it; **delay=0 is bit-identical (`ASSERT_EQ` on the float,
+60 frames x 5 curves incl. SPRING)**; a delayed entry still ages out. The three behavioural ones were
+confirmed to FAIL with the arming disabled, while the bit-identity and aging tests correctly still
+passed — which is the discrimination pattern that matters here. No capture gate was run: `delay`
+defaults to 0 and the bit-identity test is strictly stronger evidence than a single-frame dump.
+
+### M0b — original specification
 
 Add `delay` (seconds, default 0) to `Transition`: the transition's clock starts when the target
 is written; the value HOLDS at its current until `delay` elapses, then eases over `duration`
@@ -299,7 +339,74 @@ they previously lagged a frame. Layout-dump tests per surface; capture compare a
 resolutions incl. non-square; NEEDS VISUAL VERIFY: drag a panel over the console (modal stays on
 top), open a combo while moving its panel (popup tracks with zero lag — previously one frame).
 
-### M2 — Surface coordinates; position belongs to placement
+### M2 — Surface coordinates; position belongs to placement — **DONE** (2026-08-03)
+
+**Sequencing correction (2026-08-03).** An earlier note in this brief said "sequence M2 AFTER M3",
+on the grounds that M0 had shrunk M2's direct win to ~337us/1000 plates. That was wrong and is
+retracted. Position was a layout input, so under M3 alone every surface that MOVES would be
+permanently dirty — the skip would miss exactly the surfaces that move most (nameplates, dragged
+panels), which is most of its value. M2 is a PREREQUISITE for M3, not an alternative to it.
+Original M1 -> M2 -> M3 order restored.
+
+**M2 delivers no measurable win on its own, and that is expected**: nothing skips layout yet, so
+surface-local boxes cost the same as absolute ones. What it delivers is the correctness property
+M3 consumes. Do not look for a benchmark delta here; look for it in M3.
+
+**Shipped shape.** A surface is DERIVED, not declared: a root-space `floating` node (`floating &&
+!float_local`) opens one. No new authoring API, no `element.surface` flag, and the set is exactly
+right — panels, nameplates, popups and the menu bar are root-space anchors; scroll offsets and
+graph-canvas nodes are `float_local` and stay layout inputs, which is what the brief already
+required.
+
+- `layout_surface { root, surface_placement{x,y} }` + `layout_node.surface` (an index, propagated
+  down the subtree by the position pass). Subtree contiguity is untouched, so M3's per-surface
+  ranges fall out of the same pool as before.
+- `layout_builder::screen_box(node)` is the ONE conversion. Every consumer outside the layout
+  engine now goes through it — paint, clip/scissor, hit test, nav, `hovered_box`, `observed_box`,
+  `resolved_box`, `Workspace::observe`, the layout dump — so published space is unchanged and no
+  widget math moved. `element.surface` was deliberately NOT added; deriving it means there is no
+  second place to keep in sync.
+- Named `surface_placement`, not `placement`: `ui::placement` is the workspace's "where a card
+  goes" and is public API. The brief predicted the rhyme; the compiler enforced the distinction.
+
+**Two authoring defects the milestone exposed.** Both were the same bug — chrome that re-derived
+its parent's SCREEN rect because it had no way to say "relative to my panel":
+- The panel resize grip (and the workspace floating panel's grip) were root-space SIBLINGS
+  positioned from `r.right()/r.bottom()`. One panel was therefore two surfaces, and moving it wrote
+  two placements that had to agree. Now local children of the panel, positioned from its SIZE.
+- The debug lens was THREE root-space surfaces (outline, move strip, grip), each re-deriving
+  `st.rect`. Its comment justified this by saying a child "would be positioned relative to the
+  frame's box and clipped to it" — only the first half was ever true (clipping requires `.clip`,
+  which nothing there sets), and being positioned relative to the frame is exactly what was wanted.
+  Now one surface with two local children.
+
+**Verification.**
+- A/B via a one-line sentinel (record placement (0,0) and position at the anchor = pre-M2
+  behaviour): all five `tools/ui_dump.sh` screens BYTE-IDENTICAL. This is a real test of placement
+  composition, because the two arms differ in where the offset is applied but the dump reads both
+  through `screen_box`.
+- `MovingAPanelChangesItsPlacementAndNoBoxWithinIt` — the milestone as one assertion: drag a panel
+  137,-25 and every local box in its subtree is bit-identical. CONFIRMED to fail under the sentinel
+  (with the consteval self-test temporarily suppressed, since it fires first).
+- `HitTestingFollowsAMovedSurface`, `HoveredBoxIsPublishedInScreenSpace`, exact-coordinate grip
+  assertions, and the `layout_floating_self_test` consteval check extended to assert the surface
+  split (local origin + placement) as well as the screen position.
+- `checks.{ui,default,cook}` green.
+
+**COVERAGE GAP — needs eyes.** `ui_dump.sh`'s five screens contain NO panels, grips or lens, so the
+byte-identical result does NOT cover the two authoring refactors above. The panel grips are gated
+by exact-coordinate gtests instead; **the debug lens is not covered by any automated gate** (there
+is no `string-debug` test target). Its geometry is provably unchanged by algebra — frame placement
+`(rect.x-kEdge, rect.y-kEdge)`, strip local `(0,-kStrip)` -> screen `(rect.x-kEdge,
+rect.y-kEdge-kStrip)`, grip local `(frame_w, frame_h)` -> screen `(rect.x+rect.width+kEdge,
+rect.y+rect.height+kEdge)`, each identical to the old root-space formula — and layer/z resolve the
+same (layer is MAX along ancestry; z=0 means unset). **What to look for**: open a lens, confirm the
+accent outline, the translucent grab strip ABOVE it, and the small square grip at its bottom-right
+corner all sit exactly where they did, drag it and confirm the three move as one piece with no
+lag or separation, and resize it from the grip. **What failure looks like**: chrome detached from
+the outline by a few px, the strip inset from the border, or the grip landing inside the frame.
+
+### M2 — original specification
 
 Boxes inside a surface resolve in surface coordinates; the placement rect is applied at paint and
 at hit-test (cursor converted to surface coordinates per range; published boxes — `hovered_box`,
@@ -326,7 +433,72 @@ verify for drag feel (panel tracks cursor exactly as before — the M1 "same fra
 in `Panel` docs must survive); interaction gtests for hit-test coordinate conversion; nameplate
 stress benchmark shows layout column ~= structural floor.
 
-### M3 — Signatures: clean surfaces skip layout
+### M3 — Signatures: clean surfaces skip layout — **DONE** (2026-08-03)
+
+**Shipped shape.** Signatures are folded during AUTHORING (not during the position pass — the whole
+point is not to run that pass), so surface membership, placement and signature are all assigned in
+`begin`/`add_element`. `close()` then lays out each surface INDEPENDENTLY: sound because a surface
+root is out of its parent's flow in both directions, so the parent's fit/flex passes already skipped
+it when accumulating and only ever recursed into it. Hoisting those four recursions out is what
+makes one surface skippable while its neighbours reflow.
+
+Retention is keyed by surface ORDINAL, validated by the signature — deliberately not by element id.
+A signature match already proves every layout input is unchanged, and if all inputs match then the
+resolved boxes match whatever surface it "is", so the ordinal only has to be a good enough guess to
+make the check hit. Ordinal churn (a panel opening) yields a MISS, never a wrong answer — and it
+covers the ID-LESS surfaces (nameplates, tooltips) that an id-keyed store could never have skipped,
+which is most of the volume.
+
+**Measured — the honest figure is TOTAL frame cost, not the layout column.** M3 moves work out of
+layout and into authoring, so a layout-only ratio flatters it badly (it reads as 100-250x). The
+benchmark now reports both and computes the gain from the total. Same run, 2560x1440, 200 frames:
+
+| scenario                            | nodes | author | author+sig | layout base | +M0 cache | +M3 skip | total | skip/surf |
+|-------------------------------------|-------|--------|-----------|-------------|-----------|----------|-------|-----------|
+| debug shell (3 panels x 12 rows)    |  124  |   54us |     62us  |     287us   |    46us   |    2us   | 1.56x |   4/4     |
+| heavy tooling (10 panels x 30 rows) |  951  |  402us |    475us  |    2385us   |   384us   |   11us   | 1.62x |  11/11    |
+| shell + 200 nameplates              |  524  |  238us |    278us  |    1046us   |   164us   |   11us   | 1.39x | 204/204   |
+| HUD stress (1000 nameplates)        | 2124  |  983us |   1165us  |    4245us   |   654us   |   48us   | 1.35x | 1004/1004 |
+| extreme (10x60 rows + 2000 plates)  | 5851  | 2631us |   3134us  |   13035us   |  1998us   |  120us   | 1.42x | 2011/2011 |
+
+So: **35-62% off the frame**, and layout lands ON the structural floor (120us vs 109us at extreme —
+restoring a box column costs about what walking the structural passes costs, which is the right
+ballpark and the reason the gain is not larger). Absolute numbers are from a loaded build machine
+and are NOT comparable across runs — the harness re-derives every arm for exactly that reason.
+
+**The benchmark's nameplates now MOVE** (they were static, with a note deferring movement to M2).
+2011/2011 surfaces stay clean with 2000 plates drifting every frame: that is M2 and M3 together, and
+a static plate would have measured the one case the milestone did not have to solve.
+
+**Signature folding is not free, and the first draft made it much worse.** Byte-at-a-time FNV cost
++45% on authoring and ate most of the win (total gain was only 1.14-1.37x). FNV is a serial
+xor-multiply CHAIN, so cost tracks the number of MULTIPLIES, not bytes read; packing each node's
+~15 fixed-width layout inputs into 3-4 64-bit words cut the chain ~5x, bringing folding to +19% and
+the total gain to the table above. The hash is still 64-bit and the collision odds are unchanged.
+Folding is also skipped entirely when the skip is off, so `STRING_UI_NO_SKIP=1` costs nothing and
+the benchmark's arms are a fair A/B.
+
+**Verification.**
+- `ui_dump.sh` x5 screens BYTE-IDENTICAL, `STRING_UI_NO_SKIP=1` vs default — and still identical to
+  the pre-M2 baseline captured earlier the same day, so the whole M2+M3 arc is pixel-neutral.
+- Six gtests, ALL confirmed to fail with the skip disabled (so they are live, not vacuous):
+  unchanged surface is restored; restored boxes equal a forced full relayout; 100 frames of animated
+  PAINT cause zero relayouts; 100 frames of MOVEMENT cause zero relayouts (and the surface really
+  moved); each layout input (sizing / text / gap / a `float_local` anchor / viewport resize) dirties;
+  and re-nesting the same nodes dirties — the last one is why authoring DEPTH is folded, without
+  which `[A [B] C]` and `[A [B [C]]]` are the same signature.
+- `checks.{ui,default,cook}` green.
+
+**Known limits, stated rather than discovered later.**
+- `invalidate_retained()` must be called if the MEASURER changes identity or the atlas is re-baked at
+  a different size; nothing outside the signature is detected. Text content and `font_px` ARE folded,
+  so ordinary theme edits need no call. No host currently re-bakes, so nothing calls it today.
+- The skip's value depends on the app not varying layout inputs continuously. The demo's nameplates
+  scale `font_px` and bar width with depth every frame, so in the real client they would be dirty
+  whenever an actor's distance changes — an app-side choice (quantise the steps), not a kit limit.
+  The benchmark deliberately varies only placement, which is the case the milestone is about.
+
+### M3 — original specification
 
 While authoring appends a surface's nodes, fold its layout inputs into a running FNV: the
 surface's layout CONSTRAINT (placement SIZE — resize must reflow; position deliberately NOT
@@ -535,8 +707,13 @@ M1 and M2 and could land first.
 M2's best evidence was the nameplate: a plate that moves 1px re-lays-out AND re-shapes its subtree.
 **The re-shaping half is now free** — a moving plate's text, scale and wrap are unchanged, so it is a
 cache hit. What M2 still removes is the structural relayout: 337us per 1000 plates, 1025us at the
-extreme. Real, but M2 went from removing the dominant cost to removing a second-order one, and it
-should be sequenced after M3 rather than before.
+extreme. Real, but M2 went from removing the dominant cost to removing a second-order one.
+
+**This section originally concluded "so it should be sequenced after M3 rather than before". That
+was wrong — RETRACTED 2026-08-03.** It measured M2's DIRECT win and missed that M2 is a
+prerequisite for M3's: while position is a layout input, every surface that MOVES has a changing
+signature and is permanently dirty, so M3's skip would miss precisely the surfaces that move most.
+The two milestones are not comparable alternatives. See M2's sequencing note.
 
 ### M1 is the same decision as brief 12's canvas
 
