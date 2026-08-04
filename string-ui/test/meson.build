@@ -1,0 +1,33 @@
+test_files = [
+    'layout_test.cpp',
+    'layout_dump_test.cpp',
+    'text_wrap_test.cpp',
+    'font_test.cpp',
+    'ui_interaction_test.cpp',
+    'ui_facade_test.cpp',
+    'ui_panel_test.cpp',
+    'ui_workspace_test.cpp',
+    'ui_widgets_test.cpp',
+    'text_edit_test.cpp',
+    'frame_arena_test.cpp',
+    'ui_bench.cpp',
+]
+
+test_dep = [
+    dependency('gtest'),
+    dependency('gtest_main')
+]
+
+# font_test loads a DejaVu Sans copy kept beside the test (the library builds from an isolated
+# source subtree, so it can't reach the sandbox asset tree). The sandbox keeps its own copy.
+font_test_path = meson.current_source_dir() / 'DejaVuSans.ttf'
+
+test('ui_tests',
+    executable(
+        'ui_tests',
+        test_files,
+        dependencies : [ project_deps, test_dep ],
+        cpp_args : [ '-DSTRING_FONT_TEST_PATH="' + font_test_path + '"' ],
+        install : false
+    )
+)

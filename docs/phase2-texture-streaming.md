@@ -117,7 +117,7 @@ Today `TransferBatch` records all uploads at construction and the renderer drain
 - **Per-image samplers** interact with the bindless table (sampler baked into the image's descriptor
   today). Confirm the descriptor write path can carry a per-image sampler, or move to a separate
   sampler array / combined-image-sampler update on `minLod` change.
-- **Cook coarse mips.** Current cook (`tools/cook_textures.sh`) already emits full chains via
+- **Cook coarse mips.** Current cook (`string_cook`, string-asset-tools) already emits full chains via
   `--generate-mipmap`; no cook change needed for mip streaming. A separate small "always-resident"
   file is an alternative to picking a coarse-mip cutoff — decide in milestone 2.
 - **Geometry streaming** (meshlet clusters) reuses this residency machine but is sequenced later

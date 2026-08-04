@@ -1,4 +1,0 @@
-# Build the sandbox-side test suite (the asset-bake library round-trip + determinism gtests).
-# Off by default (the runnable demo doesn't need them); flake check's `cook` check turns it on.
-option('tests', type: 'boolean', value: false,
-       description: 'Build the sandbox asset-bake tests')

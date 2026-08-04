@@ -36,6 +36,8 @@ pipeline modular, the debug experience real, and the UI more mature than brief 0
 12. `13-ui-widgets.md` — Widget set (sliders, drag-values, collapsibles, tabs, tables/trees, color) inside the panels; immediate-mode CPU cost *(not yet written)*
 13. `14-debug-ui-inspect.md` — Debug tools in the UI: render-target visualizer, material/G-buffer channel isolation + material-preview sphere, per-pass toggles + inline timings, live CVar sliders *(not yet written)*
 14. `15-debug-ui-manipulate.md` — Interactive debug: transform gizmos (point lights first, generic ray-pick + handle system) + live material-property editing for scene testing *(not yet written)*
+14a. `12b-ui-frame-architecture.md` — UI frame architecture: shaping cache, frame arena, surfaces in layers. **M0 + M1 done 2026-08-03**, user-verified; M2/M3 open (see the brief for the reordering the profiling forced).
+14b. `17-input-routing.md` — Unified input: one binding table + a context stack arbitrating between UI and gameplay, interned action ids. **M1+M2 done 2026-08-03** (contexts + interned ids; UI routed actions + focus scopes). **M3 done** (context priority tiers, system actions, F8 binding inspector/rebinder). Slots beside the UI arc because the UI's hardcoded key signals are what M2 migrates.
 15. `08-vfx-telegraphs.md` — GPU particles, telegraphs, decals
 16. **End-of-Phase-A perf + quantization brief** (not yet written) — absorbs `04f` vertex quantization + probe-GI cost reduction + general perf-regression hunt. Runs after 08, before Phase B (hard deadline: quantized/skinned vertex format must be locked before Phase B skinning).
 17. `10-style-checkpoint.md` — Asset style validation (process, not feature)

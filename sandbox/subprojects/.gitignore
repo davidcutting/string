@@ -1,6 +1,12 @@
-# The only thing tracked here is the link to the sibling engine project; everything else
-# (meson's promoted redirect wraps, .wraplock, extracted sources, packagecache) is a
-# regenerable build artifact.
+# The only things tracked here are the links to the sibling library projects (engine, asset,
+# asset-tools); everything else (meson's promoted redirect wraps, .wraplock, extracted sources,
+# packagecache) is a regenerable build artifact.
 *
 !.gitignore
-!string-engine
+!string-core
+!string-asset
+!string-asset-tools
+!string-ui
+!string-render-forward
+!string-debug
+!string-client

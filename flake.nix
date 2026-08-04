@@ -18,7 +18,7 @@
         # CMake-only; find_package(simdjson CONFIG) picks up nixpkgs' simdjson (deps download
         # is thus skipped), and the CMake install exports fastgltfConfig.cmake, which Meson's
         # dependency('fastgltf') resolves via its cmake method. Off-Nix builds use the meson
-        # wrap under string-engine/subprojects/ instead.
+        # wrap under string-core/subprojects/ instead.
         fastgltf = pkgs.stdenv.mkDerivation {
           pname = "fastgltf";
           version = "0.8.0";
@@ -41,44 +41,56 @@
         # what keeps the header-only bits (e.g. core/layout.hpp) actually compiled + verified —
         # the default package build never includes them.
         checks.default = self'.packages.default.overrideAttrs (old: {
-          pname = "string-engine-tests";
+          pname = "string-core-tests";
           doCheck = true;
           buildInputs = old.buildInputs ++ [ pkgs.gtest ];
           mesonFlags = [ "-Dwsi=sdl" "-Dtests=true" ];
         });
 
-        # `nix flake check` also builds the sandbox with the asset-bake tests enabled and runs them
+        # `nix flake check` also builds the demo with the string-asset-tools tests enabled and runs them
         # (brief 04b). This proves the cook LIBRARY builds + its cooked-format round-trip and
         # cook-twice-byte-identical determinism gates pass, and that the `.#cook` CLI compiles.
-        # Mirrors packages.demo's build inputs (sandbox pulls the engine in as a subproject) plus
-        # gtest for -Dtests=true.
+        # Mirrors packages.demo's build inputs (sandbox pulls the libraries in as subprojects) plus
+        # gtest for -Dstring-asset-tools:tests=true.
         checks.cook = self'.packages.demo.overrideAttrs (old: {
           pname = "string-cook-tests";
           doCheck = true;
           buildInputs = old.buildInputs ++ [ pkgs.gtest ];
-          mesonFlags = old.mesonFlags ++ [ "-Dtests=true" ];
+          mesonFlags = old.mesonFlags ++ [ "-Dstring-asset-tools:tests=true" ];
+        });
+
+        # `nix flake check` also runs the UI kit's suite (layout, text wrap, widgets, interaction,
+        # panels, docking). Kept a SEPARATE check from cook so a failure names the library it came
+        # from. string-ui depends on nothing, so this needs no device and no engine — it is built
+        # through the demo only because that is where the subproject links live.
+        checks.ui = self'.packages.demo.overrideAttrs (old: {
+          pname = "string-ui-tests";
+          doCheck = true;
+          buildInputs = old.buildInputs ++ [ pkgs.gtest ];
+          mesonFlags = old.mesonFlags ++ [ "-Dstring-ui:tests=true" ];
         });
 
         # `.#cook` (brief 04b M3): the offline asset-cook CLI. packages.demo installs the
-        # `string_cook` binary alongside the demo (same assetbake_lib), so the app just points at
-        # it. Usage: `nix run .#cook -- [--chunk N | --no-chunk] <file.gltf> ...` — cooks each
-        # source glTF to a `.c<budget>.cooked` blob next to it and maintains the `.cook_manifest`
-        # sidecar (incremental: fresh entries are skipped). This is the pre-cook path the engine's
-        # in-process-cook WARN hint tells the user to run.
+        # `string_cook` binary from the string-asset-tools subproject, so the app just points at
+        # it. Usage: `nix run .#cook -- [--chunk N | --no-chunk] [--no-textures] <file.gltf> ...` —
+        # cooks each source glTF to a `.c<budget>.cooked` blob next to it, cooks that scene's
+        # textures to KTX2/BC7 siblings, and maintains the `.cook_manifest` sidecar (incremental:
+        # fresh entries are skipped). This is the pre-cook path the engine's in-process-cook WARN
+        # hint tells the user to run.
         apps.cook = {
           type = "app";
           program = "${self'.packages.demo}/bin/string_cook";
         };
 
         # packages.default builds ONLY the engine library (String, as intended). Its meson
-        # project is self-contained under string-engine/ (own meson.build, meson_options.txt,
+        # project is self-contained under string-core/ (own meson.build, meson_options.txt,
         # and subprojects/). Off-nix the deps come from the meson wraps; here they come from
         # nixpkgs (nix builds have no network, so `--wrap-mode=nodownload` is in effect and the
         # wraps are never fetched). Build with `nix build`.
         packages.default = pkgs.clangStdenv.mkDerivation {
-          pname = "string-engine";
+          pname = "string-core";
           version = "0.0.1";
-          src = ./string-engine;
+          src = ./string-core;
 
           nativeBuildInputs = with pkgs; [
             meson
@@ -119,14 +131,14 @@
         };
 
         # packages.demo builds the sandbox app as an EXTERNAL consumer of the engine: sandbox/
-        # is its own meson project that pulls string-engine in as a subproject (via the
-        # sandbox/subprojects/string-engine link to the sibling engine). This is both the
+        # is its own meson project that pulls string-core in as a subproject (via the
+        # sandbox/subprojects/string-core link to the sibling engine). This is both the
         # worked example of "how to include String" and the integration test that the exported
         # dependency links. Build/run with `nix run .#demo`.
         packages.demo = pkgs.clangStdenv.mkDerivation {
           pname = "string-demo";
           version = "0.0.1";
-          # Whole repo so both sandbox/ and its string-engine subproject link are present.
+          # Whole repo so both sandbox/ and its string-core subproject link are present.
           # The flake self-src unpacks under a hash-named dir, so glob for the sandbox subdir
           # rather than hardcoding it.
           src = ./.;
@@ -134,7 +146,7 @@
 
           nativeBuildInputs = with pkgs; [
             meson ninja pkg-config cmake makeWrapper glslang
-            ktx-tools     # `ktx` CLI, for cooking textures to KTX2 (tools/cook_textures.sh)
+            ktx-tools     # `ktx` CLI, kept for inspecting/debugging cooked KTX2 files
           ];
 
           buildInputs = with pkgs; [
@@ -146,7 +158,7 @@
           ];
 
           # WSI is an option of the engine subproject, so it is namespaced.
-          mesonFlags = [ "-Dstring-engine:wsi=sdl" ];
+          mesonFlags = [ "-Dstring-core:wsi=sdl" ];
 
           mesonBuildType = "debug";
           dontUseCmakeConfigure = true;
@@ -172,7 +184,7 @@
         };
 
         # packages.demo-tracy is packages.demo built with the Tracy profiler client compiled in
-        # (-Dstring-engine:tracy=true, which defines STRING_PROFILE and links the tracy wrap). The
+        # (-Dstring-core:tracy=true, which defines STRING_PROFILE and links the tracy wrap). The
         # normal .#demo stays Tracy-free. Run with `nix run .#demo-tracy` then attach the Tracy
         # viewer (`tracy` in the devShell / nixpkgs) — Connect to localhost, the client broadcasts
         # on the LAN and streams zones live. Build/run: `nix run .#demo-tracy`.
@@ -181,7 +193,7 @@
           # The Tracy client comes from nixpkgs (CMake config Tracy::TracyClient); the engine's
           # meson.build probes that before the (undownloadable-in-nix) wrap.
           buildInputs = old.buildInputs ++ [ pkgs.tracy ];
-          mesonFlags = (old.mesonFlags or []) ++ [ "-Dstring-engine:tracy=true" ];
+          mesonFlags = (old.mesonFlags or []) ++ [ "-Dstring-core:tracy=true" ];
         });
 
         # devShells.default describes the default shell with C++, cmake, boost,

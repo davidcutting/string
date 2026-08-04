@@ -1,0 +1,3 @@
+# Build the UI kit's headless gtest suite (layout, widgets, interaction, panels, text).
+option('tests', type: 'boolean', value: false,
+       description: 'Build the test suite')

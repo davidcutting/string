@@ -56,7 +56,7 @@ No blit. Leave the existing blit-based `upload_image` for the stb fallback.
   usage `TRANSFER_DST | SAMPLED` (no `TRANSFER_SRC`), call `upload_image_levels`, bind bindless slot.
 - Prefer a `.ktx2` sibling of the resolved texture path; else the existing stb path.
 
-### Cook (`tools/cook_textures.sh`)
+### Cook (`string_cook`, string-asset-tools; superseded `tools/cook_textures.sh`)
 Two stages (see the superseding format decision above): `ktx create --encode uastc --generate-mipmap
 --format R8G8B8A8_SRGB --assign-tf srgb` (linear `R8G8B8A8_UNORM`, no srgb tf, for normal /
 metallic-roughness) into a throwaway UASTC temp, then `ktx transcode --target bc7 --zstd 18` into the

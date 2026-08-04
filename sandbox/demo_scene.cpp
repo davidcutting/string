@@ -12,20 +12,32 @@
 #include <algorithm>
 #include <chrono>
 
-#include <string/core/dynamic_font.hpp>
-#include <string/core/font.hpp>
-#include <string/core/layout.hpp>
+#include <string/ui/dynamic_font.hpp>
+#include <string/ui/font.hpp>
+#include <string/ui/layout.hpp>
 #include <string/core/logger.hpp>
 #include <string/vulkan/frame_graph.hpp>
 #include "debug_cvars.hpp"
-#include "passes/debug_line_pass.hpp"
-#include "passes/geometry_pass.hpp"
-#include "passes/post_pass.hpp"
-#include "passes/ui_background_pass.hpp"
-#include "passes/ui_pass.hpp"
-#include "passes/ui_scene.hpp"
-#include "ui/debug_panels.hpp"
-#include "ui/screens.hpp"
+#include <string/render/debug_line_pass.hpp>
+#include <string/render/geometry_pass.hpp>
+#include <string/render/post_pass.hpp>
+#include <string/render/ui_background_pass.hpp>
+#include <string/render/ui_pass.hpp>
+#include "render_types.hpp"
+#include <string/debug/panels.hpp>
+#include <string/client/screens.hpp>
+#include <string/render/render_debug.hpp>
+
+namespace sandbox
+{
+
+// The app is the only place that knows about ALL the libraries — it is what wires the renderer's
+// debug panels into the debug shell, and the client's screens into the UI pass. Spelling the
+// three namespaces short keeps the authoring code readable.
+namespace client = ::string::client;
+namespace debug = ::string::debug;
+namespace ui = ::string::ui;
+}
 
 namespace sandbox
 {
@@ -66,9 +78,22 @@ std::vector<std::uint8_t> read_file(const std::filesystem::path& path)
 // reach the same instance: `Ui::observe()` caches the boxes widgets asked to measure, and sizes only
 // exist after layout. Same seam, and same reason, as `Workspace::observe`.
 using SharedUi = std::shared_ptr<std::optional<ui::Ui>>;
+// The debug shell is shared for the SAME reason: it owns a second `Ui`, and that one needs
+// The debug shell no longer owns a Ui, so it is not passed here — see DebugPanels::update_and_author.
+using SharedPanels = std::shared_ptr<debug::DebugPanels>;
 
 // Post-layout hook for an author built around `fluent`. Null-safe on the first frame, when the Ui has
 // not been constructed yet (it needs the builder and interaction references the author receives).
+//
+// ONE Ui means one `observe()`. This used to call a second one for the debug shell, and forgetting
+// that call is exactly how the DAG panel's scroll extent came to be permanently zero.
+// Drains the Ui's deferred surfaces one at a time; the pass closes each one's layout because only
+// it holds the measurer. Null-safe before the Ui exists, like the observer below.
+UIPass::DeferredAuthor make_deferred_author(SharedUi fluent)
+{
+    return [fluent] { return *fluent && (*fluent)->emit_next_deferred(); };
+}
+
 UIPass::PostLayout make_ui_observer(SharedUi fluent,
                                     std::shared_ptr<string::ui::Workspace> ws = nullptr)
 {
@@ -79,27 +104,32 @@ UIPass::PostLayout make_ui_observer(SharedUi fluent,
 }
 
 UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats,
+                              SharedPanels panels,
                               std::size_t nameplate_stress, SharedUi fluent)
 {
     return [mesh_stats,
             np_driver = UiSceneDriver(static_cast<std::uint32_t>(nameplate_stress)),
             np_scene = UiScene{}, motion = ui::Motion{}, ui_panels = string::ui::PanelStore{},
             fluent = std::move(fluent), nameplate_stress,
-            panels = ui::DebugPanels{}](
+            panels, render_dbg = ::string::render::RenderDebug{}](
                string::layout_builder& b, const UIPass::UiContext& ctx) mutable {
+        // ONE Ui per frame, always constructed — the debug shell authors into this same one, so its
+        // panels share the app's PanelStore (and therefore one z order) and its per-frame hand-offs
+        // are forwarded once, below, rather than twice from two places.
+        //
+        // Closure-lived, not stack-lived: the arena it owns backs every text view for the rest of
+        // the frame (see the lifetime note on Ui).
+        if (!*fluent) fluent->emplace(b, ctx.ui, motion, client::theme(), ui_panels);
+        ui::Ui& u = **fluent;
+        u.begin_frame();
+
         // Optional synthetic nameplate stress OVER the Sponza scene (STRING_UI_NAMEPLATES): the same
         // orbit driver as the ui-dev scene, so UI cost on top of real geometry is measurable (brief
         // 05 perf: report frametime with the stress in BOTH scenes).
         if (nameplate_stress > 0)
         {
             np_driver.update(ctx.ui.dt, 1920, 1080, np_scene);
-            // Closure-lived, not stack-lived: the arena it owns backs the nameplate text views for
-            // the rest of the frame (see the lifetime note on Ui).
-            if (!*fluent) fluent->emplace(b, ctx.ui, motion, ui::theme(), ui_panels);
-            ui::Ui& u = **fluent;
-            u.begin_frame();
-            ui::author_nameplates(u, np_scene, nameplate_stress);
-            u.end_frame();
+            client::author_nameplates(u, np_scene, nameplate_stress);
         }
 
         // Brief 06: debug surfaces (console + profiler HUD + inspector), toggled at runtime
@@ -107,67 +137,102 @@ UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats
         // clean unless asked for. The old "Hello, String!" demo panel was removed from this scene
         // (user: placeholder clutter that the console overlapped) — the widget/interaction
         // showcase lives in the ui-dev scene (STRING_SCENE=ui).
-        panels.update_and_author(b, ctx, mesh_stats.get());
+        // The APP is what joins the two libraries: the debug shell owns the panel/toggle machinery
+        // and knows nothing about renderers; the renderer supplies the numbers. Rebinding each
+        // frame keeps `mesh_stats` (a shared_ptr the pass refreshes) current without the shell
+        // ever holding a renderer type.
+        panels->set_hud_extra([&](ui::Ui& p) { render_dbg.hud_rows(p, mesh_stats.get()); });
+        panels->set_inspector([&](ui::Ui& p) { render_dbg.inspector(p, mesh_stats.get()); });
+        panels->update_and_author(u, ctx.input, ctx.input_map);
+
+        u.end_frame();
+
+        // The Ui's per-frame hand-offs, forwarded ONCE now that there is one Ui. Forgetting one used
+        // to be silent, and did in fact happen twice.
+        ctx.input.set_text_capture(u.wants_text_capture());
+        if (!u.clipboard_write().empty())
+            ctx.input.request_clipboard_write(std::string(u.clipboard_write()));
     };
 }
 
 // The ui-dev sandbox author (brief 05): synthetic world-anchored nameplates + a status panel, over
-// the flat gradient background (no geometry). Reads the shared UiScene the background pass drives.
+// the flat gradient background (no geometry). The AUTHOR drives the orbit camera + synthetic
+// anchors, exactly as the Sponza author already did — a demo camera is app logic, not something a
+// render pass should own (that ownership was the only reason string-client needed the renderer).
 // This is the permanent UI sandbox — STRING_SCENE=ui ./run.sh. `mesh_stats` is intentionally absent
 // (the overlay tolerates a null MeshOverlayStats); the demo panel from make_ui_author is reused so
 // hover/focus/text-field interaction is still exercised here.
-UIPass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::size_t nameplate_budget,
+UIPass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::uint32_t anchor_count,
+                                  SharedPanels panels,
+                                  std::size_t nameplate_budget,
                                   std::string screen,
                                   std::shared_ptr<string::ui::Workspace> ws, SharedUi fluent)
 {
     return [scene, nameplate_budget, screen, ws, motion = ui::Motion{}, ui_panels = string::ui::PanelStore{},
+            driver = client::UiSceneDriver(anchor_count),
             fluent = std::move(fluent),
-            state = ui::ScreenState{}, panels = ui::DebugPanels{}](
+            state = client::ScreenState{}, panels,
+            render_dbg = ::string::render::RenderDebug{}](
                string::layout_builder& b, const UIPass::UiContext& ctx) mutable {
         // The Ui lives in the CLOSURE, not on the stack: it owns the frame string arena and the
         // layout tree holds non-owning views into it, so it must outlive authoring — through layout
         // and record. Constructed on the first frame (the builder and interaction it binds are
         // stable members of UIPass, so the references stay valid for the run).
-        if (!*fluent) fluent->emplace(b, ctx.ui, motion, ui::theme(), ui_panels);
+        if (!*fluent) fluent->emplace(b, ctx.ui, motion, client::theme(), ui_panels);
         ui::Ui& u = **fluent;
         u.begin_frame();
         state.tick(ctx.ui.dt);
+
+        // Advance the orbit camera + write the projection into the shared UiScene. This used to run
+        // in UIBackgroundPass::update; it lands at the same point in the same frame with the same
+        // dt and screen size, so the projected nameplate positions are unchanged.
+        driver.update(ctx.ui.dt, ctx.ui.screen.width, ctx.ui.screen.height, *scene);
 
         const bool all = screen == "all";
         std::size_t np_count = 0;
 
         if (all || screen == "nameplates")
         {
-            ui::author_nameplates(u, *scene, nameplate_budget);
+            client::author_nameplates(u, *scene, nameplate_budget);
             np_count = nameplate_budget == 0 ? scene->anchors.size()
                                              : std::min(nameplate_budget, scene->anchors.size());
         }
         if (all || screen == "inventory")
-            ui::author_inventory(u);
+            client::author_inventory(u);
         if (all || screen == "actionbar")
-            ui::author_actionbar(u, state);
+            client::author_actionbar(u, state);
         if (all || screen == "chat")
-            ui::author_chat_pings(u, *scene, state);
+            client::author_chat_pings(u, *scene, state);
         // Not in "all": keeping these opt-in leaves the five brief-05 dump baselines untouched.
         if (screen == "panels")
-            ui::author_panels(u, state);
+            client::author_panels(u, state);
         if (screen == "workspace" && ws)
-            ui::author_workspace(u, *ws, state);
+            client::author_workspace(u, *ws, state);
         if (screen == "widgets")
-            ui::author_widgets(u, state);
+            client::author_widgets(u, state);
 
-        ui::author_status_panel(u, *scene, state, screen, np_count);
-        u.end_frame();
-
-        // The engine REQUESTS text capture (a focused field wants the keystrokes); the host grants
-        // it, because capture is a platform decision — the same split as the game/UI mode requests.
-        ctx.input.set_text_capture(u.wants_text_capture());
+        client::author_status_panel(u, *scene, state, screen, np_count);
 
         // Brief 06 debug surfaces work in the ui-dev sandbox too (console/HUD; inspector shows "no
         // scene" since there's no geometry). Lets tooling be iterated in STRING_SCENE=ui.
-        panels.update_and_author(b, ctx, nullptr);
+        // The renderer's panels are registered here too, with no stats to read: the inspector then
+        // reports "no scene loaded" the way it always did, rather than "no inspector registered"
+        // — an empty scene is a normal state, a missing registration is a wiring bug.
+        panels->set_hud_extra([&](ui::Ui& p) { render_dbg.hud_rows(p, nullptr); });
+        panels->set_inspector([&](ui::Ui& p) { render_dbg.inspector(p, nullptr); });
+        panels->update_and_author(u, ctx.input, ctx.input_map);
+
+        u.end_frame();
+
+        // The Ui's per-frame hand-offs, forwarded ONCE. The engine REQUESTS text capture (a focused
+        // field wants the keystrokes) and a clipboard write; the host grants them, because both are
+        // platform decisions — the same split as the game/UI mode requests.
+        ctx.input.set_text_capture(u.wants_text_capture());
+        if (!u.clipboard_write().empty())
+            ctx.input.request_clipboard_write(std::string(u.clipboard_write()));
     };
 }
+
 
 // Build the full geometry scene Setup around an already-constructed GeometryPass: the meshlet
 // subsystem's companion passes (froxel/ibl/gtao/sky/hiz/phase2) + debug lines + UI + post, plus the
@@ -189,9 +254,11 @@ String::RenderPlan::Setup make_geometry_setup(
     auto shadow = std::make_unique<ShadowPass>(gp);
     auto dbg    = std::make_unique<DebugLinePass>(ctx, mesh_stats);
     auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
+    auto dbg_panels = std::make_shared<debug::DebugPanels>();
     auto ui     = std::make_unique<UIPass>(ctx, atlas,
-                                           make_ui_author(mesh_stats, nameplate_stress, ui_slot),
-                                           make_ui_observer(ui_slot));
+                                           make_ui_author(mesh_stats, dbg_panels, nameplate_stress, ui_slot),
+                                           make_ui_observer(ui_slot),
+                                           make_deferred_author(ui_slot));
     auto post   = std::make_unique<PostProcessPass>(ctx);
 
     FroxelPass* fx = froxel.get();
@@ -239,7 +306,32 @@ String::RenderPlan::Setup make_geometry_setup(
         author_pass(fg, gi_p).prepass().toggle([gi_p] { return gi_p->is_enabled(); }).finish();
         // sky: r.pass.sky drops the background draw -> the MSAA clear shows behind the lit scene.
         author_pass(fg, sk).toggle([sk] { return sk->is_enabled(); }).finish();
-        author_pass(fg, gp).toggle([gp] { return gp->is_enabled(); }).finish();
+        // geometry.phase1 PRODUCES hz.depth — declared here so the PLAN knows it.
+        //
+        // The write itself is the group's MSAA depth MIN-resolve at EndRendering, which the graph
+        // cannot observe (it is an attachment property, not a recorded command). Sync was already
+        // correct: the renderer seeds the tracker with the post-resolve state, and hiz.build's
+        // SampledRead derives its barrier from that. What was missing is the DEPENDENCY: with no
+        // declared producer, `hz.depth` had first_writer = none and there was no geometry -> hiz.build
+        // edge, so their order rested on authoring order and the toposort's tie-break rather than on
+        // anything the planner could enforce. The M3 DAG made that visible — hiz.build sat at depth 0
+        // with nothing feeding it.
+        //
+        // This goes through `use()`, which appends to the pass's DECLARED plan lists only. It does
+        // NOT touch `Pass::usages`, which is what barrier derivation reads live — so this buys the
+        // edge, the toposort constraint and the lifetime span, and changes no barrier. The separate
+        // record-time `Access::DepthResolve` marker still names the resolve target for the group
+        // loop; it stays a non-write because the group loop scans for it by identity, and it is
+        // appended after compile so the planner never sees it anyway.
+        {
+            String::PassSpec geo_spec = author_pass(fg, gp).toggle([gp] { return gp->is_enabled(); });
+            if (gp->hiz_depth_ring().valid())
+                geo_spec.use(String::ResourceUsage{
+                    .access = String::Access::DepthWrite,
+                    .stage = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    .img = gp->hiz_depth_ring() });
+            geo_spec.finish();
+        }
         author_pass(fg, hz).computeOnly().finish();
         author_pass(fg, p2).finish();
         // transparency: joins phase2's reopened MSAA group as its LAST draw (same COLOR_TARGET, authored
@@ -288,16 +380,19 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
 
         plan.configure([atlas, ui_scene, anchor_count, np_budget, screen](String::engine_context& ctx)
                        -> String::RenderPlan::Setup {
-            auto bg = std::make_unique<UIBackgroundPass>(ctx, ui_scene, anchor_count);
+            auto bg = std::make_unique<UIBackgroundPass>(ctx);
             // Shared between the author and the post-layout hook: the workspace is authored before
             // layout and observed after it, and both need the same instance.
             auto ws = std::make_shared<string::ui::Workspace>();
             if (screen == "workspace")
-                ui::seed_workspace(*ws);
+                client::seed_workspace(*ws);
             auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
+            auto dbg_panels = std::make_shared<debug::DebugPanels>();
             auto ui = std::make_unique<UIPass>(
-                ctx, atlas, make_ui_dev_author(ui_scene, np_budget, screen, ws, ui_slot),
-                make_ui_observer(ui_slot, ws));
+                ctx, atlas,
+                make_ui_dev_author(ui_scene, anchor_count, dbg_panels, np_budget, screen, ws, ui_slot),
+                make_ui_observer(ui_slot, ws),
+                make_deferred_author(ui_slot));
             String::Pass* bgp = bg.get();
             String::Pass* uip = ui.get();
             String::RenderPlan::Setup s;

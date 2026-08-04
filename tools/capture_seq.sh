@@ -22,7 +22,7 @@ res="$(mktemp -d -t string-cap.XXXXXX)"
 trap 'rm -rf "$res"' EXIT
 mkdir -p "$res/shaders"
 for f in "$store/include/string/shaders/"*.spv; do ln -sfn "$f" "$res/shaders/$(basename "$f")"; done
-for f in "$repo/string-engine/shaders/"*.slang "$repo/sandbox/shaders/"*.slang; do ln -sfn "$f" "$res/shaders/$(basename "$f")"; done
+for f in "$repo/string-core/shaders/"*.slang "$repo/string-render-forward/shaders/"*.slang; do ln -sfn "$f" "$res/shaders/$(basename "$f")"; done
 ln -sfn "$repo/sandbox/assets" "$res/assets"
 
 mkdir -p "$(dirname "$out")"

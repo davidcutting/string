@@ -5,6 +5,12 @@
 #include <string/application.hpp>
 #include <string/core/logger.hpp>
 
+#include <string/core/cvar.hpp>
+#include <string/client/theme.hpp>
+#include <string/debug/debug_cvars.hpp>
+#include <string/render/render_cvars.hpp>
+#include <string/ui/theme.hpp>
+
 #include "debug_cvars.hpp"
 #include "demo_scene.hpp"
 
@@ -30,9 +36,21 @@ int main()
 {
     String::Application app;
 
-    // Register the sandbox debug CVars and apply the STRING_* env bridge (legacy aliases honoured)
-    // before the plan/passes are built, so the passes read already-overridden values at construction.
+    // Register every library's CVars, THEN apply the STRING_* env bridge once — all before the
+    // plan/passes are built, so they read already-overridden values at construction.
+    //
+    // The order is load-bearing: apply_env() only overrides CVars that are already registered, so
+    // every library must have declared its own first. Each register_* call is pure registration
+    // and the app owns the single bridge call, which is why a library can't get this wrong.
+    string::render::register_render_cvars();
+    string::debug::register_debug_cvars();
     sandbox::register_debug_cvars();
+    string::core::CVarRegistry::instance().apply_env();
+
+    // The kit owns the Theme type, the CLIENT owns the values, and the app is what installs one so
+    // that both the game screens and the debug shell read the same palette without either library
+    // depending on the other.
+    string::ui::set_theme(string::client::theme());
 
     const std::filesystem::path resources_directory = resolve_resources_directory();
     STRING_LOG_INFO("Using resources directory: {}", resources_directory.string());

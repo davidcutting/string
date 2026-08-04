@@ -201,7 +201,7 @@ re-filter continuously.
 matches dependency posture). Thin engine surface: sound handles, 3D positional
 emitters on scene instances, listener = camera, streaming music, bus volumes.
 
-**13. Asset pipeline / cooker.** Grow `tools/cook_textures.sh` into one cooker:
+**13. Asset pipeline / cooker.** DONE 2026-08-02 — `tools/cook_textures.sh` is now a library stage in string-asset-tools, run by `string_cook` alongside the geometry bake. Remaining scope for one cooker:
 - glTF → engine-native pack: meshlets (meshopt), BC7 KTX2, skeletons/anims,
   **paperdoll parts cooked against shared skeletons**, collision — cooked to the
   exact GPU/disk layout the streamers read.

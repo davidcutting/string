@@ -26,13 +26,13 @@ trap 'rm -rf "$res"' EXIT
 # a .slang, save, see it swap. We build a writable shaders/ dir that symlinks:
 #   - the store's build-time GLSL .spv (the passes not yet ported: 3d/shadow/cull/grid), and
 #   - the on-disk .slang SOURCES (engine + sandbox) so saves are picked up by the watcher.
-# The .slang sources shadow the store's copies; editing sandbox/shaders or string-engine/shaders
+# The .slang sources shadow the store's copies; editing string-render-forward/shaders or string-core/shaders
 # is what the hot-reload loop watches.
 mkdir -p "$res/shaders"
 for f in "$out/include/string/shaders/"*.spv; do
     ln -sfn "$f" "$res/shaders/$(basename "$f")"
 done
-for f in "$repo/string-engine/shaders/"*.slang "$repo/sandbox/shaders/"*.slang; do
+for f in "$repo/string-core/shaders/"*.slang "$repo/string-render-forward/shaders/"*.slang; do
     ln -sfn "$f" "$res/shaders/$(basename "$f")"
 done
 ln -sfn "$repo/sandbox/assets" "$res/assets"
@@ -40,7 +40,7 @@ ln -sfn "$repo/sandbox/assets" "$res/assets"
 export STRING_RESOURCES_DIR="$res"
 echo "STRING_RESOURCES_DIR=$res"
 echo "  shaders(.spv)   -> $out/include/string/shaders"
-echo "  shaders(.slang) -> $repo/{string-engine,sandbox}/shaders  (editable; hot-reloaded)"
+echo "  shaders(.slang) -> $repo/{string-core,sandbox}/shaders  (editable; hot-reloaded)"
 echo "  assets          -> $repo/sandbox/assets"
 
 exec "$out/bin/string_demo"

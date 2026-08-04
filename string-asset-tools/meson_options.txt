@@ -1,0 +1,4 @@
+# Build the asset-bake test suite (round-trip + determinism gtests). Off by default; the
+# flake's `cook` check turns it on.
+option('tests', type: 'boolean', value: false,
+       description: 'Build the asset-bake tests')

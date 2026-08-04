@@ -99,7 +99,8 @@ per-user cache-warming disappears.
   (the cooked file IS the cache; `string::core::user_cache_dir` stays for
   shaders).
 - **Textures unchanged**: the KTX2/BC7 cook stays as-is this brief. The CLI
-  may shell out to / mention `tools/cook_textures.sh`, but do not rewrite it.
+  may shell out to / mention `tools/cook_textures.sh`, but do not rewrite it. (SUPERSEDED 2026-08-02:
+  the texture cook is now C++ in string-asset-tools; the script is deleted.)
 - **Engine loader**: `GeometryPass` consumes cooked scenes (reader + upload +
   streamer registration). The synthetic quad injection (STRING_TRANSP_TEST)
   and the crowd instancing keep working — they operate on the loaded tables,
