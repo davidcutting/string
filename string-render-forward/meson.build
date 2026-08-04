@@ -36,7 +36,15 @@ asset_dep = dependency('string-asset', fallback : ['string-asset', 'project_deps
 asset_tools_dep = dependency('string-asset-tools', fallback : ['string-asset-tools', 'project_deps'])
 
 # libktx: cooked .ktx2 textures are already BC7, so the streamer uploads blocks with no transcode.
-ktx_dep = dependency('Ktx', method : 'cmake', modules : ['KTX::ktx'])
+# System KTX-Software CMake config (nix: nixpkgs' ktx-tools). Off-nix there is no system install and
+# this probe fails — libktx then arrives transitively through asset_tools_dep, which owns the wrap
+# and re-exports it. Resolving it a second time here would mean two cmake.subproject('ktx') calls in
+# one build.
+ktx_dep = dependency('Ktx', method : 'cmake', modules : ['KTX::ktx'],
+                     required : false, allow_fallback : false)
+if not ktx_dep.found()
+    ktx_dep = declare_dependency()
+endif
 
 include_dir = include_directories('include')
 

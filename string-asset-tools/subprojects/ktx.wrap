@@ -1,0 +1,25 @@
+[wrap-file]
+directory = KTX-Software-4.4.2
+source_url = https://github.com/KhronosGroup/KTX-Software/archive/refs/tags/v4.4.2.tar.gz
+source_filename = KTX-Software-4.4.2.tar.gz
+source_hash = 9412cb45045a503005acd47d98f9e8b47154634a50b4df21e17a1dfa8971d323
+# libktx (KTX-Software): .ktx2 read at runtime + the UASTC->BC7 texture cook. Built via Meson's
+# CMake integration (upstream is CMake-only), exposing the `ktx` target — the same one nixpkgs'
+# ktx-tools installs as the KTX::ktx CMake config. Both meson.build sites probe for that system
+# config FIRST and only fall back here, so nix keeps using nixpkgs and off-nix builds from source.
+#
+# The plain GitHub source archive is enough: as of v4.4.2 the only submodule is `tests/cts` (test
+# data), and basisu/astc-encoder/dfdutils are vendored in-tree. No clone-recursive needed.
+# The archive is ~210 MB, so the first off-nix configure downloads for a while; it lands in
+# subprojects/packagecache/, which is a local, regenerable cache and is not tracked in git.
+method = cmake
+
+# NO [provide] section here, unlike fastgltf.wrap — deliberate, and not because [provide] fails.
+# `[provide] ktx = ktx_dep` DOES resolve (meson's CMake integration exposes each target as
+# `<target>_dep`). The problem is what it leaves configured: with KTX's default CMake options the
+# subproject contributes all 61 targets to `all`, including the `ktx`/`toktx` CLI tools — and their
+# bundled fmt does not compile with GCC 15 ("call to consteval function ... is not a constant
+# expression"). `ninja` then fails on tools we never asked for.
+#
+# CMake defines can only be set through cmake.subproject(), so string-asset-tools/meson.build drives
+# this wrap that way and switches the tools/tests/docs off (61 targets -> 35, and it builds).

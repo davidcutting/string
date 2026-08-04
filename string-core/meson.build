@@ -93,8 +93,25 @@ endif
 deps += dependency('volk')
 
 # --- Slang (shader compiler runtime; shader.hpp uses <slang.h>) --------------
-# Prebuilt shared lib via the slang wrap; runs in-process for shader hot-reload.
-deps += dependency('slang')
+# Prebuilt shared lib; runs in-process for shader hot-reload. System install first (nix:
+# nixpkgs' shader-slang), else a per-platform wrap. Slang ships prebuilts, not source, and a
+# meson wrap-file pins exactly one archive — so the platforms are separate wraps chosen HERE by
+# an explicit subproject() call. They deliberately carry no [provide]: two wraps providing
+# `slang` would be a duplicate-provider conflict.
+slang_dep = dependency('slang', required : false, allow_fallback : false)
+if not slang_dep.found()
+    slang_wraps = {
+        'linux'   : 'slang-linux-x86_64',
+        'windows' : 'slang-windows-x86_64',
+    }
+    if not slang_wraps.has_key(system)
+        error('No prebuilt Slang wrap for host system "' + system + '". Add one from the Slang ' +
+              'releases page (same shape as slang-linux-x86_64.wrap), or install Slang so ' +
+              'dependency(\'slang\') finds it.')
+    endif
+    slang_dep = subproject(slang_wraps[system]).get_variable('slang_dep')
+endif
+deps += slang_dep
 
 # --- WSI backend (selectable via -Dwsi=) -------------------------------------
 wsi = get_option('wsi')
@@ -179,6 +196,7 @@ core_src = [
     'src/debug_draw.cpp',
     'src/vulkan/resource_state.cpp',
     'src/vulkan/graph_plan.cpp',
+    'src/vulkan/scene_registry.cpp',
     'src/vulkan/frame_scratch.cpp',
     'src/vulkan/vulkan_utils.cpp',
     'src/gpu/pipeline_builder.cpp',

@@ -60,6 +60,12 @@ public:
     void write_begin(VkCommandBuffer cmd, uint32_t frame_index, const std::string& name);
     void write_end(VkCommandBuffer cmd, uint32_t frame_index);
 
+    // Forget every per-pass stat. For a scene switch: the pass set is replaced wholesale, so the
+    // rolling averages describe passes that no longer exist and the HUD would otherwise show the two
+    // scenes' passes mixed together. Also discards results still pending readback — they belong to
+    // the outgoing scene (begin_frame resets each pool unconditionally, so dropping `pending` is safe).
+    void reset_stats();
+
     // Snapshot the current rolling per-pass stats (sorted by first-seen order). Cheap copy.
     std::vector<PassStat> stats() const;
 

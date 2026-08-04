@@ -191,11 +191,20 @@ auto resource_allocator::create_staging(VkDeviceSize size) -> resource_id
 
 void resource_allocator::destroy_resource(resource_id id)
 {
+    // 0 is the "no resource" sentinel, never a real id (see id_registry). Pass dtors destroy their
+    // optional members unconditionally, so this is the common case, not an error.
+    if (id == 0)
+    {
+        return;
+    }
+
+    bool destroyed = false;
     if (buffers_.contains(id))
     {
         allocated_buffer& garbage = buffers_.at(id);
         vmaDestroyBuffer(allocator_, garbage.buffer, garbage.allocation);
         buffers_.erase(id);
+        destroyed = true;
     }
     if (images_.contains(id))
     {
@@ -204,8 +213,21 @@ void resource_allocator::destroy_resource(resource_id id)
         vkDestroySampler(device_, garbage.sampler, nullptr);
         vmaDestroyImage(allocator_, garbage.image, garbage.allocation);
         images_.erase(id);
+        destroyed = true;
     }
-    registry_.release_id(id);
+
+    // Recycle the id ONLY if this call actually owned something. Releasing unconditionally made a
+    // double-destroy push the same id onto the free list twice, so two live resources could later be
+    // handed the SAME id — the second `buffers_[id] = ...` then overwrote the first's entry, leaking
+    // its VMA allocation (invisible until vmaDestroyAllocator asserts) and aliasing the two resources.
+    if (destroyed)
+    {
+        registry_.release_id(id);
+    }
+    else
+    {
+        STRING_LOG_WARN("destroy_resource: id {} is not live (double destroy?)", id);
+    }
 }
 
 auto resource_allocator::get_buffer(resource_id id) const -> const allocated_buffer&

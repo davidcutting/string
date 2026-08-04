@@ -9,6 +9,7 @@
 #include <string/vulkan/gpu_profiler.hpp>
 #include <string/vulkan/graph_introspect.hpp>
 #include <string/vulkan/lens.hpp>
+#include <string/vulkan/scene_registry.hpp>
 
 #include <string/debug/debug_cvars.hpp>
 #include <string/ui/theme.hpp>
@@ -267,6 +268,21 @@ void DebugPanels::author_menu_bar(::string::ui::Ui& u)
             cv_dag_enabled().set(false);
             cv_image_enabled().set(false);
         });
+    });
+
+    // The scene list, straight from the registry — the app registers scenes, this enumerates them.
+    // Nothing here knows what a scene IS or how one loads; clicking records a request that the frame
+    // loop applies between frames (see SceneRegistry::request).
+    bar.menu("Scene", [&](Menu& m) {
+        ::String::SceneRegistry& registry = ::String::SceneRegistry::instance();
+        for (const ::String::SceneRegistry::Scene& scene : registry.scenes())
+        {
+            const bool active = scene.name == registry.active();
+            // The marker column is always present, so the labels stay aligned whichever is active
+            // and the list does not reflow as you switch.
+            m.item(u.format("{} {} — {}", active ? "*" : " ", scene.name, scene.description),
+                   [name = scene.name] { ::String::SceneRegistry::instance().request(name); });
+        }
     });
 
     bar.menu("Debug", [&](Menu& m) {

@@ -1,6 +1,10 @@
 #include <string/application.hpp>
+#include <string/vulkan/scene_registry.hpp>
 #include <string/core/signals.hpp>
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <cstdlib>
 #include <thread>
 
@@ -41,6 +45,49 @@ void Application::run() {
         window_->update(event_handler_);
 
         event_handler_.update();
+
+        // STRING_SCENE_SWITCH="name@frame[,name@frame...]" drives scene switches headlessly, since a
+        // menu click is not reachable without a window. Kept permanently (same species as
+        // STRING_UI_NO_SKIP): it is the only way to gate the load_scene teardown path, and that path
+        // is where resource-ownership bugs surface — see the resource_id-0 aliasing bug it caught.
+        {
+            static const char* spec = std::getenv("STRING_SCENE_SWITCH");
+            static std::uint64_t frame = 0;
+            if (spec != nullptr)
+            {
+                std::string s(spec);
+                std::size_t pos = 0;
+                while (pos < s.size())
+                {
+                    const std::size_t comma = std::min(s.find(',', pos), s.size());
+                    const std::string entry = s.substr(pos, comma - pos);
+                    const std::size_t at = entry.find('@');
+                    if (at != std::string::npos &&
+                        std::strtoull(entry.c_str() + at + 1, nullptr, 10) == frame)
+                    {
+                        SceneRegistry::instance().request(entry.substr(0, at));
+                    }
+                    pos = comma + 1;
+                }
+            }
+            ++frame;
+        }
+
+        // Scene switching happens HERE — between frames, never inside one. A UI click or console
+        // command only records a request (SceneRegistry::request); this is the point where no
+        // command buffer is being recorded and the passes about to be destroyed are not in use by
+        // anything except already-submitted work, which load_scene() waits out.
+        if (SceneRegistry::instance().has_pending())
+        {
+            SceneRegistry& registry = SceneRegistry::instance();
+            if (const SceneRegistry::Scene* scene = registry.take_pending())
+            {
+                RenderPlan plan;
+                plan.configure(scene->configure);
+                renderer_->load_scene(plan);
+                registry.set_active(scene->name);
+            }
+        }
 
         if (!freeze_rendering_)
             renderer_->draw();

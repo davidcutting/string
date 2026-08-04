@@ -1,0 +1,20 @@
+# Slang shader compiler, windows-x86_64 prebuilt. The linux twin is slang-linux-x86_64.wrap; see it
+# for why the platforms are separate wraps selected by string-core/meson.build rather than one wrap
+# with a [provide] section.
+#
+# Same shape as the linux archive — bin/ lib/ include/ at the root — so the shared patch_directory
+# build works unchanged: it links against lib/slang.lib (the MSVC import library) via
+# cpp.find_library('slang').
+#
+# RUNTIME DIFFERENCE, and the one thing to get right when packaging: Slang dlopen()s its sibling
+# libraries at runtime, and on Windows those are the DLLs in **bin/**, not lib/ (on Linux the .so's
+# and the link target are both in lib/). So a Windows build must ship bin/ alongside the executable,
+# where lib/ is what matters on Linux.
+[wrap-file]
+directory = slang-2026.12.0.1-windows-x86_64
+source_url = https://github.com/shader-slang/slang/releases/download/v2026.12.0.1/slang-2026.12.0.1-windows-x86_64.zip
+source_filename = slang-2026.12.0.1-windows-x86_64.zip
+source_hash = d7ed90e979266ccf438a66465b95f251af5f8bd8c8fc209da16536d57089a804
+# bin/ lib/ include/ sit at the archive root, with no wrapper dir — same as the linux tarball.
+lead_directory_missing = true
+patch_directory = slang

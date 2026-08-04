@@ -35,10 +35,20 @@ public:
         return slot;
     }
 
+    // Releasing something that was never bound is a NO-OP, not an error. This is teardown: a caller
+    // freeing a resource it owns should not first have to know whether that resource ever reached a
+    // descriptor slot. The streamer is the case that proves it — a texture is created, then bound
+    // when its first mip lands, so a scene unloaded mid-stream holds images that legitimately have
+    // no slot, and `at()` threw std::out_of_range on the first scene switch away from Sponza.
+    //
+    // `get_slot()` stays strict: reading the slot of an unbound resource is a genuine bug at the
+    // point of use, where the throw actually locates it.
     void release(resource_id resource)
     {
-        registry_.release_id(get_slot(resource));
-        slot_map_.erase(resource);
+        const auto it = slot_map_.find(resource);
+        if (it == slot_map_.end()) return;
+        registry_.release_id(it->second);
+        slot_map_.erase(it);
     }
 
     auto get_slot(resource_id resource) const -> slot

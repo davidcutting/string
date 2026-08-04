@@ -1,0 +1,19 @@
+[binaries]
+c = 'x86_64-w64-mingw32-gcc'
+cpp = 'x86_64-w64-mingw32-g++'
+ar = 'x86_64-w64-mingw32-ar'
+strip = 'x86_64-w64-mingw32-strip'
+windres = 'x86_64-w64-mingw32-windres'
+
+[host_machine]
+system = 'windows'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+
+[cmake]
+CMAKE_SYSTEM_NAME = 'Windows'
+CMAKE_SYSTEM_PROCESSOR = 'x86_64'
+CMAKE_C_COMPILER = 'x86_64-w64-mingw32-gcc'
+CMAKE_CXX_COMPILER = 'x86_64-w64-mingw32-g++'
+CMAKE_RC_COMPILER = 'x86_64-w64-mingw32-windres'

@@ -17,6 +17,7 @@
 #include <string/ui/layout.hpp>
 #include <string/core/logger.hpp>
 #include <string/vulkan/frame_graph.hpp>
+#include <string/vulkan/scene_registry.hpp>
 #include "debug_cvars.hpp"
 #include <string/render/debug_line_pass.hpp>
 #include <string/render/geometry_pass.hpp>
@@ -364,10 +365,9 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
     // reference size (crisp small text), player-name-safe. Replaces the baked ASCII atlas (brief 05).
     auto atlas = std::make_shared<string::dynamic_font_atlas>(ttf);
 
-    const std::string scene_sel = cv_scene().get();
-    String::RenderPlan plan;
+    String::SceneRegistry& registry = String::SceneRegistry::instance();
 
-    if (scene_sel == "ui")
+    // Registration order is the order the scene panel lists them in.
     {
         // UI-dev sandbox: background (+ orbit camera + synthetic anchors) then the UI overlay. NO
         // GeometryPass — startup is near-instant (no glTF load / meshlet build / texture stream).
@@ -378,7 +378,8 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
         const std::uint32_t anchor_count = np > 0 ? static_cast<std::uint32_t>(np) : 24u;
         const std::size_t np_budget = np > 0 ? static_cast<std::size_t>(np) : 0;  // 0 = draw all
 
-        plan.configure([atlas, ui_scene, anchor_count, np_budget, screen](String::engine_context& ctx)
+        registry.add("ui", "UI sandbox — no geometry, instant start",
+                     [atlas, ui_scene, anchor_count, np_budget, screen](String::engine_context& ctx)
                        -> String::RenderPlan::Setup {
             auto bg = std::make_unique<UIBackgroundPass>(ctx);
             // Shared between the author and the post-layout hook: the workspace is authored before
@@ -404,10 +405,8 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
             };
             return s;
         });
-        return plan;
     }
 
-    if (scene_sel == "lookdev")
     {
         // Brief 07: the standing material-probe scene — a roughness x metallic sphere grid plus a
         // white/mirror pair, generated in-process (no glTF load; near-instant startup). Same
@@ -417,20 +416,21 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
         // calibration reference — auto-metering a sphere grid over grey would defeat that).
         // setenv with overwrite=0: an explicit STRING_EXPOSURE_AUTO from the user still wins.
         setenv("STRING_EXPOSURE_AUTO", "0", 0);
-        plan.configure([atlas](String::engine_context& ctx) -> String::RenderPlan::Setup {
+        registry.add("lookdev", "Material probe grid — roughness x metallic",
+                     [atlas](String::engine_context& ctx) -> String::RenderPlan::Setup {
             auto mesh_stats = std::make_shared<MeshOverlayStats>();
             auto geo = std::make_unique<GeometryPass>(ctx, std::vector<std::filesystem::path>{},
                                                       mesh_stats, /*lookdev=*/true);
             return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas, /*nameplate_stress=*/0);
         });
-        return plan;
     }
 
     // Default: the full Sponza scene (which draws its own procedural sky background), then debug lines +
     // the UI overlay + post. Main + curtains + ivy share one world space and merge into a single draw
     // set; the curtains exercise the brief-04 two-sided/blend material paths on real content.
     const int np_stress = std::max(0, cv_ui_nameplates().get());
-    plan.configure([atlas, np_stress](String::engine_context& ctx) -> String::RenderPlan::Setup {
+    registry.add("sponza", "Sponza — full scene, meshlets, CSM, GI",
+                 [atlas, np_stress](String::engine_context& ctx) -> String::RenderPlan::Setup {
         auto mesh_stats = std::make_shared<MeshOverlayStats>();
         auto geo = std::make_unique<GeometryPass>(ctx,
             std::vector<std::filesystem::path>{
@@ -442,6 +442,21 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
         return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas,
                                    static_cast<std::size_t>(np_stress));
     });
+
+    // `STRING_SCENE` is now a LOOKUP, not a branch. An unknown name falls back to the default rather
+    // than failing: a typo should cost you the scene you asked for, not the session.
+    const std::string requested = cv_scene().get();
+    const String::SceneRegistry::Scene* selected = registry.find(requested);
+    if (selected == nullptr)
+    {
+        if (!requested.empty() && requested != "sponza")
+            STRING_LOG_WARN("Unknown scene '{}' — falling back to 'sponza'", requested);
+        selected = registry.find("sponza");
+    }
+
+    String::RenderPlan plan;
+    plan.configure(selected->configure);
+    registry.set_active(selected->name);
     return plan;
 }
 

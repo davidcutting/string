@@ -60,6 +60,18 @@ void GpuProfiler::begin_frame(VkCommandBuffer cmd, uint32_t frame_index)
     fp.pending = false;
 }
 
+void GpuProfiler::reset_stats()
+{
+    const std::lock_guard lock(mutex_);
+    index_by_name_.clear();
+    stats_.clear();
+    for (FramePool& fp : pools_)
+    {
+        fp.pending = false;
+        fp.open_slot = UINT32_MAX;
+    }
+}
+
 void GpuProfiler::write_begin(VkCommandBuffer cmd, uint32_t frame_index, const std::string& name)
 {
     if (!enabled() || frame_index >= pools_.size()) return;

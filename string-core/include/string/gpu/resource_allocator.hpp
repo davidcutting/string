@@ -24,7 +24,7 @@ class resource_allocator
     VmaAllocator allocator_;
     VkPhysicalDevice physical_device_;
     VkDevice device_;
-    id_registry registry_;
+    id_registry registry_{ 1 };   // id 0 is reserved as the "no resource" sentinel — see id_registry
 
     std::unordered_map<resource_id, allocated_buffer> buffers_;
     std::unordered_map<resource_id, allocated_image> images_;

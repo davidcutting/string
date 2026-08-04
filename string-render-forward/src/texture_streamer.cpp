@@ -65,11 +65,26 @@ TextureStreamer::~TextureStreamer()
     {
         // A load may still be in flight (app closed mid-stream); drain it so its ktx isn't leaked
         // and the future doesn't outlive the pool. Streams free the blob as soon as they've staged
-        // their uploads, so there's nothing else to release.
+        // their uploads, so the blob itself needs nothing else.
         if (t.future.valid())
         {
             try { ktxTexture2* k = t.future.get(); if (k) ktxTexture_Destroy(ktxTexture(k)); }
             catch (...) {}
+        }
+
+        // The GPU side of each streamed texture: bindless slot, view, image. This used to be left to
+        // the device teardown, which was harmless while a streamer only ever died with the process.
+        // It stops being harmless the moment a scene can be UNLOADED while the app keeps running —
+        // Sponza's texture set would leak its VRAM and its bindless slots on every switch away.
+        // `t.view` is a CACHED COPY of the allocator's own view (see stream-in), not a second view
+        // this class created — so destroying it here as well as in destroy_resource() is a
+        // double-free that validation catches as VUID-vkDestroyImageView-imageView-parameter.
+        // The allocator owns the image, its view and its sampler; this only has to give back the
+        // bindless slot it took.
+        if (t.image != 0)
+        {
+            descriptor_table_.unbind(t.image, ::string::gpu::descriptor_type::TEXTURE);
+            allocator_.destroy_resource(t.image);
         }
     }
     for (auto& [base, sampler] : samplers_)

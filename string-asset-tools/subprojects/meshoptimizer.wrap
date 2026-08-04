@@ -1,0 +1,20 @@
+[wrap-file]
+directory = meshoptimizer-0.21
+source_url = https://github.com/zeux/meshoptimizer/archive/refs/tags/v0.21.tar.gz
+source_filename = meshoptimizer-0.21.tar.gz
+source_hash = 050a5438e4644833ff69f35110fcf4e37038a89c5fdc8aed45d8cd848ecb3a20
+# Meshlet build (meshopt_buildMeshlets) + the LOD simplify chain (brief 03). Built via Meson's CMake
+# integration (upstream is CMake-only), exposing the `meshoptimizer` CMake target.
+#
+# Tracked here, beside ktx.wrap, because only a library's OWN subprojects/ dir is in git —
+# sandbox/subprojects/ is gitignored except the sibling-library symlinks, so a wrap left there is
+# local cruft that no clean clone ever sees. This file existed only as that cruft until 2026-08-04,
+# which meant off-nix builds had no meshoptimizer at all; nix hid it by supplying one from nixpkgs.
+#
+# The hash carried by that cruft file no longer matched what the URL serves — GitHub's
+# auto-generated archive tarballs are not byte-stable across regenerations. This one is the hash
+# actually served for the v0.21 tag as of 2026-08-04.
+method = cmake
+
+[provide]
+meshoptimizer = meshoptimizer_dep

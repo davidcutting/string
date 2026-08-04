@@ -125,6 +125,18 @@ class Renderer
     bool graph_dirty_ = true;              // force a recompile (first frame, resize)
     uint64_t enabled_signature_ = 0;       // hash of frame_passes_ enabled-states; change -> recompile
     void rebuild_execution_plan();         // author frame_passes_ -> FrameGraph -> compile -> cache
+    // Construct a plan's passes and make them drawable. Shared verbatim by initialize() and
+    // load_scene() — see the definition for why the sequence inside is order-sensitive.
+    void build_scene(const RenderPlan& plan, engine_context& ctx, VkExtent2D extent);
+
+public:
+    // Replace the running scene with another plan's. Waits for the device to go idle, destroys the
+    // current passes, and builds the new ones — a multi-second, stalling operation. Safe to call from
+    // anywhere in the frame EXCEPT inside pass recording, which is why the app queues it and the
+    // Application applies it between frames.
+    void load_scene(const RenderPlan& plan);
+
+private:
     void refresh_introspection();          // brief 14 M2: refill the debug snapshot after a compile
     // Frame pacing timeline = the main lane's timeline semaphore (submissions_ owns it). Cached
     // here because every begin/end_frame touches it.

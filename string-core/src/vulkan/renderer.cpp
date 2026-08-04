@@ -230,16 +230,42 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
         &gpu_profiler_ctx_,
         resources_.transients(),
     };
+    build_scene(plan, pass_context, extent);
+
+    for (auto& frame : frames_)
+    {
+        frame.frame_id = 0;
+    }
+
+    init_gpu_profiler();
+    gpu_timing_.init(device_, frames_in_flight_);
+    GpuProfiler::set_global(&gpu_timing_);
+    GraphIntrospect::set_global(&introspect_);
+}
+
+// Everything it takes to bring a scene's passes into existence and make them drawable. Called from
+// initialize() for the first scene and from load_scene() for every one after — ONE code path, which
+// is the entire point: a bespoke reload path would be a second implementation that has to agree with
+// this one forever, and the sequence below is order-sensitive enough that it would not.
+//
+// The order is load-bearing:
+//   1. the plan constructs passes (they upload via the transfer batch and claim bindless slots),
+//   2. they learn the resolved HDR target's slot,
+//   3. their declared transient needs get backed by the per-frame arena,
+//   4. they join the graph's execution list,
+//   5. uploads drain, then they size themselves to the current extent.
+void Renderer::build_scene(const RenderPlan& plan, engine_context& ctx, VkExtent2D extent)
+{
     // Brief 11 endgame: the app constructs its passes AND returns a re-runnable fluent author lambda.
     // The Renderer owns the passes (lifecycle) and re-runs the author on every graph recompile.
     {
-        RenderPlan::Setup setup = plan.run(pass_context);
+        RenderPlan::Setup setup = plan.run(ctx);
         scene_passes_ = std::move(setup.passes);
         scene_author_ = std::move(setup.author);
     }
 
     // Brief 09: the passes exist now — notify the ones that consume the resolved HDR target
-    // (bind_composite_source() already bound it into the table before plan.build ran).
+    // (bind_composite_source() already bound it into the table before the plan ran).
     {
         const uint32_t color_slot = global_descriptor_table_.get_binding_slot(
             color_attachment_, string::gpu::descriptor_type::TEXTURE);
@@ -261,6 +287,7 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     // The frame graph's execution list: scene passes, then the composite resolve. written_
     // resources_ = everything the graph writes, so record_frame only transitions those (never
     // the static uploaded textures/buffers the transfer batch already left in SHADER_READ).
+    frame_passes_.clear();
     for (auto& pass : scene_passes_)
         frame_passes_.push_back(pass.get());
     frame_passes_.push_back(&composite_pass_);
@@ -272,19 +299,80 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
     transfer_batch_.wait_idle();
 
     for (auto& pass : scene_passes_)
-    {
         pass->resize(extent);
-    }
 
+    // The pass set changed, so the cached plan describes a graph that no longer exists.
+    graph_dirty_ = true;
+}
+
+// Swap the running scene for another one's passes. The app decides WHEN (a UI click, a console
+// command); the renderer owns the mechanics.
+//
+// SYNCHRONOUS AND STALLING, deliberately. Destroying a pass frees images and buffers the GPU may
+// still be reading from frames already submitted, so there is no correct way to do this without
+// first waiting for the device to go idle. A scene load is a multi-second operation dominated by
+// glTF parsing and texture streaming anyway; hiding a device wait inside that is not the problem.
+// Loading asynchronously (build the new passes, then swap) would avoid the hitch but doubles peak
+// VRAM — the old scene is still resident while the new one uploads — which is the worse trade on
+// the machine this has to run on.
+void Renderer::load_scene(const RenderPlan& plan)
+{
+    STRING_LOG_INFO("Loading scene...");
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // Drain the upload ring BEFORE waiting on the device. The transfer batch can hold copies that
+    // are RECORDED BUT NOT YET SUBMITTED, targeting buffers the outgoing passes own; a device wait
+    // does not flush those, so they would be submitted after their destination was destroyed.
+    transfer_batch_.wait_idle();
+    // Now nothing in flight may still reference what is about to be destroyed.
+    vkDeviceWaitIdle(device_.get_device());
+
+    // Drop the passes FIRST: their destructors unbind bindless slots and destroy their resources, and
+    // they must do that while the allocator, table and device are all still alive (the same ordering
+    // constraint the destructor has). frame_passes_ holds raw pointers into scene_passes_, so it has
+    // to be cleared in the same breath or it dangles.
+    frame_passes_.clear();
+    scene_author_ = nullptr;
+    compiled_frame_ = {};
+    scene_passes_.clear();
+
+    // Anything a destroyed pass deferred rather than freed outright.
     for (auto& frame : frames_)
-    {
-        frame.frame_id = 0;
-    }
+        frame.garbage_collector.flush();
 
-    init_gpu_profiler();
-    gpu_timing_.init(device_, frames_in_flight_);
-    GpuProfiler::set_global(&gpu_timing_);
-    GraphIntrospect::set_global(&introspect_);
+    // The rolling per-pass timings describe passes that no longer exist — without this the HUD and
+    // the frametime log line show the outgoing and incoming scenes' passes mixed together.
+    gpu_timing_.reset_stats();
+
+    // The per-frame scratch arena is sized from what the OLD passes reserved at construction, and
+    // reserve() is construction-time-only. Free it and forget the reservations so the incoming
+    // passes size a fresh one — otherwise the second scene's first reserve() trips
+    // "reserve() after materialize()".
+    resources_.reset_transients();
+
+    const VkExtent2D extent = presenter_.get_extent();
+    engine_context ctx{
+        device_,
+        allocator_,
+        global_descriptor_table_,
+        resources_,
+        shader_registry_,
+        transfer_batch_,
+        window_->get_input(),
+        input_map_,
+        string::gpu::COLOR_TARGET,
+        string::gpu::DEPTH_TARGET,
+        std::filesystem::path(application_info_.resources_directory),
+        static_cast<uint16_t>(frames_in_flight_),
+        msaa_samples_,
+        &gpu_profiler_ctx_,
+        resources_.transients(),
+    };
+    build_scene(plan, ctx, extent);
+
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    STRING_LOG_INFO("Scene loaded in {:.0f} ms ({} passes)", ms, scene_passes_.size());
 }
 
 // Stand up the Tracy GPU context on the graphics queue. Compiles to a no-op (ctx == nullptr) when

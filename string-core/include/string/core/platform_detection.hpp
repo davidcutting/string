@@ -11,13 +11,21 @@ enum class PlatformType : std::uint8_t
     LINUX
 };
 
+// meson also defines STRING_PLATFORM_<OS> on the command line (see the `system ==` branch in
+// string-core/meson.build), so guard the definitions here — an unguarded #define is a redefinition
+// warning on every translation unit. Only shows up when the two agree that we are on that platform,
+// i.e. never on the Linux-native build; found by cross-compiling to Windows.
 #ifdef _WIN32
     static constexpr PlatformType current_platform = PlatformType::WINDOWS;
-    #define STRING_PLATFORM_WINDOWS
+    #ifndef STRING_PLATFORM_WINDOWS
+        #define STRING_PLATFORM_WINDOWS
+    #endif
 #elif defined(__linux__)
     static constexpr PlatformType current_platform = PlatformType::LINUX;
     #define VK_USE_PLATFORM_WAYLAND_KHR
-    #define STRING_PLATFORM_LINUX
+    #ifndef STRING_PLATFORM_LINUX
+        #define STRING_PLATFORM_LINUX
+    #endif
 #else
     static_assert(false, "Unsupported platform!");
 #endif

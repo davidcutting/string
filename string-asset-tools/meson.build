@@ -24,9 +24,25 @@ string_dep = dependency('string-core', fallback : ['string-core', 'project_deps'
 asset_dep = dependency('string-asset', fallback : ['string-asset', 'project_deps'])
 
 # libktx (KTX-Software): the texture cook encodes UASTC then transcodes to BC7 and zstd-deflates
-# (see src/texture_cook.cpp). Resolved from its CMake config (KTX::ktx): on nix from nixpkgs'
-# ktx-tools; off-nix from a system KTX-Software install (there is no meson wrap).
-ktx_dep = dependency('Ktx', method : 'cmake', modules : ['KTX::ktx'])
+# (see src/texture_cook.cpp). System CMake config first (nix: nixpkgs' ktx-tools), else the `ktx`
+# wrap builds it from source — subprojects/ktx.wrap explains why that fallback needs the cmake
+# module and its defines rather than the usual [provide] + dependency() form.
+#
+# The ONLY place libktx is resolved: project_deps re-exports it, so string-render-forward gets it
+# transitively. A second cmake.subproject('ktx') in the same build would collide.
+ktx_dep = dependency('Ktx', method : 'cmake', modules : ['KTX::ktx'],
+                     required : false, allow_fallback : false)
+if not ktx_dep.found()
+    cmake = import('cmake')
+    ktx_opts = cmake.subproject_options()
+    ktx_opts.add_cmake_defines({
+        'KTX_FEATURE_TESTS': 'OFF',
+        'KTX_FEATURE_TOOLS': 'OFF',
+        'KTX_FEATURE_DOC': 'OFF',
+        'KTX_FEATURE_LOADTEST_APPS': 'OFF',
+    })
+    ktx_dep = cmake.subproject('ktx', options : ktx_opts).dependency('ktx')
+endif
 
 # meshoptimizer: meshlet build (meshopt_buildMeshlets) + the LOD simplify chain (brief 03).
 # Resolved from its CMake config (meshoptimizer::meshoptimizer): on nix from nixpkgs; off-nix from

@@ -136,6 +136,11 @@ public:
     // Transient HANDLES + cross-lifetime reuse are a deferred follow-up. String namespace stays for M7.)
     FrameScratch& transients() { return transients_; }
     void materialize_transients(std::uint32_t frame_slots) { transients_.materialize(allocator_, frame_slots); }
+    // Free the arena and forget every reservation, so a NEW set of passes can reserve from scratch.
+    // Needed only when the pass set is replaced wholesale (a scene switch): reserve() is a
+    // construction-time call and rejects anything after materialize(), so without this the second
+    // scene's passes fail with "reserve() after materialize()".
+    void reset_transients() { transients_.destroy(allocator_); }
 
 private:
     struct image_slot

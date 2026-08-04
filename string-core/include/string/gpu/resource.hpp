@@ -112,6 +112,13 @@ class id_registry
     resource_id capacity_ = 0;
     std::stack<resource_id> free_list_;
 public:
+    // `first` reserves the ids below it as sentinels. The resource allocator passes 1, because
+    // resource_id 0 is this codebase's universal "no resource" value: members are declared
+    // `resource_id foo_ = 0;` and guarded with `if (id != 0)`. Handing 0 out as a REAL id meant a
+    // pass whose optional resource was never created still destroyed id 0 in its dtor — i.e. someone
+    // else's buffer. Descriptor slots keep the default 0: there, slot 0 is a genuine slot.
+    explicit id_registry(resource_id first = 0) : capacity_(first) {}
+
     auto get_id() -> resource_id
     {
         resource_id new_id;

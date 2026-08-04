@@ -12,6 +12,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1193,8 +1194,17 @@ GeometryPass::~GeometryPass()
     allocator_.destroy_resource(white_image_);
     descriptor_table_.unbind(flat_normal_image_, ::string::gpu::descriptor_type::TEXTURE);
     allocator_.destroy_resource(flat_normal_image_);
+    // Only the stb-fallback textures are OURS — the KTX2 ones were created by (and are destroyed by)
+    // the TextureStreamer, which we merely cached the id of. texture_streamer_ is a member, so it is
+    // destroyed right after this body runs.
+    const std::unordered_set<::string::gpu::resource_id> streamed(streamed_textures_.begin(),
+                                                                 streamed_textures_.end());
     for (const ::string::gpu::resource_id image : texture_images_)
     {
+        if (streamed.contains(image))
+        {
+            continue;
+        }
         descriptor_table_.unbind(image, ::string::gpu::descriptor_type::TEXTURE);
         allocator_.destroy_resource(image);
     }
