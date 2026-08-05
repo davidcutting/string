@@ -367,10 +367,29 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
             direct = dbg_sun;
         }
 
-        uint froxel = froxel_index_for(s, surf.frag_coord, view_z);
+        // Local lights only exist if the froxel cull actually ran. FroxelComponent::has_work() is
+        // false when there are no lights (the lookdev scene disables them), so the cull is SKIPPED
+        // and the froxel buffer is never written — it holds whatever was in that VRAM before, which
+        // after a scene switch is the previous scene's froxel data. Reading a count out of that and
+        // indexing s.lights (which is a NULL address when light_count == 0) is a GPU null-pointer
+        // dereference: page fault, device lost, driver reset.
+        //
+        // froxel_planes.w is light_count and is uniform across the draw, so this branch is free.
+        const bool has_local_lights = s.froxel_planes.w > 0.0;
         uint stride = 1u + s.max_lights_per_froxel;
-        uint base_idx = froxel * stride;
-        uint count = s.froxels.data[base_idx];
+        uint base_idx = has_local_lights
+                      ? froxel_index_for(s, surf.frag_coord, view_z) * stride : 0u;
+        // CLAMPED, and this is load-bearing: `count` is a word read straight out of GPU memory and
+        // used as a loop bound. A stale per-frame slot, an unwritten buffer, or a race with the cull
+        // makes it garbage — and an unclamped garbage bound loops up to 2^32 times PER PIXEL, which
+        // hangs the GPU. On Windows the TDR watchdog then resets the driver: whole screen black,
+        // recovers, VK_ERROR_DEVICE_LOST, and VK_EXT_device_fault reports NO FAULT because nothing
+        // ever touched bad memory. A hang, not a corruption.
+        //
+        // The buffer's stride is 1 + max_lights_per_froxel, so a count above that is meaningless
+        // anyway: it would read into the NEXT froxel's entries.
+        uint count = has_local_lights
+                   ? min(s.froxels.data[base_idx], s.max_lights_per_froxel) : 0u;
         dbg_count = count;
         for (uint li = 0; li < count; ++li)
         {

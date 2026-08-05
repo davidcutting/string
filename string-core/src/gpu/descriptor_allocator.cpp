@@ -131,6 +131,10 @@ descriptor_table::descriptor_table(VkDevice device, resource_allocator& allocato
 
 descriptor_table::~descriptor_table()
 {
+    if (null_sampler_ != VK_NULL_HANDLE)
+    {
+        vkDestroySampler(device_, null_sampler_, nullptr);
+    }
     if (descriptor_pool_)
     {
         vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
@@ -177,15 +181,25 @@ void descriptor_table::bind(resource_id handle, descriptor_type type)
 void descriptor_table::unbind(resource_id handle, descriptor_type type)
 {
     // TODO(DCut): Handle timeline value and flushing
+    //
+    // Image slots are NULLED before the index is released, because release() erases the
+    // handle->slot mapping and the slot number is unrecoverable afterwards. Without this the set
+    // keeps the outgoing resource's view/sampler after that resource is destroyed (see write_null).
     switch(type)
     {
         case descriptor_type::STORAGE_BUFFER:
             ssbo_descriptor_allocator_.release(handle);
             break;
         case descriptor_type::TEXTURE:
+            if (texture_descriptor_allocator_.has(handle))
+                write_null(texture_descriptor_allocator_.get_slot(handle),
+                                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
             texture_descriptor_allocator_.release(handle);
             break;
         case descriptor_type::STORAGE_IMAGE:
+            if (st_image_descriptor_allocator_.has(handle))
+                write_null(st_image_descriptor_allocator_.get_slot(handle),
+                                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
             st_image_descriptor_allocator_.release(handle);
             break;
         case descriptor_type::TLAS:
@@ -295,8 +309,52 @@ void descriptor_table::unbind_storage_view(std::uint32_t slot)
 {
     auto it = slot_to_synthetic_.find(slot);
     if (it == slot_to_synthetic_.end()) return;
+    // Same reasoning as unbind(): null it before releasing, or the set keeps the dead view.
+    write_null(slot, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
     st_image_descriptor_allocator_.release(it->second);
     slot_to_synthetic_.erase(it);
+}
+
+// Point a released slot at nothing, using VK_EXT_robustness2's nullDescriptor: a VK_NULL_HANDLE
+// image descriptor is legal, reads of it return zero and writes are discarded.
+//
+// The alternative — a 1x1 placeholder image — was worse in every way: a resource to allocate, own
+// and destroy in the right order; a garbage texel that would make a stale read render plausibly
+// wrong instead of obviously zero; and an unanswerable layout question, since ONE image cannot
+// simultaneously be SHADER_READ_ONLY_OPTIMAL for binding 1 and GENERAL for binding 2, and a never-
+// transitioned image is UNDEFINED anyway. nullDescriptor has no layout, no lifetime and no storage.
+void descriptor_table::write_null(uint32_t slot, VkDescriptorType type)
+{
+    // nullDescriptor covers the IMAGE VIEW, not the sampler: for a COMBINED_IMAGE_SAMPLER the
+    // sampler member must still be a valid VkSampler (there are no immutable samplers on this
+    // binding). Passing VK_NULL_HANDLE for both crashed the driver during scene teardown. So keep
+    // one trivial sampler alive for exactly this purpose — a sampler object, not an image: no
+    // memory, no layout, no lifetime coupling to any resource.
+    if (null_sampler_ == VK_NULL_HANDLE)
+    {
+        const VkSamplerCreateInfo sampler_info = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        if (vkCreateSampler(device_, &sampler_info, nullptr, &null_sampler_) != VK_SUCCESS)
+        {
+            return;   // cannot null the slot safely; leaving it bound is the lesser evil
+        }
+    }
+
+    VkDescriptorImageInfo info = {
+        .sampler = (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ? null_sampler_
+                                                                       : VK_NULL_HANDLE,
+        .imageView = VK_NULL_HANDLE,
+        .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = descriptor_set_,
+        .dstBinding = (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ? 1u : 2u,
+        .dstArrayElement = slot,
+        .descriptorCount = 1,
+        .descriptorType = type,
+        .pImageInfo = &info,
+    };
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 }
 
 void descriptor_table::bind_image(resource_id handle, VkDescriptorType type, uint32_t slot)

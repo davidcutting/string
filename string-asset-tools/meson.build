@@ -40,6 +40,12 @@ if not ktx_dep.found()
         'KTX_FEATURE_TOOLS': 'OFF',
         'KTX_FEATURE_DOC': 'OFF',
         'KTX_FEATURE_LOADTEST_APPS': 'OFF',
+        # Static, not a DLL. Cross-compiling to Windows, KTX's shared-library target wants a
+        # generated exports.def that its CMake does not produce under our cross setup
+        # ("cannot find CMakeFiles/ktx.dir/./exports.def"). Static sidesteps that, and one fewer
+        # runtime DLL beside the exe is what we want anyway.
+        'KTX_FEATURE_STATIC_LIBRARY': 'ON',
+        'BUILD_SHARED_LIBS': 'OFF',
     })
     ktx_dep = cmake.subproject('ktx', options : ktx_opts).dependency('ktx')
 endif

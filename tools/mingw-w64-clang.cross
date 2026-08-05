@@ -1,0 +1,86 @@
+# clang targeting x86_64-w64-mingw32 (GNU ABI), from Linux.
+#
+# RUN 2026-08-04 — DOES NOT WORK on this nixpkgs pin, and the reason is NOT in our build. Kept
+# because everything below is correct and re-testable against a newer pin; see the two blockers at
+# the bottom of this comment. Use the gcc twin (mingw-w64.cross) for actual cross verification.
+#
+# Why clang rather than the gcc twin: production builds use clang on Windows, Linux and macOS, so
+# this would exercise the SAME FRONTEND our code is actually compiled by. It is still the GNU ABI,
+# not clang-with-MSVC-ABI, so even working it says nothing about the MSVC STL, the Windows SDK
+# headers, or linking against .lib import libraries.
+#
+# Run with:
+#   nix-shell -p pkgsCross.mingwW64.buildPackages.clang meson ninja cmake pkg-config \
+#     --run "meson setup build-win-clang string-core --cross-file tools/mingw-w64-clang.cross -Dwsi=sdl && ninja -C build-win-clang"
+#
+# WHAT ACTUALLY HAPPENS (verified by running it):
+#   meson setup SUCCEEDS — every subproject resolves for a windows host, incl. slang-windows-x86_64
+#   and the CMake ones (fastgltf). Compilation then fails in libstdc++, before reaching our code.
+#
+# BLOCKER A — libstdc++ route, fatal. nixpkgs' mingw gcc 15 uses **mcfgthread** as its thread model,
+# so libstdc++'s bits/gthr-default.h includes <mcfgthread/gthr.h> in effectively every TU that pulls
+# <ostream>. mcfgthread's atomic.h re-includes itself via `#include __FILE__`. Targeting Windows,
+# clang expands __FILE__ with BACKSLASHES ("\nix\store\...\atomic.h"), which cannot resolve as a path
+# on Linux; gcc emits forward slashes, so the trick works only under gcc. Clang then segfaults after
+# emitting the fatal error (a separate clang bug). There is no flag to change __FILE__'s separator.
+#
+# BLOCKER B — libc++ route, also fatal. Avoiding libstdc++ via `-stdlib=libc++` needs
+# pkgsCross.mingwW64.llvmPackages.libcxx, which EVALUATES but does not BUILD on this pin: it forces
+# a rebuild of compiler-rt-libc-x86_64-w64-mingw32, whose CMake compiler probe fails with
+# "cannot find crt2.o / -lkernel32" — a bootstrap-ordering bug in nixpkgs (compiler-rt built before
+# the mingw CRT is available). Upstream packaging, nothing we can fix from here.
+#
+# Two further blockers were known from the gcc run and are FIXED below rather than pending: KTX's
+# `Windows.h` casing (tools/wincompat) and the -lgcc_s link failure (-static-libgcc). SDL3's
+# `-lpthread` against mcfgthread remains, but is unreached — A stops the build first.
+#
+# STILL UNANSWERED because the build never got that far: whether KTX's bundled fmt consteval failure
+# is GCC-only. If a working clang toolchain ever compiles it, delete the cmake.subproject workaround
+# and restore the simpler `[provide] ktx = ktx_dep` form (see string-asset-tools/subprojects/ktx.wrap).
+
+[binaries]
+c = 'x86_64-w64-mingw32-clang'
+cpp = 'x86_64-w64-mingw32-clang++'
+ar = 'x86_64-w64-mingw32-ar'
+strip = 'x86_64-w64-mingw32-strip'
+windres = 'x86_64-w64-mingw32-windres'
+
+[host_machine]
+system = 'windows'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+
+# LOAD-BEARING: meson does not propagate the cross toolchain into CMake subprojects. Without this,
+# CMake probes with the NATIVE compiler while passing Windows link flags, and fastgltf dies at
+# "compile a simple test program" (ld.bfd: unrecognized option '--major-image-version').
+[cmake]
+CMAKE_SYSTEM_NAME = 'Windows'
+CMAKE_SYSTEM_PROCESSOR = 'x86_64'
+CMAKE_C_COMPILER = 'x86_64-w64-mingw32-clang'
+CMAKE_CXX_COMPILER = 'x86_64-w64-mingw32-clang++'
+CMAKE_RC_COMPILER = 'x86_64-w64-mingw32-windres'
+# [built-in options] below do NOT reach CMake subprojects — same reason this section exists at all.
+# Both the -lgcc_s fix and the Windows.h shim must be restated here or fastgltf/ktx fail on their own.
+CMAKE_EXE_LINKER_FLAGS = '-static-libgcc'
+CMAKE_SHARED_LINKER_FLAGS = '-static-libgcc'
+CMAKE_MODULE_LINKER_FLAGS = '-static-libgcc'
+CMAKE_CXX_FLAGS = '-I@DIRNAME@/wincompat'
+CMAKE_C_FLAGS = '-I@DIRNAME@/wincompat'
+
+[built-in options]
+# Blocker 1: KTX includes <Windows.h>; mingw ships windows.h. tools/wincompat/Windows.h forwards.
+# Paths must be ABSOLUTE — meson bakes these into subproject builds whose cwd differs.
+cpp_args = ['-I@DIRNAME@/wincompat']
+c_args = ['-I@DIRNAME@/wincompat']
+
+# Blocker 3 (found by running this, 2026-08-04): nixpkgs' cross clang defaults to the SHARED gcc
+# runtime and links -lgcc_s, but the mingw gcc package ships only libgcc.a / libgcc_eh.a plus a bare
+# libgcc_s_seh-1.dll with NO import library, so the default link cannot resolve. -static-libgcc uses
+# the static pair instead and links clean.
+#
+# -static-libstdc++ does NOT work here: that gcc ships only libstdc++.dll.a, no libstdc++.a. So the
+# resulting .exe is NOT self-contained — it needs libstdc++-6.dll beside it. A single-file hermetic
+# exe needs a different toolchain (MSVC ABI, or a mingw distribution with static libstdc++).
+cpp_link_args = ['-static-libgcc']
+c_link_args = ['-static-libgcc']

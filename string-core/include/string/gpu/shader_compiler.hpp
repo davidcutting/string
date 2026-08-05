@@ -2,12 +2,18 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
-#include <slang.h>
-#include <slang-com-ptr.h>
+// STRING_NO_SLANG (meson -Dslang=disabled) builds without Slang at all: no headers, no link, no
+// runtime compilation. Programs are then served exclusively from the prebuilt cache. The macro is a
+// public compile arg because it removes a member below — every TU must agree on the layout.
+#ifndef STRING_NO_SLANG
+    #include <slang.h>
+    #include <slang-com-ptr.h>
+#endif
 
 #include <volk.h>
 
@@ -57,9 +63,13 @@ struct compile_error
 class shader_compiler
 {
 public:
-    // `cache_dir` holds the content-hash-keyed SPIR-V cache (created if missing). `search_dirs`
-    // are the include/import roots handed to Slang.
-    shader_compiler(std::filesystem::path cache_dir, std::vector<std::filesystem::path> search_dirs);
+    // `cache_dir` is the WRITABLE content-hash-keyed program cache (created if missing).
+    // `search_dirs` are the include/import roots handed to Slang, and also what the import-closure
+    // hash is computed over. `prebuilt_cache_dir` is an optional READ-ONLY cache shipped with the
+    // package: it is consulted when `cache_dir` misses and never written to, which is what lets a
+    // -Dslang=disabled build run with no compiler present.
+    shader_compiler(std::filesystem::path cache_dir, std::vector<std::filesystem::path> search_dirs,
+                    std::filesystem::path prebuilt_cache_dir = {});
     ~shader_compiler();
 
     shader_compiler(const shader_compiler&) = delete;
@@ -69,12 +79,36 @@ public:
     // each call opens its own Slang session (the global session is the only shared state, and it is
     // documented thread-safe for session creation), so the file-watch job pool can compile off the
     // main thread. Returns nullopt on failure and fills `out_error`.
+    //
+    // Under STRING_NO_SLANG this only ever reads the caches; a miss fills `out_error` and returns
+    // nullopt, which callers already treat as a compile failure.
     std::optional<compiled_program> compile(const std::filesystem::path& source_path,
                                             compile_error& out_error);
 
+    // True if this build can actually compile (i.e. Slang is linked in). Lets callers word errors
+    // and disable shader-authoring UI honestly rather than offering a hot-reload that cannot work.
+    [[nodiscard]] static constexpr bool can_compile() noexcept
+    {
+#ifdef STRING_NO_SLANG
+        return false;
+#else
+        return true;
+#endif
+    }
+
 private:
+#ifndef STRING_NO_SLANG
+    // Creates the Slang global session on first use; false if creation failed. compile() calls this
+    // only after the program cache misses, so a fully-warm cache never constructs it — that is what
+    // keeps Slang off the startup path.
+    // Locked because compile() runs on the file-watch job pool.
+    bool ensure_global_session();
+
+    std::mutex global_session_mutex_;
     Slang::ComPtr<slang::IGlobalSession> global_session_;
+#endif
     std::filesystem::path cache_dir_;
+    std::filesystem::path prebuilt_cache_dir_;
     std::vector<std::filesystem::path> search_dirs_;
     // Hash of every importable .slang module in the search dirs, folded into every cache key so an
     // edit to an imported module invalidates stale cached SPIR-V. Computed once at construction.

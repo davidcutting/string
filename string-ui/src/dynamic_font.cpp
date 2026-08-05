@@ -75,6 +75,12 @@ dynamic_font_atlas::dynamic_font_atlas(std::span<const std::uint8_t> ttf, float 
 , atlas_w_(atlas_w)
 , atlas_h_(atlas_h)
 {
+    // Guard BEFORE stb sees the pointer: an empty span makes data() null, and
+    // stbtt_GetFontOffsetForIndex dereferences it inside stbtt__isfont — a null-deref fault, not
+    // the clean throw below. An empty blob is the shape a failed file read arrives in.
+    if (ttf_.empty())
+        throw std::runtime_error("dynamic_font: empty TrueType blob (font file missing or unread?)");
+
     const int offset = stbtt_GetFontOffsetForIndex(ttf_.data(), 0);
     if (offset < 0 || !stbtt_InitFont(&impl_->info, ttf_.data(), offset))
         throw std::runtime_error("dynamic_font: stbtt_InitFont failed (not a valid TrueType blob)");

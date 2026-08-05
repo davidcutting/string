@@ -1582,7 +1582,13 @@ void GeometryPass::update(float delta_time, uint16_t current_frame)
         scene.froxel_planes = glm::vec4(near_p, far_p, 1.0f / std::log(far_p / near_p),
                                         static_cast<float>(light_count));
         scene.lights = light_count > 0 ? resources->address(light_buffer_, current_frame) : 0;
-        scene.froxels = froxel ? froxel->froxels_address(current_frame) : 0;
+        // scene.froxels is deliberately NOT set here — it is patched in record() instead. Reading it
+        // at update() time made this pass depend on FroxelPass having already updated, an ordering
+        // that nothing enforced (the frame graph derives RECORD order from declared usages, but the
+        // update loop just walks scene_passes_ in push order). Get that order wrong and this baked a
+        // null device address that lighting.slang dereferences unconditionally -> GPU fault ->
+        // DEVICE_LOST. By record() time every pass has updated, so the address is always valid and
+        // the ordering stops being load-bearing.
         scene.max_lights_per_froxel = kMaxLightsPerFroxel;
         scene.debug_flags = (froxel_heatmap_ ? 1u : 0u) | (furnace_ ? 2u : 0u)
                           | (cv_gtao_spec_occ().get() ? 0u : 4u)    // bit2: disable bent-normal spec-occ
@@ -2067,6 +2073,22 @@ bool GeometryPass::record_shadows_if_enabled(::string::gpu::command_recorder& re
 void GeometryPass::record(::string::gpu::command_recorder& recorder, uint16_t current_frame)
 {
     VkCommandBuffer& command_buffer = recorder.get_command_buffer();
+
+    // The froxel buffer's device address is latched HERE rather than in update(), where it used to
+    // depend on FroxelPass having updated first — an ordering nothing enforced. By record() time
+    // every pass has updated, so this is always the live address. Patched straight into the
+    // persistently-mapped SceneData for this frame slot; the GPU has not read it yet (that happens
+    // after submit), and this pass is the only consumer of the field.
+    //
+    // Done BEFORE the draw_count_ early-out: the transparency pass shares this SceneData.
+    if (resources != nullptr && scene_buffer_.valid())
+    {
+        if (void* mapped = resources->mapped(scene_buffer_, current_frame))
+        {
+            static_cast<SceneData*>(mapped)->froxels =
+                froxel != nullptr ? froxel->froxels_address(current_frame) : 0;
+        }
+    }
 
     if (draw_count_ == 0)
     {

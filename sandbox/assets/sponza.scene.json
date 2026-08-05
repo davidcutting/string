@@ -1,0 +1,9 @@
+{
+  "name": "sponza",
+  "description": "Sponza — full scene, meshlets, CSM, GI",
+  "models": [
+    "sponza/main/NewSponza_Main_glTF_003.gltf",
+    "sponza/curtains/NewSponza_Curtains_glTF.gltf",
+    "sponza/ivy/NewSponza_IvyGrowth_glTF.gltf"
+  ]
+}

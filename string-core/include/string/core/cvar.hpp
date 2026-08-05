@@ -105,6 +105,11 @@ private:
 // Convert a CVar name ("r.lod.error_px") to its env-var form ("STRING_R_LOD_ERROR_PX").
 std::string env_name_for(std::string_view cvar_name);
 
+// Set an env lever ONLY if it is not already set, so an explicit value from the user always wins.
+// Equivalent to POSIX setenv(name, value, /*overwrite=*/0); Windows has no setenv, only _putenv_s.
+// Returns true if this call set it. Not thread-safe against concurrent getenv, like the C calls.
+bool set_env_default(const char* name, const char* value);
+
 class CVarBase
 {
 public:

@@ -53,6 +53,7 @@ public:
     // Tracy GPU context uses this to build a calibrated (host<->device correlated) context;
     // otherwise it falls back to an uncalibrated one. Optional feature — never a hard requirement.
     bool supports_calibrated_timestamps() const { return calibrated_timestamps_enabled_; }
+    bool supports_device_fault() const { return device_fault_enabled_; }
 
 private:
     std::shared_ptr<String::Window> window_;
@@ -75,6 +76,8 @@ private:
     VkPhysicalDeviceProperties properties_{};
     // Whether VK_EXT_calibrated_timestamps was present and enabled (optional; profiler-only).
     bool calibrated_timestamps_enabled_ = false;
+    // VK_EXT_device_fault present: enables faulting-address reporting on device loss (diagnostic).
+    bool device_fault_enabled_ = false;
 
     void select_physical_device();
     void create_logical_device();
@@ -93,7 +96,13 @@ private:
         VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
         // Task/mesh shader meshlet pipeline (brief 03). Locked requirement (RDNA3+), no fallback:
         // the geometry path draws through vkCmdDrawMeshTasksEXT.
-        VK_EXT_MESH_SHADER_EXTENSION_NAME};
+        VK_EXT_MESH_SHADER_EXTENSION_NAME,
+        // nullDescriptor: lets a released bindless slot be written as VK_NULL_HANDLE instead of
+        // being left pointing at a destroyed image. Reads of such a descriptor return zero and
+        // writes are discarded, which is defined behaviour — without it a torn-down scene leaves
+        // dangling views in the set. Hard requirement, like mesh shaders: every device that can
+        // run this engine supports it.
+        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
 };
 
 }

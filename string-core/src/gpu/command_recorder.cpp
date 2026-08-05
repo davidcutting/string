@@ -1,5 +1,6 @@
 #include <stdexcept>
 #include <string/gpu/command_recorder.hpp>
+#include <string/gpu/vk_check.hpp>
 #include <string/gpu/device.hpp>
 #include <string/core/logger.hpp>
 #include <string/gpu/queue.hpp>
@@ -118,7 +119,7 @@ auto command_recorder::immediate_submit() -> command_recorder&
     };
 
     vkQueueSubmit(queue_.queue, 1, &submit_info, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_.queue);
+    ::string::gpu::vk_report(vkQueueWaitIdle(queue_.queue), "vkQueueWaitIdle(immediate)");
     return *this;
 }
 
@@ -154,7 +155,8 @@ auto command_recorder::submit_async(VkSemaphore timeline, uint64_t signal_value)
         .pSignalSemaphoreInfos = &signal_info,
     };
 
-    if (vkQueueSubmit2(queue_.queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS)
+    if (const VkResult r = vkQueueSubmit2(queue_.queue, 1, &submit_info, VK_NULL_HANDLE);
+        !::string::gpu::vk_report(r, "vkQueueSubmit2(immediate)"))
     {
         throw std::runtime_error("Failed to submit async transfer batch!");
     }

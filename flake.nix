@@ -155,6 +155,7 @@
             shader-slang fastgltf simdjson
             ktx-tools       # libktx: the sandbox loader reads/transcodes .ktx2 (KTX::ktx cmake config)
             meshoptimizer   # meshlet build + LOD simplify (brief 03; meshoptimizer::meshoptimizer)
+            nlohmann_json   # `.scene.json` descriptors, parsed app-side (brief 18)
           ];
 
           # WSI is an option of the engine subproject, so it is namespaced.

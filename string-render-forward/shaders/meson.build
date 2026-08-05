@@ -9,6 +9,7 @@ slang_shaders = files(
     'text_shader.slang',
     'image_shader.slang', # brief 14 M4: UI image widget (channel mask / mip / range remap / false colour)
     'ui_background.slang',  # ui-dev sandbox flat gradient background (brief 05, milestone 0)
+    'shadertoy_default.slang',  # brief 18 M4: default/template shader for Shadertoy scenes
     'sky_shader.slang',
     'sky.slang',        # imported by sky_shader.slang, lighting.slang and ibl.slang
     'lighting.slang',   # shared lit-shading module (was missing from the install set pre-07)

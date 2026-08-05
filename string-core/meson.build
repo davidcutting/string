@@ -98,20 +98,33 @@ deps += dependency('volk')
 # meson wrap-file pins exactly one archive — so the platforms are separate wraps chosen HERE by
 # an explicit subproject() call. They deliberately carry no [provide]: two wraps providing
 # `slang` would be a duplicate-provider conflict.
-slang_dep = dependency('slang', required : false, allow_fallback : false)
-if not slang_dep.found()
-    slang_wraps = {
-        'linux'   : 'slang-linux-x86_64',
-        'windows' : 'slang-windows-x86_64',
-    }
-    if not slang_wraps.has_key(system)
-        error('No prebuilt Slang wrap for host system "' + system + '". Add one from the Slang ' +
-              'releases page (same shape as slang-linux-x86_64.wrap), or install Slang so ' +
-              'dependency(\'slang\') finds it.')
+#
+# -Dslang=disabled is SHIP MODE: Slang is neither linked nor compiled against, and shader_compiler
+# serves programs only from the prebuilt cache. STRING_NO_SLANG is a PUBLIC arg because it changes
+# the shader_compiler class layout (the global-session member disappears) — every TU that includes
+# the header must agree, or it is an ODR violation.
+if get_option('slang').disabled()
+    # Both lists, like STRING_PROFILE below: public_args reaches consumers via project_deps,
+    # build_args reaches this library's own TUs. `build_args += public_args` already ran above.
+    public_args += '-DSTRING_NO_SLANG'
+    build_args += '-DSTRING_NO_SLANG'
+    message('Slang DISABLED: cache-only shader loading. The package must carry a prebuilt cache.')
+else
+    slang_dep = dependency('slang', required : false, allow_fallback : false)
+    if not slang_dep.found()
+        slang_wraps = {
+            'linux'   : 'slang-linux-x86_64',
+            'windows' : 'slang-windows-x86_64',
+        }
+        if not slang_wraps.has_key(system)
+            error('No prebuilt Slang wrap for host system "' + system + '". Add one from the Slang ' +
+                  'releases page (same shape as slang-linux-x86_64.wrap), or install Slang so ' +
+                  'dependency(\'slang\') finds it.')
+        endif
+        slang_dep = subproject(slang_wraps[system]).get_variable('slang_dep')
     endif
-    slang_dep = subproject(slang_wraps[system]).get_variable('slang_dep')
+    deps += slang_dep
 endif
-deps += slang_dep
 
 # --- WSI backend (selectable via -Dwsi=) -------------------------------------
 wsi = get_option('wsi')
@@ -181,6 +194,7 @@ core_src = [
     'src/scene/camera.cpp',
     'src/vulkan/renderer.cpp',
     'src/vulkan/passes/composite_pass.cpp',
+    'src/gpu/vk_check.cpp',
     'src/gpu/driver.cpp',
     'src/gpu/device.cpp',
     'src/gpu/presenter.cpp',
@@ -197,6 +211,8 @@ core_src = [
     'src/vulkan/resource_state.cpp',
     'src/vulkan/graph_plan.cpp',
     'src/vulkan/scene_registry.cpp',
+    'src/vulkan/content_root.cpp',
+    'src/core/user_dirs.cpp',
     'src/vulkan/frame_scratch.cpp',
     'src/vulkan/vulkan_utils.cpp',
     'src/gpu/pipeline_builder.cpp',

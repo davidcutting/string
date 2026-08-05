@@ -55,6 +55,13 @@ public:
     {
         return slot_map_.at(resource);
     }
+
+    // get_slot() throws on an unbound handle; unbind() is called speculatively in destructors, so
+    // it needs to ask first.
+    [[nodiscard]] bool has(resource_id resource) const
+    {
+        return slot_map_.find(resource) != slot_map_.end();
+    }
 };
 
 struct slot_release
@@ -78,6 +85,23 @@ class descriptor_table
     descriptor_allocator st_image_descriptor_allocator_;
     descriptor_allocator tlas_descriptor_allocator_;
     descriptor_allocator blas_descriptor_allocator_;
+
+    // Write a VK_NULL_HANDLE image descriptor into `slot`, nulling it out.
+    //
+    // Releasing a slot used to free only the INDEX, leaving the descriptor set still holding the
+    // VkImageView/VkSampler of a resource that was about to be destroyed. Those handles stay in the
+    // set until something rebinds that slot — so after a scene teardown the set can carry hundreds
+    // of dangling image descriptors, and binding a set with descriptors referencing destroyed
+    // objects is undefined behaviour. It happens to survive on some drivers and faults the GPU on
+    // others, which is exactly the sort of bug that only shows up on someone else's machine.
+    //
+    // Legal because VK_EXT_robustness2's nullDescriptor is a hard device requirement (device.hpp):
+    // reads return zero, writes are discarded. No resource, no lifetime, no layout.
+    void write_null(uint32_t slot, VkDescriptorType type);
+
+    // Kept solely so a nulled COMBINED_IMAGE_SAMPLER slot has the valid sampler the spec still
+    // demands alongside a null image view. Created on first use, destroyed with the table.
+    VkSampler null_sampler_ = VK_NULL_HANDLE;
 
 public:
     // Advertised bindless capacities. Public so device suitability can verify the physical

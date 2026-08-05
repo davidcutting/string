@@ -46,6 +46,16 @@ render_dep = dependency('string-render-forward', fallback : ['string-render-forw
 debug_dep = dependency('string-debug', fallback : ['string-debug', 'project_deps'])
 client_dep = dependency('string-client', fallback : ['string-client', 'project_deps'])
 
+# JSON, for the scene descriptors. App-side on purpose: descriptors are turned into scenes here,
+# and the engine never learns what the format is (brief 18).
+# System first (nix: nixpkgs' nlohmann_json — the build sandbox has no network, so a wrap cannot
+# download there), else the wrap. allow_fallback:false keeps the first probe from erroring under
+# --wrap-mode=nodownload before we reach it.
+json_dep = dependency('nlohmann_json', required : false, allow_fallback : false)
+if not json_dep.found()
+    json_dep = dependency('nlohmann_json')
+endif
+
 
 sandbox_inc = include_directories('.')
 
@@ -57,6 +67,7 @@ executable(
         'demo_scene.cpp',
     ],
     include_directories : sandbox_inc,
-    dependencies : [ string_dep, ui_dep, render_dep, debug_dep, client_dep, asset_dep, asset_tools_dep ],
+    dependencies : [ string_dep, ui_dep, render_dep, debug_dep, client_dep, asset_dep, asset_tools_dep,
+                    json_dep ],
     install : true,
 )

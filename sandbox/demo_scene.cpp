@@ -6,6 +6,8 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -15,19 +17,25 @@
 #include <string/ui/dynamic_font.hpp>
 #include <string/ui/font.hpp>
 #include <string/ui/layout.hpp>
+#include <string/core/cvar.hpp>
 #include <string/core/logger.hpp>
 #include <string/vulkan/frame_graph.hpp>
+#include <string/vulkan/content_root.hpp>
 #include <string/vulkan/scene_registry.hpp>
 #include "debug_cvars.hpp"
 #include <string/render/debug_line_pass.hpp>
 #include <string/render/geometry_pass.hpp>
 #include <string/render/post_pass.hpp>
 #include <string/render/ui_background_pass.hpp>
+#include <string/render/shadertoy_pass.hpp>
 #include <string/render/ui_pass.hpp>
 #include "render_types.hpp"
 #include <string/debug/panels.hpp>
 #include <string/client/screens.hpp>
 #include <string/render/render_debug.hpp>
+#include <string/render/render_cvars.hpp>
+#include <string/render/scene_loader.hpp>
+#include <nlohmann/json.hpp>
 
 namespace sandbox
 {
@@ -60,10 +68,20 @@ String::PassSpec author_pass(String::FrameGraph& fg, String::Pass* p)
         .prepassCompute([p](string::gpu::pass_context& ctx) { return p->record_compute(ctx.rec, ctx.frame_slot); });
 }
 
+// Throws naming the path rather than returning an empty vector. A silent empty read used to travel
+// all the way into stb_truetype as a null pointer and fault there, which told a packager who forgot
+// to ship assets/fonts/ nothing at all about what was missing.
 std::vector<std::uint8_t> read_file(const std::filesystem::path& path)
 {
     std::ifstream f(path, std::ios::binary);
-    return { std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>() };
+    if (!f)
+        throw std::runtime_error("cannot open '" + path.string() + "' (missing or unreadable)");
+
+    std::vector<std::uint8_t> bytes{ std::istreambuf_iterator<char>(f),
+                                     std::istreambuf_iterator<char>() };
+    if (bytes.empty())
+        throw std::runtime_error("'" + path.string() + "' is empty");
+    return bytes;
 }
 
 // Author the whole demo UI every frame into ONE layout tree (UIPass draws its shapes and text from
@@ -269,11 +287,18 @@ String::RenderPlan::Setup make_geometry_setup(
     String::Pass* tr = transp.get();
     String::Pass* db = dbg.get();  String::Pass* uip = ui.get();   String::Pass* po = post.get();
 
-    // Ownership order == the per-frame update()/resize() LIFECYCLE order, which is load-bearing:
-    // FroxelPass::update() allocates the froxel index buffer, whose device address GeometryPass::update()
-    // then bakes into SceneData — so froxel (and the other producers) MUST update before geometry, or
-    // frame 0 bakes a null froxel address and the lit shader faults the GPU (DEVICE_LOST). This matches
-    // the graph author order below; it is NOT the same concern as the toposort. (Producers first.)
+    // Ownership order == the per-frame update()/resize() LIFECYCLE order. Producers first, matching
+    // the graph author order below; NOT the same concern as the toposort.
+    //
+    // This used to be LOAD-BEARING and silently so: GeometryPass::update() baked FroxelPass's buffer
+    // device address into SceneData, so getting this order wrong baked a NULL address that
+    // lighting.slang dereferences unconditionally -> GPU fault -> DEVICE_LOST. Nothing enforced it —
+    // the frame graph derives RECORD order from declared usages, but the update loop just walks
+    // scene_passes_ in push order, so an update-time dependency is invisible to it.
+    //
+    // That address is now latched in GeometryPass::record() instead, by which time every pass has
+    // updated. So this order is a convention again, not a tripwire. Keep it tidy anyway — but any
+    // NEW cross-pass dependency taken at update() time re-creates the same unenforced hazard.
     String::RenderPlan::Setup s;
     s.passes.push_back(std::move(froxel));
     s.passes.push_back(std::move(ibl));
@@ -354,6 +379,235 @@ String::RenderPlan::Setup make_geometry_setup(
     return s;
 }
 
+// A `.scene.json` descriptor: the manifest for a scene glTF alone cannot express — several files
+// merged into one world, plus engine-side overrides. Deliberately small; anything glTF already says
+// (cameras, lights, transforms, materials) is read from the ASSET, never restated here (brief 18).
+//
+//   { "name": "sponza",
+//     "description": "Sponza — full scene",
+//     "models": [ "sponza/main/X.gltf", "sponza/curtains/Y.gltf" ],
+//     "camera": "35,30,25,-2.52,-0.51" }
+//
+// `models` paths resolve relative to the DESCRIPTOR'S OWN folder, so a content folder can be moved,
+// copied or handed to someone else whole.
+struct SceneDescriptor
+{
+    std::string name;
+    std::string description;
+    std::vector<std::filesystem::path> models;
+    std::string camera;      // optional; empty = use the asset's own camera / derived framing
+    // "geometry" (default) or "shader". Content-level, not a pipeline tuning: a Shadertoy scene is a
+    // different KIND of thing, not a geometry scene with different settings (brief 18).
+    std::string kind = "geometry";
+    std::filesystem::path shader;   // kind == "shader"; empty = the built-in template
+};
+
+// Returns nullopt and logs on malformed input — one bad descriptor must not take the session down,
+// the same posture as an unknown STRING_SCENE.
+std::optional<SceneDescriptor> read_descriptor(const std::filesystem::path& file)
+{
+    std::ifstream in(file);
+    if (!in)
+    {
+        STRING_LOG_WARN("[content] cannot read {}", file.string());
+        return std::nullopt;
+    }
+
+    nlohmann::json j;
+    try
+    {
+        in >> j;
+    }
+    catch (const std::exception& e)
+    {
+        STRING_LOG_WARN("[content] {} is not valid JSON: {}", file.string(), e.what());
+        return std::nullopt;
+    }
+
+    SceneDescriptor d;
+    // Default the name to the filename so `my_level.scene.json` needs only a `models` list.
+    d.name = j.value("name", file.stem().stem().string());
+    d.description = j.value("description", std::string{});
+    d.camera = j.value("camera", std::string{});
+
+    const std::filesystem::path base = file.parent_path();
+    d.kind = j.value("kind", std::string{ "geometry" });
+    for (const auto& m : j.value("models", std::vector<std::string>{}))
+    {
+        d.models.push_back(base / m);
+    }
+
+    if (d.kind == "shader")
+    {
+        if (const std::string s = j.value("shader", std::string{}); !s.empty())
+        {
+            d.shader = base / s;
+        }
+        return d;   // no models: a shader scene has no assets at all, which is the point
+    }
+    if (d.kind != "geometry")
+    {
+        STRING_LOG_WARN("[content] {}: unknown kind '{}' (expected \"geometry\" or \"shader\")",
+                        file.string(), d.kind);
+        return std::nullopt;
+    }
+    if (d.models.empty())
+    {
+        STRING_LOG_WARN("[content] {} lists no models — skipping", file.string());
+        return std::nullopt;
+    }
+    return d;
+}
+
+// Scan the user's content root for glTF assets and register one scene per file.
+//
+// GeometryPass takes paths relative to resources_dir, but the content root is an arbitrary absolute
+// folder the user chose — so pass the absolute path through and let the loader's `resources_path /
+// rel` composition leave it alone (operator/ with an absolute right-hand side yields the absolute).
+// That is why nothing here tries to relativise: an absolute content root simply works.
+void register_content_scenes(String::SceneRegistry& registry,
+                             const std::shared_ptr<string::dynamic_font_atlas>& atlas,
+                             int np_stress)
+{
+    const std::filesystem::path& root = String::ContentRoot::get();
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec))
+    {
+        return;   // no content is a normal state, not an error
+    }
+
+    // Sorted for a stable menu order across runs (directory iteration order is not guaranteed).
+    std::vector<std::filesystem::path> assets;
+    std::vector<std::filesystem::path> descriptors;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             root, std::filesystem::directory_options::skip_permission_denied, ec))
+    {
+        if (!entry.is_regular_file(ec))
+        {
+            continue;
+        }
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".gltf" || ext == ".glb")
+        {
+            assets.push_back(entry.path());
+        }
+        else if (ext == ".json" && entry.path().stem().extension() == ".scene")
+        {
+            descriptors.push_back(entry.path());
+        }
+    }
+    std::sort(assets.begin(), assets.end());
+    std::sort(descriptors.begin(), descriptors.end());
+
+    // Descriptors FIRST, so a multi-file scene claims its name before the bare-glTF pass runs and
+    // the members of that scene do not also appear as standalone entries under the same name.
+    std::set<std::filesystem::path> claimed;
+    for (const std::filesystem::path& file : descriptors)
+    {
+        const std::optional<SceneDescriptor> d = read_descriptor(file);
+        if (!d)
+        {
+            continue;
+        }
+        // A descriptor whose assets are absent is skipped, not fatal — this is what lets a
+        // sponza.scene.json ship in the repo while the assets it names stay gitignored.
+        std::error_code mec;
+        const bool have_all = std::all_of(d->models.begin(), d->models.end(),
+                                          [&](const std::filesystem::path& p) {
+                                              return std::filesystem::exists(p, mec);
+                                          });
+        if (!have_all)
+        {
+            STRING_LOG_INFO("[content] '{}' skipped — its assets are not present", d->name);
+            continue;
+        }
+        for (const std::filesystem::path& m : d->models)
+        {
+            claimed.insert(m);
+        }
+        if (!d->camera.empty())
+        {
+            // Same lever STRING_CAM feeds, so a descriptor camera and the env override are the one
+            // mechanism. First descriptor with a camera wins; later ones do not stomp it.
+            if (::string::render::cv_camera_pose().get().empty())
+                ::string::render::cv_camera_pose().set(d->camera);
+        }
+        if (d->kind == "shader")
+        {
+            // Same pass shape as the `ui` scene — a fullscreen pass then the UI overlay, and no
+            // PostProcessPass, which IS the post bypass. The error overlay rides on that UI pass,
+            // so a shader that does not compile still has somewhere to report itself.
+            const std::filesystem::path shader =
+                d->shader.empty() ? std::filesystem::path{} : d->shader;
+            registry.add(d->name,
+                         d->description.empty() ? "Shader: " + file.filename().string()
+                                                : d->description,
+                         [atlas, shader](String::engine_context& ctx) -> String::RenderPlan::Setup {
+                const std::filesystem::path path =
+                    shader.empty() ? ctx.resources_path / "shaders" / "shadertoy_default.slang"
+                                   : shader;
+                auto toy = std::make_unique<::string::render::ShaderToyPass>(ctx, path);
+                auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
+                auto dbg_panels = std::make_shared<debug::DebugPanels>();
+                auto uip_owned = std::make_unique<UIPass>(
+                    ctx, atlas,
+                    make_ui_author(std::make_shared<MeshOverlayStats>(), dbg_panels, 0, ui_slot),
+                    make_ui_observer(ui_slot),
+                    make_deferred_author(ui_slot));
+                String::Pass* toyp = toy.get();
+                String::Pass* uip = uip_owned.get();
+                String::RenderPlan::Setup s;
+                s.passes.push_back(std::move(toy));
+                s.passes.push_back(std::move(uip_owned));
+                s.author = [toyp, uip](String::FrameGraph& fg) {
+                    author_pass(fg, toyp).finish();
+                    author_pass(fg, uip).finish();
+                };
+                return s;
+            }, {}, /*from_content=*/true);
+            continue;
+        }
+
+        registry.add(d->name, d->description.empty() ? "Content: " + file.filename().string()
+                                                     : d->description,
+                     [atlas, np_stress, models = d->models](String::engine_context& ctx)
+                       -> String::RenderPlan::Setup {
+            auto mesh_stats = std::make_shared<MeshOverlayStats>();
+            auto geo = std::make_unique<GeometryPass>(ctx, models, mesh_stats);
+            return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas,
+                                       static_cast<std::size_t>(np_stress));
+        }, d->models, /*from_content=*/true);
+    }
+
+    // Drop assets a descriptor already composes, so sponza's three files do not also show up as
+    // three separate one-file scenes.
+    std::erase_if(assets, [&](const std::filesystem::path& p) { return claimed.contains(p); });
+
+    for (const std::filesystem::path& asset : assets)
+    {
+        const std::string name = asset.stem().string();
+        // A name collision would silently replace an earlier scene (SceneRegistry::add replaces on
+        // duplicate), so qualify with the parent folder — two `scene.gltf` files in different dirs
+        // are a completely normal way for an artist to organise work.
+        const std::string unique = registry.find(name) == nullptr
+                                 ? name
+                                 : asset.parent_path().filename().string() + "/" + name;
+        registry.add(unique, "Content: " + asset.filename().string(),
+                     [atlas, np_stress, asset](String::engine_context& ctx)
+                       -> String::RenderPlan::Setup {
+            // NOTE: marked from_content below so a rescan can drop and re-add it.
+            auto mesh_stats = std::make_shared<MeshOverlayStats>();
+            auto geo = std::make_unique<GeometryPass>(
+                ctx, std::vector<std::filesystem::path>{ asset }, mesh_stats);
+            return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas,
+                                       static_cast<std::size_t>(np_stress));
+        }, std::vector<std::filesystem::path>{ asset }, /*from_content=*/true);
+    }
+    STRING_LOG_INFO("[content] {} scene(s) discovered under {}", assets.size(), root.string());
+}
+
 }  // namespace
 
 String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
@@ -364,6 +618,10 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
     // Dynamic (grow-on-demand, Unicode) SDF atlas: glyphs rasterise on first sight, baked at a large
     // reference size (crisp small text), player-name-safe. Replaces the baked ASCII atlas (brief 05).
     auto atlas = std::make_shared<string::dynamic_font_atlas>(ttf);
+
+    // Content defaults to the resources dir's assets/ — where an existing checkout already keeps
+    // sponza. Must precede any ContentRoot::get(), which memoises on first call.
+    String::ContentRoot::set_default(resources_dir / "assets");
 
     String::SceneRegistry& registry = String::SceneRegistry::instance();
 
@@ -414,8 +672,8 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
         // levers work identically. Debug lines + UI ride along for the console/HUD.
         // Brief 09: the lookdev scene PINS MANUAL exposure by default (it is the EV100/material
         // calibration reference — auto-metering a sphere grid over grey would defeat that).
-        // setenv with overwrite=0: an explicit STRING_EXPOSURE_AUTO from the user still wins.
-        setenv("STRING_EXPOSURE_AUTO", "0", 0);
+        // set_env_default: an explicit STRING_EXPOSURE_AUTO from the user still wins.
+        ::string::core::set_env_default("STRING_EXPOSURE_AUTO", "0");
         registry.add("lookdev", "Material probe grid — roughness x metallic",
                      [atlas](String::engine_context& ctx) -> String::RenderPlan::Setup {
             auto mesh_stats = std::make_shared<MeshOverlayStats>();
@@ -425,33 +683,59 @@ String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
         });
     }
 
-    // Default: the full Sponza scene (which draws its own procedural sky background), then debug lines +
-    // the UI overlay + post. Main + curtains + ivy share one world space and merge into a single draw
-    // set; the curtains exercise the brief-04 two-sided/blend material paths on real content.
     const int np_stress = std::max(0, cv_ui_nameplates().get());
-    registry.add("sponza", "Sponza — full scene, meshlets, CSM, GI",
-                 [atlas, np_stress](String::engine_context& ctx) -> String::RenderPlan::Setup {
-        auto mesh_stats = std::make_shared<MeshOverlayStats>();
-        auto geo = std::make_unique<GeometryPass>(ctx,
-            std::vector<std::filesystem::path>{
-                "assets/sponza/main/NewSponza_Main_glTF_003.gltf",
-                "assets/sponza/curtains/NewSponza_Curtains_glTF.gltf",
-                "assets/sponza/ivy/NewSponza_IvyGrowth_glTF.gltf",
-            },
-            mesh_stats);
-        return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas,
-                                   static_cast<std::size_t>(np_stress));
+
+    // Sponza is no longer registered in code: it is `assets/sponza.scene.json`, discovered by the
+    // same scan as anything the user drops in. That is deliberate — it is the proof the data path
+    // is real rather than a second-class route beside a hardcoded one. The descriptor ships; the
+    // assets it names stay gitignored, and a descriptor whose files are absent is simply skipped.
+
+    // Content scenes: `.scene.json` descriptors (several files merged into one world) plus every
+    // bare glTF, which needs no descriptor at all — drop the asset in and it is in the menu.
+    register_content_scenes(registry, atlas, np_stress);
+
+    // Install the same scan as the rescan hook, so "Rescan content" in the Scene menu picks up an
+    // asset dropped in while the engine is running. The closure outlives this function by design —
+    // it captures only the shared atlas and an int.
+    registry.set_rescan([atlas, np_stress] {
+        // instance() rather than a captured reference: the local `registry` here is a reference
+        // variable that dies with this function, even though it binds a singleton.
+        register_content_scenes(String::SceneRegistry::instance(), atlas, np_stress);
     });
 
-    // `STRING_SCENE` is now a LOOKUP, not a branch. An unknown name falls back to the default rather
-    // than failing: a typo should cost you the scene you asked for, not the session.
+    // Texture cook. Lives here rather than in the engine because it needs the asset-tools library,
+    // and string-core deliberately does not link it. Blocking — see cook_scene_textures_for.
+    registry.set_cook([resources_dir](const String::SceneRegistry::Scene& scene) {
+        const uint32_t chunk_budget =
+            static_cast<uint32_t>(std::max(0, ::string::render::cv_chunk_budget().get()));
+        STRING_LOG_INFO("[cook] '{}': {} asset(s) — the engine will be unresponsive until this "
+                        "finishes", scene.name, scene.assets.size());
+        ::string::render::cook_scene_textures_for(resources_dir, scene.assets, chunk_budget);
+    });
+
+    // `STRING_SCENE` is a LOOKUP, not a branch. An unknown name falls back rather than failing: a
+    // typo should cost you the scene you asked for, not the session.
+    //
+    // The fallback chain ends at "ui" because it is the only scene guaranteed to exist — it needs no
+    // assets at all. Falling back to sponza was what made an assetless clone unable to start.
     const std::string requested = cv_scene().get();
     const String::SceneRegistry::Scene* selected = registry.find(requested);
     if (selected == nullptr)
     {
-        if (!requested.empty() && requested != "sponza")
-            STRING_LOG_WARN("Unknown scene '{}' — falling back to 'sponza'", requested);
-        selected = registry.find("sponza");
+        // "demo" is the historical default value of the cvar and means "sponza if you have it".
+        if (requested == "demo")
+        {
+            selected = registry.find("sponza");
+        }
+        else if (!requested.empty())
+        {
+            STRING_LOG_WARN("Unknown scene '{}' — is it under the content root ({})?",
+                            requested, String::ContentRoot::get().string());
+        }
+        if (selected == nullptr)
+        {
+            selected = registry.find("ui");
+        }
     }
 
     String::RenderPlan plan;

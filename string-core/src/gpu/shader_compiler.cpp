@@ -5,9 +5,14 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
+#include <type_traits>
+#include <utility>
 
-#include <slang-com-helper.h>
+#ifndef STRING_NO_SLANG
+    #include <slang-com-helper.h>
+#endif
 
 #include <string/core/logger.hpp>
 #include <string/core/profiler.hpp>
@@ -51,8 +56,14 @@ std::optional<std::string> read_text_file(const std::filesystem::path& path)
 // compiler and reused across compiles (search dirs are fixed for the process lifetime).
 uint64_t hash_import_closure(const std::vector<std::filesystem::path>& search_dirs)
 {
-    // Collect (path, content) for every .slang under each search dir, sorted by path.
-    std::vector<std::filesystem::path> files;
+    // Collect (name, absolute) for every .slang under each search dir. `name` is the path RELATIVE
+    // to its search dir, in generic (forward-slash) form.
+    //
+    // Relative, not absolute, and generic, not native: the key must be LOCATION-INDEPENDENT so a
+    // cache baked at package time still hits after the user unzips somewhere else — and
+    // platform-independent so a cache baked on Linux hits on Windows. Hashing the absolute native
+    // path silently missed every entry when the same files moved directory.
+    std::vector<std::pair<std::string, std::filesystem::path>> files;
     for (const auto& dir : search_dirs)
     {
         std::error_code ec;
@@ -69,18 +80,25 @@ uint64_t hash_import_closure(const std::vector<std::filesystem::path>& search_di
             }
             if (it->is_regular_file(ec) && it->path().extension() == ".slang")
             {
-                files.push_back(it->path());
+                std::error_code rel_ec;
+                std::filesystem::path rel = std::filesystem::relative(it->path(), dir, rel_ec);
+                if (rel_ec || rel.empty())
+                {
+                    rel = it->path().filename();
+                }
+                files.emplace_back(rel.generic_string(), it->path());
             }
         }
     }
-    std::sort(files.begin(), files.end());
+    // Sort by the relative name so ordering does not depend on install location either.
+    std::sort(files.begin(), files.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
 
     uint64_t h = fnv1a("import-closure", 14);
-    for (const auto& f : files)
+    for (const auto& [name, path] : files)
     {
-        const std::string s = f.string();
-        h = fnv1a(s.data(), s.size(), h);
-        if (const std::optional<std::string> text = read_text_file(f))
+        h = fnv1a(name.data(), name.size(), h);
+        if (const std::optional<std::string> text = read_text_file(path))
         {
             h = fnv1a(text->data(), text->size(), h);
         }
@@ -88,6 +106,7 @@ uint64_t hash_import_closure(const std::vector<std::filesystem::path>& search_di
     return h;
 }
 
+#ifndef STRING_NO_SLANG
 // Slang's stage enum -> the Vulkan stage bit. Only the stages the engine uses are mapped.
 VkShaderStageFlagBits to_vk_stage(SlangStage stage)
 {
@@ -140,22 +159,179 @@ std::optional<VkDescriptorType> to_vk_descriptor_type(slang::TypeReflection* typ
             return std::nullopt;
     }
 }
+#endif  // STRING_NO_SLANG
+
+// --- Program cache (SPIR-V + reflection) -----------------------------------------------------
+//
+// The cache stores the WHOLE compile result, not just SPIR-V, so a hit needs no Slang at all —
+// entry-point names, stages and the reflected layout all come back from disk. That is what lets a
+// warm cache skip creating the global session, and is the groundwork for shipping without Slang.
+//
+// Format is little-endian POD; `pImmutableSamplers` is deliberately not stored because the reflector
+// only ever emits nullptr (see the reflection loop below) and a pointer could not round-trip.
+
+constexpr uint32_t kProgramCacheMagic = 0x47525053;  // "SPRG"
+constexpr uint32_t kProgramCacheVersion = 1;
+
+template <typename T>
+void put(std::string& buf, const T& v)
+{
+    static_assert(std::is_trivially_copyable_v<T>);
+    buf.append(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+
+// Reads a T and advances `at`; false if the buffer is too short (truncated/corrupt cache).
+template <typename T>
+[[nodiscard]] bool get(const std::string& buf, size_t& at, T& out)
+{
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (at + sizeof(T) > buf.size()) return false;
+    std::memcpy(&out, buf.data() + at, sizeof(T));
+    at += sizeof(T);
+    return true;
+}
+
+void write_program_cache(const std::filesystem::path& file, const compiled_program& program)
+{
+    std::string buf;
+    put(buf, kProgramCacheMagic);
+    put(buf, kProgramCacheVersion);
+
+    put(buf, static_cast<uint32_t>(program.stages.size()));
+    for (const compiled_stage& s : program.stages)
+    {
+        put(buf, static_cast<uint32_t>(s.stage));
+        put(buf, static_cast<uint32_t>(s.entry_point.size()));
+        buf.append(s.entry_point);
+        put(buf, static_cast<uint32_t>(s.spirv.size()));
+        buf.append(reinterpret_cast<const char*>(s.spirv.data()), s.spirv.size() * sizeof(uint32_t));
+    }
+
+    put(buf, static_cast<uint32_t>(program.layout.sets.size()));
+    for (const auto& set : program.layout.sets)
+    {
+        put(buf, static_cast<uint32_t>(set.size()));
+        for (const VkDescriptorSetLayoutBinding& b : set)
+        {
+            put(buf, b.binding);
+            put(buf, static_cast<uint32_t>(b.descriptorType));
+            put(buf, b.descriptorCount);
+            put(buf, static_cast<uint32_t>(b.stageFlags));
+        }
+    }
+
+    put(buf, static_cast<uint32_t>(program.layout.has_push_constant ? 1 : 0));
+    put(buf, static_cast<uint32_t>(program.layout.push_constant.stageFlags));
+    put(buf, program.layout.push_constant.offset);
+    put(buf, program.layout.push_constant.size);
+
+    // Write-then-rename: a crash mid-write must not leave a truncated file that still parses.
+    std::filesystem::path tmp = file;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        if (!out) return;
+        out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+        if (!out) return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, file, ec);
+    if (ec) std::filesystem::remove(tmp, ec);
+}
+
+std::optional<compiled_program> read_program_cache(const std::filesystem::path& file)
+{
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return std::nullopt;
+    const std::string buf{ std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>() };
+
+    size_t at = 0;
+    uint32_t magic = 0, version = 0;
+    if (!get(buf, at, magic) || !get(buf, at, version)) return std::nullopt;
+    if (magic != kProgramCacheMagic || version != kProgramCacheVersion) return std::nullopt;
+
+    compiled_program program;
+
+    uint32_t stage_count = 0;
+    if (!get(buf, at, stage_count)) return std::nullopt;
+    for (uint32_t i = 0; i < stage_count; ++i)
+    {
+        uint32_t stage = 0, name_len = 0, word_count = 0;
+        if (!get(buf, at, stage) || !get(buf, at, name_len)) return std::nullopt;
+        if (at + name_len > buf.size()) return std::nullopt;
+        std::string name = buf.substr(at, name_len);
+        at += name_len;
+        if (!get(buf, at, word_count)) return std::nullopt;
+        if (at + static_cast<size_t>(word_count) * sizeof(uint32_t) > buf.size()) return std::nullopt;
+        std::vector<uint32_t> spirv(word_count);
+        std::memcpy(spirv.data(), buf.data() + at, static_cast<size_t>(word_count) * sizeof(uint32_t));
+        at += static_cast<size_t>(word_count) * sizeof(uint32_t);
+        program.stages.push_back({ static_cast<VkShaderStageFlagBits>(stage), std::move(name),
+                                   std::move(spirv) });
+    }
+
+    uint32_t set_count = 0;
+    if (!get(buf, at, set_count)) return std::nullopt;
+    program.layout.sets.resize(set_count);
+    for (uint32_t s = 0; s < set_count; ++s)
+    {
+        uint32_t binding_count = 0;
+        if (!get(buf, at, binding_count)) return std::nullopt;
+        for (uint32_t b = 0; b < binding_count; ++b)
+        {
+            uint32_t binding = 0, type = 0, count = 0, stages = 0;
+            if (!get(buf, at, binding) || !get(buf, at, type) || !get(buf, at, count) ||
+                !get(buf, at, stages))
+            {
+                return std::nullopt;
+            }
+            program.layout.sets[s].push_back({
+                .binding = binding,
+                .descriptorType = static_cast<VkDescriptorType>(type),
+                .descriptorCount = count,
+                .stageFlags = stages,
+                .pImmutableSamplers = nullptr,
+            });
+        }
+    }
+
+    uint32_t has_pc = 0, pc_stages = 0, pc_offset = 0, pc_size = 0;
+    if (!get(buf, at, has_pc) || !get(buf, at, pc_stages) || !get(buf, at, pc_offset) ||
+        !get(buf, at, pc_size))
+    {
+        return std::nullopt;
+    }
+    program.layout.has_push_constant = has_pc != 0;
+    program.layout.push_constant = { pc_stages, pc_offset, pc_size };
+
+    if (program.stages.empty()) return std::nullopt;
+    return program;
+}
 
 }  // namespace
 
 shader_compiler::shader_compiler(std::filesystem::path cache_dir,
-                                 std::vector<std::filesystem::path> search_dirs)
+                                 std::vector<std::filesystem::path> search_dirs,
+                                 std::filesystem::path prebuilt_cache_dir)
 : cache_dir_(std::move(cache_dir))
+, prebuilt_cache_dir_(std::move(prebuilt_cache_dir))
 , search_dirs_(std::move(search_dirs))
 {
-    if (SLANG_FAILED(slang::createGlobalSession(global_session_.writeRef())))
-    {
-        throw std::runtime_error("shader_compiler: failed to create Slang global session");
-    }
+    // NOTE: the Slang global session is created lazily (ensure_global_session), not here. A run
+    // whose shaders all hit the program cache never touches Slang at all.
     std::error_code ec;
     std::filesystem::create_directories(cache_dir_, ec);
     import_closure_hash_ = hash_import_closure(search_dirs_);
 }
+
+#ifndef STRING_NO_SLANG
+bool shader_compiler::ensure_global_session()
+{
+    const std::lock_guard lock(global_session_mutex_);
+    if (global_session_) return true;
+    return !SLANG_FAILED(slang::createGlobalSession(global_session_.writeRef()));
+}
+#endif
 
 shader_compiler::~shader_compiler() = default;
 
@@ -167,6 +343,52 @@ std::optional<compiled_program> shader_compiler::compile(const std::filesystem::
     if (!source)
     {
         out_error = { source_path, "shader_compiler: could not read source file" };
+        return std::nullopt;
+    }
+
+    // --- Cache key: hash of the top file's source text, seeded with the schema version AND the
+    // import-closure hash (every importable .slang in the search dirs). Folding the closure in means
+    // editing an imported module (meshlet.slang, lighting.slang, ...) invalidates the cached result
+    // at startup, not just for live-watched top files.
+    //
+    // Computed BEFORE any Slang call so a hit costs one file read and no compiler at all. Bump the
+    // schema when compile options change the emitted SPIR-V or the cache encoding changes.
+    constexpr uint64_t kCacheSchemaVersion = 6;
+    const uint64_t seed = fnv1a(&import_closure_hash_, sizeof(import_closure_hash_),
+                                fnv1a(&kCacheSchemaVersion, sizeof(kCacheSchemaVersion)));
+    const uint64_t hash = fnv1a(source->data(), source->size(), seed);
+    char key[32];
+    std::snprintf(key, sizeof(key), "%016llx", static_cast<unsigned long long>(hash));
+    const std::string cache_name = std::string(key) + ".program";
+    const std::filesystem::path program_cache_file = cache_dir_ / cache_name;
+
+    // Writable cache first, then the read-only one shipped with the package.
+    if (std::optional<compiled_program> cached = read_program_cache(program_cache_file))
+    {
+        return cached;
+    }
+    if (!prebuilt_cache_dir_.empty())
+    {
+        if (std::optional<compiled_program> cached =
+                read_program_cache(prebuilt_cache_dir_ / cache_name))
+        {
+            return cached;
+        }
+    }
+
+#ifdef STRING_NO_SLANG
+    // Ship build: no compiler linked. A miss means the package's prebuilt cache does not match these
+    // shader sources — almost always a packaging error (cache not regenerated after a shader edit),
+    // so say that rather than emitting a bare "compile failed".
+    out_error = { source_path,
+        "shader_compiler: no cached program for this shader and this build has no compiler "
+        "(-Dslang=disabled). The prebuilt cache is missing or stale for key " + std::string(key) +
+        " — regenerate it with a slang-enabled build." };
+    return std::nullopt;
+#else
+    if (!ensure_global_session())
+    {
+        out_error = { source_path, "shader_compiler: failed to create Slang global session" };
         return std::nullopt;
     }
 
@@ -286,18 +508,6 @@ std::optional<compiled_program> shader_compiler::compile(const std::filesystem::
         }
     }
 
-    // --- Cache key: hash of the top file's source text, seeded with the schema version AND the
-    // import-closure hash (every importable .slang in the search dirs). Folding the closure in means
-    // editing an imported module (meshlet.slang, lighting.slang, ...) invalidates the cached SPIR-V
-    // at startup, not just for live-watched top files. ---
-    // Bump when compile options change the emitted SPIR-V (cached blobs are keyed on source only).
-    constexpr uint64_t kCacheSchemaVersion = 4;
-    const uint64_t seed = fnv1a(&import_closure_hash_, sizeof(import_closure_hash_),
-                                fnv1a(&kCacheSchemaVersion, sizeof(kCacheSchemaVersion)));
-    const uint64_t hash = fnv1a(source->data(), source->size(), seed);
-    char key[32];
-    std::snprintf(key, sizeof(key), "%016llx", static_cast<unsigned long long>(hash));
-
     compiled_program program;
     program.stages.reserve(static_cast<size_t>(entry_point_count));
 
@@ -308,47 +518,20 @@ std::optional<compiled_program> shader_compiler::compile(const std::filesystem::
         const VkShaderStageFlagBits stage = to_vk_stage(ep_refl->getStage());
         const std::string ep_name = ep_refl->getName();
 
-        const std::filesystem::path cache_file =
-            cache_dir_ / (std::string(key) + "." + ep_name + ".spv");
-
-        std::vector<uint32_t> spirv;
-        // Try the disk cache first (keyed by content hash + entry point).
-        if (std::ifstream in(cache_file, std::ios::binary); in)
+        Slang::ComPtr<slang::IBlob> spirv_blob;
+        Slang::ComPtr<slang::IBlob> diagnostics;
+        const SlangResult r = linked->getEntryPointCode(
+            i, 0, spirv_blob.writeRef(), diagnostics.writeRef());
+        if (SLANG_FAILED(r) || !spirv_blob)
         {
-            in.seekg(0, std::ios::end);
-            const auto size = in.tellg();
-            in.seekg(0);
-            if (size > 0 && (size % 4) == 0)
-            {
-                spirv.resize(static_cast<size_t>(size) / 4);
-                in.read(reinterpret_cast<char*>(spirv.data()), size);
-            }
+            out_error = { source_path,
+                diagnostics ? static_cast<const char*>(diagnostics->getBufferPointer())
+                            : "shader_compiler: SPIR-V generation failed" };
+            return std::nullopt;
         }
-
-        if (spirv.empty())
-        {
-            Slang::ComPtr<slang::IBlob> spirv_blob;
-            Slang::ComPtr<slang::IBlob> diagnostics;
-            const SlangResult r = linked->getEntryPointCode(
-                i, 0, spirv_blob.writeRef(), diagnostics.writeRef());
-            if (SLANG_FAILED(r) || !spirv_blob)
-            {
-                out_error = { source_path,
-                    diagnostics ? static_cast<const char*>(diagnostics->getBufferPointer())
-                                : "shader_compiler: SPIR-V generation failed" };
-                return std::nullopt;
-            }
-            const size_t bytes = spirv_blob->getBufferSize();
-            spirv.resize(bytes / 4);
-            std::memcpy(spirv.data(), spirv_blob->getBufferPointer(), bytes);
-
-            // Write-through to the cache (best effort; a failed write just costs a recompile).
-            if (std::ofstream out(cache_file, std::ios::binary); out)
-            {
-                out.write(reinterpret_cast<const char*>(spirv.data()),
-                          static_cast<std::streamsize>(spirv.size() * 4));
-            }
-        }
+        const size_t bytes = spirv_blob->getBufferSize();
+        std::vector<uint32_t> spirv(bytes / 4);
+        std::memcpy(spirv.data(), spirv_blob->getBufferPointer(), bytes);
 
         program.stages.push_back({ stage, ep_name, std::move(spirv) });
     }
@@ -409,7 +592,10 @@ std::optional<compiled_program> shader_compiler::compile(const std::filesystem::
         }
     }
 
+    // Write-through (best effort; a failed write just costs a recompile next run).
+    write_program_cache(program_cache_file, program);
     return program;
+#endif  // STRING_NO_SLANG
 }
 
 }  // namespace string::gpu

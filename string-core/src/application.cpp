@@ -1,5 +1,8 @@
 #include <string/application.hpp>
 #include <string/vulkan/scene_registry.hpp>
+#include <string/vulkan/content_root.hpp>
+#include <string/core/cvar.hpp>
+#include <string/core/logger.hpp>
 #include <string/core/signals.hpp>
 #include <algorithm>
 #include <cstdio>
@@ -71,6 +74,51 @@ void Application::run() {
                 }
             }
             ++frame;
+        }
+
+        // `content.root <dir>` from the console: validate + persist the user's content folder.
+        // Polled rather than hooked because CVar has no change callback; a string compare per frame
+        // is free next to the work below. Applying it live would mean re-registering every scene
+        // while one is loaded, so set() deliberately only persists and asks for a restart.
+        {
+            static std::string last_seen = cv_content_root().get();
+            if (const std::string now = cv_content_root().get(); now != last_seen)
+            {
+                last_seen = now;
+                if (!now.empty())
+                {
+                    if (std::string err; !ContentRoot::set(now, err))
+                    {
+                        STRING_LOG_WARN("[content] {}", err);
+                    }
+                }
+            }
+        }
+
+        // `content.cook <scene>` — the same texture cook the Scene menu offers, reachable from the
+        // console and headlessly (a menu click is not, which is how this gets gated). Blocking, by
+        // design; cleared after firing so it runs once per request rather than every frame.
+        {
+            static string::core::CVar<std::string> cook_scene{
+                "content.cook", "",
+                "cook a scene's textures to KTX2/BC7 (blocking, minutes). Name, or empty for none."};
+            // Seeded from the env ONCE, read directly rather than via the cvar's env alias: this
+            // cvar is constructed on the first poll, which is after the registry's env sweep, so
+            // the alias would never see it (same trap as ContentRoot).
+            static const bool seeded = [] {
+                if (const char* e = std::getenv("STRING_CONTENT_COOK"); e != nullptr && *e != '\0')
+                {
+                    cook_scene.set(e);
+                }
+                return true;
+            }();
+            (void)seeded;
+            if (const std::string want = cook_scene.get(); !want.empty())
+            {
+                cook_scene.set("");
+                SceneRegistry::instance().cook(want == "*" ? SceneRegistry::instance().active()
+                                                          : std::string_view{ want });
+            }
         }
 
         // Scene switching happens HERE — between frames, never inside one. A UI click or console

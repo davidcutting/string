@@ -283,6 +283,25 @@ void DebugPanels::author_menu_bar(::string::ui::Ui& u)
             m.item(u.format("{} {} — {}", active ? "*" : " ", scene.name, scene.description),
                    [name = scene.name] { ::String::SceneRegistry::instance().request(name); });
         }
+        // Pick up an asset dropped into the content folder without restarting. Cheap (a directory
+        // walk), so it is a plain item rather than anything staged.
+        if (registry.can_rescan())
+        {
+            m.separator();
+            m.item("Rescan content folder",
+                   [] { ::String::SceneRegistry::instance().rescan(); });
+        }
+        // Cooking is minutes of BC7 encoding and blocks the frame loop, so it is deliberately an
+        // explicit action on the ACTIVE scene, labelled with what it costs.
+        if (registry.can_cook())
+        {
+            const ::String::SceneRegistry::Scene* act = registry.find(registry.active());
+            if (act != nullptr && !act->assets.empty())
+            {
+                m.item(u.format("Cook textures for '{}' (slow, freezes)", act->name),
+                       [name = act->name] { ::String::SceneRegistry::instance().cook(name); });
+            }
+        }
     });
 
     bar.menu("Debug", [&](Menu& m) {

@@ -25,6 +25,17 @@ std::string env_name_for(std::string_view cvar_name)
     return out;
 }
 
+bool set_env_default(const char* name, const char* value)
+{
+    if (std::getenv(name) != nullptr) return false;
+#if defined(_WIN32)
+    // No setenv on Windows. _putenv_s always overwrites, hence the getenv guard above.
+    return _putenv_s(name, value) == 0;
+#else
+    return ::setenv(name, value, /*overwrite=*/0) == 0;
+#endif
+}
+
 namespace
 {
 // Trim ASCII whitespace both ends — env values and console tokens can carry stray spaces.

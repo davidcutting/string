@@ -6,6 +6,7 @@
 #include <string/core/logger.hpp>
 
 #include <string/core/cvar.hpp>
+#include <string/core/user_dirs.hpp>
 #include <string/client/theme.hpp>
 #include <string/debug/debug_cvars.hpp>
 #include <string/render/render_cvars.hpp>
@@ -19,11 +20,25 @@ namespace
 // Resolve the resources root (which contains a `shaders/` directory, and at runtime an
 // `assets/` one):
 //   1. $STRING_RESOURCES_DIR if set (the Nix package wraps the binary to point here),
-//   2. else $XDG_CONFIG_HOME/string, else $HOME/.config/string.
+//   2. else BESIDE THE EXECUTABLE, if that looks like a resources root,
+//   3. else $XDG_CONFIG_HOME/string, else $HOME/.config/string,
+//   4. else the working directory.
+//
+// Step 2 is what makes a distributed build work. The XDG/HOME steps are POSIX-shaped: on Windows
+// HOME is normally unset (it is USERPROFILE), so without it a shipped build fell through to the
+// working directory and only ran when launched from its own folder — a desktop shortcut or "Open
+// with" sets a different cwd and the shaders would not be found. Probing for `shaders/` rather than
+// just taking the exe dir keeps a dev build (exe in build/, resources elsewhere) on its old path.
 std::filesystem::path resolve_resources_directory()
 {
     if (const char* env = std::getenv("STRING_RESOURCES_DIR"))
         return env;
+
+    std::error_code ec;
+    const std::filesystem::path beside = string::core::executable_dir();
+    if (!beside.empty() && std::filesystem::is_directory(beside / "shaders", ec))
+        return beside;
+
     if (const char* xdg = std::getenv("XDG_CONFIG_HOME"))
         return std::filesystem::path(xdg) / "string";
     if (const char* home = std::getenv("HOME"))

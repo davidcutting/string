@@ -11,9 +11,22 @@ cpu_family = 'x86_64'
 cpu = 'x86_64'
 endian = 'little'
 
+# LOAD-BEARING: meson does not propagate the cross toolchain into CMake subprojects. Without this,
+# CMake probes with the NATIVE compiler while passing Windows link flags, and fastgltf dies at
+# "compile a simple test program" (ld.bfd: unrecognized option '--major-image-version').
 [cmake]
 CMAKE_SYSTEM_NAME = 'Windows'
 CMAKE_SYSTEM_PROCESSOR = 'x86_64'
 CMAKE_C_COMPILER = 'x86_64-w64-mingw32-gcc'
 CMAKE_CXX_COMPILER = 'x86_64-w64-mingw32-g++'
 CMAKE_RC_COMPILER = 'x86_64-w64-mingw32-windres'
+# [built-in options] below do NOT reach CMake subprojects — restated here so ktx sees the shim too.
+CMAKE_CXX_FLAGS = '-I@DIRNAME@/wincompat'
+CMAKE_C_FLAGS = '-I@DIRNAME@/wincompat'
+
+[built-in options]
+# KTX's lib/astc_codec.cpp includes <Windows.h>; mingw ships windows.h and Linux is case-sensitive.
+# tools/wincompat/Windows.h forwards to it. A plain CXXFLAGS= does nothing — meson bakes flags at
+# configure time — so it has to be here.
+cpp_args = ['-I@DIRNAME@/wincompat']
+c_args = ['-I@DIRNAME@/wincompat']

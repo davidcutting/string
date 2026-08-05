@@ -67,6 +67,7 @@ render_lib = static_library(
         'src/post_pass.cpp',
         'src/ui_pass.cpp',
         'src/ui_background_pass.cpp',
+        'src/shadertoy_pass.cpp',
         'src/debug_line_pass.cpp',
         'src/grid_2d_pass.cpp',
         'src/render_cvars.cpp',

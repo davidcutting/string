@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 #include <string/gpu/device.hpp>
+#include <string/gpu/vk_check.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 #include <string/gpu/command_recorder.hpp>
@@ -60,9 +61,13 @@ bool device::is_device_suitable(const VkPhysicalDevice& device) {
     }
 
     // Set up feature query
+    VkPhysicalDeviceRobustness2FeaturesEXT robustness2_features{};
+    robustness2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
+    robustness2_features.pNext = nullptr;
+
     VkPhysicalDeviceDynamicRenderingFeatures dynamic_rendering_features{};
     dynamic_rendering_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
-    dynamic_rendering_features.pNext = nullptr;
+    dynamic_rendering_features.pNext = &robustness2_features;
 
     // Task + mesh shader stages (brief 03 meshlet pipeline). Queried here, required below.
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shader_features{};
@@ -106,7 +111,10 @@ bool device::is_device_suitable(const VkPhysicalDevice& device) {
         && vulkan12_features.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE
         && vulkan12_features.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE
         && vulkan12_features.descriptorBindingStorageImageUpdateAfterBind == VK_TRUE
-        && vulkan12_features.descriptorBindingVariableDescriptorCount == VK_TRUE;
+        && vulkan12_features.descriptorBindingVariableDescriptorCount == VK_TRUE
+        // nullDescriptor: required so a released bindless slot can be nulled rather than left
+        // dangling at a destroyed resource (descriptor_table::unbind).
+        && robustness2_features.nullDescriptor == VK_TRUE;
 
     // And the arrays must be large enough for the table's advertised capacities.
     VkPhysicalDeviceDescriptorIndexingProperties indexing_props{};
@@ -317,8 +325,21 @@ void device::create_logical_device()
     }
 
     // Only enable the features we want, and there are many:
+    // nullDescriptor makes a VK_NULL_HANDLE descriptor legal: reads return zero, writes are
+    // discarded. descriptor_table::unbind writes one into every released image slot so the set
+    // never carries a view of a destroyed resource (see descriptor_allocator.cpp).
+    // Diagnostic-only; chained ahead of robustness2 and harmless when the extension is absent.
+    VkPhysicalDeviceFaultFeaturesEXT fault_features{};
+    fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+    fault_features.deviceFault = VK_TRUE;
+
+    VkPhysicalDeviceRobustness2FeaturesEXT robustness2_features{};
+    robustness2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
+    robustness2_features.nullDescriptor = VK_TRUE;
+
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT extended_dynamic_state2_features{};
     extended_dynamic_state2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
+    extended_dynamic_state2_features.pNext = &robustness2_features;
     extended_dynamic_state2_features.extendedDynamicState2 = VK_TRUE;
 
     // Task + mesh shader stages (brief 03 meshlet pipeline). vkCmdDrawMeshTasksEXT + the
@@ -415,9 +436,23 @@ void device::create_logical_device()
             {
                 enabled_extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
                 calibrated_timestamps_enabled_ = true;
-                break;
+            }
+            // VK_EXT_device_fault: on VK_ERROR_DEVICE_LOST this reports the FAULTING GPU ADDRESS and
+            // access type, turning "the device died somewhere" into a specific address. Optional —
+            // not every driver implements it — and diagnostic-only, so it never gates creation.
+            if (std::string(ext.extensionName) == VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
+            {
+                enabled_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+                device_fault_enabled_ = true;
             }
         }
+    }
+
+    // Chain the fault feature only once we know the extension is enabled — feeding a driver a
+    // feature struct for an extension it does not have is invalid. Probed above, chained here.
+    if (device_fault_enabled_)
+    {
+        robustness2_features.pNext = &fault_features;
     }
 
     // clang-format off
@@ -445,6 +480,12 @@ void device::create_logical_device()
     }
 
     volkLoadDevice(device_);
+
+    // Hand the fault reporter the device, so a DEVICE_LOST anywhere can name the faulting address.
+    // After volkLoadDevice: vkGetDeviceFaultInfoEXT is a device-level entry point.
+    ::string::gpu::vk_set_fault_device(device_, device_fault_enabled_);
+    STRING_LOG_INFO("GPU fault reporting (VK_EXT_device_fault): {}",
+                    device_fault_enabled_ ? "available" : "NOT available on this driver");
 
     // The queue set now exists; expose it as named lanes (1:1, capability-derived).
     build_submission_lanes();

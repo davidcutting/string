@@ -13,3 +13,12 @@ option('tests', type: 'boolean', value: false,
 # The profiler viewer is a separate tool (nixpkgs `tracy` in the dev shell).
 option('tracy', type: 'boolean', value: false,
        description: 'Enable the Tracy profiler client')
+
+# Link the Slang shader compiler.
+#   enabled  - default; shaders compile at runtime, hot-reload and the Shadertoy REPL work
+#   disabled - SHIP MODE: the Slang path is compiled out entirely and shaders are served only from
+#              the prebuilt program cache. Drops ~33MB of DLLs from a Windows package. A cache miss
+#              becomes a hard error, so the package MUST carry a cache warmed by an enabled build
+#              (see docs/off-nix-build.md).
+option('slang', type: 'feature', value: 'enabled',
+       description: 'Link Slang for runtime shader compilation (disable for a cache-only ship build)')

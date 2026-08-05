@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <string/core/cache_dir.hpp>
+#include <string/gpu/vk_check.hpp>
 #include <string/core/cvar.hpp>
 #include <string/core/png_writer.hpp>
 #include <string/debug_draw.hpp>
@@ -118,9 +119,13 @@ Renderer::Renderer(const ApplicationInfo& application_info, std::shared_ptr<Wind
 , file_watcher_(shader_jobs_)
 // Cache lives under the per-user cache dir (the resources/shaders tree may be read-only, e.g.
 // the Nix store); it is content-hash keyed so a stale entry is simply never hit.
+// `shadercache/` beside the shaders is the READ-ONLY cache a package ships (see
+// docs/off-nix-build.md); it is what a -Dslang=disabled build runs from. Absent in a dev tree,
+// which is harmless — it is only consulted after the writable cache misses.
 , shader_compiler_(
     string::core::user_cache_dir("shaders"),
-    { std::filesystem::path(application_info.resources_directory) / "shaders" })
+    { std::filesystem::path(application_info.resources_directory) / "shaders" },
+    std::filesystem::path(application_info.resources_directory) / "shadercache")
 , shader_registry_(device_, shader_compiler_, file_watcher_, shader_jobs_)
 , composite_pass_(device_, allocator_, global_descriptor_table_, std::filesystem::path(application_info.resources_directory), presenter_.get_format(), shader_registry_)
 {
@@ -264,8 +269,13 @@ void Renderer::build_scene(const RenderPlan& plan, engine_context& ctx, VkExtent
         scene_author_ = std::move(setup.author);
     }
 
-    // Brief 09: the passes exist now — notify the ones that consume the resolved HDR target
-    // (bind_composite_source() already bound it into the table before the plan ran).
+    // Rebind the composite's HDR source. It is bound at init and on resize, but NOT on a scene
+    // load — and composite_pass_ is renderer-owned, so it is excluded from the scene_passes_ loop
+    // below that does exactly this for everything else. Idempotent: a no-op when the target
+    // survived the switch, and the fix when it did not.
+    bind_composite_source();
+
+    // Brief 09: the passes exist now — notify the ones that consume the resolved HDR target.
     {
         const uint32_t color_slot = global_descriptor_table_.get_binding_slot(
             color_attachment_, string::gpu::descriptor_type::TEXTURE);
@@ -325,7 +335,7 @@ void Renderer::load_scene(const RenderPlan& plan)
     // does not flush those, so they would be submitted after their destination was destroyed.
     transfer_batch_.wait_idle();
     // Now nothing in flight may still reference what is about to be destroyed.
-    vkDeviceWaitIdle(device_.get_device());
+    ::string::gpu::vk_report(vkDeviceWaitIdle(device_.get_device()), "vkDeviceWaitIdle(load_scene teardown)");
 
     // Drop the passes FIRST: their destructors unbind bindless slots and destroy their resources, and
     // they must do that while the allocator, table and device are all still alive (the same ordering
@@ -417,7 +427,7 @@ void Renderer::init_gpu_profiler()
 Renderer::~Renderer()
 {
     STRING_LOG_DEBUG("Waiting for device to be idle...");
-    vkDeviceWaitIdle(device_.get_device());
+    ::string::gpu::vk_report(vkDeviceWaitIdle(device_.get_device()), "vkDeviceWaitIdle(build_scene)");
 
     // Tear down the per-lane Tracy GPU contexts (no-op when profiling is off) before the device
     // goes away. gpu_profiler_ctx_ aliases the main lane's context — don't double-destroy it.
@@ -517,10 +527,63 @@ void Renderer::begin_frame()
         .pSemaphores = &frame_semaphore_,
         .pValues = &frame.frame_id,
     };
-    vkWaitSemaphores(device_.get_device(), &wait_info, UINT64_MAX);
+    // Bounded, not UINT64_MAX, purely so a stall is DIAGNOSABLE. These two cases look identical from
+    // the outside (frozen window, black screen, driver reset) but have opposite causes:
+    //
+    //   - this wait TIMES OUT  -> the CPU is blocked on a timeline value the GPU never signalled:
+    //                             a missed/mismatched signal, i.e. a synchronisation bug of ours.
+    //   - this wait RETURNS ok -> the CPU is running fine and the GPU is chewing on work that never
+    //                             finishes: a shader hang / oversized dispatch, and the driver's
+    //                             watchdog is what kills us.
+    //
+    // VK_EXT_device_fault reports "no fault" for BOTH, so this is the cheapest way to tell them
+    // apart on a machine we cannot attach a debugger to. Five seconds is well past the ~2s Windows
+    // TDR threshold, so a real hang trips TDR first and this only fires on a genuine CPU-side stall.
+    constexpr uint64_t kFrameWaitTimeoutNs = 5'000'000'000ull;
+    if (const VkResult wr = vkWaitSemaphores(device_.get_device(), &wait_info, kFrameWaitTimeoutNs);
+        wr == VK_TIMEOUT)
+    {
+        uint64_t reached = 0;
+        vkGetSemaphoreCounterValue(device_.get_device(), frame_semaphore_, &reached);
+        STRING_LOG_CRITICAL("FRAME WAIT STALLED: waiting for main timeline value {} but the GPU has "
+                            "only reached {} after 5s. The CPU is blocked on a signal that never "
+                            "came — a synchronisation bug, NOT a GPU hang (a hang would trip the "
+                            "driver watchdog instead). frame_count={} slot={}",
+                            frame.frame_id, reached, frame_count_, current_frame_);
+    }
+    else
+    {
+        ::string::gpu::vk_report(wr, "vkWaitSemaphores(frame pacing)");
+    }
 
     frame.garbage_collector.flush();
     main_recorder(current_frame_).reset();
+
+    // Acquire the swapchain image for this frame, unconditionally and exactly once.
+    //
+    // This used to be LATE-LATCHED — deferred into record_frame until the composite group needed
+    // it — to buy CPU run-ahead so the async-compute submit could overlap the previous frame. That
+    // optimisation cost far more than it bought. end_frame's main submit ALWAYS waits on
+    // acquired_wait_semaphore_ and record_frame ALWAYS transitions acquired_image_ to Present, so
+    // the whole design rested on an invariant ("the composite group always runs") that was implicit,
+    // unenforced, and false often enough to matter. When it broke, the frame waited on a BINARY
+    // semaphore belonging to an earlier frame that had already been waited on and consumed — a wait
+    // that can never be satisfied. The submit then sits in the queue forever: the CPU runs ahead,
+    // the GPU stalls on the oldest submitted frame, and begin_frame blocks with
+    //   "waiting for main timeline value N but the GPU has only reached N-1"
+    // while VK_EXT_device_fault reports no fault, because nothing is hung — it is waiting.
+    //
+    // Acquiring here makes that unrepresentable: one acquire, one fresh semaphore, always waited,
+    // always presented. No idempotence flag, no conditional wait lists, no frame that presents an
+    // image it never drew. The lost overlap is recoverable later (and is worth measuring before
+    // being reintroduced); correctness is not negotiable in the same way.
+    {
+        string::gpu::acquired_image acquired = presenter_.acquire_next_frame();
+        acquired_image_ = acquired.image;
+        acquired_image_view_ = acquired.image_view;
+        acquired_wait_semaphore_ = acquired.wait_for_image_available;
+        acquired_signal_semaphore_ = acquired.signal_when_ready_to_present;
+    }
 
     // Shader hot-reload, at the frame boundary (GPU work for this slot has completed — see the
     // semaphore wait above). Poll the file watcher for edits, then apply any completed recompiles:
@@ -913,7 +976,8 @@ void Renderer::record_frame()
                 .signalSemaphoreInfoCount = 1,
                 .pSignalSemaphoreInfos = &async_signal,
             };
-            if (vkQueueSubmit2(lane.vk_queue, 1, &async_submit, nullptr) != VK_SUCCESS)
+            if (const VkResult r = vkQueueSubmit2(lane.vk_queue, 1, &async_submit, nullptr);
+                !::string::gpu::vk_report(r, "vkQueueSubmit2(async compute)"))
                 throw std::runtime_error("failed to submit async compute command buffer");
             submissions_.mark_signaled(async_lane_, frame_count_);
 
@@ -1033,16 +1097,9 @@ void Renderer::record_frame()
     // the swapchain, and the fresh image/view is latched before any swapchain command is recorded.
     // Copy the handles out of string::gpu::acquired_image (which holds references into vectors
     // resize() reallocates).
-    bool swapchain_acquired = false;
-    const auto acquire_swapchain = [&] {
-        if (swapchain_acquired) return;
-        swapchain_acquired = true;
-        string::gpu::acquired_image acquired = presenter_.acquire_next_frame();
-        acquired_image_ = acquired.image;
-        acquired_image_view_ = acquired.image_view;
-        acquired_wait_semaphore_ = acquired.wait_for_image_available;
-        acquired_signal_semaphore_ = acquired.signal_when_ready_to_present;
-    };
+    // The swapchain image was acquired unconditionally in begin_frame — see the note there for why
+    // the late-latch version was removed. acquired_image_ / _view_ / the two semaphores are already
+    // valid and belong to THIS frame.
 
     size_t start = 0;
     bool seen_msaa_group = false;   // has a COLOR_TARGET group already cleared the MSAA targets?
@@ -1099,7 +1156,7 @@ void Renderer::record_frame()
         const string::gpu::resource_id group_color = color_target_of(order[start]);
         // First (and only) group targeting the screen: latch the swapchain image now, before the
         // group's transitions/attachment info dereference image_of/image_view_of(SWAPCHAIN_TARGET).
-        if (group_color == string::gpu::SWAPCHAIN_TARGET) acquire_swapchain();
+        // (swapchain image already acquired in begin_frame)
         std::optional<string::gpu::resource_id> group_depth;
         size_t end = start;
         while (end < order.size() && color_target_of(order[end]) == group_color)
@@ -1255,9 +1312,9 @@ void Renderer::record_frame()
         start = end;
     }
 
-    // The swapchain was rendered by the final group; ready it for presentation. (Defensive: a
-    // plan with no screen-targeting group would reach here without having latched an image.)
-    acquire_swapchain();
+    // The swapchain image was acquired in begin_frame and rendered by the final group; ready it
+    // for presentation. No acquire here: exactly one acquire per frame, done up front.
+
     resource_states_.transition(command_buffer, acquired_image_, VK_IMAGE_ASPECT_COLOR_BIT,
         Access::Present, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 
@@ -1451,7 +1508,8 @@ void Renderer::end_frame()
         .pSignalSemaphoreInfos = signal_semaphore_infos
     };
 
-    if (vkQueueSubmit2(graphics_queue_.queue, 1, &submit_info, nullptr) != VK_SUCCESS)
+    if (const VkResult r = vkQueueSubmit2(graphics_queue_.queue, 1, &submit_info, nullptr);
+        !::string::gpu::vk_report(r, "vkQueueSubmit2(graphics)"))
     {
         throw std::runtime_error("failed to submit draw command buffer!");
     }

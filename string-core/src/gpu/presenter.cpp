@@ -7,6 +7,7 @@
 #include <string/core/logger.hpp>
 #include <string/gpu/presenter.hpp>
 #include <string/gpu/queue.hpp>
+#include <string/gpu/vk_check.hpp>
 
 #include <volk.h>
 
@@ -195,6 +196,7 @@ auto presenter::acquire_next_frame() -> acquired_image
             resize(extent_);
             continue;
         }
+        ::string::gpu::vk_report(result, "vkAcquireNextImageKHR");
         throw std::runtime_error("Failed to acquire swapchain image!");
     }
     throw std::runtime_error("Failed image acquisition after retries: " + std::to_string(max_acquisition_attempts));
@@ -229,6 +231,7 @@ void presenter::present()
     }
     else if (result != VK_SUCCESS)
     {
+        ::string::gpu::vk_report(result, "vkQueuePresentKHR");
         throw std::runtime_error("Failed to present swapchain image!");
     }
 

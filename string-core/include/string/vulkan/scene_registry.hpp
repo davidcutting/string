@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -34,13 +35,42 @@ public:
         std::string name;           // stable id, matches STRING_SCENE / dbg.scene
         std::string description;    // one line, for the UI
         RenderPlan::ConfigureFn configure;
+        // Source assets this scene loads, when it has any (content scenes and sponza). Empty for
+        // scenes with nothing on disk behind them (ui, lookdev). Used by the texture cook.
+        std::vector<std::filesystem::path> assets;
+        // Discovered by scanning the user's content folder, rather than registered in code. Only
+        // these are dropped by a rescan — built-ins (ui, lookdev, sponza) must survive one.
+        bool from_content = false;
     };
 
     static SceneRegistry& instance();
 
     // Registration order is preserved — it is the order a UI lists them in, so the app controls it.
     // Re-registering a name REPLACES it, so a scene can be overridden without unregistering first.
-    void add(std::string name, std::string description, RenderPlan::ConfigureFn configure);
+    void add(std::string name, std::string description, RenderPlan::ConfigureFn configure,
+             std::vector<std::filesystem::path> assets = {}, bool from_content = false);
+
+    // --- rescan ----------------------------------------------------------------------------------
+    // Re-run content discovery so an asset dropped in while the engine is running shows up without a
+    // restart. The registry cannot scan anything itself (it deliberately knows nothing about assets),
+    // so the app installs the scanner and the UI just asks for it.
+    using RescanFn = std::function<void()>;
+    void set_rescan(RescanFn fn) { rescan_ = std::move(fn); }
+    [[nodiscard]] bool can_rescan() const noexcept { return static_cast<bool>(rescan_); }
+
+    // --- texture cook ----------------------------------------------------------------------------
+    // Cook a scene's textures to KTX2/BC7 so later loads stream blocks instead of decoding PNGs.
+    // Installed by the app for the same layering reason as the scanner: the registry knows nothing
+    // about assets or cooking. BLOCKING and slow (minutes) — see cook_scene_textures_for.
+    using CookFn = std::function<void(const Scene&)>;
+    void set_cook(CookFn fn) { cook_ = std::move(fn); }
+    [[nodiscard]] bool can_cook() const noexcept { return static_cast<bool>(cook_); }
+    // No-op when the name is unknown, no cooker is installed, or the scene has no source assets
+    // (ui/lookdev/shader scenes) — asking to cook those is not an error, there is just nothing to do.
+    void cook(std::string_view name);
+    // Drops content scenes and re-runs the scanner. The ACTIVE scene is kept whatever happens —
+    // dropping the configure function of the scene currently on screen would strand a later reload.
+    void rescan();
 
     [[nodiscard]] const std::vector<Scene>& scenes() const noexcept { return scenes_; }
     // Null when absent. The caller decides what a missing scene means — the sandbox falls back to its
@@ -73,6 +103,8 @@ private:
     std::vector<Scene> scenes_;
     std::string active_;
     std::string pending_;
+    RescanFn rescan_;
+    CookFn cook_;
 };
 
 }  // namespace String

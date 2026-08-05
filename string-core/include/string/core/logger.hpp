@@ -1,10 +1,10 @@
 #pragma once
 
-#include <print>
 #include <format>
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <source_location>
 #include <string>
 #include <string_view>
@@ -146,8 +146,16 @@ private:
             message = fmt.get();
         }
 
-        std::println("[{}] [{}] {}",
-                    timestamp, level_str, message);
+        // NOT std::println: its unicode-terminal path needs std::__open_terminal /
+        // std::__write_to_terminal, which mingw's libstdc++ does not provide, so every binary fails
+        // to link when cross-compiling to Windows. The message is already formatted here, so
+        // println was only doing the write. Cost is losing println's UTF-16 console handling on
+        // Windows; log lines are ASCII.
+        std::fputs(std::format("[{}] [{}] {}\n", timestamp, level_str, message).c_str(), stdout);
+        // Explicit flush: stdout is block-buffered when redirected to a file or pipe, which is how
+        // every capture/gate script runs the engine. Without this the last lines before a crash —
+        // exactly the ones worth having — are lost in the unflushed buffer.
+        std::fflush(stdout);
 
         // Mirror into the in-engine console ring (brief 06). Timestamp trimmed to HH:MM:SS to keep
         // the console line short; severity is carried structurally for colouring.

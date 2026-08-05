@@ -9,7 +9,8 @@ test_files = [
     'shader_compiler_test.cpp',
     'cvar_test.cpp',
     'debug_draw_test.cpp',
-    'input_map_test.cpp'
+    'input_map_test.cpp',
+    'scene_registry_test.cpp'
 ]
 
 test_dep = [
