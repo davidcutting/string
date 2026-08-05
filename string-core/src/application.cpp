@@ -40,8 +40,14 @@ Application::~Application()
 
 void Application::run() {
     const auto start = std::chrono::steady_clock::now();
-    // Cap at 60fps
-    const auto period = std::chrono::duration<double>(1 / 60);
+    // Cap at 60fps.
+    //
+    // 1.0 / 60.0, NOT 1 / 60 — the latter is integer division and yields a ZERO period, which makes
+    // `(now - start) / period` a divide-by-zero (+inf), `(inf + 1) * period` a NaN, and the NaN ->
+    // integral-duration conversion in `start + ...` undefined. libstdc++'s sleep_until shrugs and
+    // returns immediately (symptom: no frame cap, invisible); MSVC's STL spins in its retry loop
+    // forever and the app hangs at 100% CPU immediately after frame 1 presents.
+    const auto period = std::chrono::duration<double>(1.0 / 60.0);
 
     while (application_running_ && !g_signal_quit.load())
     {

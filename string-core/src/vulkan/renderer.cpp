@@ -360,6 +360,17 @@ void Renderer::load_scene(const RenderPlan& plan)
     // "reserve() after materialize()".
     resources_.reset_transients();
 
+    // Every image the outgoing scene owned has just been destroyed. The tracker keys images by RAW
+    // VkImage HANDLE, and the driver reuses handle values — so without this the incoming scene's
+    // fresh images inherit the dead scene's tracked layout. The consequences are silent and fatal:
+    // transition()'s "pure read in the current layout" fast path (resource_state.cpp) sees a layout
+    // that already matches and emits NO barrier at all, so the first frame of the new scene samples
+    // an image that is really still UNDEFINED. On a driver that compresses colour targets (RDNA2's
+    // DCC) that means reading compression metadata which was never initialised — garbage output, and
+    // a shader fault that takes the queue down with it. handle_resize has always done this, for the
+    // same reason and with the same comment; load_scene destroys strictly more and did not.
+    resource_states_.clear();
+
     const VkExtent2D extent = presenter_.get_extent();
     engine_context ctx{
         device_,
@@ -550,6 +561,28 @@ void Renderer::begin_frame()
                             "came — a synchronisation bug, NOT a GPU hang (a hang would trip the "
                             "driver watchdog instead). frame_count={} slot={}",
                             frame.frame_id, reached, frame_count_, current_frame_);
+        // EVERY lane, not just main. A stall here is nearly always a cross-lane edge: the main
+        // submit waits on another lane's timeline at a value that lane never signalled, so main
+        // never starts and its own timeline never advances. Printing only the main value shows
+        // the symptom and hides the cause.
+        for (uint32_t i = 0; i < submissions_.lane_count(); ++i)
+        {
+            uint64_t v = 0;
+            vkGetSemaphoreCounterValue(device_.get_device(), submissions_.timeline(i), &v);
+            STRING_LOG_CRITICAL("  lane '{}': timeline reached {}, last value we submitted was {}",
+                                submissions_.lane(i).name, v, submissions_.last_signaled(i));
+        }
+
+        // Do NOT fall through. Everything below this point — flushing the frame's garbage collector,
+        // resetting the frame slot's command pool, acquiring with this slot's binary semaphore —
+        // assumes the GPU is DONE with this slot. On a timeout it demonstrably is not, so proceeding
+        // destroys resources that are still being read, resets a command buffer that is still
+        // pending, and reuses a semaphore that still has operations outstanding. That is what turns a
+        // recoverable stall into VK_ERROR_DEVICE_LOST a few frames later, with the original cause
+        // long gone from the log. Keep waiting instead: either the work lands and we continue
+        // correctly, or the device is genuinely lost and we get told so.
+        const VkResult wr2 = vkWaitSemaphores(device_.get_device(), &wait_info, UINT64_MAX);
+        ::string::gpu::vk_report(wr2, "vkWaitSemaphores(frame pacing, after stall)");
     }
     else
     {
@@ -1464,7 +1497,15 @@ void Renderer::end_frame()
             .pNext = nullptr,
             .semaphore = acquired_wait_semaphore_,
             .value = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            // ALL_COMMANDS, not COLOR_ATTACHMENT_OUTPUT. The first thing this submit does to the
+            // acquired image is a LAYOUT TRANSITION, and a layout transition is a write that the
+            // barrier may execute in any stage — in particular before COLOR_ATTACHMENT_OUTPUT. With
+            // the narrower wait stage there is no execution dependency between the presentation
+            // engine's read of that image and our transition writing it, which syncval reports as
+            // SYNC-HAZARD-WRITE-AFTER-READ against vkAcquireNextImageKHR. Widening the wait is the
+            // cheap half of the fix (validation's own hint (c)): the wait sits at the head of the
+            // submit regardless, so nothing is serialised that was not already.
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             .deviceIndex = 0
         }
     };

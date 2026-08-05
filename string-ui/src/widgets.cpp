@@ -819,7 +819,9 @@ void ColorPicker::emit()
         // each gets a derived id, and the adapter binding converts between the 0-255 byte and the
         // float the slider speaks.
         const auto channel = [&](Ui& cu, std::string_view suffix, int which) {
-            slider(cu, cu.own(base + suffix),
+            // std::string + std::string_view is P2591 (C++26) and MSVC's STL has not shipped it,
+            // so materialise the view rather than relying on the operator.
+            slider(cu, cu.own(base + std::string(suffix)),
                    binding<float>{
                        [this, which] {
                            const string::color c = value_.get();

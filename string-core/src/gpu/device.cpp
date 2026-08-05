@@ -470,10 +470,10 @@ void device::create_logical_device()
     };
     // clang-format on
 
-#ifdef STRING_DEBUG
-    create_info.enabledLayerCount = static_cast<uint32_t>(validation_layers.size());
-    create_info.ppEnabledLayerNames = validation_layers.data();
-#endif
+    // NO device layers. VkDeviceCreateInfo::enabledLayerCount must be 0 (VUID-...-12384): device
+    // layers have been non-functional since Vulkan 1.0 and are deprecated. The validation layer is
+    // enabled at INSTANCE creation (driver.cpp), which is what actually takes effect; setting it
+    // here only produced a validation error of its own on every startup.
 
     if (vkCreateDevice(physical_device_, &create_info, nullptr, &device_) != VK_SUCCESS) {
         throw std::runtime_error("failed to create logical device!");
