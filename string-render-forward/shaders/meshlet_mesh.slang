@@ -58,6 +58,23 @@ struct Payload
 };
 groupshared Payload payload;
 
+// Survivor ballot for the payload compaction below — one bit per thread, so kTaskGroup must stay
+// <= 32 (it is 32; the payload arrays are sized by it too).
+//
+// This replaces WavePrefixCountBits/WaveActiveCountBits, which were WRONG IN PRINCIPLE here. Those
+// are SUBGROUP-scoped (they compile to OpGroupNonUniformBallot* with Subgroup scope), but `slot`
+// indexes a WORKGROUP-shared payload array and `total` is the workgroup's mesh-dispatch count. The
+// two only agree while the entire workgroup happens to live in one subgroup, which nothing in the
+// shader or the pipeline declares or enforces: this codebase asks for numthreads(32) while an
+// RDNA2 device reports subgroupSize=64 (minSubgroupSize=32, maxSubgroupSize=64), and a driver is
+// free to schedule that differently. If a subgroup were ever narrower than the workgroup, each
+// subgroup would compute slots from zero — overlapping payload writes — and DispatchMesh would be
+// handed a per-subgroup count instead of the workgroup's.
+//
+// A groupshared ballot is workgroup-scoped by construction. Bit i is thread i, so the slot order is
+// identical to the lane-ordered prefix count it replaces and payload contents are unchanged.
+groupshared uint gs_task_ballot;
+
 // LOD-relative meshlet id -> global meshlet id, for the draw's selected LOD.
 uint global_meshlet_id(DrawInfo di, uint lod, uint local)
 {
@@ -68,6 +85,11 @@ uint global_meshlet_id(DrawInfo di, uint lod, uint local)
 [numthreads(kTaskGroup)]
 void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint draw : SV_DrawIndex)
 {
+    // Clear the survivor ballot before anyone votes. Safe as a group-uniform barrier: task_main has
+    // no early return, so every thread reaches this.
+    if (tid == 0) gs_task_ballot = 0u;
+    GroupMemoryBarrierWithGroupSync();
+
     // Brief 04c: the expand compute wrote a compacted {draw_index, lod} record per surviving draw;
     // SV_DrawIndex is the index into records[] (shaderDrawParameters enabled). LOD histogram lives in
     // the cull compute (once per draw), so it is NOT written here.
@@ -179,9 +201,12 @@ void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint draw : 
         }
     }
 
-    // Compact survivors into the payload with a wave/prefix count.
-    uint slot = WavePrefixCountBits(survive);
-    uint total = WaveActiveCountBits(survive);
+    // Compact survivors into the payload with a WORKGROUP-scoped ballot (see gs_task_ballot).
+    if (survive) InterlockedOr(gs_task_ballot, 1u << tid);
+    GroupMemoryBarrierWithGroupSync();
+    const uint ballot = gs_task_ballot;
+    const uint slot = countbits(ballot & ((1u << tid) - 1u));   // exclusive prefix == lane order
+    const uint total = countbits(ballot);
     if (survive) payload.meshlet_ids[slot] = global_id;
 
     DispatchMesh(total, 1, 1, payload);

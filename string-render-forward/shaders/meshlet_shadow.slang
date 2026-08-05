@@ -30,11 +30,19 @@ struct Push
 
 struct Payload { uint meshlet_ids[kTaskGroup]; uint draw_index; };
 groupshared Payload payload;
+// Survivor ballot for the payload compaction (one bit per thread, so kTaskGroup must stay <= 32).
+// Workgroup-scoped on purpose — see the long note on gs_task_ballot in meshlet_mesh.slang for why
+// WavePrefixCountBits/WaveActiveCountBits are the wrong scope for a workgroup-shared payload.
+groupshared uint gs_task_ballot;
 
 [shader("amplification")]
 [numthreads(kTaskGroup)]
 void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint draw : SV_DrawIndex)
 {
+    // Clear the survivor ballot before anyone votes (task_main has no early return, so uniform).
+    if (tid == 0) gs_task_ballot = 0u;
+    GroupMemoryBarrierWithGroupSync();
+
     DrawRecord rec = pc.records.records[draw];
     uint draw_index = rec.draw_index;
     DrawInfo di = pc.draws.draws[draw_index];
@@ -60,8 +68,11 @@ void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint draw : 
         survive = sphere_in_frustum(planes, center_ws, ml.radius * smax);
     }
 
-    uint slot = WavePrefixCountBits(survive);
-    uint total = WaveActiveCountBits(survive);
+    if (survive) InterlockedOr(gs_task_ballot, 1u << tid);
+    GroupMemoryBarrierWithGroupSync();
+    const uint ballot = gs_task_ballot;
+    const uint slot = countbits(ballot & ((1u << tid) - 1u));   // exclusive prefix == lane order
+    const uint total = countbits(ballot);
     if (survive) payload.meshlet_ids[slot] = global_id;
     DispatchMesh(total, 1, 1, payload);
 }

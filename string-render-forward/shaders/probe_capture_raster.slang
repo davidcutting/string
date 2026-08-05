@@ -99,11 +99,18 @@ groupshared Payload payload;
 // compute them ONCE per workgroup into groupshared instead of 6x per meshlet per thread (a ~32x cut
 // in the dominant cull arithmetic — the "why is the bake heavy" fix). 6 faces x 6 planes.
 groupshared float4 gs_planes[6][6];
+// Survivor ballot for the payload compaction (one bit per thread, so kTaskGroup must stay <= 32).
+// Workgroup-scoped on purpose — see the long note on gs_task_ballot in meshlet_mesh.slang for why
+// WavePrefixCountBits/WaveActiveCountBits are the wrong scope for a workgroup-shared payload.
+groupshared uint gs_task_ballot;
 
 [shader("amplification")]
 [numthreads(kTaskGroup)]
 void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID)
 {
+    // Clear the survivor ballot; the barrier below (for gs_planes) publishes it to the workgroup.
+    if (tid == 0) gs_task_ballot = 0u;
+
     // Cooperatively build the 6 face frusta: threads 0..5 each own one face.
     if (tid < 6)
     {
@@ -153,8 +160,11 @@ void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID)
         }
     }
 
-    uint slot = WavePrefixCountBits(survive);
-    uint total = WaveActiveCountBits(survive);
+    if (survive) InterlockedOr(gs_task_ballot, 1u << tid);
+    GroupMemoryBarrierWithGroupSync();
+    const uint ballot = gs_task_ballot;
+    const uint slot = countbits(ballot & ((1u << tid) - 1u));   // exclusive prefix == lane order
+    const uint total = countbits(ballot);
     if (survive)
     {
         payload.meshlet_ids[slot] = global_id;
