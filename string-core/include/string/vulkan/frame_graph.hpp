@@ -1,426 +1,437 @@
 #pragma once
 
-// Brief 11 — fluent render-graph authoring facade (the top-level API shape locked 2026-07-25).
+// Brief 20 — the render graph. Two states, one declaration channel.
 //
-// This sits ON TOP of the existing planner (graph_plan.hpp: PlanBuilder/GraphPlan) and
-// lowers to the SAME `ResourceUsage` vocabulary the executor already consumes (resource_usage.hpp)
-// — one model, shared. It adds what the planner lacks and the brief-11 vision needs:
+//   BUILDING   frame_graph      declare passes (data + a recording callback) and resources
+//   COMPILED   compiled_frame   toposorted, transients packed, groups derived; execute against it
 //
-//   - Fluent Daxa-style authoring:  fg.pass("x").reads(a).writes(b).toggle(cv).compute(fn)
-//   - Lean typed resource handles over resource_id — NO generation counter (brief 11 decision:
-//     timeline semaphores already guard the critical GPU-lifetime sync; keep it lean).
-//   - Per-pass enable/disable (.toggle) with the GRACEFUL-DEGRADE fallback policy: a disabled
-//     producer does NOT skip its consumers — optional reads bind a neutral fallback resource
-//     (cleared to a value that cancels), and ONLY reads marked .requires() transitively skip.
-//     (This is what makes debug pass-toggling behave: shadows off -> lit scene, not black.)
+// A pass IS its declaration: a name, what it touches, and one callback. There is no pass base class,
+// no second hand-written usage channel, no resource_id in pass code and no pipeline-stage masks in
+// pass code. The graph derives ordering, barriers, layouts, attachment load/store/resolve and queue
+// placement from what was declared — that is the whole point of declaring.
 //
-// SCOPE — FIRST INCREMENT (this file): the authoring + compile layer (ordering, enable/disable,
-// fallback classification), unit-tested WITHOUT a GPU. Deliberately out of scope here, tracked as
-// follow-on milestones in docs/briefs/11-pipeline-modularity.md:
-//   * resource *allocation* — image()/buffer() currently mint LOGICAL handles only; physical
-//     backing wires to the allocator + FrameScratch later.
-//   * *execution* — feeding CompiledFrame into the Renderer's frame loop (replacing the imperative
-//     Pass::usages + record() hooks) and the persistent compile+invalidate plan.
+// AUTHORED ONCE, COMPILED ONCE. A toggle is an in-graph conditional evaluated at execute; a resize
+// swaps resource BACKING and re-sizes viewport-scaled transients. Neither re-authors and neither
+// re-plans, so there is no recompile trigger and nothing needs a re-runnable author callback.
 //
-// Naming (reconciled, brief 11): ONE author-facing graph — `FrameGraph` (this file, the fluent
-// builder + compiler). It lowers onto the internal planner in graph_plan.hpp: a `PlanBuilder`
-// produces a `GraphPlan` (the plan = adjacency / toposort / lifetimes). So the vocabulary is
-// FrameGraph (public) -> PlanBuilder -> GraphPlan (plan), with `CompiledFrame::plan` a GraphPlan.
-// No competing "*Graph"/"*Builder" names remain.
+// The app owns the graph object and every declaration in it; the library owns what is DERIVED from
+// the graph rather than declared in it — swapchain acquire, resize, queue placement and present.
 
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include <string/gpu/command_recorder.hpp>
-#include <string/gpu/pass_context.hpp>
 #include <string/gpu/resource.hpp>
-#include <string/vulkan/graph_plan.hpp>
+#include <string/vulkan/resource_state.hpp>
 #include <string/vulkan/resource_usage.hpp>
 
 #include <volk.h>
 
-namespace String
+namespace String { struct engine_context; }
+
+namespace string
 {
 
-// Brief 16 M7: the graph layer identifies resources by raw `resource_id` — its identity was always a
-// resource_id, and the old phantom-typed `Handle<Image>/Handle<Buffer>` only wrapped one with a kind
-// tag. That typing job now lives one layer up on the real logical handles (`string::gpu::image`/
-// `buffer`, resource_registry.hpp); the graph doesn't need it. (`Handle<*>` retired.)
+class frame_graph;
+class compiled_frame;
+struct pass_context;
 
-enum class PassKind : std::uint8_t { Raster, Compute };
+// The pass body. One callback: the pass records its work through the context, which is also how it
+// resolves every handle it declared. There is no second entry point — a pass that needs two is two
+// passes, which is exactly what makes its edges derivable.
+using record_fn = std::function<void(pass_context&)>;
+// Re-evaluated at EXECUTE, every frame. Empty => always enabled. This is the in-graph conditional:
+// flipping it does not recompile anything.
+using enable_fn = std::function<bool()>;
+// Recomputes a viewport-derived size. Declared, not computed at author time — that is what lets a
+// resize be a backing swap instead of a re-author.
+using size_fn = std::function<VkDeviceSize(VkExtent2D)>;
 
-// The pass body. Brief 16 M1: takes a pass_context& (the execute-time surface — command_recorder +
-// registry + frame slot) instead of a bare (command_recorder&, frame). The executor builds one
-// pass_context per invocation; an authoring adapter that wraps a legacy Pass unpacks ctx.rec /
-// ctx.frame_slot, while a handle-native pass resolves its resources through ctx directly.
-using RecordFn = std::function<void(string::gpu::pass_context&)>;
+enum class pass_kind : std::uint8_t { raster, compute, transfer };
 
-// Toggle predicate: re-evaluated at compile time. Empty => always enabled. A CVar-bound bool is
-// wrapped into one of these by the caller (the debug-UI checkbox writes the same CVar — brief 14).
-using EnablePredicate = std::function<bool()>;
+// Where the graph may place a pass. `async` marks a dependency-free compute chain the scheduler puts
+// on an async compute lane when the hardware exposes one; on 1-lane hardware it records inline on the
+// main queue — same graph, serialized placement, no special cases.
+enum class pass_lane : std::uint8_t { main, async };
 
-// A prepass/compute body: returns true if it recorded work (mirrors Pass::record_compute).
-using ComputeFn = std::function<bool(string::gpu::pass_context&)>;
-// A dynamic yes/no query re-evaluated each frame (e.g. "does the async chain have work this frame?").
-using QueryFn = std::function<bool()>;
+// --- resource declarations ----------------------------------------------------------------------
 
-// A getter the graph calls to read a pass's current logical usages. Brief 16: this REPLACES the old
-// `usagesFrom(&pass->usages)` raw pointer into a pass's public member — the graph now reads usages
-// through an interface the pass controls (returns a stable reference; the graph never holds a pointer
-// into pass internals). The usages carry LOGICAL registry handles (ResourceUsage::buf/img); the
-// executor resolves the per-frame physical via ResourceUsage::resolve() — resolution is the graph's
-// single job, not the pass's.
-using UsagesFn = std::function<const std::vector<ResourceUsage>&()>;
-
-// The full RUNTIME surface of a pass — everything the executor needs to run it WITHOUT the Pass
-// interface. Callbacks close over the (stable) pass object. This retires the Pass* `source` bridge:
-// the executor drives passes as data + callbacks, not virtual dispatch. Any field may be empty/null
-// (a pass that only draws leaves record_compute null; a non-async pass leaves has_async null).
-struct PassExec
-{
-    bool compute_only = false;   // runs standalone in the group loop, after the scene resolve (post)
-    bool prepass_only = false;   // runs record_compute in the frame-top prepass, forms no group
-    RecordFn record;             // draw / compute-only body (group-loop record)
-    ComputeFn record_compute;    // frame-top prepass compute (null = none)
-    QueryFn has_async;           // dynamic async gate (null = never async)
-    RecordFn record_async;       // async chain body
-    UsagesFn usages;             // reads the pass's live logical usages (graph resolves physical)
-    UsagesFn async_usages;       // reads the pass's live async logical usages
-};
-
-// --- internal per-pass record (authoring intent, pre-compile) -----------------------------------
-struct FgRead
-{
-    string::gpu::resource_id resource;
-    Access access;
-    VkPipelineStageFlags2 stage;
-    bool required;   // .requires() -> transitive skip when the producer is disabled; else fallback
-};
-
-struct FgWrite
-{
-    string::gpu::resource_id resource;
-    Access access;
-    VkPipelineStageFlags2 stage;
-};
-
-struct FgPass
+// An externally-owned image: the owner allocates and destroys it, the graph manages its USAGE only.
+// One physical id, or one per frame-in-flight (a ring) — the graph resolves by slot either way, so a
+// ring is not a distinct lifetime, just a backing detail the owner chose.
+struct persistent_image_info
 {
     std::string name;
-    PassKind kind = PassKind::Raster;
-    std::vector<FgRead> reads;
-    std::vector<FgWrite> writes;
-    EnablePredicate enabled;   // empty => always on
-    RecordFn record;           // (legacy raster()/compute() body; the executor uses exec.record now)
-    PassExec exec;             // the runtime surface the executor drives (retires the Pass* bridge)
+    std::vector<gpu::resource_id> physical;
+    // Late-latched: the backing is not known until the frame acquires it (the reference doc's
+    // TaskImage::swapchain_image). The executor substitutes the acquired image at execute.
+    bool swapchain = false;
+    // The layout the owner's backing is ALREADY in when the graph first sees it. The graph cannot
+    // know this: a texture uploaded during construction is left in SHADER_READ_ONLY by a transfer
+    // that ran before any graph existed, and a tracker starting from UNDEFINED would transition
+    // with a discard and throw those contents away. Default UNDEFINED means "nothing in it yet",
+    // which is right for a target the graph will fully write before anything reads it.
+    VkImageLayout initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // What a consumer binds when this resource's producer is toggled off (graceful degrade). The
+    // neutral value is declared WITH the resource because only the resource knows what cancels:
+    // 1.0 for shadow/AO, black for an additive term.
+    VkClearColorValue neutral{};
 };
 
-// --- compile output -----------------------------------------------------------------------------
-struct CompiledPass
+struct persistent_buffer_info
 {
     std::string name;
-    PassKind kind;
-    // Lowered usages for the planner/executor. EXCLUDES fallback reads (they touch a neutral
-    // substitute, not the named resource, so they must not forge ordering edges).
-    std::vector<ResourceUsage> usages;
-    // Optional reads whose producer was disabled: the executor binds the resource's neutral
-    // fallback here instead of the real image/buffer (brief 11 graceful-degrade).
-    std::vector<string::gpu::resource_id> fallback_reads;
-    PassExec exec;   // the runtime surface (owned by value — callbacks close over the stable passes)
+    std::vector<gpu::resource_id> physical;
 };
 
-struct CompiledFrame
+// A frame-scoped image the graph allocates, owns and may alias against other transients whose
+// lifetimes do not overlap.
+struct transient_image_info
 {
-    std::vector<CompiledPass> passes;   // in toposorted execution order
-    GraphPlan plan;                   // planner output (adjacency / toposort / lifetimes)
+    std::string name;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkExtent3D extent{ 1, 1, 1 };
+    // Sized from the viewport rather than fixed: extent = viewport * scale, recomputed on resize
+    // without re-authoring. Declaring the RELATIONSHIP is what keeps the graph authored-once.
+    bool viewport_scaled = false;
+    float viewport_scale = 1.0f;
+    std::uint32_t mip_levels = 1;
+    std::uint32_t array_layers = 1;
+    bool cube = false;
+    VkImageUsageFlags usage = 0;
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    gpu::sampler_info sampler{};
+    VkClearColorValue neutral{};
+    // One physical per frame-in-flight. Needed only when a resource is read one frame after it is
+    // written (temporal reprojection); everything else is single-buffered and the graph derives the
+    // within-frame edge instead of spending memory on it.
+    bool per_frame = false;
 };
 
-// Brief 11 M4: introspection — a read-only snapshot of an AUTHORED pass, taken BEFORE the toggle-drop
-// so tooling (brief 14's pass panel) lists EVERY pass with its live enabled state + nature, including
-// the ones currently disabled. `enabled` is the toggle predicate evaluated live (false = dropped from
-// the compiled plan this frame). Pair with GpuProfiler::stats() (keyed by the same name) for timing.
-struct PassInfo
+struct transient_buffer_info
+{
+    std::string name;
+    VkDeviceSize bytes = 0;
+    // Declared viewport relationship (see transient_image_info::viewport_scaled). When set, `bytes`
+    // is recomputed by this function on resize.
+    size_fn bytes_for;
+    VkBufferUsageFlags usage = 0;
+    VmaMemoryUsage memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    VmaAllocationCreateFlags allocation_flags = 0;
+    bool per_frame = false;
+};
+
+// --- pass declaration ---------------------------------------------------------------------------
+
+struct pass_decl
+{
+    std::string name;
+    pass_kind kind = pass_kind::raster;
+    pass_lane lane = pass_lane::main;
+    std::vector<resource_use> uses;      // reads and writes; is_write(u.how) distinguishes them
+    std::vector<bool> required;          // parallel to `uses`: a .requires() read transitively skips
+    enable_fn enabled;                   // empty => always on
+    record_fn record;
+};
+
+// Fluent per-pass builder. The terminal raster()/compute()/transfer() sets the kind and the body and
+// appends the pass to the graph.
+class pass_spec
+{
+    frame_graph& graph_;
+    pass_decl building_;
+
+    static VkPipelineStageFlags2 main_stage(pass_kind kind);
+    // Fill any use declared without an explicit stage with the pass's main stage. Runs at the
+    // terminal, because that is the first moment the pass KIND is known.
+    void resolve_stages();
+    pass_spec& add(const resource_use& u, bool required);
+
+public:
+    pass_spec(frame_graph& g, std::string name) : graph_(g) { building_.name = std::move(name); }
+
+    // --- reads. Optional by default: if the producer is toggled off the pass still runs and binds
+    //     the resource's declared neutral fallback. Only .requires() propagates the skip. ----------
+    pass_spec& reads(gpu::image_view v);
+    pass_spec& reads(gpu::image i)  { return reads(i.whole()); }
+    pass_spec& reads(gpu::buffer b);
+    pass_spec& reads(gpu::image_view v, access how, VkPipelineStageFlags2 stage = 0);
+    pass_spec& reads(gpu::image i, access how, VkPipelineStageFlags2 stage = 0) { return reads(i.whole(), how, stage); }
+    pass_spec& reads(gpu::buffer b, access how, VkPipelineStageFlags2 stage = 0);
+
+    pass_spec& requires_(gpu::image_view v);
+    pass_spec& requires_(gpu::image i) { return requires_(i.whole()); }
+    pass_spec& requires_(gpu::buffer b);
+
+    // --- writes -----------------------------------------------------------------------------------
+    pass_spec& writes(gpu::image_view v);
+    pass_spec& writes(gpu::image i) { return writes(i.whole()); }
+    pass_spec& writes(gpu::buffer b);
+    pass_spec& writes(gpu::image_view v, access how, VkPipelineStageFlags2 stage = 0);
+    pass_spec& writes(gpu::image i, access how, VkPipelineStageFlags2 stage = 0) { return writes(i.whole(), how, stage); }
+    pass_spec& writes(gpu::buffer b, access how, VkPipelineStageFlags2 stage = 0);
+
+    // --- attachments. Load/store/resolve are DERIVED from the graph's lifetime facts, never
+    //     declared: the first writer clears, later writers load, the last before a resolve
+    //     resolves. ----------------------------------------------------------------------------
+    pass_spec& color(gpu::image_view v);
+    pass_spec& color(gpu::image i) { return color(i.whole()); }
+    pass_spec& depth(gpu::image_view v);
+    pass_spec& depth(gpu::image i) { return depth(i.whole()); }
+    pass_spec& depth_read(gpu::image_view v);
+    pass_spec& depth_read(gpu::image i) { return depth_read(i.whole()); }
+
+    // --- gating + placement -----------------------------------------------------------------------
+    pass_spec& toggle(enable_fn pred) { building_.enabled = std::move(pred); return *this; }
+    pass_spec& toggle(const bool* flag) { building_.enabled = [flag] { return *flag; }; return *this; }
+    pass_spec& async() { building_.lane = pass_lane::async; return *this; }
+
+    // --- terminal ---------------------------------------------------------------------------------
+    void raster(record_fn fn);
+    void compute(record_fn fn);
+    void transfer(record_fn fn);
+};
+
+// Read-only view of an authored pass, for tooling. Taken BEFORE the conditional is applied, so every
+// pass is listed with its live enabled state — including the ones currently off.
+struct pass_info
 {
     std::string_view name;
-    PassKind kind;
-    bool compute_only;
-    bool prepass_only;
+    pass_kind kind;
+    pass_lane lane;
     bool enabled;
 };
 
-class FrameGraph;
+// --- the graph (BUILDING) -----------------------------------------------------------------------
 
-// Fluent per-pass builder. reads/writes/requires/toggle configure the pass; raster()/compute()
-// finalize it (set kind + body) and append it to the graph.
-class PassSpec
+class frame_graph
 {
-    FrameGraph& graph_;
-    FgPass building_;
-
-    static constexpr VkPipelineStageFlags2 main_stage(PassKind kind)
-    {
-        return kind == PassKind::Compute ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
-                                         : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    }
-
-    void add_read(string::gpu::resource_id r, Access a, VkPipelineStageFlags2 s, bool required)
-    {
-        building_.reads.push_back({ r, a, s, required });
-    }
-
 public:
-    PassSpec(FrameGraph& graph, std::string name) : graph_(graph)
+    frame_graph() = default;
+    frame_graph(const frame_graph&) = delete;
+    frame_graph& operator=(const frame_graph&) = delete;
+
+    // Externally-owned resources: the graph manages usage, never lifetime.
+    gpu::image  use_persistent(const persistent_image_info& info);
+    gpu::buffer use_persistent(const persistent_buffer_info& info);
+    // Re-point a persistent handle at fresh backing (the reference doc's TaskImage::set_images).
+    // This is how a resize reaches the graph: the declarations never change, only the backing.
+    void set_images (gpu::image h,  std::span<const gpu::resource_id> physical);
+    void set_buffers(gpu::buffer h, std::span<const gpu::resource_id> physical);
+
+    // Graph-owned, frame-scoped, aliasable.
+    gpu::image  image (const transient_image_info& info);
+    gpu::buffer buffer(const transient_buffer_info& info);
+
+    pass_spec pass(std::string name) { return pass_spec(*this, std::move(name)); }
+
+    // Allocate transients, pack aliasable ones, toposort, derive render-pass groups. Called ONCE.
+    compiled_frame compile(String::engine_context& ctx, VkExtent2D viewport);
+
+    std::vector<pass_info> passes() const;
+
+    // --- resource records (the graph is the single resolution authority) -------------------------
+    struct image_record
     {
-        building_.name = std::move(name);
-    }
-
-    // --- reads (optional by default: a disabled producer -> neutral fallback, pass still runs) ---
-    // Convenience: defaults to SampledRead at the pass's main stage. Use the explicit .read(res,
-    // Access, stage) form for anything else (a buffer's StorageRead, vertex/index/indirect fetch,
-    // task/mesh-stage reads, storage-image reads). Brief 16 M7: takes a raw resource_id (Handle<*> retired).
-    PassSpec& reads(string::gpu::resource_id r) { add_read(r, Access::SampledRead, main_stage(building_.kind), false); return *this; }
-    PassSpec& read(string::gpu::resource_id r, Access a, VkPipelineStageFlags2 s) { add_read(r, a, s, false); return *this; }
-
-    // --- requires (essential: a disabled producer transitively skips THIS pass too) --------------
-    PassSpec& requires_(string::gpu::resource_id r) { add_read(r, Access::SampledRead, main_stage(building_.kind), true); return *this; }
-    PassSpec& require(string::gpu::resource_id r, Access a, VkPipelineStageFlags2 s) { add_read(r, a, s, true); return *this; }
-
-    // --- writes ----------------------------------------------------------------------------------
-    PassSpec& writes(string::gpu::resource_id r) { building_.writes.push_back({ r, Access::StorageImageWrite, main_stage(building_.kind) }); return *this; }
-    PassSpec& write(string::gpu::resource_id r, Access a, VkPipelineStageFlags2 s) { building_.writes.push_back({ r, a, s }); return *this; }
-
-    // --- attachments (raster) --------------------------------------------------------------------
-    PassSpec& color(string::gpu::resource_id r) { building_.writes.push_back({ r, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT }); return *this; }
-    PassSpec& depth(string::gpu::resource_id r) { building_.writes.push_back({ r, Access::DepthWrite, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT }); return *this; }
-
-    // --- gating ----------------------------------------------------------------------------------
-    PassSpec& toggle(EnablePredicate pred) { building_.enabled = std::move(pred); return *this; }
-    PassSpec& toggle(const bool* flag) { building_.enabled = [flag] { return *flag; }; return *this; }
-
-    // --- runtime surface + I/O authoring ---------------------------------------------------------
-    // Bind the pass's full runtime surface (callbacks + flags + live-usage pointers) — the executor
-    // drives passes through this, not a Pass* virtual. `use()` authors an already-declared
-    // ResourceUsage for the planner (routing to reads/writes by is_write); the executor reads the
-    // LIVE usages via exec.usages, so per-frame-slot buffer variation needs no re-author.
-    PassSpec& exec(PassExec e) { building_.exec = std::move(e); return *this; }
-    PassSpec& use(const ResourceUsage& u)
-    {
-        // Brief 16: the planner keys on the usage's stable LOGICAL identity (u.key() — the handle for
-        // registry-backed resources, else the raw id). Physical resolution is the executor's job at
-        // execute (u.resolve()); the graph orders by logical identity.
-        if (is_write(u.access)) building_.writes.push_back({ u.key(), u.access, u.stage });
-        else                    building_.reads.push_back({ u.key(), u.access, u.stage, /*required=*/false });
-        return *this;
-    }
-
-    // --- fluent runtime-surface authoring (the endgame: the app declares each pass's nature here,
-    //     retiring the Pass flag-virtuals) ---------------------------------------------------------
-    // Nature flags: computeOnly() runs standalone in the group loop after the resolve (post chain);
-    // prepass() runs record_compute in the frame-top prepass and forms no group (IBL/GTAO).
-    PassSpec& computeOnly() { building_.exec.compute_only = true; return *this; }
-    PassSpec& prepass()     { building_.exec.prepass_only = true; return *this; }
-    // The draw / compute-only body, and the frame-top prepass-compute body.
-    PassSpec& record(RecordFn fn)          { building_.exec.record = std::move(fn); return *this; }
-    PassSpec& prepassCompute(ComputeFn fn) { building_.exec.record_compute = std::move(fn); return *this; }
-    // The dependency-free async chain: dynamic gate + body + the (live) usages it produces/consumes.
-    PassSpec& async(QueryFn has, RecordFn rec, UsagesFn usages)
-    {
-        building_.exec.has_async = std::move(has);
-        building_.exec.record_async = std::move(rec);
-        building_.exec.async_usages = std::move(usages);
-        return *this;
-    }
-    // Brief 16: bind the pass's usage GETTER (replaces the retired usagesFrom(&pass->usages) raw
-    // pointer). Authors the current usages into the planner NOW by their LOGICAL key() (for the
-    // toposort — run at recompile) AND stores the getter so the executor reads them fresh each frame
-    // and resolves the per-frame physical via ResourceUsage::resolve(). The graph reads through the
-    // getter's interface; it never holds a pointer into a pass's internals.
-    PassSpec& usages(UsagesFn get)
-    {
-        for (const ResourceUsage& u : get()) use(u);
-        building_.exec.usages = std::move(get);
-        return *this;
-    }
-
-    // Terminal: append the built pass to the graph (defined out-of-line — FrameGraph is incomplete here).
-    void finish();
-
-    // --- finalize (append to the graph). raster()/compute() are terminal. ------------------------
-    void raster(RecordFn fn);
-    void compute(RecordFn fn);
-};
-
-class FrameGraph
-{
-    std::vector<FgPass> passes_;
-    // Transient logical ids are minted below the renderer's SWAPCHAIN/COLOR/DEPTH sentinels and
-    // above 0 (allocator ids count up from 0). This space is for LOGICAL identity only until
-    // physical allocation is wired (see file header).
-    string::gpu::resource_id next_transient_ = TRANSIENT_BASE;
-
-public:
-    // Reserved logical-id band for graph transients (well below the renderer sentinels at the top
-    // of the id space; comfortably above allocator-assigned ids in practice for the planner tests
-    // and the future execution wiring, which will resolve these to physical backing).
-    static constexpr string::gpu::resource_id TRANSIENT_BASE = (string::gpu::resource_id{1} << 48);
-
-    // Mint a transient logical id (Brief 16 M7: a raw resource_id — Handle<*> retired). `name` is
-    // retained for the future introspection API. image()/buffer() are the same mint now (the graph
-    // keys by id, not kind); both are kept so authoring reads intent-fully.
-    string::gpu::resource_id image(const std::string& /*name*/)  { return next_transient_++; }
-    string::gpu::resource_id buffer(const std::string& /*name*/) { return next_transient_++; }
-
-    // Import an externally-owned resource by its existing id (e.g. COLOR_TARGET, a persistent
-    // buffer, a streamed texture) — the graph treats it as an always-available input it never
-    // produces.
-    string::gpu::resource_id import_image(string::gpu::resource_id id)  { return id; }
-    string::gpu::resource_id import_buffer(string::gpu::resource_id id) { return id; }
-
-    PassSpec pass(const std::string& name) { return PassSpec(*this, name); }
-
-    // Enable/disable + graceful-degrade + lowering + toposort. Pure; no GPU. See the .cpp-less
-    // definition below (kept inline so this stays header-only for the first increment).
-    CompiledFrame compile() const;
-
-    // Brief 11 M4 introspection (read seam for brief 14): enumerate every AUTHORED pass with its
-    // metadata + live enabled state (BEFORE the toggle-drop, so disabled passes still appear). Pure;
-    // evaluates each toggle predicate now. Order = authoring order.
-    std::vector<PassInfo> passes() const
-    {
-        std::vector<PassInfo> out;
-        out.reserve(passes_.size());
-        for (const FgPass& p : passes_)
-            out.push_back({ p.name, p.kind, p.exec.compute_only, p.exec.prepass_only,
-                            !p.enabled || p.enabled() });
-        return out;
-    }
-
-private:
-    friend class PassSpec;
-    void add(FgPass&& p) { passes_.push_back(std::move(p)); }
-};
-
-inline void PassSpec::raster(RecordFn fn)
-{
-    building_.kind = PassKind::Raster;
-    building_.record = fn;
-    building_.exec.record = std::move(fn);
-    graph_.add(std::move(building_));
-}
-
-inline void PassSpec::compute(RecordFn fn)
-{
-    building_.kind = PassKind::Compute;
-    building_.record = fn;
-    building_.exec.record = std::move(fn);
-    graph_.add(std::move(building_));
-}
-
-inline void PassSpec::finish()
-{
-    graph_.add(std::move(building_));
-}
-
-inline CompiledFrame FrameGraph::compile() const
-{
-    const auto n = static_cast<uint32_t>(passes_.size());
-
-    auto is_enabled = [](const FgPass& p) { return !p.enabled || p.enabled(); };
-
-    // A resource is EXTERNAL (an input, always available) iff NO pass in the graph writes it.
-    // A resource written by some pass but by NO SURVIVING pass has a "disabled producer".
-    std::unordered_map<string::gpu::resource_id, bool> written_by_any;
-    for (const FgPass& p : passes_)
-        for (const FgWrite& w : p.writes)
-            written_by_any[w.resource] = true;
-
-    // Survivor fixpoint: a pass is dropped if it is disabled, OR if any of its .requires() reads
-    // names a resource that IS produced somewhere but NO surviving pass produces it (its producer
-    // was disabled and there is no neutral fallback for an essential input). Iterate: dropping a
-    // pass removes its writes, which may starve another pass's required read.
-    std::vector<bool> survive(n);
-    for (uint32_t i = 0; i < n; ++i) survive[i] = is_enabled(passes_[i]);
-
-    auto produced_by_survivor = [&](string::gpu::resource_id r) {
-        for (uint32_t i = 0; i < n; ++i)
-            if (survive[i])
-                for (const FgWrite& w : passes_[i].writes)
-                    if (w.resource == r) return true;
-        return false;
+        std::string name;
+        bool transient = false;
+        bool swapchain = false;
+        bool per_frame = false;
+        VkImageLayout initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        std::vector<gpu::resource_id> physical;   // 1, or one per frame slot
+        transient_image_info info{};              // transient only (re-created on resize)
+        VkClearColorValue neutral{};
+        gpu::image fallback{};                    // 1x1 neutral substitute, minted at compile
     };
 
-    bool changed = true;
-    while (changed)
+    struct buffer_record
     {
-        changed = false;
-        for (uint32_t i = 0; i < n; ++i)
+        std::string name;
+        bool transient = false;
+        bool per_frame = false;
+        std::vector<gpu::resource_id> physical;
+        transient_buffer_info info{};
+    };
+
+    const image_record&  record_of(gpu::image h)  const { return images_[h.index]; }
+    const buffer_record& record_of(gpu::buffer h) const { return buffers_[h.index]; }
+    const std::vector<pass_decl>& declarations() const { return passes_; }
+
+private:
+    friend class pass_spec;
+    friend class compiled_frame;
+    void add(pass_decl&& p) { passes_.push_back(std::move(p)); }
+
+    std::vector<pass_decl> passes_;
+    std::vector<image_record> images_;
+    std::vector<buffer_record> buffers_;
+};
+
+// --- the compiled graph (COMPILED) ---------------------------------------------------------------
+
+// A run of consecutive passes sharing one dynamic-rendering instance. Derived, not declared: passes
+// that write the same color/depth attachments and sit adjacent in the toposort form one group, and
+// the framework opens it (vkCmdBeginRendering) with load/store/resolve derived from the group's
+// position in each attachment's lifetime.
+struct render_group
+{
+    std::uint32_t first = 0;   // index into compiled_frame::order
+    std::uint32_t count = 0;
+    // Colour attachments, in declaration order. More than one is MRT — the probe-GI cube capture
+    // writes albedo and normal-depth together. A single multisampled entry paired with a
+    // single-sample one is a RESOLVE instead, which is why the two cases are distinguished by
+    // sample count rather than by count alone.
+    std::vector<gpu::image_view> colors;
+    // All faces/layers of a layered attachment rendered in one pass (viewMask). Derived from the
+    // declared slice: a 6-layer colour slice is a cubemap capture.
+    std::uint32_t view_mask = 0;
+    std::optional<gpu::image_view> color;
+    std::optional<gpu::image_view> depth;
+    // MSAA resolve targets, derived from the attachments' sample counts: a multisampled attachment
+    // paired with a 1-sample image of the same size resolves into it at EndRendering.
+    std::optional<gpu::image_view> color_resolve;
+    std::optional<gpu::image_view> depth_resolve;
+    bool clears_color = false;   // this group is the first writer of `color` this frame
+    bool clears_depth = false;
+    // Does any pass in the group WRITE depth? Read-only depth must be bound in the read-only layout —
+    // binding it as a writable attachment contradicts the barrier its own declaration produced.
+    bool depth_writes = false;
+    bool last_color = false;     // last group writing `color` -> store/resolve rather than store
+};
+
+struct execute_info
+{
+    gpu::command_recorder& rec;
+    gpu::command_recorder* async_rec = nullptr;   // null => async passes record inline on `rec`
+    std::uint32_t frame_slot = 0;
+    VkExtent2D extent{};
+    // Late-latched swapchain backing for this frame (persistent_image_info::swapchain).
+    gpu::resource_id swapchain = 0;
+    VkImage swapchain_image = VK_NULL_HANDLE;
+    VkImageView swapchain_view = VK_NULL_HANDLE;
+};
+
+class compiled_frame
+{
+public:
+    compiled_frame() = default;
+
+    // Run the frame. Evaluates conditionals, derives every barrier from the declarations against
+    // tracked state, opens/closes render-pass groups, and places async passes on the async recorder
+    // when one is supplied.
+    void execute(const execute_info& info);
+
+    // Re-size viewport-scaled transients and forget tracked state. Does NOT re-author or re-plan:
+    // the declarations are unchanged, only the backing. Caller waits for device idle first.
+    void resize(String::engine_context& ctx, VkExtent2D viewport);
+
+    // Did the executor skip `pass_index` (order index) this frame? For introspection/timing.
+    bool ran(std::uint32_t order_index) const;
+
+    const std::vector<std::uint32_t>& order() const { return order_; }
+    const std::vector<render_group>& groups() const { return groups_; }
+    frame_graph* graph() const { return graph_; }
+
+    // Total bytes the graph allocated for transients (reported after compile; the aliasing win).
+    VkDeviceSize transient_bytes() const { return transient_bytes_; }
+
+    // Resolve a handle's backing for a frame slot. Public for the debug capture path, which has to
+    // reach a real image; pass code resolves through pass_context instead.
+    gpu::resource_id physical_of(gpu::image h, std::uint32_t slot) const { return physical(h, slot); }
+    gpu::resource_id physical_of(gpu::buffer h, std::uint32_t slot) const { return physical(h, slot); }
+
+    // Tell the tracker an image's layout was changed OUTSIDE the graph. The debug capture drains the
+    // device and transitions its source directly, so without this the tracker's belief goes stale and
+    // the next frame's derived barrier is wrong. Announcing it is what keeps the tracker the single
+    // authority even when a debug path has to step around it.
+    void note_external_layout(gpu::image h, VkImageLayout layout);
+
+private:
+    friend class frame_graph;
+
+    friend struct pass_context;
+
+    // Allocate every transient from its declaration (viewport-scaled ones against `viewport`).
+    void materialize(String::engine_context& ctx, VkExtent2D viewport);
+    // Group adjacent raster passes sharing attachments, and derive each group's clear/load/store
+    // facts from that attachment's lifetime across the frame.
+    void derive_groups();
+    // Seed the tracker with each persistent's already-established layout (see initial_layout).
+    // Bind every declared resource into the bindless table once, at compile — never during recording.
+    void bind_declared_slots();
+    void seed_persistent_layouts();
+
+    // Derive and emit every barrier a pass's declarations imply, against tracked state.
+    void barrier_for(VkCommandBuffer cmd, const pass_decl& p, std::uint32_t slot,
+                     bool skip_attachments);
+    // Open a render-pass instance with load/store/resolve derived from the group's lifetime facts.
+    void open_group(VkCommandBuffer cmd, const render_group& g, std::uint32_t slot, VkExtent2D extent);
+    static VkImageAspectFlags aspect_of(VkFormat format);
+    // One-shot clear of each neutral fallback to its declared value, on the first executed frame.
+    void init_fallbacks(VkCommandBuffer cmd);
+    VkSampleCountFlagBits samples_of(gpu::image h) const;
+    // Is this resource produced by a pass that survived this frame's conditionals? Persistent
+    // resources always count: their contents outlive the frame, so a skipped producer means "not
+    // updated", not "invalid".
+    bool producer_alive(gpu::image h) const;
+
+    // Resolve a declared use to this frame's physical backing + subresource range.
+    gpu::resource_id physical(gpu::image h, std::uint32_t slot) const;
+    gpu::resource_id physical(gpu::buffer h, std::uint32_t slot) const;
+    // A slice resolves to its own resource_id, created on demand and cached (allocator::create_view).
+    gpu::resource_id resolve_view(gpu::image_view v, std::uint32_t slot) const;
+    // The bindless slot for a handle THIS pass declared, with the descriptor type derived from that
+    // declaration — and the neutral fallback substituted when the producer did not survive.
+    std::uint32_t slot_for(gpu::image_view v, std::uint32_t pass_index, std::uint32_t slot) const;
+    std::uint32_t slot_for(gpu::image_view v, access how, std::uint32_t pass_index, std::uint32_t slot) const;
+    std::uint32_t slot_for(gpu::buffer h, std::uint32_t pass_index, std::uint32_t slot) const;
+
+    gpu::resource_allocator& allocator() const;
+
+    // Survivor computation for this frame's conditionals: a disabled pass drops, and a pass whose
+    // .requires() read has no surviving producer drops with it (transitively). Optional reads of a
+    // dropped producer bind the resource's neutral fallback instead.
+    void compute_survivors();
+
+    frame_graph* graph_ = nullptr;
+    String::engine_context* ctx_ = nullptr;
+    std::vector<std::uint32_t> order_;          // toposorted pass indices
+    std::vector<render_group> groups_;
+    std::vector<bool> alive_;                   // per declared pass, this frame
+    resource_state_tracker states_;
+    VkDeviceSize transient_bytes_ = 0;
+    VkExtent2D viewport_{};
+    // This frame's late-latched swapchain backing (see persistent_image_info::swapchain).
+    gpu::resource_id swapchain_ = 0;
+    VkImage swapchain_image_ = VK_NULL_HANDLE;
+    VkImageView swapchain_view_ = VK_NULL_HANDLE;
+
+    // Sub-resource views, created on first use and reused. Keyed by the slice plus the frame slot,
+    // because a per-frame resource's slices belong to different backing images.
+    struct slice_key
+    {
+        std::uint32_t image = 0, base_mip = 0, mip_count = 0, base_layer = 0, layer_count = 0, slot = 0;
+        bool operator==(const slice_key&) const = default;
+    };
+    struct slice_hash
+    {
+        std::size_t operator()(const slice_key& k) const
         {
-            if (!survive[i]) continue;
-            for (const FgRead& rd : passes_[i].reads)
-            {
-                if (!rd.required) continue;
-                const bool external = written_by_any.find(rd.resource) == written_by_any.end();
-                if (external) continue;                       // real input, always available
-                if (!produced_by_survivor(rd.resource))       // producer disabled, no fallback
-                {
-                    survive[i] = false;
-                    changed = true;
-                    break;
-                }
-            }
+            std::size_t h = k.image;
+            for (std::uint32_t v : { k.base_mip, k.mip_count, k.base_layer, k.layer_count, k.slot })
+                h = h * 1099511628211u ^ v;
+            return h;
         }
-    }
+    };
+    mutable std::unordered_map<slice_key, gpu::resource_id, slice_hash> slices_;
+    // Fallbacks created by materialize(), awaiting their one-shot clear.
+    std::vector<gpu::image> pending_fallbacks_;
+};
 
-    // Lower surviving passes onto the existing planner. Fallback reads (optional, producer
-    // disabled) are recorded separately and EXCLUDED from the planner usages so they forge no
-    // ordering edge against a resource nothing produces this frame.
-    PlanBuilder builder;
-    std::vector<std::vector<string::gpu::resource_id>> fallback_reads(n);
-    std::vector<uint32_t> lowered_index;   // planner pass index -> original pass index
-    for (uint32_t i = 0; i < n; ++i)
-    {
-        if (!survive[i]) continue;
-        const FgPass& p = passes_[i];
-        PassBuilder pb = builder.add_pass(p.name);
-        for (const FgWrite& w : p.writes)
-            pb.use(w.resource, w.access, w.stage);
-        for (const FgRead& rd : p.reads)
-        {
-            const bool external = written_by_any.find(rd.resource) == written_by_any.end();
-            if (!external && !produced_by_survivor(rd.resource))
-            {
-                // optional (required ones already caused a skip above) read of a disabled
-                // producer -> neutral fallback, not a graph edge.
-                fallback_reads[i].push_back(rd.resource);
-                continue;
-            }
-            pb.use(rd.resource, rd.access, rd.stage);
-        }
-        pb.end_pass();
-        lowered_index.push_back(i);
-    }
-
-    CompiledFrame frame;
-    frame.plan = builder.build();
-
-    frame.passes.reserve(frame.plan.toposorted.size());
-    for (uint32_t planner_idx : frame.plan.toposorted)
-    {
-        const uint32_t orig = lowered_index[planner_idx];
-        const FgPass& p = passes_[orig];
-        CompiledPass cp;
-        cp.name = p.name;
-        cp.kind = p.kind;
-        cp.usages = frame.plan.passes[planner_idx].usages;
-        cp.fallback_reads = fallback_reads[orig];
-        cp.exec = p.exec;   // by value — callbacks close over the stable pass objects (no dangling)
-        frame.passes.push_back(std::move(cp));
-    }
-    return frame;
-}
-
-}  // namespace String
+}  // namespace string

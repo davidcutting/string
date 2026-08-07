@@ -6,22 +6,18 @@
 #include <string/gpu/pipeline_builder.hpp>
 #include <string/gpu/shader_compiler.hpp>
 #include <string/gpu/shader_program_registry.hpp>
-#include <string/core/logger.hpp>
 
 namespace string::render
 {
+using namespace String;
 
-void FroxelComponent::init(String::engine_context& context, uint32_t frames_in_flight)
+froxel_component::froxel_component(engine_context& ctx)
+: device_(ctx.device)
 {
-    resources_ = &context.resources;
-    frames_in_flight_ = frames_in_flight;
-    // Actual allocation is deferred to ensure_capacity() (called from FroxelPass::resize() once the
-    // screen size is known — the deterministic point, before any per-frame update). The registry-owned
-    // PerFrame handle stays invalid until then.
-
-    // Froxel light-binning compute pipeline (Slang, hot-reloadable).
-    program_ = context.shader_registry.create(
-        context.resources_path / "shaders" / "froxel_cull.slang",
+    // Froxel light-binning compute pipeline (Slang, hot-reloadable). Push-constant only: the light
+    // and froxel buffers are reached by device address, so there is no descriptor set to bind.
+    program_ = ctx.shader_registry.create(
+        ctx.resources_path / "shaders" / "froxel_cull.slang",
         [](::string::gpu::device& dev, const ::string::gpu::compiled_program& compiled) {
             ::string::gpu::pipeline p{};
             p.push_constants = compiled.layout.push_constant;
@@ -40,71 +36,80 @@ void FroxelComponent::init(String::engine_context& context, uint32_t frames_in_f
         });
 }
 
-void FroxelComponent::ensure_capacity(VkExtent2D screen)
+froxel_component::~froxel_component()
 {
-    if (screen.width == 0 || screen.height == 0)
-    {
-        return;
-    }
-    tiles_x_ = (screen.width + kFroxelTileSize - 1) / kFroxelTileSize;
-    tiles_y_ = (screen.height + kFroxelTileSize - 1) / kFroxelTileSize;
-    count_ = tiles_x_ * tiles_y_ * kFroxelDepthSlices;
-    if (count_ <= capacity_ && froxel_buffer_.valid())
-    {
-        return;   // fits the existing allocation
-    }
-    // Grow (or first allocation). The renderer waits the device idle on resize, so recreating these
-    // device-addressed buffers here is safe. Stride = [count, idx...] = 1 + max per froxel.
-    const VkDeviceSize stride = (1 + kMaxLightsPerFroxel) * sizeof(uint32_t);
-    const VkDeviceSize size = stride * count_;
-    const ::string::gpu::buffer_info info{
-        .size = size,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-    };
-    if (froxel_buffer_.valid()) resources_->recreate_per_frame(froxel_buffer_, info);
-    else                        froxel_buffer_ = resources_->create_per_frame(info, frames_in_flight_);
-    capacity_ = count_;
-    STRING_LOG_INFO("[froxel] grid {}x{}x{} = {} froxels ({} MB/frame)", tiles_x_,
-                    tiles_y_, kFroxelDepthSlices, count_, size / (1024 * 1024));
+    if (!program_) return;
+    const ::string::gpu::pipeline& p = program_->current();
+    vkDestroyPipeline(device_.get_device(), p.pipeline, nullptr);
+    vkDestroyPipelineLayout(device_.get_device(), p.pipeline_layout, nullptr);
 }
 
-void FroxelComponent::record(::string::gpu::command_recorder& recorder, uint16_t frame, const FroxelParams& params)
+uint32_t froxel_component::tiles_x(VkExtent2D screen)
 {
-    if (!active(frame)) return;
+    return (screen.width + kFroxelTileSize - 1) / kFroxelTileSize;
+}
+
+uint32_t froxel_component::tiles_y(VkExtent2D screen)
+{
+    return (screen.height + kFroxelTileSize - 1) / kFroxelTileSize;
+}
+
+uint32_t froxel_component::froxel_count(VkExtent2D screen)
+{
+    return tiles_x(screen) * tiles_y(screen) * kFroxelDepthSlices;
+}
+
+// Stride = [count, idx...] = 1 + max lights per froxel, one entry per froxel.
+VkDeviceSize froxel_component::bytes_for(VkExtent2D screen)
+{
+    const VkDeviceSize stride = (1 + kMaxLightsPerFroxel) * sizeof(uint32_t);
+    return stride * froxel_count(screen);
+}
+
+void froxel_component::tick(const FroxelParams& params)
+{
+    params_ = params;
+}
+
+void froxel_component::declare(::string::frame_graph& fg, ::string::gpu::buffer froxels,
+                               ::string::gpu::buffer lights)
+{
+    fg.pass("froxel.cull")
+      .reads(lights)
+      .writes(froxels)
+      .async()
+      .toggle([this] { return has_work(); })
+      .compute([this, froxels, lights](::string::pass_context& ctx) { record(ctx, froxels, lights); });
+}
+
+void froxel_component::record(::string::pass_context& ctx, ::string::gpu::buffer froxels,
+                              ::string::gpu::buffer lights)
+{
+    const uint32_t tx = tiles_x(ctx.extent);
+    const uint32_t ty = tiles_y(ctx.extent);
+    if (tx == 0 || ty == 0) return;
+
+    ::string::gpu::command_recorder& recorder = ctx.rec;
     const ::string::gpu::pipeline& fp = program_->current();
     const FroxelPush fpush{
-        .view = params.view,
-        .inv_proj = params.inv_proj,
-        .screen = params.screen,
-        .grid = glm::uvec2(tiles_x_, tiles_y_),
+        .view = params_.view,
+        .inv_proj = params_.inv_proj,
+        .screen = glm::uvec2(ctx.extent.width, ctx.extent.height),
+        .grid = glm::uvec2(tx, ty),
         .slices = kFroxelDepthSlices,
         .tile_size = kFroxelTileSize,
-        .near_plane = params.near_plane,
-        .far_plane = params.far_plane,
-        .light_count = params.light_count,
+        .near_plane = params_.near_plane,
+        .far_plane = params_.far_plane,
+        .light_count = params_.light_count,
         .max_per_froxel = kMaxLightsPerFroxel,
         ._pad0 = 0, ._pad1 = 0,
-        .lights = params.lights,
-        .froxels = resources_->address(froxel_buffer_, frame),
+        .lights = params_.light_count > 0 ? ctx.address(lights) : 0,
+        .froxels = ctx.address(froxels),
     };
     recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, fp.pipeline);
     recorder.push_constants(fp.pipeline_layout, fp.push_constants.stageFlags,
                             0, sizeof(FroxelPush), &fpush);
-    recorder.dispatch((tiles_x_ + 3) / 4, (tiles_y_ + 3) / 4, (kFroxelDepthSlices + 3) / 4);
-}
-
-void FroxelComponent::destroy()
-{
-    // The froxel index ring is owned + freed by the ResourceRegistry now (brief 16 M2); nothing to
-    // free here. (The compute pipeline is torn down by the owning FroxelPass destructor.)
-}
-
-VkDeviceAddress FroxelComponent::froxels_address(uint16_t frame) const
-{
-    if (!froxel_buffer_.valid()) return 0;
-    return resources_->address(froxel_buffer_, frame);
+    recorder.dispatch((tx + 3) / 4, (ty + 3) / 4, (kFroxelDepthSlices + 3) / 4);
 }
 
 }  // namespace string::render

@@ -1,7 +1,30 @@
 # Brief 16 — Resource virtualization + execution context (the render-graph resource layer)
 
-Status: **DESIGN LOCKED / not started.** Architecture settled with user 2026-07-26 across an extended
-design conversation. This is the **completion of the brief-11 render-graph vision** and the concrete
+> **PROVENANCE AUDIT 2026-08-06 — parts of this document are NOT the user's design.**
+> The file was authored 2026-08-01 in commit `820dcfa "More UI touch up"` — the same commit that
+> backdated an agent-invented process rule into brief 11's "Decisions locked with user" section.
+> A design conversation on 2026-07-26 **did** happen and the memory-layer NAMING below is confirmed
+> by the user as theirs. Other parts are agent-shaped and contradict the user's own reference sketch
+> (`docs/taskgraph_reference.md`, salvaged from their code 2026-07-06). Per-claim status:
+>
+> | claim | status |
+> |---|---|
+> | `string::gpu::image`/`buffer` naming + the inversion rationale; `Handle<*>` retired | **USER-CONFIRMED** |
+> | `pass_context` (= Daxa `TaskInterface`), `engine_context`, resolve-at-execute | **traceable** — `TaskInterface` is in the sketch |
+> | `command_recorder` as one type with verbs | **traceable** — sketch's `CommandRecorder` |
+> | `ResourceManager` with `want`/`unwant`/`collect_garbage` for STREAMING | **traceable** — sketch |
+> | `TaskImage`/`TaskBuffer`; graph owns transients, app hands in persistents | **traceable** — sketch |
+> | `ResourceRegistry` as one class owning all resources + wrapping descriptor_table | **AGENT-SHAPED** — sketch splits streaming (`ResourceManager`) from graph resources (`TaskGraph`) |
+> | `Lifetime` 5-value enum as a declared field | **AGENT-SHAPED** — sketch distinguishes by which API you call |
+> | `binding(image, slot)` — registry assigns bindless slots | **AGENT-SHAPED** — `descriptor_table` owns bindings |
+> | framework-opens render passes (vs Daxa's task-opens) | **AGENT-SHAPED** — an explicit deviation from the user's reference |
+> | "incremental, byte-parity gated" migration framing | **AGENT-SHAPED** — same fabrication as brief 11 |
+>
+> Do not treat this file as authority until the open topics in
+> `docs/briefs/20-graph-declaration-unification.md` are settled with the user.
+
+Status: **UNDER AUDIT** (was: "DESIGN LOCKED"). Architecture partly settled with user 2026-07-26; see
+the provenance table above. This is the **completion of the brief-11 render-graph vision** and the concrete
 realization of the "Stage 3 render-graph target" sketched in `docs/taskgraph_reference.md` (the Daxa-style
 TaskGraph). Brief 11 delivered the *scheduling* half of a task graph (declare I/O → derive sync + order →
 persistent compile → fn-driven execute, fluent app-authoring). This brief delivers the *resource* half:

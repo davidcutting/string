@@ -5,7 +5,6 @@
 
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource_allocator.hpp>
-#include <string/gpu/resource_registry.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/gpu/shader_program_registry.hpp>
 #include <string/vulkan/frame_scratch.hpp>
@@ -17,56 +16,39 @@
 namespace String
 {
 
-// The GPU-side context a pass needs at construction. It bundles the renderer-owned systems
-// (device, allocator, bindless table, upload recorder) plus where resources live and how many
-// frames are in flight. Passes receive this as their first constructor argument so the
-// application can declare *what* to draw (content) without touching *how* it's built (the GPU
-// context, which only exists inside the Renderer). See render_plan.hpp for how it's injected.
+// The GPU-side services a pass object needs at CONSTRUCTION (the reference doc has no analogue —
+// Daxa's app owns its device directly). Distinct from `string::pass_context`, which is the
+// EXECUTE-time surface and is where handles resolve.
+//
+// Brief 20: this no longer carries `color_target` / `depth_target`. Those were raw resource_id
+// sentinels a pass declared its attachment writes against; the scene's colour and depth are now
+// viewport-scaled transients the application declares to its frame_graph and passes to whichever
+// pass objects need them, as logical handles. It also no longer carries a ResourceRegistry — the
+// graph is the resolution authority.
 struct engine_context
 {
     string::gpu::device& device;
     string::gpu::resource_allocator& allocator;
     string::gpu::descriptor_table& descriptor_table;
-    // Brief 16 Layer 1: the resource-virtualization hub. Passes declare their logical image/buffer
-    // handles here at construction (M1: the SceneData PerFrame ring) instead of hand-managing
-    // per-frame [frame] vectors of resource_ids; the registry owns the backing + resolves it per frame.
-    string::gpu::ResourceRegistry& resources;
-    // Registry for hot-reloadable Slang pipelines: a pass calls create(source.slang, builder) to
-    // get a shader_program whose pipeline recompiles + swaps on save (brief 01). The overlay pass
-    // also reads its current_errors() to render compile diagnostics.
+    // Registry for hot-reloadable Slang pipelines: a pass calls create(source.slang, builder) to get
+    // a shader_program whose pipeline recompiles + swaps on save.
     string::gpu::shader_program_registry& shader_registry;
-    // Batches a pass's one-time uploads (mesh/texture staging copies); flushed once by the
-    // renderer after all passes are built, so uploads cost a single submit, not one per copy.
+    // Batches a pass's one-time construction uploads, flushed once after all passes are built so
+    // uploads cost a single submit rather than one per copy.
     TransferBatch& transfer;
-    // Polled per-frame input (keyboard/mouse), for passes that respond to it (e.g. a camera).
-    // Stable for the app's lifetime; a pass may store the reference and read it in update(). Non-
-    // const so a UI pass can write intent back (e.g. request game/UI capture mode).
+    // Polled per-frame input. Non-const so a UI pass can write intent back (e.g. capture mode).
     Input& input;
-    // Remappable action layer over `input`. Passes bind their actions here (or via a helper like
-    // Camera::bind_default_controls) and query them by name, instead of reading raw key codes.
+    // Remappable action layer over `input`; passes bind actions here instead of raw key codes.
     InputMap& input_map;
-    // The offscreen render targets a scene pass draws into, so it can declare its ColorWrite /
-    // DepthWrite usages (the render graph orders + barriers passes from these).
-    string::gpu::resource_id color_target;
-    string::gpu::resource_id depth_target;
-    // Root that contains shaders/ (and, at runtime, assets/); passes resolve their files here.
+    // Root containing shaders/ (and, at runtime, assets/); passes resolve their files here.
     std::filesystem::path resources_path;
     uint16_t frames_in_flight;
-    // MSAA sample count of the scene color/depth targets. Scene-pass pipelines must set their
-    // rasterizationSamples to this (via set_multisampling) to be compatible with the render pass.
-    VkSampleCountFlagBits sample_count;
-    // Brief 06: address of the renderer's Tracy GPU context so a pass can open finer per-STAGE GPU
-    // zones INSIDE its record()/record_compute() (the renderer only wraps the whole pass in one
-    // zone named by debug_name()). It is a POINTER because the context is created after the passes
-    // are built (init_gpu_profiler runs post plan.build) — the pass stores this address at
-    // construction and dereferences it at record time, by which point the context is live. Without
-    // -Dtracy the context type is void*, so the value is always a valid null-holding slot; the GPU
-    // zone macros are no-ops. May be null if the renderer chooses not to expose one.
+    // Address of the renderer's Tracy GPU context, so a pass can open finer per-stage GPU zones
+    // inside its recording callback. A POINTER because the context is created after the passes are
+    // built — the pass stores the address and dereferences it at record time, by which point the
+    // context is live. Without -Dtracy the type is void* and the zone macros are no-ops.
     STRING_PROFILE_GPU_CONTEXT_TYPE* gpu_profiler_ctx;
-    // Brief 04e M3: the per-frame-slot scratch arena. Passes RESERVE per-frame transient bytes
-    // during construction (returns a byte offset); the renderer materializes one buffer per
-    // frame slot after all passes are built. Address at record time: scratch.buffer(slot) /
-    // scratch.address(slot) + offset.
+    // The per-frame-slot scratch arena passes reserve transient byte regions from at construction.
     string::gpu::FrameScratch& scratch;
 };
 

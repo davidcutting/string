@@ -4,19 +4,17 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include <string/core/cvar.hpp>
 #include <string/core/logger.hpp>
 #include <string/gpu/pipeline_builder.hpp>
 #include <string/vulkan/passes/composite_pass.hpp>
-#include <string/vulkan/vulkan_utils.hpp>
 
 #include <string/render/render_cvars.hpp>
 
 namespace string::render
 {
-
-namespace vku = String::vku;
 
 namespace
 {
@@ -36,39 +34,43 @@ struct ExposureOut
     float _pad;
 };
 
+glm::uvec2 screen_of(const ::string::pass_context& ctx)
+{
+    return glm::uvec2(ctx.extent.width, ctx.extent.height);
+}
+
+// The bloom pyramid's base is half the viewport, and mip m is that halved m more times — the same
+// arithmetic the pass has always used, now recomputed per record from the context's extent rather
+// than cached at target-creation time. That is what lets a resize be a backing swap: the
+// declarations, the pass count and the compiled plan are all unchanged.
+glm::uvec2 bloom_base_of(const ::string::pass_context& ctx)
+{
+    return glm::max(screen_of(ctx) / 2u, glm::uvec2(1));
+}
+
+glm::uvec2 bloom_mip_size(const glm::uvec2& base, uint32_t m)
+{
+    return glm::uvec2(std::max(base.x >> m, 1u), std::max(base.y >> m, 1u));
+}
+
 }  // namespace
 
-PostProcessPass::PostProcessPass(String::engine_context& context)
-: device_(context.device)
-, allocator_(context.allocator)
-, descriptor_table_(context.descriptor_table)
-, scratch_(&context.scratch)
-, frames_in_flight_(context.frames_in_flight)
+post_pass::post_pass(String::engine_context& ctx)
+: device_(ctx.device)
+, allocator_(ctx.allocator)
+, descriptor_table_(ctx.descriptor_table)
+, frames_in_flight_(ctx.frames_in_flight)
 {
     // Register/touch the post CVars (central sandbox registration in debug_cvars handles the env
     // bridge; these accessors just make first use explicit here).
     cv_bloom_enabled();
     cv_bloom_intensity();
+    cv_bloom_mips();
 
-    // Linear clamp sampler for the bloom chain (bilinear tent taps; must not wrap).
-    const VkSamplerCreateInfo sampler_info = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .maxLod = VK_LOD_CLAMP_NONE,
-    };
-    if (vkCreateSampler(device_.get_device(), &sampler_info, nullptr, &sampler_) != VK_SUCCESS)
-        throw std::runtime_error("PostProcessPass: failed to create sampler");
-
-    // Histogram bins: the first REAL FrameScratch customer outside geometry — a per-frame
-    // transient (rewritten from scratch every frame) placed in the per-slot arena.
-    hist_off_ = scratch_->reserve(256 * sizeof(uint32_t));
-
-    // Per-slot host-visible exposure readback ring (16 B each; read frames_in_flight later).
+    // Per-slot host-visible exposure readback ring (16 B each; read frames_in_flight later). This
+    // is a genuine CPU readback with a real temporal dependency, so it stays the pass's own ring
+    // rather than becoming a graph resource — the graph orders GPU work, and nothing on the GPU
+    // reads this back.
     readback_.resize(frames_in_flight_);
     readback_mapped_.resize(frames_in_flight_);
     for (uint16_t f = 0; f < frames_in_flight_; ++f)
@@ -88,8 +90,8 @@ PostProcessPass::PostProcessPass(String::engine_context& context)
     // One post.slang, one compute pipeline per entry point (hot-reload registry).
     VkDescriptorSetLayout layout = descriptor_table_.get_layout();
     const auto make_entry = [&](const char* entry) {
-        return context.shader_registry.create(
-            context.resources_path / "shaders" / "post.slang",
+        return ctx.shader_registry.create(
+            ctx.resources_path / "shaders" / "post.slang",
             [layout, entry](::string::gpu::device& dev, const ::string::gpu::compiled_program& compiled) {
                 ::string::gpu::pipeline p{};
                 p.push_constants = compiled.layout.push_constant;
@@ -114,7 +116,7 @@ PostProcessPass::PostProcessPass(String::engine_context& context)
     bloom_apply_program_ = make_entry("bloom_apply_main");
 }
 
-PostProcessPass::~PostProcessPass()
+post_pass::~post_pass()
 {
     const auto destroy_program = [&](::string::gpu::shader_program* prog) {
         if (!prog) return;
@@ -128,104 +130,120 @@ PostProcessPass::~PostProcessPass()
     destroy_program(bloom_down_program_);
     destroy_program(bloom_up_program_);
     destroy_program(bloom_apply_program_);
-    destroy_targets();
-    if (color_storage_slot_ != UINT32_MAX)
-        descriptor_table_.unbind_storage_view(color_storage_slot_);
     for (::string::gpu::resource_id id : readback_) allocator_.destroy_resource(id);
-    vkDestroySampler(device_.get_device(), sampler_, nullptr);
 }
 
-void PostProcessPass::bind_color_source(uint32_t sampled_slot, ::string::gpu::resource_id physical_id)
+uint32_t post_pass::bloom_mip_count(VkExtent2D viewport)
 {
-    color_sampled_slot_ = sampled_slot;
-    color_id_ = physical_id;
-    // Fresh storage-image slot for the (new) HDR target's default view — the bloom apply writes
-    // it in place. Descriptor updates happen here (init / resize), before any recording.
-    if (color_storage_slot_ != UINT32_MAX)
-        descriptor_table_.unbind_storage_view(color_storage_slot_);
-    color_storage_slot_ = descriptor_table_.bind_storage_view(allocator_.get_image(physical_id).view);
-}
-
-void PostProcessPass::destroy_targets()
-{
-    for (uint32_t s : bloom_mip_slots_) descriptor_table_.unbind_storage_view(s);
-    bloom_mip_slots_.clear();
-    for (VkImageView v : bloom_mip_views_) vkDestroyImageView(device_.get_device(), v, nullptr);
-    bloom_mip_views_.clear();
-    if (bloom_image_ != 0)
-    {
-        descriptor_table_.unbind(bloom_image_, ::string::gpu::descriptor_type::TEXTURE);
-        allocator_.destroy_resource(bloom_image_);
-        bloom_image_ = 0;
-    }
-    bloom_layout_init_ = false;
-}
-
-void PostProcessPass::ensure_targets()
-{
-    if (screen_size.width == 0 || screen_size.height == 0) return;
-    const glm::uvec2 screen(screen_size.width, screen_size.height);
-    if (bloom_image_ != 0 && screen == bloom_screen_) return;
-    destroy_targets();
-    bloom_screen_ = screen;
-    bloom_base_ = glm::max(screen / 2u, glm::uvec2(1));
-
+    const glm::uvec2 base = glm::max(glm::uvec2(viewport.width, viewport.height) / 2u,
+                                     glm::uvec2(1));
     uint32_t mips = uint32_t(std::clamp(cv_bloom_mips().get(), 1, 8));
-    while (mips > 1 && (std::min(bloom_base_.x, bloom_base_.y) >> (mips - 1)) < 4) --mips;
+    while (mips > 1 && (std::min(base.x, base.y) >> (mips - 1)) < 4) --mips;
+    return mips;
+}
+
+// ================================================================================================
+// authoring
+// ================================================================================================
+
+// One declaration per dispatch. Every edge the chain used to hold together with an unscoped global
+// memory barrier is now a write->read (or write->write) relationship between two declarations over
+// the same logical resource — the bins buffer for the histogram, and per-MIP slices of the bloom
+// pyramid for the pyramid. The graph derives the ordering, the barrier scopes and the layouts.
+void post_pass::declare(::string::frame_graph& fg, ::string::gpu::image hdr,
+                        ::string::gpu::image bloom, uint32_t mips, ::string::gpu::buffer bins)
+{
     bloom_mips_ = mips;
 
-    bloom_image_ = allocator_.create_resource(::string::gpu::image_info{
-        .extent = { bloom_base_.x, bloom_base_.y, 1 },
-        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-        .mip_levels = mips,
-    });
-    const ::string::gpu::allocated_image& img = allocator_.get_image(bloom_image_);
-    descriptor_table_.bind(bloom_image_, ::string::gpu::descriptor_type::TEXTURE);
-    bloom_sampled_slot_ = descriptor_table_.get_binding_slot(bloom_image_, ::string::gpu::descriptor_type::TEXTURE);
-    descriptor_table_.update_texture(bloom_sampled_slot_, img.view, sampler_);
+    // --- 1. Auto-exposure metering (histogram over the PRE-bloom resolved HDR) -------------------
+    // clear -> accumulate -> reduce. The two barriers that used to separate them are these three
+    // declarations of `bins`: WAW between clear and accumulate, RAW between accumulate and reduce.
+    fg.pass("post.histogram.clear")
+      .writes(bins)
+      .compute([this, bins](::string::pass_context& ctx) { record_hist_clear(ctx, bins); });
+
+    fg.pass("post.histogram.accumulate")
+      .reads(hdr)
+      .writes(bins)   // atomic read-modify-write; the storage-write scope covers both directions
+      .compute([this, bins, hdr](::string::pass_context& ctx) { record_hist(ctx, bins, hdr); });
+
+    fg.pass("post.histogram.reduce")
+      .reads(bins)
+      .compute([this, bins](::string::pass_context& ctx) { record_hist_reduce(ctx, bins); });
+
+    // --- 2. Bloom (r.bloom.enabled; off = the identity/parity lever) -----------------------------
+    // An in-graph conditional, not a recompile trigger: the passes stay declared and compiled and
+    // are simply skipped for the frames the CVar is off.
+    const auto bloom_on = [] { return cv_bloom_enabled().get(); };
+
+    // Downsample pyramid: mip 0 reads the scene (Karis average + firefly clamp), mip m reads
+    // mip m-1. Declaring the SLICES is what makes the chain derivable — mip m-1 and mip m no
+    // longer collide as "the same image", so the graph sees mips-1 producer/consumer pairs where it
+    // used to see one opaque pass with hand-rolled barriers inside it.
     for (uint32_t m = 0; m < mips; ++m)
     {
-        const VkImageViewCreateInfo vi = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = img.image,
-            .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 0, 1 },
-        };
-        VkImageView view = VK_NULL_HANDLE;
-        if (vkCreateImageView(device_.get_device(), &vi, nullptr, &view) != VK_SUCCESS)
-            throw std::runtime_error("PostProcessPass: failed to create bloom mip view");
-        bloom_mip_views_.push_back(view);
-        bloom_mip_slots_.push_back(descriptor_table_.bind_storage_view(view));
+        ::string::pass_spec spec = fg.pass("post.bloom.down." + std::to_string(m));
+        if (m == 0) spec.reads(hdr);
+        else        spec.reads(bloom.mip(m - 1));
+        spec.writes(bloom.mip(m))
+            .toggle(bloom_on)
+            .compute([this, hdr, bloom, m](::string::pass_context& ctx) {
+                record_bloom_down(ctx, hdr, bloom, m);
+            });
     }
-    STRING_LOG_INFO("[post] bloom chain {}x{} x{} mips", bloom_base_.x, bloom_base_.y, mips);
+
+    // Tent upsample-accumulate back to mip 0. Each step SAMPLES mip m+1 and read-modify-writes
+    // mip m in the same dispatch (post.slang bloom_up_main: `cur + up` into dst_images). Only the
+    // write is declared for mip m — access::storage_image_write's scope is WRITE|READ|SAMPLED and
+    // its layout is GENERAL, so a read-modify-write is exactly what it already describes; declaring
+    // a second, read use of the same slice would add nothing but a second entry to reason about.
+    for (int m = int(mips) - 2; m >= 0; --m)
+    {
+        const auto mu = uint32_t(m);
+        fg.pass("post.bloom.up." + std::to_string(mu))
+          .reads(bloom.mip(mu + 1))
+          .writes(bloom.mip(mu))
+          .toggle(bloom_on)
+          .compute([this, bloom, mu](::string::pass_context& ctx) {
+              record_bloom_up(ctx, bloom, mu);
+          });
+    }
+
+    // Apply into the scene target in place: sampled read of bloom mip 0, storage read-and-write of
+    // the HDR colour. The write against hdr is what orders this after the histogram's and the first
+    // downsample's sampled reads of the same image — the last of the six barriers.
+    fg.pass("post.bloom.apply")
+      .reads(bloom.mip(0))
+      .writes(hdr)
+      .toggle(bloom_on)
+      .compute([this, hdr, bloom](::string::pass_context& ctx) {
+          record_bloom_apply(ctx, hdr, bloom);
+      });
 }
 
-void PostProcessPass::update(float delta_time, uint16_t current_frame)
-{
-    // Descriptor updates (target recreation) must land before this frame's recording binds the
-    // bindless set — update() runs pre-record by construction (the brief-07 UPDATE_AFTER_BIND
-    // gotcha).
-    ensure_targets();
+// ================================================================================================
+// per-frame CPU work
+// ================================================================================================
 
-    // Auto-exposure: consume the metering value this slot's buffer carries (written
-    // frames_in_flight frames ago; the frame-slot timeline wait in begin_frame makes it safe).
-    if (frame_index_ >= frames_in_flight_ && current_frame < readback_.size())
+void post_pass::tick(float dt)
+{
+    // The readback ring is this pass's own, so it is indexed by this pass's own frame counter: the
+    // slot read here is the slot the reduce dispatch writes later this frame, and the value in it
+    // was written frames_in_flight frames ago. The frame-slot timeline wait in begin_frame is what
+    // makes reading it CPU-side safe.
+    readback_slot_ = frames_in_flight_ ? uint32_t(frame_index_ % frames_in_flight_) : 0;
+
+    if (frame_index_ >= frames_in_flight_ && readback_slot_ < readback_.size())
     {
         ExposureOut out{};
-        std::memcpy(&out, readback_mapped_[current_frame], sizeof(out));
+        std::memcpy(&out, readback_mapped_[readback_slot_], sizeof(out));
         if (cv_exposure_verify().get() && !verify_logged_ && out.total != 0)
         {
             verify_logged_ = true;
             STRING_LOG_INFO("[exposure] histogram total {} (expect {}x{} = {}), kept {} "
                             "(cut {:.2f}/{:.2f}), avg log2 lum {:.3f}",
-                            out.total, screen_size.width, screen_size.height,
-                            uint64_t(screen_size.width) * screen_size.height, out.kept,
+                            out.total, extent_.width, extent_.height,
+                            uint64_t(extent_.width) * extent_.height, out.kept,
                             cv_exposure_cut_low().get(), cv_exposure_cut_high().get(),
                             out.avg_log_lum);
         }
@@ -270,162 +288,136 @@ void PostProcessPass::update(float delta_time, uint16_t current_frame)
                 // eye stops down fast), "down" = EV falling (dark adaptation, slower).
                 const float rate = target > ev100_ ? cv_exposure_speed_up().get()
                                                    : cv_exposure_speed_down().get();
-                ev100_ += (target - ev100_) * (1.0f - std::exp(-delta_time * rate));
+                ev100_ += (target - ev100_) * (1.0f - std::exp(-dt * rate));
                 // Snap once within a millistop: the exponential approach never exactly converges
                 // in fp, which would leave a permanent last-ulp EV difference between two runs
                 // whose warmup (texture-streaming timing) differed — the run-twice AE=0 gate
                 // requires the settled state to be history-free.
                 if (std::abs(target - ev100_) < 1e-3f) ev100_ = target;
             }
-            String::CompositePass::set_auto_ev100(ev100_);
+            String::composite_pass::set_auto_ev100(ev100_);
         }
     }
     ++frame_index_;
-
-    // Declared usages for this frame slot (04e authoring contract): the HDR target is sampled +
-    // storage-written at COMPUTE (GENERAL); histogram scratch + readback are compute writes.
-    usages.clear();
-    usages.push_back({ ::string::gpu::COLOR_TARGET, String::Access::StorageImageWrite,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT });
-    if (scratch_->materialized())
-        usages.push_back({ scratch_->buffer(current_frame), String::Access::StorageWrite,
-                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT });
-    usages.push_back({ readback_[current_frame], String::Access::StorageWrite,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT });
 }
 
-void PostProcessPass::record(::string::gpu::command_recorder& recorder, uint16_t current_frame)
+// ================================================================================================
+// recording
+// ================================================================================================
+
+void post_pass::dispatch(::string::pass_context& ctx, ::string::gpu::shader_program* prog,
+                         const PostPush& push, uint32_t gx, uint32_t gy)
 {
-    if (bloom_image_ == 0) return;
-    VkCommandBuffer cb = recorder.vk();   // escape: vku::transition_image + record_outline_slot take a raw cb
+    ::string::gpu::command_recorder& recorder = ctx.rec;
+    const ::string::gpu::pipeline& p = prog->current();
     VkDescriptorSet set = descriptor_table_.get_set();
+    recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+    recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
+                                  0, 1, &set, 0, nullptr);
+    recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(PostPush), &push);
+    recorder.dispatch(gx, gy, 1);
+}
 
-    const auto dispatch = [&](::string::gpu::shader_program* prog, const PostPush& push,
-                              uint32_t gx, uint32_t gy) {
-        const ::string::gpu::pipeline& p = prog->current();
-        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-        recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
-                                      0, 1, &set, 0, nullptr);
-        recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(PostPush), &push);
-        recorder.dispatch(gx, gy, 1);
-    };
-    const auto barrier = [&] {
-        const VkMemoryBarrier2 mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
-                           | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-                           | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
-                           | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-                           | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-        };
-        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-        recorder.barrier(dep);
-    };
+PostPush post_pass::base_push(::string::pass_context& ctx, ::string::gpu::buffer bins) const
+{
+    PostPush base{};
+    base.hist = ctx.address(bins);
+    base.readback = allocator_.get_buffer(readback_[readback_slot_]).device_address;
+    base.log_min = kLogMin;
+    base.log_inv_range = 1.0f / (kLogMax - kLogMin);
+    return base;
+}
 
-    // Bloom chain lives permanently in GENERAL (07 cubemap pattern): one-time transition, then a
-    // single execution barrier orders this frame's writes against last frame's reads.
-    const ::string::gpu::allocated_image& bloom = allocator_.get_image(bloom_image_);
-    if (!bloom_layout_init_)
+void post_pass::record_hist_clear(::string::pass_context& ctx, ::string::gpu::buffer bins)
+{
+    dispatch(ctx, hist_clear_program_, base_push(ctx, bins), 1, 1);
+}
+
+void post_pass::record_hist(::string::pass_context& ctx, ::string::gpu::buffer bins,
+                            ::string::gpu::image hdr)
+{
+    extent_ = ctx.extent;
+    const glm::uvec2 screen = screen_of(ctx);
+    PostPush push = base_push(ctx, bins);
+    push.src_slot = ctx.slot(hdr);
+    push.src_size = screen;
+    dispatch(ctx, hist_program_, push, (screen.x + 15) / 16, (screen.y + 15) / 16);
+}
+
+void post_pass::record_hist_reduce(::string::pass_context& ctx, ::string::gpu::buffer bins)
+{
+    PostPush push = base_push(ctx, bins);
+    push.p0 = std::clamp(cv_exposure_cut_low().get(), 0.0f, 0.95f);
+    push.p1 = std::clamp(cv_exposure_cut_high().get(), 0.0f, 0.5f);
+    dispatch(ctx, hist_reduce_program_, push, 1, 1);
+}
+
+void post_pass::record_bloom_down(::string::pass_context& ctx, ::string::gpu::image hdr,
+                                  ::string::gpu::image bloom, uint32_t m)
+{
+    const glm::uvec2 screen = screen_of(ctx);
+    const glm::uvec2 base = bloom_base_of(ctx);
+    const glm::uvec2 dst = bloom_mip_size(base, m);
+
+    PostPush push{};
+    push.log_min = kLogMin;
+    push.log_inv_range = 1.0f / (kLogMax - kLogMin);
+    if (m == 0)
     {
-        bloom_layout_init_ = true;
-        vku::transition_image(cb, {
-            .image = bloom.image,
-            .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-            .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
-            .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-            .level_count = bloom_mips_,
-        });
+        push.src_slot = ctx.slot(hdr);
+        push.src_size = screen;
+        push.flags = 1u;   // Karis + clamp
+        push.p0 = std::max(cv_bloom_clamp().get(), 0.0f);
     }
     else
     {
-        barrier();   // cross-frame WAR on the bloom chain (same queue, cross-CB)
+        // The source slot is now the SLICE's own texture slot, not the whole image's — so the
+        // shader's source mip is selected by the descriptor rather than by the lod field, and the
+        // lod bits (flags 8..15) are 0. Same texels, same taps, same dispatch; the mip selection
+        // moved from a hand-packed push field to the declaration the graph already needed.
+        push.src_slot = ctx.slot(bloom.mip(m - 1));
+        push.src_size = bloom_mip_size(base, m - 1);
     }
+    push.dst_slot = ctx.slot(bloom.mip(m));
+    push.dst_size = dst;
+    dispatch(ctx, bloom_down_program_, push, (dst.x + 7) / 8, (dst.y + 7) / 8);
+}
 
-    const glm::uvec2 screen(screen_size.width, screen_size.height);
-    PostPush base{};
-    base.hist = scratch_->materialized() ? scratch_->address(current_frame) + hist_off_ : 0;
-    base.readback = allocator_.get_buffer(readback_[current_frame]).device_address;
-    base.log_min = kLogMin;
-    base.log_inv_range = 1.0f / (kLogMax - kLogMin);
+void post_pass::record_bloom_up(::string::pass_context& ctx, ::string::gpu::image bloom, uint32_t m)
+{
+    const glm::uvec2 base = bloom_base_of(ctx);
+    const glm::uvec2 dst = bloom_mip_size(base, m);
 
-    // --- 1. Auto-exposure metering (histogram over the PRE-bloom resolved HDR) ---
-    if (base.hist != 0)
-    {
-        PostPush push = base;
-        dispatch(hist_clear_program_, push, 1, 1);
-        barrier();
-        push.src_slot = color_sampled_slot_;
-        push.src_size = screen;
-        dispatch(hist_program_, push, (screen.x + 15) / 16, (screen.y + 15) / 16);
-        barrier();
-        push.p0 = std::clamp(cv_exposure_cut_low().get(), 0.0f, 0.95f);
-        push.p1 = std::clamp(cv_exposure_cut_high().get(), 0.0f, 0.5f);
-        dispatch(hist_reduce_program_, push, 1, 1);
-    }
+    PostPush push{};
+    push.log_min = kLogMin;
+    push.log_inv_range = 1.0f / (kLogMax - kLogMin);
+    push.src_slot = ctx.slot(bloom.mip(m + 1));   // slice slot; lod bits stay 0 (see down)
+    push.src_size = bloom_mip_size(base, m + 1);
+    push.dst_slot = ctx.slot(bloom.mip(m));
+    push.dst_size = dst;
+    push.p0 = std::clamp(cv_bloom_radius().get(), 0.0f, 2.0f);
+    dispatch(ctx, bloom_up_program_, push, (dst.x + 7) / 8, (dst.y + 7) / 8);
+}
 
-    // --- 2. Bloom (r.bloom.enabled; off = the identity/parity lever) ---
-    if (cv_bloom_enabled().get())
-    {
-        // Downsample pyramid. Mip 0 reads the scene (Karis average + firefly clamp).
-        for (uint32_t m = 0; m < bloom_mips_; ++m)
-        {
-            PostPush push = base;
-            const glm::uvec2 dst(std::max(bloom_base_.x >> m, 1u), std::max(bloom_base_.y >> m, 1u));
-            if (m == 0)
-            {
-                push.src_slot = color_sampled_slot_;
-                push.src_size = screen;
-                push.flags = 1u;   // Karis + clamp
-                push.p0 = std::max(cv_bloom_clamp().get(), 0.0f);
-            }
-            else
-            {
-                push.src_slot = bloom_sampled_slot_;
-                push.src_size = glm::uvec2(std::max(bloom_base_.x >> (m - 1), 1u),
-                                           std::max(bloom_base_.y >> (m - 1), 1u));
-                push.flags = (m - 1) << 8;
-            }
-            push.dst_slot = bloom_mip_slots_[m];
-            push.dst_size = dst;
-            dispatch(bloom_down_program_, push, (dst.x + 7) / 8, (dst.y + 7) / 8);
-            barrier();
-        }
-        // Tent upsample-accumulate back to mip 0.
-        for (int m = int(bloom_mips_) - 2; m >= 0; --m)
-        {
-            PostPush push = base;
-            const glm::uvec2 dst(std::max(bloom_base_.x >> m, 1u), std::max(bloom_base_.y >> m, 1u));
-            push.src_slot = bloom_sampled_slot_;
-            push.src_size = glm::uvec2(std::max(bloom_base_.x >> (m + 1), 1u),
-                                       std::max(bloom_base_.y >> (m + 1), 1u));
-            push.flags = uint32_t(m + 1) << 8;
-            push.dst_slot = bloom_mip_slots_[uint32_t(m)];
-            push.dst_size = dst;
-            push.p0 = std::clamp(cv_bloom_radius().get(), 0.0f, 2.0f);
-            dispatch(bloom_up_program_, push, (dst.x + 7) / 8, (dst.y + 7) / 8);
-            barrier();
-        }
-        // Apply into the scene target in place (after the histogram's reads — the barriers above
-        // ordered them).
-        PostPush push = base;
-        push.src_slot = bloom_sampled_slot_;
-        push.src_size = bloom_base_;
-        push.dst_slot = color_storage_slot_;
-        push.dst_size = screen;
-        push.p0 = std::max(cv_bloom_intensity().get(), 0.0f);
-        dispatch(bloom_apply_program_, push, (screen.x + 7) / 8, (screen.y + 7) / 8);
-    }
+void post_pass::record_bloom_apply(::string::pass_context& ctx, ::string::gpu::image hdr,
+                                   ::string::gpu::image bloom)
+{
+    const glm::uvec2 screen = screen_of(ctx);
+    const glm::uvec2 base = bloom_base_of(ctx);
 
-    // --- 3. Outline/rim slot (brief 10 decides the style; depth + reconstructed normals are
+    PostPush push{};
+    push.log_min = kLogMin;
+    push.log_inv_range = 1.0f / (kLogMax - kLogMin);
+    push.src_slot = ctx.slot(bloom.mip(0));   // bloom_apply_main samples at lod 0.0 unconditionally
+    push.src_size = base;
+    push.dst_slot = ctx.slot(hdr);
+    push.dst_size = screen;
+    push.p0 = std::max(cv_bloom_intensity().get(), 0.0f);
+    dispatch(ctx, bloom_apply_program_, push, (screen.x + 7) / 8, (screen.y + 7) / 8);
+
+    // --- Outline/rim slot (brief 10 decides the style; depth + reconstructed normals are
     // available at this point in the frame) ---
-    record_outline_slot(cb);
+    record_outline_slot(ctx.rec.vk());
 }
 
 }  // namespace string::render

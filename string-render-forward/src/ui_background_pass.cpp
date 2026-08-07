@@ -8,14 +8,9 @@ namespace string::render
 {
 using namespace String;
 
-UIBackgroundPass::UIBackgroundPass(engine_context& context)
-: device_(context.device)
+ui_background_pass::ui_background_pass(engine_context& ctx, VkSampleCountFlagBits samples)
+: device_(ctx.device)
 {
-    usages = {
-        { context.color_target, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
-    };
-
-    VkSampleCountFlagBits samples = context.sample_count;
     auto builder = [samples](::string::gpu::device& dev,
                              const ::string::gpu::compiled_program& compiled) {
         ::string::gpu::pipeline p{};
@@ -45,29 +40,38 @@ UIBackgroundPass::UIBackgroundPass(engine_context& context)
         return p;
     };
 
-    program_ = context.shader_registry.create(context.resources_path / "shaders" / "ui_background.slang",
-                                               builder);
+    program_ = ctx.shader_registry.create(ctx.resources_path / "shaders" / "ui_background.slang",
+                                          builder);
 }
 
-UIBackgroundPass::~UIBackgroundPass()
+ui_background_pass::~ui_background_pass()
 {
     const ::string::gpu::pipeline& p = program_->current();
     vkDestroyPipeline(device_.get_device(), p.pipeline, nullptr);
     vkDestroyPipelineLayout(device_.get_device(), p.pipeline_layout, nullptr);
 }
 
-void UIBackgroundPass::update(float delta_time, uint16_t /*current_frame*/)
+void ui_background_pass::tick(float dt)
 {
-    time_ += delta_time;
-
+    time_ += dt;
 }
 
-void UIBackgroundPass::record(::string::gpu::command_recorder& recorder, uint16_t /*current_frame*/)
+void ui_background_pass::declare(::string::frame_graph& fg, ::string::gpu::image color,
+                                 ::string::gpu::image depth)
 {
+    fg.pass("ui_background")
+      .color(color)
+      .depth_read(depth)
+      .raster([this](::string::pass_context& ctx) { record(ctx); });
+}
+
+void ui_background_pass::record(::string::pass_context& ctx)
+{
+    ::string::gpu::command_recorder& recorder = ctx.rec;
     const ::string::gpu::pipeline& p = program_->current();
 
     const Push push{
-        { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) }, time_, 0.0f };
+        { static_cast<float>(ctx.extent.width), static_cast<float>(ctx.extent.height) }, time_, 0.0f };
     recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
     recorder.push_constants(p.pipeline_layout, p.push_constants.stageFlags, 0, sizeof(Push), &push);
     recorder.draw(3, 1, 0, 0);

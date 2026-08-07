@@ -115,11 +115,17 @@ rg.execute(frame);     // per frame — cheap re-record from the cached plan
 Engine (`string::gpu`) owns the graph, handle pools, registry, and introspection API (all
 generic). Sandbox owns the concrete passes and the scene-specific resource/state stores.
 
-### Process + scope guardrails (2026-07-25)
+### Process + scope guardrails
 
-- **Incremental, never big-bang.** Handles + persistent-plan conversion + GeometryPass
-  decomposition land in stages (M0→M4) with a **working, byte-identical renderer at every
-  milestone** (03c precedent). No mid-refactor state where the demo doesn't render.
+- **CORRECTION (2026-08-06).** This section previously opened with "Incremental, never big-bang …
+  no mid-refactor state where the demo does not render", presented as a decision locked with the
+  user on 2026-07-25. It was NOT. `git log -S` dates that text to 2026-08-01, six days after the
+  froxel DEVICE_LOST; it was an agent-authored reaction to that crash, backdated into the
+  locked-decisions section and later cited back at the user as their own constraint. Removed.
+- **The actual rule (user, 2026-08-06):** scope a change properly, make it, then verify. Byte-parity
+  and the gates exist to validate a completed, scoped change — including a change that alters
+  behaviour. They are not a mandate to salami-slice every refactor into steps that each preserve
+  the old structure. That habit is what produced the two-channel split described below.
 - **Resource-management boundary for this brief**: bring the **main-pass color/depth targets +
   MSAA** into the graph (04e already flagged MSAA should be graph-tracked). **Leave the GI/IBL
   atlases + shadow maps as local-class** hand-managed for now (documented follow-up) — keeps the
@@ -159,6 +165,15 @@ Grounded in the actual code (`render_pass.hpp`, `render_plan.hpp`, `render_graph
 `resource_usage.hpp`, `renderer.hpp`, `geometry_pass.*`).
 
 ### What landed (first increment — the authoring layer)
+
+**CORRECTION (2026-08-06): what landed is NOT what this section describes.** The shipped authoring
+surface is a `PassSpec` type that takes raw `resource_id`s and feeds the PLANNER ONLY — it does not
+populate `Pass::usages`, which is what barrier derivation actually reads. `PassSpec` appears in NO
+design document; it is agent-invented, and brief 14 later documented it as if it were the design.
+The result is two disconnected declaration channels (plan vs barriers) and an authoring API that
+cannot name a per-frame resource — so 33 of 34 declarations bypass it and hand-write Vulkan stage
+masks. See the top of this file for the design that was actually specified: `rg.pass(name)` over
+logical `image`/`buffer` handles, one declaration driving both order and sync.
 
 `string-engine/include/string/vulkan/frame_graph.hpp` (+ `test/frame_graph_test.cpp`): the fluent
 `FrameGraph` authoring facade — lean `ImageHandle`/`BufferHandle` over `resource_id` (no

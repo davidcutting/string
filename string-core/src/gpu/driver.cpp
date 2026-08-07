@@ -1,6 +1,8 @@
 #include <string/gpu/driver.hpp>
+#include <string/core/logger.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 
+#include <cstdlib>
 #include <string.h>
 
 #define VOLK_STATIC_DISPATCH
@@ -114,6 +116,30 @@ driver::driver(const String::ApplicationInfo& info, const std::shared_ptr<String
 
     String::vku::default_debug_messenger_create_info(instance_debug_create_info);
     create_info.pNext = (VkDebugUtilsMessengerCreateInfoEXT*)&instance_debug_create_info;
+
+    // STRING_SYNC_VALIDATION=1: turn on SYNCHRONIZATION validation.
+    //
+    // This is OPT-IN and separate from the default checks, which is easy to be caught out by: a
+    // clean validation run says the API usage is LEGAL, not that the synchronisation is CORRECT.
+    // Missing barriers are invisible to the default layer set, and they are precisely the bug class
+    // that renders correctly on one vendor and produces garbage on another (whoever's scheduler
+    // happens to overlap the unsynchronised work). If output is wrong on one machine and right on
+    // another while plain validation stays silent, this is the check that has not been run yet.
+    //
+    // Not on by default even in debug: it is expensive, and it is a deliberate investigation tool.
+    // Kept as an env var rather than a CVar because it must be decided before instance creation,
+    // which is well before the CVar registry exists.
+    VkValidationFeaturesEXT validation_features{ VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT };
+    const VkValidationFeatureEnableEXT sync_feature =
+        VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+    if (const char* sv = std::getenv("STRING_SYNC_VALIDATION"); sv != nullptr && sv[0] == '1')
+    {
+        validation_features.enabledValidationFeatureCount = 1;
+        validation_features.pEnabledValidationFeatures = &sync_feature;
+        validation_features.pNext = create_info.pNext;   // keep the debug messenger in the chain
+        create_info.pNext = &validation_features;
+        STRING_LOG_INFO("Vulkan SYNCHRONIZATION validation ENABLED (STRING_SYNC_VALIDATION=1)");
+    }
 #endif
 
     if (vkCreateInstance(&create_info, nullptr, &instance_) != VK_SUCCESS) {

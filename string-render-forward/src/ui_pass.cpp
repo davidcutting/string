@@ -18,7 +18,6 @@
 #include <string/ui/text_measurer.hpp>
 #include <string/gpu/pipeline_builder.hpp>
 #include <string/vulkan/passes/composite_pass.hpp>
-#include <string/vulkan/vulkan_utils.hpp>
 
 namespace string::render
 {
@@ -240,8 +239,8 @@ void append_glyphs(::string::dynamic_font_atlas& atlas, ::string::text_shape_cac
 
 }  // namespace
 
-void UIPass::make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight,
-                       std::uint32_t capacity, std::size_t stride)
+void ui_pass::make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight,
+                        std::uint32_t capacity, std::size_t stride)
 {
     ring.resize(frames_in_flight);
     for (Ring& r : ring)
@@ -259,8 +258,9 @@ void UIPass::make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight,
     }
 }
 
-UIPass::UIPass(engine_context& context, std::shared_ptr<::string::dynamic_font_atlas> atlas,
-               Author author, PostLayout post_layout, DeferredAuthor deferred)
+ui_pass::ui_pass(engine_context& context, VkSampleCountFlagBits samples,
+                 std::shared_ptr<::string::dynamic_font_atlas> atlas,
+                 Author author, PostLayout post_layout, DeferredAuthor deferred)
 : device_(context.device)
 , allocator_(context.allocator)
 , descriptor_table_(context.descriptor_table)
@@ -292,8 +292,12 @@ UIPass::UIPass(engine_context& context, std::shared_ptr<::string::dynamic_font_a
 
     const std::filesystem::path& resources_path = context.resources_path;
 
-    // --- Dynamic SDF atlas: an R8 sampled image, seeded here and re-uploaded (dirty region) each
-    // frame the atlas grows (record_compute). ---
+    // --- Dynamic SDF atlas: an R8 sampled image, seeded here and re-uploaded (whole atlas) by the
+    // declared ui.atlas_upload transfer pass on any frame the atlas grew. ---
+    //
+    // The sampler is part of the image now (brief 20): LINEAR/LINEAR with NEAREST mip mode and
+    // CLAMP_TO_EDGE, no anisotropy, transparent-black border — exactly the configuration this pass
+    // used to create by hand and force in through the deleted update_texture().
     atlas_upload_bytes_ = static_cast<std::uint32_t>(atlas_->pixels_size());
     atlas_image_ = allocator_.create_resource(::string::gpu::image_info{
         .extent = { atlas_->atlas_w(), atlas_->atlas_h(), 1 },
@@ -303,11 +307,18 @@ UIPass::UIPass(engine_context& context, std::shared_ptr<::string::dynamic_font_a
         .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
+        .sampler = {
+            .mag_filter = VK_FILTER_LINEAR,
+            .min_filter = VK_FILTER_LINEAR,
+            .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .anisotropy = false,
+            .border_color = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        },
         .mip_levels = 1,
     });
     context.transfer.upload_image(atlas_->pixels(), atlas_->pixels_size(), atlas_image_);
-    atlas_->take_dirty();  // consume the seed generation's dirty flag; record_compute owns re-uploads
-    atlas_uploaded_ = true;
+    atlas_->take_dirty();  // consume the seed generation's dirty flag; the upload pass owns re-uploads
     // Per-frame-in-flight host-visible staging buffers for the dynamic re-upload.
     atlas_staging_.resize(context.frames_in_flight);
     for (::string::gpu::resource_id& s : atlas_staging_)
@@ -320,24 +331,10 @@ UIPass::UIPass(engine_context& context, std::shared_ptr<::string::dynamic_font_a
                               | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
         });
     }
+    // bind() is sufficient on its own again: it reads the sampler off the image, which is now the
+    // one configured above. The slot is kept for pack-time image widgets (see atlas_slot_).
     descriptor_table_.bind(atlas_image_, ::string::gpu::descriptor_type::TEXTURE);
     atlas_slot_ = descriptor_table_.get_binding_slot(atlas_image_, ::string::gpu::descriptor_type::TEXTURE);
-    const VkSamplerCreateInfo sampler_info = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .maxLod = VK_LOD_CLAMP_NONE,
-        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
-    };
-    if (vkCreateSampler(device_.get_device(), &sampler_info, nullptr, &atlas_sampler_) != VK_SUCCESS)
-    {
-        throw std::runtime_error("UIPass: failed to create atlas sampler");
-    }
-    descriptor_table_.update_texture(atlas_slot_, allocator_.get_image(atlas_image_).view, atlas_sampler_);
 
     // --- Per-frame ring buffers: shapes + glyphs ---
     make_ring(shape_ring_, context.frames_in_flight, kMaxShapes, sizeof(GpuShape));
@@ -346,16 +343,11 @@ UIPass::UIPass(engine_context& context, std::shared_ptr<::string::dynamic_font_a
     batches_.resize(context.frames_in_flight);
     descriptor_set_ = descriptor_table_.get_set();
 
-    usages = {
-        { context.color_target, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
-    };
-
     // Both overlay pipelines share the same fixed state (instanced quads, no cull, MSAA, no depth,
     // alpha blend); only the shaders + reflected push-constant range differ. Build them via the
     // hot-reload registry so a save recompiles + swaps them. Set 0 stays the bindless table layout;
     // reflection drives the push-constant range.
     VkDescriptorSetLayout global_layout = descriptor_table_.get_layout();
-    VkSampleCountFlagBits samples = context.sample_count;
     auto overlay_builder = [global_layout, samples](::string::gpu::device& dev,
                                                     const ::string::gpu::compiled_program& compiled) {
         ::string::gpu::pipeline p{};
@@ -393,7 +385,7 @@ UIPass::UIPass(engine_context& context, std::shared_ptr<::string::dynamic_font_a
                                                     overlay_builder);
 }
 
-UIPass::~UIPass()
+ui_pass::~ui_pass()
 {
     const ::string::gpu::pipeline& shape_p = shape_program_->current();
     vkDestroyPipeline(device_.get_device(), shape_p.pipeline, nullptr);
@@ -425,10 +417,9 @@ UIPass::~UIPass()
     {
         allocator_.destroy_resource(s);
     }
-    vkDestroySampler(device_.get_device(), atlas_sampler_, nullptr);
 }
 
-void UIPass::author_error_overlay()
+void ui_pass::author_error_overlay()
 {
     const std::vector<::string::gpu::compile_error> errors = shader_registry_.current_errors();
     if (errors.empty())
@@ -481,7 +472,7 @@ void UIPass::author_error_overlay()
 // place in the codebase that does. Host conventions live HERE, not in the engine: what counts as a
 // stick flick, which gamepad button activates, whether the cursor is captured. The engine gets
 // de-edged intent and nothing else, which is what keeps `::string::ui` platform-free and testable.
-::string::ui::interaction_input UIPass::populate_interaction(float delta_time)
+::string::ui::interaction_input ui_pass::populate_interaction(float delta_time)
 {
     ::string::ui::interaction_input in;
     const glm::vec2 mouse = input_.mouse_position();
@@ -564,7 +555,7 @@ void UIPass::author_error_overlay()
 
 // The engine REQUESTS a mode; the host grants it. Kept out of the resolvers deliberately: capture is
 // a platform decision, and `::string::ui` must not know that a window or a cursor exists.
-void UIPass::apply_mode_requests()
+void ui_pass::apply_mode_requests()
 {
     if (interaction_.wants_game_mode) input_.set_capture_requested(true);
     if (interaction_.wants_ui_mode) input_.set_capture_requested(false);
@@ -573,7 +564,7 @@ void UIPass::apply_mode_requests()
 // Brief 12 M0a. Writes the positioned tree once, on the configured frame, when dbg.ui.dump names a
 // path. Deliberately dumb: no exit, no capture coupling — the harness bounds the run with `timeout`
 // exactly like tools/capture.sh does, which keeps this out of the renderer's shutdown path.
-void UIPass::maybe_dump_layout()
+void ui_pass::maybe_dump_layout()
 {
     const std::string& path = cv_ui_dump().get();
     if (path.empty()) return;
@@ -600,8 +591,12 @@ void UIPass::maybe_dump_layout()
                     ui_frames_);
 }
 
-void UIPass::update(float delta_time, uint16_t current_frame)
+// Ordinary per-frame CPU work — interaction, authoring, layout, packing — run by the app before the
+// graph executes. Not a graph concept: nothing here records a command.
+void ui_pass::tick(float delta_time, VkExtent2D screen, std::uint32_t frame_slot)
 {
+    screen_size = screen;
+    const std::uint32_t current_frame = frame_slot;
     if (screen_size.width == 0 || screen_size.height == 0 || current_frame >= shape_ring_.size())
     {
         return;  // not sized yet
@@ -737,7 +732,7 @@ void UIPass::update(float delta_time, uint16_t current_frame)
     if ((shapes.size() > kMaxShapes || glyphs.size() > kMaxGlyphs || images.size() > kMaxImages)
         && !warned_overflow_)
     {
-        STRING_LOG_WARN("UIPass: content exceeds ring capacity ({} shapes / {} glyphs / {} images);"
+        STRING_LOG_WARN("ui_pass: content exceeds ring capacity ({} shapes / {} glyphs / {} images);"
                         " truncating", shapes.size(), glyphs.size(), images.size());
         warned_overflow_ = true;
     }
@@ -811,35 +806,61 @@ void UIPass::update(float delta_time, uint16_t current_frame)
     // their entries seen, so anything untouched by either is genuinely gone from the UI this frame.
     // Doing it earlier would evict runs the pass had not replayed yet.
     shape_cache_.end_frame();
+
+    // Latch whether the atlas grew while measuring/packing above. take_dirty() CONSUMES the atlas's
+    // flag, so it is read exactly once, here — the graph's conditional then asks atlas_dirty(), which
+    // does not consume, and the upload callback is what clears it. Reading it in the predicate
+    // instead would eat the flag on the frame the planner evaluated it and never upload.
+    atlas_dirty_ = atlas_->take_dirty() || atlas_dirty_;
 }
 
-bool UIPass::record_compute(::string::gpu::command_recorder& recorder, uint16_t current_frame)
+// Author onto the graph. The glyph atlas is the pass's own image, so it enters the graph as a
+// PERSISTENT resource — the graph manages its usage, never its lifetime — and the two declarations
+// below are what the write->read edge is derived from. The upload used to sit in record_compute()
+// wrapped in a hand-rolled SHADER_READ->TRANSFER_DST / TRANSFER_DST->SHADER_READ barrier pair; both
+// are deleted. The first is derived from ui.atlas_upload's transfer_write against the tracked state
+// (which now carries across the frame boundary, so it also covers the cross-frame WAR against LAST
+// frame's text draw); the second from this pass's sampled read of the same handle.
+void ui_pass::declare(::string::frame_graph& fg, ::string::gpu::image target)
 {
-    // Re-upload the dynamic atlas when new glyphs appeared this frame (the author's measure/shape
-    // rasterised them into the CPU atlas during update()). Runs OUTSIDE dynamic rendering, so the
-    // image-layout barriers are legal here. Whole-atlas copy (simple + the atlas is ~1MB); the
-    // dirty flag makes it a no-op on the common no-new-glyph frame.
-    if (current_frame >= atlas_staging_.size() || !atlas_->take_dirty())
-    {
-        return false;
-    }
-
-    const ::string::gpu::allocated_buffer& staging = allocator_.get_buffer(atlas_staging_[current_frame]);
-    std::memcpy(staging.allocation_info.pMappedData, atlas_->pixels(), atlas_upload_bytes_);
-
-    VkCommandBuffer cb = recorder.vk();   // escape: vku::transition_image below takes a raw cb
-    const VkImage image = allocator_.get_image(atlas_image_).image;
-
-    // SHADER_READ (or UNDEFINED, but we uploaded the seed) -> TRANSFER_DST.
-    String::vku::transition_image(cb, {
-        .image = image,
-        .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .new_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .src_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-        .src_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-        .dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT,
-        .dst_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+    atlas_handle_ = fg.use_persistent(::string::persistent_image_info{
+        .name = "ui.atlas",
+        .physical = { atlas_image_ },
+        // The seed generation was uploaded by the transfer batch during construction, which leaves
+        // the image in SHADER_READ_ONLY. The graph cannot observe that — it happened before any
+        // graph existed — so the owner states it, or the first derived barrier asserts a layout the
+        // image never reached.
+        .initial_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     });
+
+    // The dynamic atlas re-upload: whole-atlas copy (simple, and the atlas is ~1 MB), conditional on
+    // new glyphs having appeared while tick() measured and packed. On the common no-new-glyph frame
+    // the conditional drops the pass and nothing is recorded at all.
+    fg.pass("ui.atlas_upload")
+      .writes(atlas_handle_.whole(), ::string::access::transfer_write)
+      .toggle([this] { return atlas_dirty(); })
+      .transfer([this](::string::pass_context& ctx) { record_atlas_upload(ctx); });
+
+    // The overlay draw itself: samples the atlas for its text, writes the scene colour target.
+    fg.pass("ui")
+      .reads(atlas_handle_)
+      .color(target)
+      .raster([this](::string::pass_context& ctx) { record(ctx); });
+}
+
+void ui_pass::record_atlas_upload(::string::pass_context& ctx)
+{
+    if (ctx.frame_slot >= atlas_staging_.size())
+    {
+        return;
+    }
+    // Cleared HERE rather than in the predicate: the conditional is asked every frame and must not
+    // consume what it reports. This is the one place that knows the upload actually happened.
+    atlas_dirty_ = false;
+
+    ::string::gpu::command_recorder& recorder = ctx.rec;
+    const ::string::gpu::allocated_buffer& staging = allocator_.get_buffer(atlas_staging_[ctx.frame_slot]);
+    std::memcpy(staging.allocation_info.pMappedData, atlas_->pixels(), atlas_upload_bytes_);
 
     const VkBufferImageCopy region = {
         .bufferOffset = 0,
@@ -849,23 +870,19 @@ bool UIPass::record_compute(::string::gpu::command_recorder& recorder, uint16_t 
         .imageOffset = { 0, 0, 0 },
         .imageExtent = { atlas_->atlas_w(), atlas_->atlas_h(), 1 },
     };
-    recorder.copy_buffer_to_image(staging.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    // TRANSFER_DST -> SHADER_READ for the color pass's text draw.
-    String::vku::transition_image(cb, {
-        .image = image,
-        .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .src_stage = VK_PIPELINE_STAGE_2_COPY_BIT,
-        .src_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-    });
-    return true;
+    // The image is already in TRANSFER_DST — the graph put it there, derived from the transfer_write
+    // this pass declared.
+    recorder.copy_buffer_to_image(staging.buffer, ctx.vk_image(atlas_handle_.whole()),
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 }
 
-void UIPass::record(::string::gpu::command_recorder& recorder, uint16_t current_frame)
+void ui_pass::record(::string::pass_context& ctx)
 {
+    ::string::gpu::command_recorder& recorder = ctx.rec;
+    const std::uint32_t current_frame = ctx.frame_slot;
+    // The viewport comes from the context now, not from a resize() the renderer pushed in. Same value
+    // tick() laid out against; deliberately shadows the member so the draw code below reads unchanged.
+    const VkExtent2D screen_size = ctx.extent;
     if (current_frame >= shape_ring_.size())
     {
         return;
@@ -895,7 +912,11 @@ void UIPass::record(::string::gpu::command_recorder& recorder, uint16_t current_
     // multiply the whole frame by the EV100 exposure scale before the tonemap LUT. Pre-divide the
     // UI colors by that same scale (same frame, same value the composite's record() reads) so the
     // exposure cancels and the console/HUD keep their authored brightness at any scene EV.
-    const float inv_exposure = 1.0f / String::CompositePass::exposure_scale();
+    const float inv_exposure = 1.0f / String::composite_pass::exposure_scale();
+
+    // The atlas's bindless slot, resolved from THIS pass's own declaration of it (.reads(atlas_handle_)) —
+    // never handed in from outside, never latched at init.
+    const std::uint32_t atlas_slot = ctx.slot(atlas_handle_);
 
     const auto draw_shapes = [&](std::uint32_t first, std::uint32_t count) {
         if (count == 0) return;
@@ -916,7 +937,7 @@ void UIPass::record(::string::gpu::command_recorder& recorder, uint16_t current_
             text_p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
         const TextPush push{
             { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
-            gr.slot, atlas_slot_, first, inv_exposure };
+            gr.slot, atlas_slot, first, inv_exposure };
         recorder.push_constants(text_p.pipeline_layout,
             text_p.push_constants.stageFlags, 0, sizeof(TextPush), &push);
         recorder.draw(6, count, 0, 0);

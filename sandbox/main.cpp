@@ -78,7 +78,7 @@ int main()
     try
     {
         STRING_LOG_DEBUG("Initializing application...");
-        app.initialize(app_info, sandbox::build_demo_plan(resources_directory));
+        app.initialize(app_info, sandbox::build_demo_scene(resources_directory));
         STRING_LOG_DEBUG("Running application...");
         app.run();
     }

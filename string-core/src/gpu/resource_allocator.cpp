@@ -49,8 +49,14 @@ resource_allocator::~resource_allocator()
     for (auto&[id, image] : images_)
     {
         vkDestroyImageView(device_, image.view, nullptr);
-        vkDestroySampler(device_, image.sampler, nullptr);
-        vmaDestroyImage(allocator_, image.image, image.allocation);
+        // A sub-resource view SHARES its source's VkImage, allocation and sampler — it owns only its
+        // own view. Freeing them here as well is a double free, and it faults inside VMA rather than
+        // where the mistake is. destroy_resource() has always honoured this; the destructor did not.
+        if (!image.is_view)
+        {
+            vkDestroySampler(device_, image.sampler, nullptr);
+            vmaDestroyImage(allocator_, image.image, image.allocation);
+        }
     }
     if (allocator_ != VK_NULL_HANDLE)
     {
@@ -170,7 +176,8 @@ auto resource_allocator::create_resource(const image_info& info) -> resource_id
 
     new_image.mip_levels = info.mip_levels;
     new_image.array_layers = info.cube ? 6u : 1u;
-    create_image_sampler(new_image);
+    new_image.samples = info.samples;
+    create_image_sampler(new_image, info.sampler);
     create_image_view(new_image, info.aspect_flags);
 
     const auto& id = registry_.get_id();
@@ -210,8 +217,13 @@ void resource_allocator::destroy_resource(resource_id id)
     {
         allocated_image& garbage = images_.at(id);
         vkDestroyImageView(device_, garbage.view, nullptr);
-        vkDestroySampler(device_, garbage.sampler, nullptr);
-        vmaDestroyImage(allocator_, garbage.image, garbage.allocation);
+        // A sub-resource view owns nothing but its VkImageView — the image, allocation and sampler
+        // belong to the source image it slices.
+        if (!garbage.is_view)
+        {
+            vkDestroySampler(device_, garbage.sampler, nullptr);
+            vmaDestroyImage(allocator_, garbage.image, garbage.allocation);
+        }
         images_.erase(id);
         destroyed = true;
     }
@@ -252,7 +264,12 @@ void resource_allocator::copy_data_to_buffer(const void* data, resource_id resou
     vmaUnmapMemory(allocator_, buffer.allocation);
 }
 
-void resource_allocator::create_image_sampler(allocated_image& allocated_image)
+// Every image gets a sampler, as it always did — but the configuration now comes from the image's
+// own `image_info::sampler` instead of being hardcoded (brief 20). sampler_info's defaults reproduce
+// the previous hardcoded configuration, so an image_info that says nothing about sampling gets
+// exactly the sampler it got before. A pass that needs NEAREST or CLAMP_TO_EDGE asks for it here
+// rather than creating its own VkSampler and forcing it into the descriptor set afterwards.
+void resource_allocator::create_image_sampler(allocated_image& allocated_image, const sampler_info& info)
 {
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(physical_device_, &properties);
@@ -261,22 +278,23 @@ void resource_allocator::create_image_sampler(allocated_image& allocated_image)
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .magFilter = info.mag_filter,
+        .minFilter = info.min_filter,
+        .mipmapMode = info.mipmap_mode,
+        .addressModeU = info.address_mode,
+        .addressModeV = info.address_mode,
+        .addressModeW = info.address_mode,
         .mipLodBias = 0.f,
-        .anisotropyEnable = VK_TRUE,
-        .maxAnisotropy = properties.limits.maxSamplerAnisotropy,
-        .compareEnable = VK_FALSE,
-        .compareOp = VK_COMPARE_OP_ALWAYS,
+        // maxAnisotropy must be 1.0 when anisotropy is off; the device limit is only legal with it on.
+        .anisotropyEnable = info.anisotropy ? VK_TRUE : VK_FALSE,
+        .maxAnisotropy = info.anisotropy ? properties.limits.maxSamplerAnisotropy : 1.f,
+        .compareEnable = info.compare_enable ? VK_TRUE : VK_FALSE,
+        .compareOp = info.compare_op,
         .minLod = 0.f,
         // Sample across the whole mip chain (trilinear). VK_LOD_CLAMP_NONE lets the hardware pick
         // the level from the derivative regardless of how many levels the image actually has.
         .maxLod = VK_LOD_CLAMP_NONE,
-        .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .borderColor = info.border_color,
         .unnormalizedCoordinates = VK_FALSE
     };
 
@@ -309,6 +327,42 @@ void resource_allocator::create_image_view(allocated_image& allocated_image, VkI
     {
         throw std::runtime_error("Failed to create image view!");
     }
+}
+
+auto resource_allocator::create_view(resource_id source, const view_range& range) -> resource_id
+{
+    const allocated_image& src = get_image(source);
+
+    allocated_image slice = src;                 // shares image/allocation/sampler/format/extent
+    slice.id = registry_.get_id();
+    slice.is_view = true;
+    slice.mip_levels = range.mip_count;
+    slice.array_layers = range.layer_count;
+    slice.view = VK_NULL_HANDLE;
+
+    const VkImageViewCreateInfo view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .image = src.image,
+        .viewType = range.view_type,
+        .format = src.format,
+        .components = {},
+        .subresourceRange = {
+            .aspectMask = range.aspect,
+            .baseMipLevel = range.base_mip,
+            .levelCount = range.mip_count,
+            .baseArrayLayer = range.base_layer,
+            .layerCount = range.layer_count
+        }
+    };
+    if (vkCreateImageView(device_, &view_info, nullptr, &slice.view) != VK_SUCCESS)
+    {
+        throw std::runtime_error("Failed to create sub-resource image view!");
+    }
+
+    images_[slice.id] = slice;
+    return slice.id;
 }
 
 }

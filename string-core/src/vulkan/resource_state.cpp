@@ -1,111 +1,173 @@
+#include <cstdlib>
+#include <string/core/logger.hpp>
 #include <string/vulkan/resource_state.hpp>
 #include <string/vulkan/vulkan_utils.hpp>
 
-namespace String
+#include <algorithm>
+
+namespace string
 {
 
-void ResourceStateTracker::seed(VkImage image, VkImageLayout layout,
-    VkPipelineStageFlags2 write_stage, VkAccessFlags2 write_access)
+void resource_state_tracker::track(VkImage image, VkImageAspectFlags aspect,
+                                   std::uint32_t mip_levels, std::uint32_t array_layers)
 {
-    ResourceState& s = images_[image];
-    s.layout = layout;
-    s.last_write_stage = write_stage;
-    s.last_write_access = write_access;
-    s.reader_stages = 0;
-    s.visible_stages = 0;
-    s.visible_access = 0;
+    image_track& t = images_[image];
+    const std::uint32_t want_mips = std::max(mip_levels, 1u);
+    const std::uint32_t want_layers = std::max(array_layers, 1u);
+    if (!t.cells.empty() && want_mips <= t.mips && want_layers <= t.layers) return;
+
+    // GROW rather than return early. An image first touched through a SLICE sized the grid to that
+    // slice; a later whole-image use then clamped itself to the smaller grid and silently transitioned
+    // only part of the image while believing it had done all of it. That is how a whole-cube sampled
+    // read ended up re-emitting barriers with stale state for mips it had never actually covered.
+    // Existing cells keep their state; new ones start UNDEFINED, which is the truth about them.
+    const std::uint32_t new_mips = std::max(want_mips, t.mips);
+    const std::uint32_t new_layers = std::max(want_layers, t.layers);
+    std::vector<sync_state> grown(static_cast<std::size_t>(new_mips) * new_layers);
+    // Copy cell-by-cell with the OLD stride on the read side and the NEW stride on the write side —
+    // the two differ whenever the layer count grew, and only copy what actually exists.
+    const std::uint32_t copy_mips = std::min(t.mips, new_mips);
+    const std::uint32_t copy_layers = std::min(t.layers, new_layers);
+    for (std::uint32_t m = 0; m < copy_mips && !t.cells.empty(); ++m)
+        for (std::uint32_t l = 0; l < copy_layers; ++l)
+            grown[static_cast<std::size_t>(m) * new_layers + l] =
+                t.cells[static_cast<std::size_t>(m) * t.layers + l];
+
+    t.aspect = aspect;
+    t.mips = new_mips;
+    t.layers = new_layers;
+    t.cells = std::move(grown);
 }
 
-void ResourceStateTracker::transition(VkCommandBuffer command_buffer, VkImage image,
-    VkImageAspectFlags aspect, Access access, VkPipelineStageFlags2 stage, bool discard,
-    uint32_t level_count)
+void resource_state_tracker::transition(VkCommandBuffer cmd, VkImage image, const subresource& sub,
+                                        access how, VkPipelineStageFlags2 stage, bool discard)
 {
-    ResourceState& current = images_[image];   // default: UNDEFINED, no prior access
-    const AccessScope target = access_scope(access);
-    const bool write = is_write(access);
-    const bool layout_change = discard || target.layout != current.layout;
-
-    if (!write && !layout_change)
+    image_track& t = images_[image];
+    if (t.cells.empty())
     {
-        // Pure read in the current layout. Free if the last write is already visible to this
-        // (stage, access); otherwise make it visible (RAW) without a layout change.
-        if ((current.visible_stages & stage) == stage
-            && (current.visible_access & target.access) == target.access)
-        {
-            current.reader_stages |= stage;
-            return;
-        }
-        vku::transition_image(command_buffer, {
-            .image = image,
-            .old_layout = current.layout,
-            .new_layout = current.layout,
-            .src_stage = current.last_write_stage,
-            .src_access = current.last_write_access,
-            .dst_stage = stage,
-            .dst_access = target.access,
-            .aspect = aspect,
-            .level_count = level_count,
-        });
-        current.reader_stages |= stage;
-        current.visible_stages |= stage;
-        current.visible_access |= target.access;
-        return;
+        // First touch without an explicit track(): assume the declared shape.
+        t.aspect = sub.aspect;
+        t.mips = std::max(sub.base_mip + sub.mip_count, 1u);
+        t.layers = std::max(sub.base_layer + sub.layer_count, 1u);
+        t.cells.assign(static_cast<std::size_t>(t.mips) * t.layers, sync_state{});
     }
 
-    // Write and/or layout change: order against the last write (WAW/availability) AND every
-    // reader since it (WAR — execution dependency; readers need no availability).
-    VkPipelineStageFlags2 src_stage = current.last_write_stage | current.reader_stages;
-    if (src_stage == 0) src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-    vku::transition_image(command_buffer, {
-        .image = image,
-        .old_layout = discard ? VK_IMAGE_LAYOUT_UNDEFINED : current.layout,
-        .new_layout = target.layout,
-        .src_stage = src_stage,
-        .src_access = current.last_write_access,
-        .dst_stage = stage,
-        .dst_access = target.access,
-        .aspect = aspect,
-        .level_count = level_count,
-    });
-    current.layout = target.layout;
-    current.last_write_stage = stage;
-    current.last_write_access = target.access;
-    current.reader_stages = 0;
-    current.visible_stages = stage;
-    current.visible_access = target.access;
+    const access_scope target = scope_of(how);
+    const bool write = is_write(how);
+
+    // Clamping to the tracked grid is only safe because track() grows it to fit — otherwise a
+    // whole-image use silently covers a subset while recording that it covered everything.
+    const std::uint32_t mip_end = std::min(sub.base_mip + sub.mip_count, t.mips);
+    const std::uint32_t layer_end = std::min(sub.base_layer + sub.layer_count, t.layers);
+
+    // Walk the requested cells and coalesce maximal runs whose tracked state is identical, so the
+    // common whole-image case emits exactly one barrier and a genuinely divergent mip chain emits
+    // only as many as it actually needs.
+    for (std::uint32_t layer = sub.base_layer; layer < layer_end; ++layer)
+    {
+        std::uint32_t mip = sub.base_mip;
+        while (mip < mip_end)
+        {
+            const sync_state before = t.at(mip, layer);
+            std::uint32_t run = 1;
+            while (mip + run < mip_end && t.at(mip + run, layer) == before) ++run;
+
+            if (std::getenv("STRING_TRACE_IMG") && reinterpret_cast<std::uintptr_t>(image) == std::strtoull(std::getenv("STRING_TRACE_IMG"), nullptr, 0))
+                STRING_LOG_INFO("[trk] mip={} run<= layer={} old={} want={} write={} discard={}", mip, layer, int(before.layout), int(target.layout), write, discard);
+            const bool layout_change = discard || target.layout != before.layout;
+            sync_state after = before;
+
+            if (!write && !layout_change)
+            {
+                if ((before.visible_stages & stage) == stage
+                    && (before.visible_access & target.mask) == target.mask)
+                {
+                    after.reader_stages |= stage;
+                }
+                else
+                {
+                    String::vku::transition_image(cmd, {
+                        .image = image,
+                        .old_layout = before.layout,
+                        .new_layout = before.layout,
+                        .src_stage = before.last_write_stage,
+                        .src_access = before.last_write_access,
+                        .dst_stage = stage,
+                        .dst_access = target.mask,
+                        .aspect = t.aspect,
+                        .base_mip = mip,
+                        .level_count = run,
+                        .base_layer = layer,
+                        .layer_count = 1,
+                    });
+                    after.reader_stages |= stage;
+                    after.visible_stages |= stage;
+                    after.visible_access |= target.mask;
+                }
+            }
+            else
+            {
+                // Write and/or layout change: order against the last write (WAW / availability) AND
+                // every reader since it (WAR — an execution dependency; readers need no availability).
+                VkPipelineStageFlags2 src_stage = before.last_write_stage | before.reader_stages;
+                if (src_stage == 0) src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+                String::vku::transition_image(cmd, {
+                    .image = image,
+                    .old_layout = discard ? VK_IMAGE_LAYOUT_UNDEFINED : before.layout,
+                    .new_layout = target.layout,
+                    .src_stage = src_stage,
+                    .src_access = before.last_write_access,
+                    .dst_stage = stage,
+                    .dst_access = target.mask,
+                    .aspect = t.aspect,
+                    .base_mip = mip,
+                    .level_count = run,
+                    .base_layer = layer,
+                    .layer_count = 1,
+                });
+                after.layout = target.layout;
+                after.last_write_stage = stage;
+                after.last_write_access = target.mask;
+                after.reader_stages = 0;
+                after.visible_stages = stage;
+                after.visible_access = target.mask;
+            }
+            for (std::uint32_t i = 0; i < run; ++i) t.at(mip + i, layer) = after;
+            mip += run;
+        }
+    }
 }
 
-void ResourceStateTracker::buffer_access(string::gpu::resource_id resource, Access access,
-                                         VkPipelineStageFlags2 stage)
+void resource_state_tracker::buffer_access(gpu::resource_id resource, access how,
+                                           VkPipelineStageFlags2 stage)
 {
-    ResourceState& current = buffers_[resource];
-    const AccessScope target = access_scope(access);
+    sync_state& current = buffers_[resource];
+    const access_scope target = scope_of(how);
 
-    if (!is_write(access))
+    if (!is_write(how))
     {
         if ((current.visible_stages & stage) == stage
-            && (current.visible_access & target.access) == target.access)
+            && (current.visible_access & target.mask) == target.mask)
         {
             current.reader_stages |= stage;
             return;
         }
         // RAW: make the last write visible to this read. A buffer never written under tracking
-        // (static upload, host-written ring) has no hazard here — its producer's barrier
-        // (transfer batch / host submission guarantee) already covers it.
+        // (a static upload, a host-written ring) has no hazard here — its producer's own
+        // guarantee already covers it.
         if (current.last_write_access != 0)
         {
             pending_src_stage_ |= current.last_write_stage;
             pending_src_access_ |= current.last_write_access;
             pending_dst_stage_ |= stage;
-            pending_dst_access_ |= target.access;
+            pending_dst_access_ |= target.mask;
         }
         current.reader_stages |= stage;
         current.visible_stages |= stage;
-        current.visible_access |= target.access;
+        current.visible_access |= target.mask;
         return;
     }
 
-    // Write: hazard only if something was tracked before (first-ever access needs no barrier).
     const bool prior_write = current.last_write_access != 0;
     const bool prior_read = current.reader_stages != 0;
     if (prior_write || prior_read)
@@ -113,16 +175,16 @@ void ResourceStateTracker::buffer_access(string::gpu::resource_id resource, Acce
         pending_src_stage_ |= current.last_write_stage | current.reader_stages;
         pending_src_access_ |= current.last_write_access;
         pending_dst_stage_ |= stage;
-        pending_dst_access_ |= target.access;
+        pending_dst_access_ |= target.mask;
     }
     current.last_write_stage = stage;
-    current.last_write_access = target.access;
+    current.last_write_access = target.mask;
     current.reader_stages = 0;
     current.visible_stages = stage;
-    current.visible_access = target.access;
+    current.visible_access = target.mask;
 }
 
-void ResourceStateTracker::flush_buffers(VkCommandBuffer command_buffer)
+void resource_state_tracker::flush_buffers(VkCommandBuffer cmd)
 {
     if (pending_dst_stage_ == 0) return;
     const VkMemoryBarrier2 barrier = {
@@ -144,14 +206,21 @@ void ResourceStateTracker::flush_buffers(VkCommandBuffer command_buffer)
         .imageMemoryBarrierCount = 0,
         .pImageMemoryBarriers = nullptr,
     };
-    vkCmdPipelineBarrier2(command_buffer, &dependency);
+    vkCmdPipelineBarrier2(cmd, &dependency);
     pending_src_stage_ = 0;
     pending_src_access_ = 0;
     pending_dst_stage_ = 0;
     pending_dst_access_ = 0;
 }
 
-void ResourceStateTracker::clear()
+void resource_state_tracker::set_layout(VkImage image, VkImageLayout layout)
+{
+    const auto it = images_.find(image);
+    if (it == images_.end()) return;
+    for (sync_state& s : it->second.cells) s.layout = layout;
+}
+
+void resource_state_tracker::clear()
 {
     images_.clear();
     buffers_.clear();
@@ -161,4 +230,4 @@ void ResourceStateTracker::clear()
     pending_dst_access_ = 0;
 }
 
-}  // namespace String
+}  // namespace string

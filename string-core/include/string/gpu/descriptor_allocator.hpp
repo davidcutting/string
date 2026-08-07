@@ -99,6 +99,12 @@ class descriptor_table
     // reads return zero, writes are discarded. No resource, no lifetime, no layout.
     void write_null(uint32_t slot, VkDescriptorType type);
 
+    // Write a resource's descriptor into an already-allocated slot. bind() is the only caller:
+    // bind_image reads the sampler straight off the resource (`allocated_image::sampler`, configured
+    // per-image through `image_info::sampler`), which is what makes bind() sufficient on its own.
+    void bind_buffer(resource_id handle, VkDescriptorType type, uint32_t slot);
+    void bind_image(resource_id handle, VkDescriptorType type, uint32_t slot);
+
     // Kept solely so a nulled COMBINED_IMAGE_SAMPLER slot has the valid sampler the spec still
     // demands alongside a null image view. Created on first use, destroyed with the table.
     VkSampler null_sampler_ = VK_NULL_HANDLE;
@@ -116,30 +122,9 @@ public:
     void bind(resource_id handle, descriptor_type type);
     void unbind(resource_id handle, descriptor_type type);
 
-    // Rewrite an already-allocated texture slot's combined-image-sampler (binding 1) with a new
-    // view/sampler. Used by streaming to swap a texture's sampler as its resident mip range grows
-    // or shrinks (an adjustable minLod), without reallocating the bindless slot. The set is
-    // UPDATE_AFTER_BIND, so this is safe to call between frames while the slot stays bound.
-    void update_texture(std::uint32_t slot, VkImageView view, VkSampler sampler);
-
-    // Bind an arbitrary (caller-owned) image view into a fresh storage-image slot (binding 2), with
-    // no backing resource_id. Used for per-mip views of a HiZ pyramid where one image needs several
-    // storage slots (the resource-keyed bind() can't give more than one slot per handle). The view's
-    // lifetime is the caller's; unbind_storage_view() frees the slot. Returns the slot.
-    auto bind_storage_view(VkImageView view) -> std::uint32_t;
-    void unbind_storage_view(std::uint32_t slot);
-
     auto get_binding_slot(resource_id handle, descriptor_type type) -> std::uint32_t;
     auto get_layout() const -> VkDescriptorSetLayout { return descriptor_set_layout_; }
     auto get_set() const -> VkDescriptorSet { return descriptor_set_; }
-
-private:
-    void bind_buffer(resource_id handle, VkDescriptorType type, uint32_t slot);
-    void bind_image(resource_id handle, VkDescriptorType type, uint32_t slot);
-
-    // Maps a storage-image slot from bind_storage_view() back to its synthetic allocator key, so
-    // unbind_storage_view() can release it (these slots have no resource_id).
-    std::unordered_map<std::uint32_t, resource_id> slot_to_synthetic_;
 };
 
 } // namespace string::gpu

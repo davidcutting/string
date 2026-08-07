@@ -7,6 +7,13 @@ agents implement them, they do not re-decide them. Parent spec:
 
 ## Order
 
+**IMMEDIATE — `20-graph-declaration-unification.md`** (2026-08-06). Runs NEXT, before everything
+below. A provenance audit found the shipped render-graph authoring surface diverges from the design
+locked in 04e/11/16: two disconnected declaration channels, agent-invented concepts presented as
+user decisions, and ~44 hand-rolled barriers surviving behind exemptions that existed for agent
+convenience. Nothing else is built until the graph matches the vision — briefs 12-15 in particular
+rest on brief 11 deliverables that are unaudited.
+
 Reordered with the user 2026-07-22 (after brief 03 closed): solidify the
 pipeline and land UI + tooling + PBR *before* VFX/post — the last three briefs
 proved tooling leverage, the UI was accreted placeholder code, and post/VFX

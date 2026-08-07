@@ -1,13 +1,14 @@
 #pragma once
 
 #include <cstdint>
-#include <vector>
 
 #include <string/gpu/command_recorder.hpp>
+#include <string/gpu/device.hpp>
+#include <string/gpu/pass_context.hpp>
 #include <string/gpu/resource.hpp>
-#include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/shader_program.hpp>
 #include <string/vulkan/engine_context.hpp>
+#include <string/vulkan/frame_graph.hpp>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -18,7 +19,6 @@ namespace string::render
 {
 
 // Push constant for the froxel light-binning compute (matches Push in shaders/froxel_cull.slang).
-// Moved out of geometry_pass.hpp with the FroxelComponent extraction (brief 11).
 struct FroxelPush
 {
     glm::mat4 view;
@@ -37,66 +37,63 @@ struct FroxelPush
     VkDeviceAddress froxels;
 };
 
-// Per-frame inputs the froxel binning reads from shared scene state (camera + the local-light buffer,
-// both owned by GeometryPass).
+// The per-frame CPU inputs the binning needs. The screen extent and both device addresses are NOT
+// here: the extent comes from pass_context, and the light + froxel buffers are declared handles the
+// context resolves while the pass records — which is what makes a stale address structurally
+// impossible rather than a matter of who updated whom first.
 struct FroxelParams
 {
     glm::mat4 view;
     glm::mat4 inv_proj;
-    glm::uvec2 screen;
     float near_plane;
     float far_plane;
     uint32_t light_count;
-    VkDeviceAddress lights;   // 0 when there are no local lights
 };
 
-// Forward+ froxel light-binning: a dependency-free async-compute chain that bins the scene's local
-// lights into per-froxel index lists the lit fragment reads. Owns its compute pipeline + the
-// per-frame index buffers; the grid dimensions + froxel buffer address feed SceneData via accessors.
-// GeometryPass Phase-1 component (brief 11).
-class FroxelComponent
+// Forward+ froxel light-binning: a dependency-free compute pass that bins the scene's local lights
+// into the per-froxel index lists the lit fragment reads. Owns its compute pipeline and nothing else
+// — the index buffer is a viewport-derived graph resource the app declares (see bytes_for()).
+//
+// Brief 20: a plain app-owned object, no base class. It runs on the async lane (.async()); on 1-lane
+// hardware the graph records it inline. No usages vector, no barriers, no ensure_capacity/resize —
+// the buffer is sized from the declared viewport relationship and the graph reallocates it.
+class froxel_component
 {
-    // Brief 16 M2: the froxel index ring is a registry-owned PerFrame buffer now (was a hand-managed
-    // [frame] vector over the allocator). Allocated at the deterministic resize point + resolved
-    // through the registry, so its address is valid from frame 0 regardless of pass update order —
-    // the crash-class fix.
-    ::string::gpu::ResourceRegistry* resources_ = nullptr;
-    ::string::gpu::buffer froxel_buffer_;
-    ::string::gpu::shader_program* program_ = nullptr;
-    uint32_t tiles_x_ = 0;
-    uint32_t tiles_y_ = 0;
-    uint32_t count_ = 0;
-    uint32_t capacity_ = 0;   // allocated froxel count (grows with the screen)
-    uint32_t frames_in_flight_ = 1;
-
 public:
-    // Registers froxel_cull.slang and reserves the per-frame buffer slots (allocation deferred to
-    // ensure_capacity() once the screen size is known).
-    void init(String::engine_context& context, uint32_t frames_in_flight);
-    // (Re)allocate the per-frame index buffers for the current screen if it grew.
-    void ensure_capacity(VkExtent2D screen);
-    // Bind + dispatch the binning compute for `frame`.
-    void record(::string::gpu::command_recorder& recorder, uint16_t frame, const FroxelParams& params);
-    // Free the index buffers (the pipeline is torn down by the GeometryPass destructor).
-    void destroy();
+    explicit froxel_component(String::engine_context& ctx);
+    ~froxel_component();
 
-    bool has_work() const { return program_ != nullptr && count_ > 0 && froxel_buffer_.valid(); }
-    bool active(uint16_t frame) const
-    {
-        return program_ != nullptr && count_ > 0 && froxel_buffer_.valid();
-    }
-    ::string::gpu::resource_id buffer(uint16_t frame) const
-    {
-        return froxel_buffer_.valid() ? resources_->physical(froxel_buffer_, frame) : 0;
-    }
-    // Brief 16: the LOGICAL froxel index-buffer handle (the async pass declares this; the executor
-    // resolves the per-frame physical). Invalid until ensure_capacity() has allocated the ring.
-    ::string::gpu::buffer handle() const { return froxel_buffer_; }
-    VkDeviceAddress froxels_address(uint16_t frame) const;   // 0 when the slot has no buffer
-    uint32_t tiles_x() const { return tiles_x_; }
-    uint32_t tiles_y() const { return tiles_y_; }
-    uint32_t count() const { return count_; }
-    ::string::gpu::shader_program* program() const { return program_; }
+    froxel_component(const froxel_component&) = delete;
+    froxel_component& operator=(const froxel_component&) = delete;
+
+    // Author onto the graph: reads the local-light buffer, writes the froxel index buffer, on the
+    // async lane. `froxels` is the viewport-scaled transient described by bytes_for().
+    void declare(::string::frame_graph& fg, ::string::gpu::buffer froxels,
+                 ::string::gpu::buffer lights);
+
+    // Ordinary app code: latch the camera + light count this frame's dispatch will push.
+    void tick(const FroxelParams& params);
+
+    // The dynamic gate the declared pass toggles on. False only when the Slang pipeline failed to
+    // build; the dispatch otherwise always runs, because it is what ZEROES the per-froxel counts —
+    // skipping it on a light-less frame would leave the previous frame's lists live.
+    bool has_work() const { return program_ != nullptr; }
+
+    // --- the froxel grid, as a pure function of the viewport ---------------------------------------
+    // These are what the app's transient_buffer_info declares its size relationship with:
+    //   .bytes_for = [](VkExtent2D e) { return froxel_component::bytes_for(e); }
+    static uint32_t tiles_x(VkExtent2D screen);
+    static uint32_t tiles_y(VkExtent2D screen);
+    static uint32_t froxel_count(VkExtent2D screen);
+    static VkDeviceSize bytes_for(VkExtent2D screen);
+
+private:
+    void record(::string::pass_context& ctx, ::string::gpu::buffer froxels,
+                ::string::gpu::buffer lights);
+
+    ::string::gpu::device& device_;
+    ::string::gpu::shader_program* program_ = nullptr;
+    FroxelParams params_{};
 };
 
 }  // namespace string::render

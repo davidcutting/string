@@ -3,7 +3,6 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
-#include <stdexcept>
 
 #include <string/gpu/command_recorder.hpp>
 #include <string/gpu/pipeline.hpp>
@@ -17,107 +16,21 @@
 
 namespace string::render
 {
+using namespace String;
 
-void IblComponent::init(String::engine_context& context)
+ibl_component::ibl_component(engine_context& ctx)
+: device_(ctx.device)
+, allocator_(ctx.allocator)
+, descriptor_set_(ctx.descriptor_table.get_set())
 {
-    device_ = &context.device;
-    allocator_ = &context.allocator;
-    table_ = &context.descriptor_table;
-
-    // Linear clamp-to-edge trilinear sampler: the prefilter ladder interpolates between roughness
-    // mips, and the DFG LUT must not wrap at NdotV/roughness extremes (the allocator's default
-    // sampler REPEATs).
-    const VkSamplerCreateInfo sampler_info = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .maxLod = VK_LOD_CLAMP_NONE,
-        .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
-    };
-    if (vkCreateSampler(device_->get_device(), &sampler_info, nullptr, &env_sampler_) != VK_SUCCESS)
-        throw std::runtime_error("GeometryPass: failed to create env sampler");
-
-    const auto make_cube = [&](uint32_t mips) {
-        return allocator_->create_resource(::string::gpu::image_info{
-            .extent = { kEnvSize, kEnvSize, 1 },
-            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-            .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            .allocation_flags = {},
-            .mip_levels = mips,
-            .cube = true,
-        });
-    };
-    env_capture_ = make_cube(kEnvCaptureMips);
-    env_prefiltered_ = make_cube(kEnvPrefilterMips);
-
-    // Sampled (SamplerCube) slots + per-mip 2D_ARRAY storage views for the compute writes.
-    const auto bind_cube = [&](::string::gpu::resource_id id, uint32_t mips,
-                               std::vector<VkImageView>& views, std::vector<uint32_t>& slots) {
-        const ::string::gpu::allocated_image& img = allocator_->get_image(id);
-        table_->bind(id, ::string::gpu::descriptor_type::TEXTURE);
-        const uint32_t sample_slot =
-            table_->get_binding_slot(id, ::string::gpu::descriptor_type::TEXTURE);
-        table_->update_texture(sample_slot, img.view, env_sampler_);
-        for (uint32_t m = 0; m < mips; ++m)
-        {
-            const VkImageViewCreateInfo vi = {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                .image = img.image,
-                .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-                .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 0, 6 },
-            };
-            VkImageView view = VK_NULL_HANDLE;
-            if (vkCreateImageView(device_->get_device(), &vi, nullptr, &view) != VK_SUCCESS)
-                throw std::runtime_error("GeometryPass: failed to create env mip view");
-            views.push_back(view);
-            slots.push_back(table_->bind_storage_view(view));
-        }
-        return sample_slot;
-    };
-    env_capture_sample_slot_ = bind_cube(env_capture_, kEnvCaptureMips,
-                                         env_capture_mip_views_, env_capture_mip_slots_);
-    env_prefiltered_slot_ = bind_cube(env_prefiltered_, kEnvPrefilterMips,
-                                      env_prefiltered_mip_views_, env_prefiltered_mip_slots_);
-
-    // DFG LUT: 2D RGBA16F (rg used), baked once; TRANSFER_SRC for the dbg.ibl_verify readback.
-    dfg_lut_ = allocator_->create_resource(::string::gpu::image_info{
-        .extent = { kDfgSize, kDfgSize, 1 },
-        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-               | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-    });
-    const ::string::gpu::allocated_image& dfg = allocator_->get_image(dfg_lut_);
-    table_->bind(dfg_lut_, ::string::gpu::descriptor_type::TEXTURE);
-    dfg_sample_slot_ = table_->get_binding_slot(dfg_lut_, ::string::gpu::descriptor_type::TEXTURE);
-    table_->update_texture(dfg_sample_slot_, dfg.view, env_sampler_);
-    dfg_storage_slot_ = table_->bind_storage_view(dfg.view);
-
-    // SH coefficients (9 x float4), written by the projection compute, read by every lit fragment.
-    sh_buffer_ = allocator_->create_resource(::string::gpu::buffer_info{
-        .size = sizeof(float) * 4 * 9,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-               | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-    });
-
-    // The five compute pipelines, one per ibl.slang entry point (hot-reload registry).
-    VkDescriptorSetLayout layout = table_->get_layout();
+    // The five compute pipelines, one per ibl.slang entry point (hot-reload registry). No images, no
+    // samplers, no per-mip views and no bindless slots are created here: the cubemaps, the DFG LUT
+    // and the SH buffer are graph resources, and every slot the pushes carry is resolved from the
+    // pass's own declaration while it records.
+    VkDescriptorSetLayout layout = ctx.descriptor_table.get_layout();
     const auto make_ibl_entry = [&](const char* entry) {
-        return context.shader_registry.create(
-            context.resources_path / "shaders" / "ibl.slang",
+        return ctx.shader_registry.create(
+            ctx.resources_path / "shaders" / "ibl.slang",
             [layout, entry](::string::gpu::device& dev, const ::string::gpu::compiled_program& compiled) {
                 ::string::gpu::pipeline p{};
                 p.push_constants = compiled.layout.push_constant;
@@ -144,207 +57,175 @@ void IblComponent::init(String::engine_context& context)
                     "DFG {}px, L2 SH", kEnvSize, kEnvCaptureMips, kEnvPrefilterMips, kDfgSize);
 }
 
-void IblComponent::begin_frame(const glm::vec3& sun_dir, bool furnace, bool force_every_frame)
+ibl_component::~ibl_component()
 {
-    if (env_capture_ == 0) return;
-    constexpr float kSunDeltaCos = 0.999998477f;   // cos(0.1 deg)
-    const float align = glm::dot(glm::normalize(sun_dir), ibl_captured_sun_dir_);
-    if (!ibl_primed_ || force_every_frame || furnace != ibl_captured_furnace_ || align < kSunDeltaCos)
-        ibl_update_pending_ = true;
-}
-
-// Record the sky-IBL update chain: capture -> capture mip chain -> SH projection + GGX prefilter
-// ladder. Runs only on frames where the sun moved past the trigger — the whole chain is a
-// single-frame update, so the ambient is always self-consistent (no popping). The DFG LUT bake
-// rides the first call. All barriers here are the documented INTRA-pass class (like the HiZ mip
-// chain): everything is produced and consumed by this pass; the SH buffer's fragment-read edge is
-// graph-declared (usages) and the final memory barrier makes the image writes visible to the
-// fragment stage.
-void IblComponent::record_update(::string::gpu::command_recorder& recorder, const IblLighting& light)
-{
-    VkCommandBuffer cb = recorder.vk();   // escape for the vku::transition_image calls in the mip/copy tail
-    VkDescriptorSet set = table_->get_set();
-    const auto dispatch = [&](::string::gpu::shader_program* prog, const IblPush& push,
-                              uint32_t gx, uint32_t gy, uint32_t gz) {
-        const ::string::gpu::pipeline& p = prog->current();
-        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-        recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
-                                      0, 1, &set, 0, nullptr);
-        recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(IblPush), &push);
-        recorder.dispatch(gx, gy, gz);
-    };
-    const auto compute_barrier = [&](VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
-        const VkMemoryBarrier2 mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_access,
-        };
-        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-        recorder.barrier(dep);
-    };
-
-    IblPush push{};
-    push.sun_dir = glm::vec4(glm::normalize(light.sun_dir), light.furnace ? 1.0f : 0.0f);
-    push.sky_zenith = glm::vec4(light.sky_zenith, 0.0f);
-    push.sky_ground = glm::vec4(light.sky_ground, 0.0f);
-    push.sun_color = glm::vec4(light.sun_color, light.sun_intensity);   // w: klx (ground-band lighting)
-    push.sh = allocator_->get_buffer(sh_buffer_).device_address;
-
-    // One-time: DFG LUT bake + move the cubemaps into their permanent GENERAL layout.
-    if (!dfg_baked_)
-    {
-        const ::string::gpu::allocated_image& dfg = allocator_->get_image(dfg_lut_);
-        String::vku::transition_image(cb, {
-            .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-            .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
-            .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-        });
-        IblPush dpush = push;
-        dpush.dst_slot = dfg_storage_slot_;
-        dpush.dst_size = kDfgSize;
-        dpush.sample_count = kDfgSamples;
-        dispatch(dfg_program_, dpush, (kDfgSize + 7) / 8, (kDfgSize + 7) / 8, 1);
-        String::vku::transition_image(cb, {
-            .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_GENERAL,
-            .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-        });
-        dfg_baked_ = true;
-    }
-    if (!ibl_layouts_initialized_)
-    {
-        for (::string::gpu::resource_id id : { env_capture_, env_prefiltered_ })
-        {
-            const ::string::gpu::allocated_image& img = allocator_->get_image(id);
-            String::vku::transition_image(cb, {
-                .image = img.image, .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-                .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
-                .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
-                            | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-                .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-                .level_count = img.mip_levels,
-                .layer_count = 6,
-            });
-        }
-        ibl_layouts_initialized_ = true;
-    }
-    else
-    {
-        // Cross-frame WAR: last frame's fragment reads of the prefiltered ladder must retire
-        // before this frame's rewrite (execution dependency; no memory flush needed for reads).
-        const VkMemoryBarrier2 war = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-            .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .srcAccessMask = 0,
-            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        };
-        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .memoryBarrierCount = 1, .pMemoryBarriers = &war };
-        vkCmdPipelineBarrier2(cb, &dep);
-    }
-
-    // 1) Sky -> capture mip 0.
-    {
-        IblPush cpush = push;
-        cpush.dst_slot = env_capture_mip_slots_[0];
-        cpush.dst_size = kEnvSize;
-        dispatch(env_capture_program_, cpush, kEnvSize / 8, kEnvSize / 8, 6);
-    }
-    // 2) Capture average chain (PDF-mip source + SH source).
-    for (uint32_t m = 1; m < kEnvCaptureMips; ++m)
-    {
-        compute_barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-        IblPush mpush = push;
-        mpush.src_slot = env_capture_mip_slots_[m - 1];
-        mpush.dst_slot = env_capture_mip_slots_[m];
-        mpush.src_size = kEnvSize >> (m - 1);
-        mpush.dst_size = kEnvSize >> m;
-        dispatch(env_mip_program_, mpush, (mpush.dst_size + 7) / 8, (mpush.dst_size + 7) / 8, 6);
-    }
-    // Capture writes -> SH storage reads + prefilter SAMPLED reads.
-    compute_barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    // 3) L2 SH projection (one workgroup; the fragment-read edge is graph-declared in usages).
-    {
-        IblPush spush = push;
-        spush.src_slot = env_capture_mip_slots_[kShSourceMip];
-        spush.src_size = kEnvSize >> kShSourceMip;
-        dispatch(sh_project_program_, spush, 1, 1, 1);
-    }
-    // 4) GGX prefilter ladder (mips independent — no barriers between them).
-    for (uint32_t m = 0; m < kEnvPrefilterMips; ++m)
-    {
-        IblPush ppush = push;
-        ppush.src_slot = env_capture_sample_slot_;
-        ppush.src_size = kEnvSize;
-        ppush.dst_slot = env_prefiltered_mip_slots_[m];
-        ppush.dst_size = kEnvSize >> m;
-        ppush.roughness = float(m) / float(kEnvPrefilterMips - 1);
-        ppush.sample_count = kPrefilterSamples;
-        ppush.mip_count = kEnvCaptureMips;
-        dispatch(env_prefilter_program_, ppush, (ppush.dst_size + 7) / 8, (ppush.dst_size + 7) / 8, 6);
-    }
-    // Ladder writes -> the lit fragments' sampled reads (image stays in GENERAL).
-    compute_barrier(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-
-    ibl_captured_sun_dir_ = glm::normalize(light.sun_dir);
-    ibl_captured_furnace_ = light.furnace;
-    ibl_primed_ = true;
-    ibl_update_pending_ = false;   // (GeometryPass cleared this after the call before brief 11)
-    ++ibl_update_count_;
-}
-
-VkDeviceAddress IblComponent::sh_address() const
-{
-    return sh_buffer_ != 0 ? allocator_->get_buffer(sh_buffer_).device_address : 0;
-}
-
-void IblComponent::destroy()
-{
-    if (!device_) return;
     const auto destroy_program = [this](::string::gpu::shader_program* prog) {
         if (!prog) return;
         const ::string::gpu::pipeline& p = prog->current();
-        vkDestroyPipeline(device_->get_device(), p.pipeline, nullptr);
-        vkDestroyPipelineLayout(device_->get_device(), p.pipeline_layout, nullptr);
+        vkDestroyPipeline(device_.get_device(), p.pipeline, nullptr);
+        vkDestroyPipelineLayout(device_.get_device(), p.pipeline_layout, nullptr);
     };
     destroy_program(env_capture_program_);
     destroy_program(env_mip_program_);
     destroy_program(env_prefilter_program_);
     destroy_program(sh_project_program_);
     destroy_program(dfg_program_);
+}
 
-    if (env_capture_ != 0)
+void ibl_component::tick(const IblLighting& light, bool force_every_frame)
+{
+    light_ = light;
+    constexpr float kSunDeltaCos = 0.999998477f;   // cos(0.1 deg)
+    const float align = glm::dot(glm::normalize(light.sun_dir), ibl_captured_sun_dir_);
+    if (!ibl_primed_ || force_every_frame || light.furnace != ibl_captured_furnace_
+        || align < kSunDeltaCos)
+        ibl_update_pending_ = true;
+
+    // One decision per frame, read by every pass's conditional. The bookkeeping that used to sit at
+    // the end of record_update() belongs here with it: the chain is a CPU decision about whether to
+    // record, and a pass body that mutated the decision would gate the rest of itself off.
+    chain_this_frame_ = (ibl_update_pending_ || !dfg_baked_)
+                     && env_capture_program_ != nullptr && env_capture_.valid();
+    if (chain_this_frame_)
     {
-        const auto drop_cube = [&](::string::gpu::resource_id id, std::vector<VkImageView>& views,
-                                   std::vector<uint32_t>& slots) {
-            for (uint32_t s : slots) table_->unbind_storage_view(s);
-            for (VkImageView v : views) vkDestroyImageView(device_->get_device(), v, nullptr);
-            table_->unbind(id, ::string::gpu::descriptor_type::TEXTURE);
-            allocator_->destroy_resource(id);
-        };
-        drop_cube(env_capture_, env_capture_mip_views_, env_capture_mip_slots_);
-        drop_cube(env_prefiltered_, env_prefiltered_mip_views_, env_prefiltered_mip_slots_);
-        table_->unbind_storage_view(dfg_storage_slot_);
-        table_->unbind(dfg_lut_, ::string::gpu::descriptor_type::TEXTURE);
-        allocator_->destroy_resource(dfg_lut_);
-        allocator_->destroy_resource(sh_buffer_);
-        vkDestroySampler(device_->get_device(), env_sampler_, nullptr);
+        ibl_captured_sun_dir_ = glm::normalize(light.sun_dir);
+        ibl_captured_furnace_ = light.furnace;
+        ibl_primed_ = true;
+        ibl_update_pending_ = false;
+        ++ibl_update_count_;
     }
+}
+
+// The capture -> mip chain -> SH + prefilter ladder, as declared passes. Every ordering fact the nine
+// hand-rolled barriers used to assert is a declaration here:
+//   * capture mip m reads mip m-1 and writes mip m, so the chain derives from the slices themselves
+//   * the SH projection names the ONE mip it reads (kShSourceMip), not the whole cube
+//   * the prefilter mips write disjoint slices of the ladder and read the capture cube whole, so they
+//     stay independent of each other — which is what the "mips independent" comment meant
+//   * first use discards (no UNDEFINED->GENERAL prologue), the cross-frame WAR against last frame's
+//     shading reads derives from tracked state, and the read edges into the lit fragments derive from
+//     the consumers' own declarations
+void ibl_component::declare(::string::frame_graph& fg,
+                            ::string::gpu::image env_capture, ::string::gpu::image env_prefiltered,
+                            ::string::gpu::image dfg_lut, ::string::gpu::buffer sh)
+{
+    env_capture_ = env_capture;
+    env_prefiltered_ = env_prefiltered;
+    dfg_lut_ = dfg_lut;
+    sh_buffer_ = sh;
+
+    const auto chain = [this] { return chain_this_frame_; };
+
+    // Split-sum BRDF LUT: one-time, independent of the sky.
+    fg.pass("ibl.dfg")
+      .writes(dfg_lut_)
+      .toggle([this] { return !dfg_baked_; })
+      .compute([this](::string::pass_context& ctx) { record_dfg(ctx); });
+
+    // 1) Sky -> capture mip 0 (all six faces).
+    fg.pass("ibl.capture")
+      .writes(env_capture_.mip(0))
+      .toggle(chain)
+      .compute([this](::string::pass_context& ctx) { record_capture(ctx); });
+
+    // 2) Capture average chain (PDF-mip source + SH source), one pass per mip.
+    for (uint32_t m = 1; m < kEnvCaptureMips; ++m)
+    {
+        fg.pass("ibl.capture.mip" + std::to_string(m))
+          .reads(env_capture_.mip(m - 1), ::string::access::storage_image_read)
+          .writes(env_capture_.mip(m))
+          .toggle(chain)
+          .compute([this, m](::string::pass_context& ctx) { record_capture_mip(ctx, m); });
+    }
+
+    // 3) L2 SH projection from exactly one capture mip.
+    fg.pass("ibl.sh_project")
+      .reads(env_capture_.mip(kShSourceMip), ::string::access::storage_image_read)
+      .writes(sh_buffer_)
+      .toggle(chain)
+      .compute([this](::string::pass_context& ctx) { record_sh_project(ctx); });
+
+    // 4) GGX prefilter ladder: each mip samples the whole capture cube (computed LOD) and writes its
+    //    own slice of the ladder — six disjoint writes, no derived serialisation between them.
+    for (uint32_t m = 0; m < kEnvPrefilterMips; ++m)
+    {
+        fg.pass("ibl.prefilter." + std::to_string(m))
+          .reads(env_capture_)
+          .writes(env_prefiltered_.mip(m))
+          .toggle(chain)
+          .compute([this, m](::string::pass_context& ctx) { record_prefilter(ctx, m); });
+    }
+}
+
+IblPush ibl_component::base_push() const
+{
+    IblPush push{};
+    push.sun_dir = glm::vec4(glm::normalize(light_.sun_dir), light_.furnace ? 1.0f : 0.0f);
+    push.sky_zenith = glm::vec4(light_.sky_zenith, 0.0f);
+    push.sky_ground = glm::vec4(light_.sky_ground, 0.0f);
+    push.sun_color = glm::vec4(light_.sun_color, light_.sun_intensity);   // w: klx (ground-band lighting)
+    return push;
+}
+
+void ibl_component::dispatch(::string::pass_context& ctx, ::string::gpu::shader_program* prog,
+                             const IblPush& push, uint32_t gx, uint32_t gy, uint32_t gz) const
+{
+    const ::string::gpu::pipeline& p = prog->current();
+    ctx.rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+    ctx.rec.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
+                                 0, 1, &descriptor_set_, 0, nullptr);
+    ctx.rec.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(IblPush), &push);
+    ctx.rec.dispatch(gx, gy, gz);
+}
+
+void ibl_component::record_dfg(::string::pass_context& ctx)
+{
+    IblPush push = base_push();
+    push.dst_slot = ctx.slot(dfg_lut_);
+    push.dst_size = kDfgSize;
+    push.sample_count = kDfgSamples;
+    dispatch(ctx, dfg_program_, push, (kDfgSize + 7) / 8, (kDfgSize + 7) / 8, 1);
+    dfg_baked_ = true;
+}
+
+void ibl_component::record_capture(::string::pass_context& ctx)
+{
+    IblPush push = base_push();
+    push.dst_slot = ctx.slot(env_capture_.mip(0));
+    push.dst_size = kEnvSize;
+    dispatch(ctx, env_capture_program_, push, kEnvSize / 8, kEnvSize / 8, 6);
+}
+
+void ibl_component::record_capture_mip(::string::pass_context& ctx, uint32_t mip)
+{
+    IblPush push = base_push();
+    push.src_slot = ctx.slot(env_capture_.mip(mip - 1));
+    push.dst_slot = ctx.slot(env_capture_.mip(mip));
+    push.src_size = kEnvSize >> (mip - 1);
+    push.dst_size = kEnvSize >> mip;
+    dispatch(ctx, env_mip_program_, push, (push.dst_size + 7) / 8, (push.dst_size + 7) / 8, 6);
+}
+
+void ibl_component::record_sh_project(::string::pass_context& ctx)
+{
+    IblPush push = base_push();
+    push.src_slot = ctx.slot(env_capture_.mip(kShSourceMip));
+    push.src_size = kEnvSize >> kShSourceMip;
+    push.sh = ctx.address(sh_buffer_);
+    dispatch(ctx, sh_project_program_, push, 1, 1, 1);
+}
+
+void ibl_component::record_prefilter(::string::pass_context& ctx, uint32_t mip)
+{
+    IblPush push = base_push();
+    push.src_slot = ctx.slot(env_capture_);            // SamplerCube: the whole capture chain
+    push.src_size = kEnvSize;
+    push.dst_slot = ctx.slot(env_prefiltered_.mip(mip));
+    push.dst_size = kEnvSize >> mip;
+    push.roughness = float(mip) / float(kEnvPrefilterMips - 1);
+    push.sample_count = kPrefilterSamples;
+    push.mip_count = kEnvCaptureMips;
+    dispatch(ctx, env_prefilter_program_, push, (push.dst_size + 7) / 8, (push.dst_size + 7) / 8, 6);
 }
 
 namespace
@@ -402,14 +283,18 @@ glm::dvec2 dfg_reference(double NdotV, double perceptual, uint32_t samples)
 
 }  // namespace
 
-void IblComponent::run_verification(bool furnace)
+// Debug only, and deliberately UNCHANGED: it drains the device and runs on its own immediate submit,
+// so it is outside the frame graph rather than an exception to it. (The sh_buffer copy below still
+// has no barrier of its own and relies entirely on that device idle — as before.)
+void ibl_component::run_verification(bool furnace, ::string::gpu::resource_id sh_buffer,
+                                     ::string::gpu::resource_id dfg_lut)
 {
-    if (sh_buffer_ == 0 || dfg_lut_ == 0) return;
-    vkDeviceWaitIdle(device_->get_device());
+    if (sh_buffer == 0 || dfg_lut == 0) return;
+    vkDeviceWaitIdle(device_.get_device());
 
-    const VkDeviceSize sh_bytes = sizeof(float) * 4 * 9;
+    const VkDeviceSize sh_bytes = sizeof(float) * 4 * kShCoefficients;
     const VkDeviceSize dfg_bytes = VkDeviceSize(kDfgSize) * kDfgSize * 8;   // RGBA16F
-    const ::string::gpu::resource_id staging = allocator_->create_resource(::string::gpu::buffer_info{
+    const ::string::gpu::resource_id staging = allocator_.create_resource(::string::gpu::buffer_info{
         .size = sh_bytes + dfg_bytes,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
@@ -418,12 +303,12 @@ void IblComponent::run_verification(bool furnace)
     });
     {
         ::string::gpu::command_recorder rec;
-        rec.init(device_->get_device(), device_->get_queue(::string::gpu::queue_type::GRAPHICS));
+        rec.init(device_.get_device(), device_.get_queue(::string::gpu::queue_type::GRAPHICS));
         VkCommandBuffer cb = rec.begin();
         const VkBufferCopy sh_region = { 0, 0, sh_bytes };
-        vkCmdCopyBuffer(cb, allocator_->get_buffer(sh_buffer_).buffer,
-                        allocator_->get_buffer(staging).buffer, 1, &sh_region);
-        const ::string::gpu::allocated_image& dfg = allocator_->get_image(dfg_lut_);
+        vkCmdCopyBuffer(cb, allocator_.get_buffer(sh_buffer).buffer,
+                        allocator_.get_buffer(staging).buffer, 1, &sh_region);
+        const ::string::gpu::allocated_image& dfg = allocator_.get_image(dfg_lut);
         String::vku::transition_image(cb, {
             .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .new_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -439,7 +324,7 @@ void IblComponent::run_verification(bool furnace)
             .imageExtent = { kDfgSize, kDfgSize, 1 },
         };
         vkCmdCopyImageToBuffer(cb, dfg.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               allocator_->get_buffer(staging).buffer, 1, &dfg_region);
+                               allocator_.get_buffer(staging).buffer, 1, &dfg_region);
         String::vku::transition_image(cb, {
             .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -454,7 +339,7 @@ void IblComponent::run_verification(bool furnace)
     }
 
     const uint8_t* mapped = static_cast<const uint8_t*>(
-        allocator_->get_buffer(staging).allocation_info.pMappedData);
+        allocator_.get_buffer(staging).allocation_info.pMappedData);
     const float* sh = reinterpret_cast<const float*>(mapped);
     const uint16_t* dfg = reinterpret_cast<const uint16_t*>(mapped + sh_bytes);
 
@@ -527,7 +412,7 @@ void IblComponent::run_verification(bool furnace)
     }
 
     STRING_LOG_INFO("[ibl-verify] overall: {}", pass ? "PASS" : "FAIL");
-    allocator_->destroy_resource(staging);
+    allocator_.destroy_resource(staging);
 }
 
 }  // namespace string::render

@@ -153,4 +153,25 @@ static_assert(offsetof(SceneData, probe_active) == 840);
 static_assert(offsetof(SceneData, probe_occluded_floor) == 848);
 static_assert(sizeof(SceneData) == 856);
 
+
+// Push for the half-res GTAO chain (matches Push in shaders/gtao.slang).
+struct GtaoPush
+{
+    glm::mat4 view;         // 0    prev-frame world->view
+    glm::mat4 inv_proj;     // 64   prev-frame inverse projection
+    uint32_t depth_slot;    // 128  prev hz.depth sampled slot
+    uint32_t dst_slot;      // 132
+    glm::uvec2 dst_size;    // 136
+    glm::uvec2 depth_size;  // 144
+    float radius;           // 152
+    float proj00;           // 156
+    float proj11;           // 160
+    uint32_t src_slot;      // 164  denoise input (raw AO)
+    uint32_t _pad0;         // 168
+    uint32_t _pad1;         // 172
+};
+static_assert(offsetof(GtaoPush, depth_slot) == 128);
+static_assert(offsetof(GtaoPush, dst_size) == 136);
+static_assert(offsetof(GtaoPush, radius) == 152);
+static_assert(sizeof(GtaoPush) == 176);
 }  // namespace string::render

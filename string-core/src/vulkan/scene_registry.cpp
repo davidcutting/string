@@ -11,7 +11,7 @@ SceneRegistry& SceneRegistry::instance()
     return registry;
 }
 
-void SceneRegistry::add(std::string name, std::string description, RenderPlan::ConfigureFn configure,
+void SceneRegistry::add(std::string name, std::string description, Application::scene_fn configure,
                         std::vector<std::filesystem::path> assets, bool from_content)
 {
     const auto it = std::find_if(scenes_.begin(), scenes_.end(),

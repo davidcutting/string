@@ -6,8 +6,8 @@ namespace string::render
 {
 using namespace String;
 
-Grid2DPass::Grid2DPass(engine_context& context)
-: device_(context.device)
+grid_2d_pass::grid_2d_pass(engine_context& ctx, VkSampleCountFlagBits samples)
+: device_(ctx.device)
 {
     grid_2d_push_constant_range_ = {
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -23,32 +23,38 @@ Grid2DPass::Grid2DPass(engine_context& context)
     // 2D background grid: procedural (no vertex input), no depth test/write (but declares the
     // offscreen D32 format so the pipeline matches the pass) so it never occludes the geometry.
     pipeline_.pipeline = ::string::gpu::pipeline_builder(device_)
-        .add_vertex_shader(context.resources_path / "shaders/grid_2d_shader.vert.spv")
-        .add_fragment_shader(context.resources_path / "shaders/grid_2d_shader.frag.spv")
+        .add_vertex_shader(ctx.resources_path / "shaders/grid_2d_shader.vert.spv")
+        .add_fragment_shader(ctx.resources_path / "shaders/grid_2d_shader.frag.spv")
         .set_input_assembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
         .set_tessellation()
         .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
-        .set_multisampling(context.sample_count)
+        .set_multisampling(samples)
         .enable_depth_stencil(false, false)
         .enable_color_blending()
         .build_graphics_pipeline(pipeline_.pipeline_layout);
     pipeline_.pipeline_type = ::string::gpu::pipeline_type::GRAPHICS;
-
-    // Draws into the offscreen color target (background; no depth).
-    usages = {
-        { context.color_target, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
-    };
 }
 
-Grid2DPass::~Grid2DPass()
+grid_2d_pass::~grid_2d_pass()
 {
     vkDestroyPipeline(device_.get_device(), pipeline_.pipeline, nullptr);
     vkDestroyPipelineLayout(device_.get_device(), pipeline_.pipeline_layout, nullptr);
 }
 
-void Grid2DPass::record(::string::gpu::command_recorder& recorder, uint16_t current_frame)
+// The declaration says only WHAT is touched: the grid draws into the scene colour and shares the
+// depth attachment without reading or writing it. Load/store and every barrier derive from that.
+void grid_2d_pass::declare(::string::frame_graph& fg, ::string::gpu::image color,
+                           ::string::gpu::image depth)
 {
-    (void)current_frame;
+    fg.pass("grid2d")
+      .color(color)
+      .depth_read(depth)
+      .raster([this](::string::pass_context& ctx) { record(ctx); });
+}
+
+void grid_2d_pass::record(::string::pass_context& ctx)
+{
+    ::string::gpu::command_recorder& recorder = ctx.rec;
 
     Grid2DParams params = {
         .background_color = {0.0f, 0.0f, 0.0f, 0.0f},
@@ -56,9 +62,9 @@ void Grid2DPass::record(::string::gpu::command_recorder& recorder, uint16_t curr
         .border_color = {0.8f, 0.8f, 0.8f, 1.0f},
         .axis_color = {0.6f, 0.6f, 0.6f, 1.0f},
         .grid_resolution = {50.0f, 50.0f},
-        .grid_center = { screen_size.width / 2, screen_size.height / 2 },
+        .grid_center = { ctx.extent.width / 2, ctx.extent.height / 2 },
         .grid_size = { 800.0f, 800.0f },
-        .screen_size = { screen_size.width, screen_size.height },
+        .screen_size = { ctx.extent.width, ctx.extent.height },
         .line_width = 1.0f,
         .fade_distance = 500.0f,
         .border_width = 3.0f,

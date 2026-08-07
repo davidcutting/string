@@ -1,0 +1,38 @@
+# Cognitive-complexity baseline for tools/complexity.sh --gate
+# Regenerate ONLY when intentionally accepting new debt: tools/complexity.sh --baseline
+# Format: <score>\t<file>::<function>   (threshold 25, third_party excluded)
+# Recorded: cff9126 (working tree may differ)
+230	string-debug/src/panels.cpp::author_dag
+183	string-core/src/vulkan/renderer.cpp::record_frame
+169	string-render-forward/src/geometry_pass.cpp::update
+107	string-ui/src/widgets.cpp::rows
+89	string-ui/src/widgets.cpp::nodes
+69	string-asset-tools/src/gltf_loader.cpp::flatten_geometry
+63	string-render-forward/src/geometry_pass_meshlet.cpp::build_meshlet_gpu
+61	string-render-forward/src/geometry_pass.cpp::GeometryPass
+58	string-debug/src/panels.cpp::author_bindings
+51	string-ui/src/widgets.cpp::emit
+50	string-core/src/vulkan/graph_plan.cpp::build
+46	string-ui/src/text_edit.cpp::apply_text_edit
+44	string-render-forward/src/geometry_pass_lighting.cpp::compute_cascades
+43	string-core/src/gpu/shader_compiler.cpp::compile
+42	string-core/src/vulkan/renderer.cpp::refresh_introspection
+41	string-render-forward/src/ui_pass.cpp::update
+40	string-core/src/platform/sdl_window.cpp::update
+39	string-render-forward/src/scene_loader.cpp::load_cooked_scenes
+38	string-ui/src/ui.cpp::emit_panel
+38	sandbox/demo_scene.cpp::register_content_scenes
+37	string-core/src/application.cpp::run
+34	string-core/src/gpu/residency_manager.cpp::tick
+33	string-ui/src/interaction.cpp::resolve_interaction
+33	string-render-forward/src/probe_gi_component.cpp::create_probe_resources
+31	string-client/src/screens.cpp::author_widgets
+30	string-ui/src/interaction.cpp::hit_test_layered
+29	string-ui/src/interaction.cpp::route_action
+29	string-core/src/gpu/shader_compiler.cpp::read_program_cache
+29	string-asset-tools/src/bake.cpp::bake_scene
+28	string-ui/src/widgets.cpp::emit_bar
+28	string-debug/src/panels.cpp::handle_console_input
+26	string-render-forward/src/geometry_pass.cpp::record_compute
+26	string-asset-tools/tools/cook_main.cpp::main
+26	sandbox/demo_scene.cpp::make_ui_dev_author

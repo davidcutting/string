@@ -21,7 +21,8 @@
 #include <string/platform/input.hpp>
 #include <string/platform/input_map.hpp>
 #include <string/vulkan/engine_context.hpp>
-#include <string/vulkan/render_pass.hpp>
+#include <string/vulkan/frame_graph.hpp>
+#include <string/gpu/pass_context.hpp>
 
 #include <volk.h>
 
@@ -82,7 +83,11 @@ struct GpuImage
 // it can style and route text. Game vs UI mode is the cursor-capture state (Input): captured =
 // mouse-look/WASD to the camera, free = clicks/typing to the UI. A click on empty UI space requests
 // game mode again (the pass owns that decision, so the UI gets first dibs on a click).
-class UIPass final : public String::Pass
+//
+// Brief 20 — a plain application-owned object, not a Pass subclass. It authors ITSELF onto the app's
+// frame_graph in declare() and records through pass_context; tick() is ordinary per-frame CPU work
+// the app calls before the graph executes.
+class ui_pass
 {
 public:
     // State handed to the authoring callback each frame so it can style/route by interaction.
@@ -111,23 +116,43 @@ public:
     using DeferredAuthor = std::function<bool()>;
 
     // `atlas` is the dynamic (grow-on-demand, Unicode) SDF glyph atlas — shared, mutated as new
-    // glyphs are seen. `author` declares the whole UI (shapes + text) each frame.
-    UIPass(String::engine_context& context, std::shared_ptr<::string::dynamic_font_atlas> atlas,
-           Author author, PostLayout post_layout = {}, DeferredAuthor deferred = {});
-    ~UIPass() override;
+    // glyphs are seen. `author` declares the whole UI (shapes + text) each frame. `samples` is the
+    // MSAA sample count of the scene target this overlay draws into: pipeline fixed state, supplied
+    // by the app exactly like composite_pass's colour format (engine_context no longer carries it).
+    ui_pass(String::engine_context& context, VkSampleCountFlagBits samples,
+            std::shared_ptr<::string::dynamic_font_atlas> atlas,
+            Author author, PostLayout post_layout = {}, DeferredAuthor deferred = {});
+    ~ui_pass();
 
-    UIPass(const UIPass&) = delete;
-    UIPass& operator=(const UIPass&) = delete;
+    ui_pass(const ui_pass&) = delete;
+    ui_pass& operator=(const ui_pass&) = delete;
 
-    // Stable identity for tooling (Tracy zones, inspector). Brief 06.
-    std::string_view debug_name() const override { return "ui"; }
+    // Author this pass onto the graph. Two declarations:
+    //
+    //   ui.atlas_upload   a TRANSFER pass, conditional on the glyph atlas having grown this frame,
+    //                     that copies the CPU atlas into the atlas image
+    //   ui                the overlay draw, which SAMPLES that atlas and writes `target`
+    //
+    // The write->read edge between them is derived from those two declarations, as is the
+    // cross-frame WAR against the previous frame's text draw. There are no hand-rolled barriers here.
+    void declare(::string::frame_graph& fg, ::string::gpu::image target);
 
-    void update(float delta_time, uint16_t current_frame) override;
-    // Uploads the dynamic atlas's dirty region (glyphs added this frame) before the color pass draws.
-    bool record_compute(::string::gpu::command_recorder& recorder, uint16_t current_frame) override;
-    void record(::string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+    // Per-frame CPU work: interaction, authoring, layout, packing into this frame's rings. Ordinary
+    // app code, called before the graph executes. `screen` and `frame_slot` are what the deleted
+    // Pass::resize()/update(dt, current_frame) lifecycle used to supply; `frame_slot` MUST be the
+    // same slot the graph then executes with, because it selects the ring buffer record() draws from.
+    void tick(float delta_time, VkExtent2D screen, std::uint32_t frame_slot);
+
+    // Has the glyph atlas grown since the last upload? Non-consuming: the graph's conditional asks
+    // this every frame, and the upload callback is what clears it.
+    bool atlas_dirty() const { return atlas_dirty_; }
 
 private:
+    // The recording callbacks, bound in declare().
+    void record(::string::pass_context& ctx);
+    // Copies the whole CPU atlas into this frame slot's staging buffer and into the atlas image.
+    void record_atlas_upload(::string::pass_context& ctx);
+
     // Per-frame ring capacities. Raised for the brief-05 500-nameplate synthetic stress (each
     // nameplate is a name run + 1-2 bars; 500 of them plus screens fit comfortably here). Content
     // beyond these is dropped (with a one-time warn).
@@ -244,15 +269,23 @@ private:
     std::vector<Ring> image_ring_;
     std::vector<std::vector<DrawBatch>> batches_;   // per frame-in-flight, parallel to the rings
     ::string::gpu::resource_id atlas_image_ = 0;
-    VkSampler atlas_sampler_ = VK_NULL_HANDLE;
+    // The same atlas as a LOGICAL handle, registered with the graph in declare(): the upload pass
+    // writes it, the draw pass samples it, and that pair is what the graph derives the sync from.
+    ::string::gpu::image atlas_handle_{};
+    // The atlas's bindless texture slot, resolved once at construction. Needed at PACK time (an
+    // image widget sourced from the glyph atlas is packed into the ring during tick(), long before
+    // any pass_context exists); the draw's own atlas slot comes from ctx.slot() at record time.
     std::uint32_t atlas_slot_ = 0;
     // Dynamic-atlas re-upload: a host-visible staging buffer per frame in flight (the atlas grows as
-    // new glyphs appear). record_compute copies the whole CPU atlas into this frame's staging and
-    // vkCmdCopyBufferToImage's it when the atlas reports dirty, wrapped in the SHADER_READ<->TRANSFER
-    // barriers. atlas_uploaded_ gates the very first transition (UNDEFINED -> SHADER_READ).
+    // new glyphs appear). The declared ui.atlas_upload transfer pass copies the whole CPU atlas into
+    // this frame's staging and vkCmdCopyBufferToImage's it whenever the atlas reported dirty.
     std::vector<::string::gpu::resource_id> atlas_staging_;
     std::uint32_t atlas_upload_bytes_ = 0;
-    bool atlas_uploaded_ = false;
+    // Latched in tick() from the atlas's CONSUMING take_dirty(), so the graph's conditional can ask
+    // "is it dirty?" every frame without eating the flag. Cleared by the upload callback.
+    bool atlas_dirty_ = false;
+    // This frame's screen size, latched in tick(). record() uses pass_context::extent instead.
+    VkExtent2D screen_size{};
 
     bool warned_overflow_ = false;
 

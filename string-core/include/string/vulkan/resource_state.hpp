@@ -1,81 +1,106 @@
 #pragma once
 
+#include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 #include <string/gpu/resource.hpp>
 #include <string/vulkan/resource_usage.hpp>
 
 #include <volk.h>
 
-namespace String
+namespace string
 {
 
-// The current sync2 state of a tracked resource: the last write's scope, the accumulated reader
-// stages since that write, and (for images) the layout. `visible_*` is where the last write has
-// already been made visible, so redundant read-after-read barriers are skipped.
-struct ResourceState
+// The current sync2 state of one tracked subresource: the last write's scope, the reader stages
+// accumulated since that write, and (images) the layout. `visible_*` records where the last write has
+// already been made visible, so a redundant read-after-read barrier is skipped.
+struct sync_state
 {
-    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;   // images only
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkPipelineStageFlags2 last_write_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
     VkAccessFlags2 last_write_access = 0;
     VkPipelineStageFlags2 reader_stages = 0;
     VkPipelineStageFlags2 visible_stages = 0;
     VkAccessFlags2 visible_access = 0;
+
+    bool operator==(const sync_state& o) const
+    {
+        return layout == o.layout && last_write_stage == o.last_write_stage
+            && last_write_access == o.last_write_access && reader_stages == o.reader_stages
+            && visible_stages == o.visible_stages && visible_access == o.visible_access;
+    }
 };
 
-// Tracks each resource's state and derives sync2 barriers from tracked state plus a target
-// Access (via access_scope) — callers say "I need this resource for a ColorWrite at this stage"
-// rather than hand-writing barriers. Brief 04e M2: this is now HAZARD-COMPLETE, the execution
-// substrate the render graph drives from pass-declared usages:
-//   - a WRITE emits a barrier against the last write AND all readers since it (WAW + WAR),
-//     even when the layout doesn't change (the 04d msaa ghosting class);
-//   - a READ emits a barrier only if the last write isn't yet visible to its (stage, access)
-//     — repeat readers are free;
-//   - BUFFERS are tracked by resource_id; their hazards accumulate into ONE merged global
-//     memory barrier per flush (minimal united scopes).
-class ResourceStateTracker
+// The slice of an image a transition applies to. Tracking is PER SUBRESOURCE, which is what makes a
+// mip chain (each level written from the one above) and a cubemap (each face written separately)
+// expressible: the graph derives the chain instead of a `level_count` parameter transitioning every
+// mip at once under an assumption nothing checks.
+struct subresource
 {
-    std::unordered_map<VkImage, ResourceState> images_;
-    std::unordered_map<string::gpu::resource_id, ResourceState> buffers_;
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    std::uint32_t base_mip = 0;
+    std::uint32_t mip_count = 1;
+    std::uint32_t base_layer = 0;
+    std::uint32_t layer_count = 1;
+};
 
-    // Pending merged buffer barrier scopes (flushed as a single VkMemoryBarrier2).
+// Derives sync2 barriers from tracked state plus a target access — callers say "I need this
+// subresource for a color_write at this stage" and never hand-write a barrier. Hazard-complete:
+//   - a WRITE barriers against the last write AND every reader since it (WAW + WAR), even when the
+//     layout does not change;
+//   - a READ barriers only if the last write is not yet visible to its (stage, access) — repeat
+//     readers are free;
+//   - BUFFERS are tracked by resource_id and their hazards merge into ONE global memory barrier per
+//     flush point, with minimal united scopes.
+//
+// This class IS the derived-barrier emitter. It is not an exception to "no hand-rolled barriers" —
+// it is the implementation of that rule.
+class resource_state_tracker
+{
+public:
+    // Register an image's shape so subresource tracking has somewhere to live. Idempotent; called by
+    // the executor when it first touches an image.
+    void track(VkImage image, VkImageAspectFlags aspect, std::uint32_t mip_levels,
+               std::uint32_t array_layers);
+
+    // Barrier `image`'s `sub` into the layout + access that `how` requires at `stage`, then update
+    // the tracked state. `discard` sources from UNDEFINED, for a subresource whose contents are
+    // fully overwritten. Emits nothing when the request is already satisfied. Subresources whose
+    // tracked state matches are coalesced into a single barrier.
+    void transition(VkCommandBuffer cmd, VkImage image, const subresource& sub, access how,
+                    VkPipelineStageFlags2 stage, bool discard = false);
+
+    // Note a buffer access, accumulating any required global memory-barrier scopes into the pending
+    // merge. flush_buffers() emits it before the consuming commands are recorded.
+    void buffer_access(gpu::resource_id resource, access how, VkPipelineStageFlags2 stage);
+    void flush_buffers(VkCommandBuffer cmd);
+
+    // Forget all tracked state (frame boundary with recreated backing, or a resize).
+    void clear();
+
+    // Overwrite an image's tracked layout without emitting a barrier, for a layout changed outside
+    // the graph (the debug capture, which drains the device and transitions directly). This is a
+    // NOTIFICATION, not a back door for deriving sync — the tracker stays the single authority.
+    void set_layout(VkImage image, VkImageLayout layout);
+
+private:
+    struct image_track
+    {
+        VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        std::uint32_t mips = 1;
+        std::uint32_t layers = 1;
+        std::vector<sync_state> cells;   // mips * layers, mip-major
+        sync_state& at(std::uint32_t mip, std::uint32_t layer) { return cells[mip * layers + layer]; }
+    };
+
+    std::unordered_map<VkImage, image_track> images_;
+    std::unordered_map<gpu::resource_id, sync_state> buffers_;
+
     VkPipelineStageFlags2 pending_src_stage_ = 0;
     VkAccessFlags2 pending_src_access_ = 0;
     VkPipelineStageFlags2 pending_dst_stage_ = 0;
     VkAccessFlags2 pending_dst_access_ = 0;
-
-public:
-    // Record a barrier moving `image` to the layout + access that `access` requires at `stage`,
-    // then update the tracked state. `discard` drops the current contents (source layout
-    // UNDEFINED) — for targets that are fully cleared/overwritten each use. Emits nothing when
-    // the request is already satisfied (visible read, no hazard). `level_count` = mip levels to
-    // transition (default 1 = single-mip; pass the image's full mip count for a mip chain like the
-    // HiZ pyramid, which is uniform across mips at every pass boundary — intra-pass per-mip
-    // divergence during its own reduce is handled by that pass's local barriers, not the tracker).
-    void transition(VkCommandBuffer command_buffer, VkImage image, VkImageAspectFlags aspect,
-                    Access access, VkPipelineStageFlags2 stage, bool discard = false,
-                    uint32_t level_count = 1);
-
-    // Brief 11 step 2b: SEED a resource's state without emitting a barrier — for a write the tracker
-    // cannot observe through transition()/buffer_access(), namely a render-pass attachment RESOLVE
-    // (the two-phase MSAA depth -> hz.depth min-resolve executes at the group's EndRendering in the
-    // COLOR_ATTACHMENT_OUTPUT stage). After seeding, a later transition() derives the correct
-    // wait-on-resolve. Overwrites any prior tracked state for `image`.
-    void seed(VkImage image, VkImageLayout layout, VkPipelineStageFlags2 write_stage,
-              VkAccessFlags2 write_access);
-    // Is this image currently tracked (seeded or previously transitioned)? Lets the renderer skip
-    // static uploaded inputs (never tracked) while still transitioning seeded resolve targets.
-    bool is_tracked(VkImage image) const { return images_.count(image) != 0; }
-
-    // Note a buffer access; accumulates any required global memory-barrier scopes into the
-    // pending merge. Call flush_buffers() before the consuming commands are recorded.
-    void buffer_access(string::gpu::resource_id resource, Access access,
-                       VkPipelineStageFlags2 stage);
-    // Emit the merged pending buffer barrier (if any) into the command buffer.
-    void flush_buffers(VkCommandBuffer command_buffer);
-
-    // Forget all tracked state (e.g. after the swapchain + attachments are recreated on resize).
-    void clear();
 };
 
-}  // namespace String
+}  // namespace string

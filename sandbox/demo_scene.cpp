@@ -1,5 +1,9 @@
 #include "demo_scene.hpp"
 
+#include <string/vulkan/passes/composite_pass.hpp>
+#include <string/vulkan/frame_graph.hpp>
+#include <string/render/geometry_pass.hpp>
+
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -53,20 +57,38 @@ namespace sandbox
 namespace
 {
 
-// Brief 11 endgame: author a stateful pass's standard runtime surface onto the graph — its live
-// per-frame usages + record + optional prepass-compute bodies (both delegate to the pass object).
-// The caller adds nature flags fluently (.computeOnly()/.prepass()/.async()/.toggle()) then .finish().
-String::PassSpec author_pass(String::FrameGraph& fg, String::Pass* p)
+// The app chooses these because it declares the attachments they describe. The renderer no longer
+// has an opinion about sample count or swapchain format to supply.
+constexpr VkSampleCountFlagBits kSceneSamples = VK_SAMPLE_COUNT_4_BIT;
+
+// The INITIAL viewport, and only the initial one: everything viewport-derived is declared as a
+// relationship, so a resize re-sizes backing without re-authoring anything.
+VkExtent2D scene_viewport()
 {
-    return fg.pass(std::string(p->debug_name()))
-        // Brief 16: declare the pass's usages via a getter (retires usagesFrom's raw member pointer);
-        // the usages carry logical handles, the executor resolves the per-frame physical.
-        .usages([p]() -> const std::vector<String::ResourceUsage>& { return p->usages; })
-        // Brief 16 M1: the executor hands a pass_context; the legacy Pass interface still takes
-        // (command_recorder&, frame), so unpack ctx here. Handle-native passes take ctx directly.
-        .record([p](string::gpu::pass_context& ctx) { p->record(ctx.rec, ctx.frame_slot); })
-        .prepassCompute([p](string::gpu::pass_context& ctx) { return p->record_compute(ctx.rec, ctx.frame_slot); });
+    VkExtent2D e{ 800, 800 };
+    if (const char* ws = std::getenv("STRING_WINDOW_SIZE"))
+    {
+        unsigned w = 0, h = 0;
+        if (std::sscanf(ws, "%ux%u", &w, &h) == 2 && w >= 64 && h >= 64) e = { w, h };
+    }
+    return e;
 }
+
+// Brief 20: author_pass is DELETED. It existed to bridge a Pass object onto the graph by handing
+// over its hand-written `usages` vector plus two record hooks — the second declaration channel and
+// the two-entry-point pass, in one helper. A pass now declares itself; there is nothing to bridge.
+
+// Defined below; the content-scan registry lambdas above call them.
+struct scene_resources;
+std::function<void(float)> make_geometry_scene(
+    string::frame_graph& fg, String::engine_context& ctx, VkExtent2D viewport,
+    VkSampleCountFlagBits samples, VkFormat swapchain_format,
+    std::vector<std::filesystem::path> models,
+    std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t np_stress, string::renderer& rr);
+struct scene_resources;
+std::function<void(float)> make_shader_scene(
+    string::frame_graph& fg, String::engine_context& ctx, const std::filesystem::path& shader,
+    std::shared_ptr<string::dynamic_font_atlas> atlas, string::renderer& rr);
 
 // Throws naming the path rather than returning an empty vector. A silent empty read used to travel
 // all the way into stb_truetype as a null pointer and fault there, which told a packager who forgot
@@ -108,12 +130,12 @@ using SharedPanels = std::shared_ptr<debug::DebugPanels>;
 // that call is exactly how the DAG panel's scroll extent came to be permanently zero.
 // Drains the Ui's deferred surfaces one at a time; the pass closes each one's layout because only
 // it holds the measurer. Null-safe before the Ui exists, like the observer below.
-UIPass::DeferredAuthor make_deferred_author(SharedUi fluent)
+ui_pass::DeferredAuthor make_deferred_author(SharedUi fluent)
 {
     return [fluent] { return *fluent && (*fluent)->emit_next_deferred(); };
 }
 
-UIPass::PostLayout make_ui_observer(SharedUi fluent,
+ui_pass::PostLayout make_ui_observer(SharedUi fluent,
                                     std::shared_ptr<string::ui::Workspace> ws = nullptr)
 {
     return [fluent, ws](const string::layout_builder& b) {
@@ -122,7 +144,7 @@ UIPass::PostLayout make_ui_observer(SharedUi fluent,
     };
 }
 
-UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats,
+ui_pass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats,
                               SharedPanels panels,
                               std::size_t nameplate_stress, SharedUi fluent)
 {
@@ -131,7 +153,7 @@ UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats
             np_scene = UiScene{}, motion = ui::Motion{}, ui_panels = string::ui::PanelStore{},
             fluent = std::move(fluent), nameplate_stress,
             panels, render_dbg = ::string::render::RenderDebug{}](
-               string::layout_builder& b, const UIPass::UiContext& ctx) mutable {
+               string::layout_builder& b, const ui_pass::UiContext& ctx) mutable {
         // ONE Ui per frame, always constructed — the debug shell authors into this same one, so its
         // panels share the app's PanelStore (and therefore one z order) and its per-frame hand-offs
         // are forwarded once, below, rather than twice from two places.
@@ -181,7 +203,7 @@ UIPass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats
 // This is the permanent UI sandbox — STRING_SCENE=ui ./run.sh. `mesh_stats` is intentionally absent
 // (the overlay tolerates a null MeshOverlayStats); the demo panel from make_ui_author is reused so
 // hover/focus/text-field interaction is still exercised here.
-UIPass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::uint32_t anchor_count,
+ui_pass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::uint32_t anchor_count,
                                   SharedPanels panels,
                                   std::size_t nameplate_budget,
                                   std::string screen,
@@ -192,7 +214,7 @@ UIPass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::uint32_t 
             fluent = std::move(fluent),
             state = client::ScreenState{}, panels,
             render_dbg = ::string::render::RenderDebug{}](
-               string::layout_builder& b, const UIPass::UiContext& ctx) mutable {
+               string::layout_builder& b, const ui_pass::UiContext& ctx) mutable {
         // The Ui lives in the CLOSURE, not on the stack: it owns the frame string arena and the
         // layout tree holds non-owning views into it, so it must outlive authoring — through layout
         // and record. Constructed on the first frame (the builder and interaction it binds are
@@ -256,128 +278,241 @@ UIPass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::uint32_t 
 // Build the full geometry scene Setup around an already-constructed GeometryPass: the meshlet
 // subsystem's companion passes (froxel/ibl/gtao/sky/hiz/phase2) + debug lines + UI + post, plus the
 // fluent author that declares each pass's nature onto the graph. Shared by the lookdev + Sponza scenes.
-String::RenderPlan::Setup make_geometry_setup(
-    String::engine_context& ctx, std::unique_ptr<GeometryPass> geo,
-    std::shared_ptr<MeshOverlayStats> mesh_stats,
-    std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t nameplate_stress)
+// Brief 20 — the application declares its own resources and passes.
+//
+// Everything the scene renders into or through is stated HERE, once, as logical handles: the
+// renderer creates no render targets, and no pass owns a viewport-sized image any more. Sizes that
+// follow the window are declared as RELATIONSHIPS (viewport_scaled / bytes_for) rather than computed,
+// which is what lets a resize be a backing swap instead of a re-author.
+struct scene_resources
 {
-    GeometryPass* gp = geo.get();
-    auto froxel = std::make_unique<FroxelPass>(ctx, gp->scene());
-    auto ibl    = std::make_unique<IblPass>(ctx, gp->scene());
-    auto gtao   = std::make_unique<GtaoPass>(gp);
-    auto gi     = std::make_unique<GiPass>(gp);
-    auto sky    = std::make_unique<SkyPass>(ctx, gp->scene());
-    auto hiz    = std::make_unique<HizBuildPass>(gp);
-    auto phase2 = std::make_unique<GeometryPhase2Pass>(gp);
-    auto transp = std::make_unique<TransparencyPass>(gp);
-    auto shadow = std::make_unique<ShadowPass>(gp);
-    auto dbg    = std::make_unique<DebugLinePass>(ctx, mesh_stats);
-    auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
-    auto dbg_panels = std::make_shared<debug::DebugPanels>();
-    auto ui     = std::make_unique<UIPass>(ctx, atlas,
-                                           make_ui_author(mesh_stats, dbg_panels, nameplate_stress, ui_slot),
-                                           make_ui_observer(ui_slot),
-                                           make_deferred_author(ui_slot));
-    auto post   = std::make_unique<PostProcessPass>(ctx);
+    string::gpu::image swapchain, color, depth, hdr;
+    string::gpu::image hiz_depth, hiz_pyramid;
+    string::gpu::image gtao_raw, gtao_ao;
+    string::gpu::image bloom;
+    string::gpu::image shadow[::string::render::kMaxCascades];
+    string::gpu::image env_capture, env_prefiltered, dfg_lut;
+    string::gpu::image hiz_depth_prev;
+    string::gpu::image gi_irradiance, gi_cap_gbuf, gi_cap_albedo, gi_visibility;
+    string::gpu::image gi_cube_albedo, gi_cube_nd, gi_cube_depth;
+    string::gpu::buffer froxels, ibl_sh, worklists, transparency_list, histogram_bins;
+    string::gpu::buffer scene_data, lights, stats;
+    string::gpu::buffer gi_active, gi_offset, gi_meshlet_table;
+    uint32_t hiz_mips = 0, bloom_mips = 0;
+};
 
-    FroxelPass* fx = froxel.get();
-    String::Pass* ib = ibl.get();  String::Pass* gt = gtao.get(); String::Pass* sk = sky.get();
-    String::Pass* gi_p = gi.get();
-    String::Pass* hz = hiz.get();  String::Pass* p2 = phase2.get();  String::Pass* sh = shadow.get();
-    String::Pass* tr = transp.get();
-    String::Pass* db = dbg.get();  String::Pass* uip = ui.get();   String::Pass* po = post.get();
+scene_resources declare_resources(string::frame_graph& fg, VkExtent2D viewport,
+                                  VkSampleCountFlagBits samples, uint32_t shadow_res,
+                                  uint32_t cascades, uint32_t max_draws,
+                                  const ::string::render::ProbeVolume& gi_volume,
+                                  std::size_t gi_table_entries)
+{
+    using namespace string;
+    scene_resources r;
 
-    // Ownership order == the per-frame update()/resize() LIFECYCLE order. Producers first, matching
-    // the graph author order below; NOT the same concern as the toposort.
-    //
-    // This used to be LOAD-BEARING and silently so: GeometryPass::update() baked FroxelPass's buffer
-    // device address into SceneData, so getting this order wrong baked a NULL address that
-    // lighting.slang dereferences unconditionally -> GPU fault -> DEVICE_LOST. Nothing enforced it —
-    // the frame graph derives RECORD order from declared usages, but the update loop just walks
-    // scene_passes_ in push order, so an update-time dependency is invisible to it.
-    //
-    // That address is now latched in GeometryPass::record() instead, by which time every pass has
-    // updated. So this order is a convention again, not a tripwire. Keep it tidy anyway — but any
-    // NEW cross-pass dependency taken at update() time re-creates the same unenforced hazard.
-    String::RenderPlan::Setup s;
-    s.passes.push_back(std::move(froxel));
-    s.passes.push_back(std::move(ibl));
-    s.passes.push_back(std::move(gtao));
-    s.passes.push_back(std::move(gi));
-    s.passes.push_back(std::move(sky));
-    s.passes.push_back(std::move(geo));
-    s.passes.push_back(std::move(hiz));
-    s.passes.push_back(std::move(phase2));
-    s.passes.push_back(std::move(transp));
-    s.passes.push_back(std::move(shadow));
-    s.passes.push_back(std::move(dbg));
-    s.passes.push_back(std::move(ui));
-    s.passes.push_back(std::move(post));
+    // The one image whose backing the renderer still latches — it is not known until the frame
+    // acquires it. Everything else the graph owns outright.
+    r.swapchain = fg.use_persistent(string::persistent_image_info{ .name = "swapchain", .swapchain = true });
 
-    // The render graph, authored fluently — order = record order (the toposort preserves it). Nature is
-    // declared HERE, not via Pass virtuals: froxel is the async light-binning chain; ibl/gtao are
-    // frame-top prepass compute; hiz.build + post are compute-only; geometry.phase1 is toggleable.
-    s.author = [fx, ib, gt, gi_p, sk, gp, hz, p2, tr, sh, db, uip, po](String::FrameGraph& fg) {
-        author_pass(fg, fx).computeOnly()
-            .async([fx] { return fx->async_has_work(); },
-                   [fx](string::gpu::pass_context& ctx) { fx->record_async_compute(ctx.rec, ctx.frame_slot); },
-                   [fx]() -> const std::vector<String::ResourceUsage>& { return fx->async_usages; }).finish();
-        author_pass(fg, ib).prepass().finish();
-        // gtao / gi: prepass seams, toggleable through their feature cvars (r.gtao.enabled / r.gi) —
-        // off drops the pass AND SceneData already degrades (gtao_slot invalid / probe_gi 0).
-        author_pass(fg, gt).prepass().toggle([gt] { return gt->is_enabled(); }).finish();
-        // gi.probe: prepass compute seam over GeometryPass. Authored after ibl (relight reads this
-        // frame's SH) and before geometry+shadow (relight's shadow-map reads precede the shadow depth
-        // writes — the WAR execution edge). prepass() = frame-top compute, forms no render group.
-        author_pass(fg, gi_p).prepass().toggle([gi_p] { return gi_p->is_enabled(); }).finish();
-        // sky: r.pass.sky drops the background draw -> the MSAA clear shows behind the lit scene.
-        author_pass(fg, sk).toggle([sk] { return sk->is_enabled(); }).finish();
-        // geometry.phase1 PRODUCES hz.depth — declared here so the PLAN knows it.
-        //
-        // The write itself is the group's MSAA depth MIN-resolve at EndRendering, which the graph
-        // cannot observe (it is an attachment property, not a recorded command). Sync was already
-        // correct: the renderer seeds the tracker with the post-resolve state, and hiz.build's
-        // SampledRead derives its barrier from that. What was missing is the DEPENDENCY: with no
-        // declared producer, `hz.depth` had first_writer = none and there was no geometry -> hiz.build
-        // edge, so their order rested on authoring order and the toposort's tie-break rather than on
-        // anything the planner could enforce. The M3 DAG made that visible — hiz.build sat at depth 0
-        // with nothing feeding it.
-        //
-        // This goes through `use()`, which appends to the pass's DECLARED plan lists only. It does
-        // NOT touch `Pass::usages`, which is what barrier derivation reads live — so this buys the
-        // edge, the toposort constraint and the lifetime span, and changes no barrier. The separate
-        // record-time `Access::DepthResolve` marker still names the resolve target for the group
-        // loop; it stays a non-write because the group loop scans for it by identity, and it is
-        // appended after compile so the planner never sees it anyway.
-        {
-            String::PassSpec geo_spec = author_pass(fg, gp).toggle([gp] { return gp->is_enabled(); });
-            if (gp->hiz_depth_ring().valid())
-                geo_spec.use(String::ResourceUsage{
-                    .access = String::Access::DepthWrite,
-                    .stage = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                    .img = gp->hiz_depth_ring() });
-            geo_spec.finish();
-        }
-        author_pass(fg, hz).computeOnly().finish();
-        author_pass(fg, p2).finish();
-        // transparency: joins phase2's reopened MSAA group as its LAST draw (same COLOR_TARGET, authored
-        // immediately after phase2 so it's consecutive — it must come BEFORE the prepass shadow seam or
-        // shadow's non-color usage would split the group between phase2 and transparency). r.pass.transparency
-        // drops it -> opaque geometry only.
-        author_pass(fg, tr).toggle([tr] { return tr->is_enabled(); }).finish();
-        // shadow.cascades: prepass compute seam over GeometryPass. Authored AFTER phase2 so its
-        // record_compute is ordered after geometry.phase1's (draw-cull/expand produced the per-cascade
-        // worklists it draws) while its record() no-ops — it must NOT sit between phase1 and phase2 or it
-        // would split the reopened MSAA group. prepass() = frame-top compute, forms no render group.
-        // r.pass.shadow drops it; SceneData cascade_count 0 (set in GeometryPass::update off the same
-        // cvar) makes the scene render unshadowed.
-        author_pass(fg, sh).prepass().toggle([sh] { return sh->is_enabled(); }).finish();
-        author_pass(fg, db).finish();
-        author_pass(fg, uip).finish();
-        author_pass(fg, po).computeOnly().finish();
+    // The multisampled scene targets and the single-sample HDR they resolve into. Declaring both as
+    // colour writes on one pass is what tells the graph there is a resolve; there is no marker and no
+    // hook.
+    r.color = fg.image({ .name = "scene.color", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                         .viewport_scaled = true, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                         .samples = samples });
+    r.depth = fg.image({ .name = "scene.depth", .format = VK_FORMAT_D32_SFLOAT,
+                         .viewport_scaled = true,
+                         .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         .aspect = VK_IMAGE_ASPECT_DEPTH_BIT, .samples = samples });
+    r.hdr = fg.image({ .name = "scene.hdr", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                       .viewport_scaled = true,
+                       .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                              | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                              | VK_IMAGE_USAGE_STORAGE_BIT });
+
+    // HiZ. The depth ring is the one genuinely temporal image in the renderer — GTAO reprojection
+    // reads the PREVIOUS frame slot's resolved depth — so it is per_frame, and gtao declares a second
+    // handle over the same backing rotated one slot back.
+    const VkExtent2D hz = ::string::render::geometry_pass::hiz_extent(viewport);
+    r.hiz_mips = ::string::render::geometry_pass::hiz_mip_count(viewport);
+    r.hiz_depth = fg.image({ .name = "hiz.depth", .format = VK_FORMAT_D32_SFLOAT,
+                             .viewport_scaled = true,
+                             .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                             .aspect = VK_IMAGE_ASPECT_DEPTH_BIT, .per_frame = true });
+    r.hiz_pyramid = fg.image({ .name = "hiz.pyramid", .format = VK_FORMAT_R32_SFLOAT,
+                               .extent = { hz.width, hz.height, 1 }, .mip_levels = r.hiz_mips,
+                               .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                               .sampler = { .mag_filter = VK_FILTER_NEAREST,
+                                            .min_filter = VK_FILTER_NEAREST,
+                                            .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                                            .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                            .anisotropy = false } });
+
+    // GTAO, half res. `neutral` on the AO target is what a consumer gets when GTAO is toggled off:
+    // a flat encoded bent normal with visibility 1, i.e. no occlusion — not black.
+    const gpu::sampler_info clamp_linear{ .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
+                                          .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                                          .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                          .anisotropy = false };
+    r.gtao_raw = fg.image({ .name = "gtao.raw", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                            .viewport_scaled = true, .viewport_scale = 0.5f,
+                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                            .sampler = clamp_linear });
+    r.gtao_ao = fg.image({ .name = "gtao.ao", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                           .viewport_scaled = true, .viewport_scale = 0.5f,
+                           .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                           .sampler = clamp_linear,
+                           .neutral = {{ 0.5f, 0.5f, 0.5f, 1.0f }} });
+
+    // Shadow cascades: ONE image each, no ring. The three-deep ring was pure frames-in-flight
+    // write-after-read avoidance, which the graph derives — 144 MB down to 48 MB. `neutral` 1.0 is
+    // what makes toggling shadows off produce a lit unshadowed scene rather than a black one.
+    for (uint32_t c = 0; c < cascades; ++c)
+        r.shadow[c] = fg.image({
+            .name = "shadow.cascade" + std::to_string(c), .format = VK_FORMAT_D32_SFLOAT,
+            .extent = { shadow_res, shadow_res, 1 },
+            .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+            .sampler = { .mag_filter = VK_FILTER_NEAREST, .min_filter = VK_FILTER_NEAREST,
+                         .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                         .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                         .anisotropy = false,
+                         .border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE },
+            .neutral = {{ 1.0f, 0.0f, 0.0f, 0.0f }} });
+
+    // IBL: two 128^3 cubes with a 6-mip roughness ladder, the split-sum BRDF LUT, and the SH buffer.
+    const gpu::sampler_info env_sampler{ .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
+                                         .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                                         .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                         .anisotropy = false,
+                                         .border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE };
+    r.env_capture = fg.image({ .name = "ibl.env_capture", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                               .extent = { 128, 128, 1 }, .mip_levels = 6, .array_layers = 6, .cube = true,
+                               .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               .sampler = env_sampler });
+    r.env_prefiltered = fg.image({ .name = "ibl.env_prefiltered", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                                   .extent = { 128, 128, 1 }, .mip_levels = 6, .array_layers = 6, .cube = true,
+                                   .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   .sampler = env_sampler });
+    r.dfg_lut = fg.image({ .name = "ibl.dfg", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                           .extent = { 128, 128, 1 },
+                           .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                                  | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                           .sampler = env_sampler });
+
+    // Bloom's mip count is fixed at author time, from the initial viewport — authored-once means the
+    // number of declared passes cannot change on resize.
+    r.bloom_mips = ::string::render::post_pass::bloom_mip_count(viewport);
+    r.bloom = fg.image({ .name = "post.bloom", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                         .viewport_scaled = true, .viewport_scale = 0.5f, .mip_levels = r.bloom_mips,
+                         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                         .sampler = clamp_linear });
+
+    // --- buffers ---------------------------------------------------------------------------------
+    r.froxels = fg.buffer({ .name = "froxels",
+                            .bytes_for = [](VkExtent2D e) { return ::string::render::froxel_component::bytes_for(e); },
+                            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT });
+    r.ibl_sh = fg.buffer({ .name = "ibl.sh", .bytes = sizeof(float) * 4 * 9,
+                           .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                                  | VK_BUFFER_USAGE_TRANSFER_SRC_BIT });
+    r.transparency_list = fg.buffer({
+        .name = "transparency.list",
+        .bytes = ::string::render::sorted_transparency::layout_for(max_draws).bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+               | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+        .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .per_frame = true });
+    // Probe GI. The atlases are tiled by the probe grid — the app sizes them from the SAME fit the
+    // component uses (probe_gi_component::fit_volume), so neither side can drift from the other.
+    const glm::uvec2 gi_tiles = gi_volume.tile_grid();
+    const gpu::sampler_info gi_sampler{ .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
+                                        .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                                        .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                        .anisotropy = false };
+    const VkImageUsageFlags gi_atlas_usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                                           | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const auto gi_atlas = [&](const char* name, uint32_t stride) {
+        return fg.image({ .name = name, .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                          .extent = { std::max(1u, gi_tiles.x * stride),
+                                      std::max(1u, gi_tiles.y * stride), 1 },
+                          .usage = gi_atlas_usage, .sampler = gi_sampler });
     };
-    return s;
+    r.gi_irradiance  = gi_atlas("gi.irradiance",     ::string::render::kProbeIrradStride);
+    r.gi_cap_gbuf    = gi_atlas("gi.capture_gbuf",   ::string::render::kProbeVisStride);
+    r.gi_cap_albedo  = gi_atlas("gi.capture_albedo", ::string::render::kProbeVisStride);
+    r.gi_visibility  = gi_atlas("gi.visibility",     ::string::render::kProbeVisStride);
+
+    // The per-probe cube G-buffer, destructively reused between probes — pure write-after-read, no
+    // history, so one set serves every probe.
+    const auto gi_cube = [&](const char* name, VkFormat fmt, VkImageUsageFlags use, VkImageAspectFlags asp) {
+        return fg.image({ .name = name, .format = fmt, .extent = { 32, 32, 1 },
+                          .array_layers = 6, .cube = true, .usage = use, .aspect = asp,
+                          .sampler = gi_sampler });
+    };
+    r.gi_cube_albedo = gi_cube("gi.cube_albedo", VK_FORMAT_R16G16B16A16_SFLOAT,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT);
+    r.gi_cube_nd     = gi_cube("gi.cube_nd", VK_FORMAT_R16G16B16A16_SFLOAT,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT);
+    r.gi_cube_depth  = gi_cube("gi.cube_depth", VK_FORMAT_D32_SFLOAT,
+                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                               VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    const VkBufferUsageFlags gi_buf = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                    | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                                    | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    r.gi_active = fg.buffer({ .name = "gi.active",
+                              .bytes = std::max<VkDeviceSize>(4 * gi_volume.total(), 4),
+                              .usage = gi_buf });
+    r.gi_offset = fg.buffer({ .name = "gi.offset",
+                              .bytes = std::max<VkDeviceSize>(16 * gi_volume.total(), 16),
+                              .usage = gi_buf });
+    r.gi_meshlet_table = fg.buffer({ .name = "gi.meshlet_table",
+                                     .bytes = 8 * std::max<VkDeviceSize>(gi_table_entries, 1),
+                                     .usage = gi_buf });
+
+    r.histogram_bins = fg.buffer({ .name = "post.histogram.bins", .bytes = 256 * sizeof(uint32_t),
+                                   .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                   .per_frame = true });
+
+    // SceneData, the animated light ring and the GPU stats block. All three are host-written each
+    // frame and read by that same frame's draws, so they ring for CPU-vs-GPU pacing.
+    const VkBufferUsageFlags host_ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                       | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    const VmaAllocationCreateFlags mapped = VMA_ALLOCATION_CREATE_MAPPED_BIT
+                                          | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+    r.scene_data = fg.buffer({ .name = "scene.data", .bytes = sizeof(::string::render::SceneData),
+                               .usage = host_ssbo, .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+                               .allocation_flags = mapped, .per_frame = true });
+    r.lights = fg.buffer({ .name = "scene.lights",
+                           .bytes = sizeof(::string::render::GpuLight) * 1024u,
+                           .usage = host_ssbo, .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+                           .allocation_flags = mapped, .per_frame = true });
+    r.stats = fg.buffer({ .name = "scene.stats", .bytes = sizeof(::string::render::GpuMeshStats),
+                          .usage = host_ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
+                          .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT, .per_frame = true });
+
+    // The worklist arena: draw-cull counts, scan offsets, and the compacted indirect command lists
+    // for the camera, the two-sided set and every cascade. One buffer, many regions.
+    // The meshlet worklist arena is the per-frame SCRATCH buffer — the passes reserve byte regions
+    // from it at construction and address them as offsets, so the graph handle must name that same
+    // allocation, not a separate one. Its backing is filled in after the arena materializes
+    // (wire_scratch_arena), because reservations are only known once every pass has been built.
+    r.worklists = fg.use_persistent(string::persistent_buffer_info{ .name = "meshlet.worklists" });
+
+    // GTAO reads the PREVIOUS frame slot's resolved depth. Rather than inventing a "read at slot-1"
+    // verb, that is a SECOND logical handle over the same physical ring, rotated one slot back. Both
+    // handles resolve to the same VkImages, so the tracker sees one resource and derives the
+    // cross-frame edge correctly — and it is persistent, because degrade must never substitute a
+    // fallback for real history.
+    r.hiz_depth_prev = fg.use_persistent(string::persistent_image_info{ .name = "hiz.depth_prev" });
+
+    return r;
 }
+
 
 // A `.scene.json` descriptor: the manifest for a scene glTF alone cannot express — several files
 // merged into one world, plus engine-side overrides. Deliberately small; anything glTF already says
@@ -544,40 +679,27 @@ void register_content_scenes(String::SceneRegistry& registry,
             registry.add(d->name,
                          d->description.empty() ? "Shader: " + file.filename().string()
                                                 : d->description,
-                         [atlas, shader](String::engine_context& ctx) -> String::RenderPlan::Setup {
+                         [atlas, shader](string::frame_graph& fg, String::engine_context& ctx,
+                                         string::renderer& r) -> std::function<void(float)> {
+                // Same shape as the `ui` scene: a fullscreen pass then the UI overlay, and NO post
+                // chain — that absence IS the post bypass. The error overlay rides on the UI pass, so
+                // a shader that fails to compile still has somewhere to report itself.
                 const std::filesystem::path path =
                     shader.empty() ? ctx.resources_path / "shaders" / "shadertoy_default.slang"
                                    : shader;
-                auto toy = std::make_unique<::string::render::ShaderToyPass>(ctx, path);
-                auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
-                auto dbg_panels = std::make_shared<debug::DebugPanels>();
-                auto uip_owned = std::make_unique<UIPass>(
-                    ctx, atlas,
-                    make_ui_author(std::make_shared<MeshOverlayStats>(), dbg_panels, 0, ui_slot),
-                    make_ui_observer(ui_slot),
-                    make_deferred_author(ui_slot));
-                String::Pass* toyp = toy.get();
-                String::Pass* uip = uip_owned.get();
-                String::RenderPlan::Setup s;
-                s.passes.push_back(std::move(toy));
-                s.passes.push_back(std::move(uip_owned));
-                s.author = [toyp, uip](String::FrameGraph& fg) {
-                    author_pass(fg, toyp).finish();
-                    author_pass(fg, uip).finish();
-                };
-                return s;
+                return make_shader_scene(fg, ctx, path, atlas, r);
             }, {}, /*from_content=*/true);
             continue;
         }
 
         registry.add(d->name, d->description.empty() ? "Content: " + file.filename().string()
                                                      : d->description,
-                     [atlas, np_stress, models = d->models](String::engine_context& ctx)
-                       -> String::RenderPlan::Setup {
-            auto mesh_stats = std::make_shared<MeshOverlayStats>();
-            auto geo = std::make_unique<GeometryPass>(ctx, models, mesh_stats);
-            return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas,
-                                       static_cast<std::size_t>(np_stress));
+                     [atlas, np_stress, models = d->models](string::frame_graph& fg,
+                                                            String::engine_context& ctx,
+                                                            string::renderer& r)
+                       -> std::function<void(float)> {
+            return make_geometry_scene(fg, ctx, scene_viewport(), kSceneSamples, r.swapchain_format(),
+                                       models, atlas, static_cast<std::size_t>(np_stress), r);
         }, d->models, /*from_content=*/true);
     }
 
@@ -595,153 +717,238 @@ void register_content_scenes(String::SceneRegistry& registry,
                                  ? name
                                  : asset.parent_path().filename().string() + "/" + name;
         registry.add(unique, "Content: " + asset.filename().string(),
-                     [atlas, np_stress, asset](String::engine_context& ctx)
-                       -> String::RenderPlan::Setup {
+                     [atlas, np_stress, asset](string::frame_graph& fg, String::engine_context& ctx, string::renderer& r)
+                       -> std::function<void(float)> {
             // NOTE: marked from_content below so a rescan can drop and re-add it.
-            auto mesh_stats = std::make_shared<MeshOverlayStats>();
-            auto geo = std::make_unique<GeometryPass>(
-                ctx, std::vector<std::filesystem::path>{ asset }, mesh_stats);
-            return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas,
-                                       static_cast<std::size_t>(np_stress));
+            return make_geometry_scene(fg, ctx, scene_viewport(), kSceneSamples, r.swapchain_format(),
+                                       std::vector<std::filesystem::path>{ asset }, atlas,
+                                       static_cast<std::size_t>(np_stress), r);
         }, std::vector<std::filesystem::path>{ asset }, /*from_content=*/true);
     }
     STRING_LOG_INFO("[content] {} scene(s) discovered under {}", assets.size(), root.string());
 }
 
+
+// The geometry scene: construct every component, declare them onto the graph in execution order,
+// and return the per-frame CPU tick.
+//
+// DECLARATION ORDER IS EXECUTION ORDER. The toposort breaks ties by authoring index, so this
+// sequence is what the graph falls back on wherever two passes do not genuinely depend on each
+// other. Two orderings here are LOAD-BEARING rather than cosmetic:
+//   * ibl before gi     — GI relight reads this frame's sky SH (a read-after-write edge);
+//   * gi  before shadow — GI relight SAMPLES the cascades the shadow passes then REWRITE, so the
+//                         write-after-read edge only exists in that direction.
+// Getting either wrong now yields a wrong derived barrier, which sync validation catches. The old
+// push-order equivalent yielded a null device address on frame 0 and took the machine down.
+
+struct geometry_scene_state
+{
+    std::shared_ptr<MeshOverlayStats> mesh_stats = std::make_shared<MeshOverlayStats>();
+    std::unique_ptr<geometry_pass> geo;
+    std::unique_ptr<froxel_component> froxel;
+    std::unique_ptr<ibl_component> ibl;
+    std::unique_ptr<gtao_chain> gtao;
+    std::unique_ptr<probe_gi_component> gi;
+    std::unique_ptr<sky_component> sky;
+    std::unique_ptr<shadow_maps> shadow;
+    std::unique_ptr<sorted_transparency> transparency;
+    std::unique_ptr<debug_line_pass> debug_lines;
+    std::unique_ptr<ui_pass> ui;
+    std::unique_ptr<post_pass> post;
+    std::unique_ptr<String::composite_pass> composite;
+    scene_resources res;
+    string::frame_graph* graph = nullptr;
+    bool history_wired = false;
+};
+
+// GTAO reads the PREVIOUS frame slot's resolved depth. That is expressed as a SECOND logical handle
+// over the SAME physical ring, rotated one slot back — no "read at slot-1" verb, no ping-pong, and
+// no second allocation. It has to happen after compile(), because the ring's physicals are what the
+// graph allocated; set_images() is exactly the backing-swap verb for it.
+// Point the worklist handle at the materialized scratch arena, one physical per frame slot.
+void wire_scratch_arena(geometry_scene_state& s, String::engine_context& ctx)
+{
+    if (!ctx.scratch.materialized()) return;
+    std::vector<string::gpu::resource_id> slots;
+    for (std::uint32_t i = 0; i < ctx.frames_in_flight; ++i) slots.push_back(ctx.scratch.buffer(i));
+    s.graph->set_buffers(s.res.worklists, slots);
+}
+
+void wire_depth_history(geometry_scene_state& s)
+{
+    if (s.history_wired || s.graph == nullptr) return;
+    const std::vector<string::gpu::resource_id>& ring = s.graph->record_of(s.res.hiz_depth).physical;
+    if (ring.empty()) return;
+    std::vector<string::gpu::resource_id> rotated(ring.size());
+    for (std::size_t i = 0; i < ring.size(); ++i)
+        rotated[i] = ring[(i + ring.size() - 1) % ring.size()];
+    s.graph->set_images(s.res.hiz_depth_prev, rotated);
+    s.history_wired = true;
+}
+
+// The shadertoy scene: one fullscreen pass, the UI overlay, and the composite. Deliberately NO post
+// chain — that absence IS the post bypass.
+struct shader_scene_state
+{
+    std::unique_ptr<shadertoy_pass> toy;
+    std::unique_ptr<ui_pass> ui;
+    std::unique_ptr<String::composite_pass> composite;
+    scene_resources res;
+};
+
+std::function<void(float)> make_shader_scene(
+    string::frame_graph& fg, String::engine_context& ctx, const std::filesystem::path& shader,
+    std::shared_ptr<string::dynamic_font_atlas> atlas, string::renderer& rr)
+{
+    auto s = std::make_shared<shader_scene_state>();
+    s->res = declare_resources(fg, scene_viewport(), kSceneSamples, 2048, 0, 0,
+                               ::string::render::ProbeVolume{}, 0);
+    s->toy = std::make_unique<shadertoy_pass>(ctx, shader, kSceneSamples);
+    auto toy_ui_slot = std::make_shared<std::optional<ui::Ui>>();
+    auto toy_panels = std::make_shared<debug::DebugPanels>();
+    s->ui = std::make_unique<ui_pass>(
+        ctx, kSceneSamples, atlas,
+        make_ui_author(std::make_shared<MeshOverlayStats>(), toy_panels, 0, toy_ui_slot),
+        make_ui_observer(toy_ui_slot), make_deferred_author(toy_ui_slot));
+    s->composite = std::make_unique<String::composite_pass>(ctx, rr.swapchain_format());
+
+    s->toy->declare(fg, s->res.color, s->res.depth);
+    s->ui->declare(fg, s->res.color);
+    s->composite->declare(fg, s->res.hdr, s->res.swapchain);
+    rr.capture_source(s->res.hdr);
+
+    return [s](float dt) {
+        s->toy->tick(dt);
+        s->ui->tick(dt, scene_viewport(), 0);
+        s->composite->tick();
+    };
+}
+
+std::function<void(float)> make_geometry_scene(
+    string::frame_graph& fg, String::engine_context& ctx, VkExtent2D viewport,
+    VkSampleCountFlagBits samples, VkFormat swapchain_format,
+    std::vector<std::filesystem::path> models,
+    std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t np_stress, string::renderer& rr)
+{
+    auto s = std::make_shared<geometry_scene_state>();
+    s->graph = &fg;
+
+    s->geo = std::make_unique<geometry_pass>(ctx, samples, std::move(models), s->mesh_stats);
+    ::string::render::GeometryScene* scene = s->geo->scene();
+
+    const ::string::render::ProbeVolume gi_volume =
+        probe_gi_component::fit_volume(scene->scene_aabb_min_, scene->scene_aabb_max_);
+    s->res = declare_resources(fg, viewport, samples, scene->settings_.shadow_resolution,
+                               scene->settings_.cascade_count, scene->cull_max_draws_,
+                               gi_volume, s->geo->gi_capture_entries());
+    const scene_resources& r = s->res;
+
+    s->froxel       = std::make_unique<froxel_component>(ctx);
+    s->ibl          = std::make_unique<ibl_component>(ctx);
+    s->gtao         = std::make_unique<gtao_chain>(ctx, scene);
+    s->gi           = std::make_unique<probe_gi_component>(ctx, scene, samples);
+    s->sky          = std::make_unique<sky_component>(ctx, samples);
+    s->shadow       = std::make_unique<shadow_maps>(ctx, scene);
+    s->transparency = std::make_unique<sorted_transparency>(ctx, scene, samples);
+    s->debug_lines  = std::make_unique<debug_line_pass>(ctx, s->mesh_stats, samples);
+    auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
+    auto dbg_panels = std::make_shared<debug::DebugPanels>();
+    s->ui = std::make_unique<ui_pass>(
+        ctx, samples, atlas,
+        make_ui_author(s->mesh_stats, dbg_panels, np_stress, ui_slot),
+        make_ui_observer(ui_slot), make_deferred_author(ui_slot));
+    s->post         = std::make_unique<post_pass>(ctx);
+    s->composite    = std::make_unique<String::composite_pass>(ctx, swapchain_format);
+
+    const std::span<const string::gpu::image> cascades{ r.shadow, scene->settings_.cascade_count };
+    const probe_gi_component::resources gi_res{
+        r.gi_irradiance, r.gi_cap_gbuf, r.gi_cap_albedo, r.gi_visibility,
+        r.gi_cube_albedo, r.gi_cube_nd, r.gi_cube_depth,
+        r.gi_active, r.gi_offset, r.gi_meshlet_table };
+
+    s->froxel->declare(fg, r.froxels, r.lights);
+    s->ibl->declare(fg, r.env_capture, r.env_prefiltered, r.dfg_lut, r.ibl_sh);
+    s->gtao->declare(fg, r.hiz_depth_prev, r.gtao_raw, r.gtao_ao);
+    s->gi->declare(fg, gi_res, r.ibl_sh, r.scene_data, cascades, r.color, r.depth);
+    s->shadow->declare(fg, cascades, r.worklists);
+    s->sky->declare(fg, r.color, r.depth, [] { return ::string::render::cv_pass_sky().get(); });
+    s->geo->declare(fg, r.color, r.hdr, r.depth, r.hiz_depth, r.hiz_pyramid, r.hiz_mips,
+                    r.worklists, r.scene_data, r.lights, r.stats,
+                    cascades, r.gtao_ao, r.env_prefiltered, r.dfg_lut, r.ibl_sh, r.froxels);
+    s->transparency->declare(fg, r.color, r.depth, r.transparency_list, r.scene_data, r.stats);
+    s->debug_lines->declare(fg, r.color, r.depth);
+    s->ui->declare(fg, r.color);
+    s->post->declare(fg, r.hdr, r.bloom, r.bloom_mips, r.histogram_bins);
+    s->composite->declare(fg, r.hdr, r.swapchain);
+
+    // The headless gates capture the resolved HDR target — an app-declared transient, so the app is
+    // what names it. This is the seam the renderer cannot fill on its own.
+    rr.capture_source(r.hdr);
+
+    // The per-frame tick. Ordinary app code: nothing here resolves a device address or a bindless
+    // slot — every one of those is looked up through pass_context while its owning pass records.
+    ::string::render::GeometryScene* scene_ptr = scene;
+    String::engine_context* ctx_ptr = &ctx;
+    string::renderer* rp = &rr;
+    return [s, scene_ptr, ctx_ptr, rp](float dt) {
+        // The live viewport. This used to arrive via Pass::resize(); with that gone, the scene state
+        // carries it and the app is what knows it. Zero here means every viewport-derived layout —
+        // the UI most visibly — computes against a 0x0 screen and draws nothing.
+        scene_ptr->screen_size = rp->extent();
+        wire_depth_history(*s);
+        wire_scratch_arena(*s, *ctx_ptr);
+        const std::uint32_t slot = rp->frame_slot();
+        s->geo->tick(dt, slot);
+        s->gtao->tick(rp->extent(), static_cast<uint16_t>(slot));
+        s->ibl->tick(scene_ptr->ibl_lighting(), false);
+        s->gi->tick();
+        s->shadow->tick();
+        s->froxel->tick(scene_ptr->froxel_params());
+        s->sky->tick(scene_ptr->sky_params());
+        s->ui->tick(dt, rp->extent(), slot);
+        s->post->tick(dt);
+        s->composite->tick();
+    };
+}
 }  // namespace
 
-String::RenderPlan build_demo_plan(const std::filesystem::path& resources_dir)
+String::Application::scene_fn build_demo_scene(const std::filesystem::path& resources_dir)
 {
-    // The UI's SDF atlas is baked once, up front and shared: UIPass's per-frame layout measures
+    // The UI's SDF atlas is baked once, up front and shared: the UI pass's per-frame layout measures
     // against it and draws text from it.
     const std::vector<std::uint8_t> ttf = read_file(resources_dir / "assets/fonts/DejaVuSans.ttf");
-    // Dynamic (grow-on-demand, Unicode) SDF atlas: glyphs rasterise on first sight, baked at a large
-    // reference size (crisp small text), player-name-safe. Replaces the baked ASCII atlas (brief 05).
     auto atlas = std::make_shared<string::dynamic_font_atlas>(ttf);
 
-    // Content defaults to the resources dir's assets/ — where an existing checkout already keeps
-    // sponza. Must precede any ContentRoot::get(), which memoises on first call.
+    // Content defaults to the resources dir's assets/. Must precede any ContentRoot::get(), which
+    // memoises on first call.
     String::ContentRoot::set_default(resources_dir / "assets");
 
-    String::SceneRegistry& registry = String::SceneRegistry::instance();
-
-    // Registration order is the order the scene panel lists them in.
+    std::vector<std::filesystem::path> models;
+    if (const char* scene = std::getenv("STRING_SCENE"))
     {
-        // UI-dev sandbox: background (+ orbit camera + synthetic anchors) then the UI overlay. NO
-        // GeometryPass — startup is near-instant (no glTF load / meshlet build / texture stream).
-        auto ui_scene = std::make_shared<UiScene>();
-        int np = cv_ui_nameplates().get();
-        const std::string screen = cv_ui_screen().get();
-        // Default a visible handful of anchors so nameplates show without opting into the stress.
-        const std::uint32_t anchor_count = np > 0 ? static_cast<std::uint32_t>(np) : 24u;
-        const std::size_t np_budget = np > 0 ? static_cast<std::size_t>(np) : 0;  // 0 = draw all
-
-        registry.add("ui", "UI sandbox — no geometry, instant start",
-                     [atlas, ui_scene, anchor_count, np_budget, screen](String::engine_context& ctx)
-                       -> String::RenderPlan::Setup {
-            auto bg = std::make_unique<UIBackgroundPass>(ctx);
-            // Shared between the author and the post-layout hook: the workspace is authored before
-            // layout and observed after it, and both need the same instance.
-            auto ws = std::make_shared<string::ui::Workspace>();
-            if (screen == "workspace")
-                client::seed_workspace(*ws);
-            auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
-            auto dbg_panels = std::make_shared<debug::DebugPanels>();
-            auto ui = std::make_unique<UIPass>(
-                ctx, atlas,
-                make_ui_dev_author(ui_scene, anchor_count, dbg_panels, np_budget, screen, ws, ui_slot),
-                make_ui_observer(ui_slot, ws),
-                make_deferred_author(ui_slot));
-            String::Pass* bgp = bg.get();
-            String::Pass* uip = ui.get();
-            String::RenderPlan::Setup s;
-            s.passes.push_back(std::move(bg));
-            s.passes.push_back(std::move(ui));
-            s.author = [bgp, uip](String::FrameGraph& fg) {
-                author_pass(fg, bgp).finish();   // background (+ synthetic anchors) into the scene target
-                author_pass(fg, uip).finish();   // UI overlay
-            };
-            return s;
-        });
+        const std::filesystem::path p = String::ContentRoot::get() / scene;
+        if (std::filesystem::exists(p)) models.push_back(p);
     }
 
-    {
-        // Brief 07: the standing material-probe scene — a roughness x metallic sphere grid plus a
-        // white/mirror pair, generated in-process (no glTF load; near-instant startup). Same
-        // GeometryPass, so sun/TOD scrub keys, the furnace CVar, IBL, shadows and all capture
-        // levers work identically. Debug lines + UI ride along for the console/HUD.
-        // Brief 09: the lookdev scene PINS MANUAL exposure by default (it is the EV100/material
-        // calibration reference — auto-metering a sphere grid over grey would defeat that).
-        // set_env_default: an explicit STRING_EXPOSURE_AUTO from the user still wins.
-        ::string::core::set_env_default("STRING_EXPOSURE_AUTO", "0");
-        registry.add("lookdev", "Material probe grid — roughness x metallic",
-                     [atlas](String::engine_context& ctx) -> String::RenderPlan::Setup {
-            auto mesh_stats = std::make_shared<MeshOverlayStats>();
-            auto geo = std::make_unique<GeometryPass>(ctx, std::vector<std::filesystem::path>{},
-                                                      mesh_stats, /*lookdev=*/true);
-            return make_geometry_setup(ctx, std::move(geo), mesh_stats, atlas, /*nameplate_stress=*/0);
-        });
-    }
+    const std::size_t np_stress = static_cast<std::size_t>(std::max(0, cv_ui_nameplates().get()));
 
-    const int np_stress = std::max(0, cv_ui_nameplates().get());
+    // Populate the scene registry so the Scene panel can LIST what is on disk. Registration was
+    // dropped when build_demo_plan became build_demo_scene, which is why the dropdown was empty.
+    // NOTE: listing is all this restores — SELECTING a scene still does nothing, because switching
+    // needs the app to tear down its pass objects and author a fresh graph (see the TODO in
+    // application.cpp). A menu that lists scenes and silently ignores clicks is its own trap, so
+    // that gap is called out here rather than left to be discovered.
+    register_content_scenes(String::SceneRegistry::instance(), atlas, static_cast<int>(np_stress));
 
-    // Sponza is no longer registered in code: it is `assets/sponza.scene.json`, discovered by the
-    // same scan as anything the user drops in. That is deliberate — it is the proof the data path
-    // is real rather than a second-class route beside a hardcoded one. The descriptor ships; the
-    // assets it names stay gitignored, and a descriptor whose files are absent is simply skipped.
-
-    // Content scenes: `.scene.json` descriptors (several files merged into one world) plus every
-    // bare glTF, which needs no descriptor at all — drop the asset in and it is in the menu.
-    register_content_scenes(registry, atlas, np_stress);
-
-    // Install the same scan as the rescan hook, so "Rescan content" in the Scene menu picks up an
-    // asset dropped in while the engine is running. The closure outlives this function by design —
-    // it captures only the shared atlas and an int.
-    registry.set_rescan([atlas, np_stress] {
-        // instance() rather than a captured reference: the local `registry` here is a reference
-        // variable that dies with this function, even though it binds a singleton.
-        register_content_scenes(String::SceneRegistry::instance(), atlas, np_stress);
-    });
-
-    // Texture cook. Lives here rather than in the engine because it needs the asset-tools library,
-    // and string-core deliberately does not link it. Blocking — see cook_scene_textures_for.
-    registry.set_cook([resources_dir](const String::SceneRegistry::Scene& scene) {
-        const uint32_t chunk_budget =
-            static_cast<uint32_t>(std::max(0, ::string::render::cv_chunk_budget().get()));
-        STRING_LOG_INFO("[cook] '{}': {} asset(s) — the engine will be unresponsive until this "
-                        "finishes", scene.name, scene.assets.size());
-        ::string::render::cook_scene_textures_for(resources_dir, scene.assets, chunk_budget);
-    });
-
-    // `STRING_SCENE` is a LOOKUP, not a branch. An unknown name falls back rather than failing: a
-    // typo should cost you the scene you asked for, not the session.
-    //
-    // The fallback chain ends at "ui" because it is the only scene guaranteed to exist — it needs no
-    // assets at all. Falling back to sponza was what made an assetless clone unable to start.
-    const std::string requested = cv_scene().get();
-    const String::SceneRegistry::Scene* selected = registry.find(requested);
-    if (selected == nullptr)
-    {
-        // "demo" is the historical default value of the cvar and means "sponza if you have it".
-        if (requested == "demo")
-        {
-            selected = registry.find("sponza");
-        }
-        else if (!requested.empty())
-        {
-            STRING_LOG_WARN("Unknown scene '{}' — is it under the content root ({})?",
-                            requested, String::ContentRoot::get().string());
-        }
-        if (selected == nullptr)
-        {
-            selected = registry.find("ui");
-        }
-    }
-
-    String::RenderPlan plan;
-    plan.configure(selected->configure);
-    registry.set_active(selected->name);
-    return plan;
+    // Brief 20: the app hands back ONE callback. It constructs the scene against the ready graph and
+    // engine context, declares every pass, and returns the per-frame tick. There is no pass list
+    // alongside it — that second list, and the unenforced agreement between the two, is what this
+    // brief deleted.
+    return [atlas, models, np_stress](string::frame_graph& fg, String::engine_context& ctx, string::renderer& r)
+             -> std::function<void(float)> {
+        return make_geometry_scene(fg, ctx, scene_viewport(), kSceneSamples, r.swapchain_format(),
+                                   models, atlas, np_stress, r);
+    };
 }
 
 }  // namespace sandbox

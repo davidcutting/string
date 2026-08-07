@@ -4,8 +4,9 @@
 #include <memory>
 #include <vector>
 
-#include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/engine_context.hpp>
+#include <string/vulkan/frame_graph.hpp>
+#include <string/gpu/pass_context.hpp>
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/device.hpp>
 
@@ -35,21 +36,30 @@ struct Grid2DParams {
     float show_axes;
 };
 
-class Grid2DPass final : public String::Pass
+// Brief 20: a plain app-owned object. No base class — declare() authors it onto the app's graph and
+// the recording callback captures `this`. The grid is static, so there is no per-frame CPU work.
+class grid_2d_pass
 {
     ::string::gpu::device& device_;
     VkPushConstantRange grid_2d_push_constant_range_;
     ::string::gpu::pipeline pipeline_;
 
 public:
-    explicit Grid2DPass(String::engine_context& context);
-    virtual ~Grid2DPass() override;
+    // `samples` is the MSAA sample count of the colour/depth attachments this draws into: the
+    // pipeline's rasterizationSamples must match the render-pass instance the graph opens.
+    grid_2d_pass(String::engine_context& ctx, VkSampleCountFlagBits samples);
+    ~grid_2d_pass();
 
-    // Stable identity for tooling (Tracy zones, inspector). Brief 06.
-    std::string_view debug_name() const override { return "grid2d"; }
+    grid_2d_pass(const grid_2d_pass&) = delete;
+    grid_2d_pass& operator=(const grid_2d_pass&) = delete;
 
-    // No update() override — the grid is static, so it uses Pass's default no-op.
-    virtual void record(::string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+    // Author onto the graph: a colour write into the scene target, and a read-only depth attachment
+    // (the pipeline declares the D32 format but neither tests nor writes depth, so it never occludes
+    // the geometry — it just has to share the geometry group's attachment set).
+    void declare(::string::frame_graph& fg, ::string::gpu::image color, ::string::gpu::image depth);
+
+private:
+    void record(::string::pass_context& ctx);
 };
 
 }  // namespace string::render

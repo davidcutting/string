@@ -1,0 +1,278 @@
+# clang-uml configuration — architecture diagrams for the String renderer.
+#
+#   tools/uml.sh                 # all diagrams
+#   tools/uml.sh render_passes   # one
+#
+# Output: docs/diagrams/<name>.{puml,svg}
+#
+# TWO SETUP FACTS (tools/uml.sh handles both):
+#  - compilation_database_dir must be a NATIVE build. The build-win-* dirs are mingw cross builds and
+#    libclang cannot parse their flags/headers. build-uml is configure-only (nothing is compiled).
+#  - clang-uml must run INSIDE `nix develop`, because query_driver has to find the real clang++.
+compilation_database_dir: build-uml
+output_directory: docs/diagrams
+
+# The nix devShell's clang wrapper injects system include paths via env vars rather than into the
+# compile DB, so libclang cannot find <vector> on its own. query_driver interrogates the real driver
+# for them, and must name the compiler the DB actually used — clang++ here, NOT g++.
+query_driver: clang++
+
+# Sensible defaults for every diagram: no template noise, no argument lists cluttering method rows.
+generate_method_arguments: none
+generate_packages: false
+
+diagrams:
+  # ---------------------------------------------------------------------------------------------
+  # 1. THE ARCHITECTURE DIAGRAM. Structure only — members are hidden, so what you see is the pass
+  #    hierarchy, the technique components each pass owns, and who points at GeometryScene.
+  #    This is the one to look at when asking "what owns what".
+  #
+  #    Explicit file list rather than a glob: it keeps the picture to the render architecture, and
+  #    sidesteps the noise of a full-namespace filter (~200 classes).
+  # ---------------------------------------------------------------------------------------------
+  render_passes:
+    type: class
+    glob:
+      - string-render-forward/src/geometry_pass.cpp
+      - string-render-forward/src/shadow_maps.cpp
+      - string-render-forward/src/gtao.cpp
+      - string-render-forward/src/probe_gi_component.cpp
+      - string-render-forward/src/sorted_transparency.cpp
+      - string-render-forward/src/sky_component.cpp
+      - string-render-forward/src/froxel_component.cpp
+      - string-render-forward/src/ibl_component.cpp
+      - string-render-forward/src/post_pass.cpp
+    # A CURATED element list, not a namespace filter. Filtering by namespace still admits ~200
+    # classes here — every push-constant struct, enum, streamer and input type the TUs touch — and
+    # the picture stops being readable. Naming the participants is what makes this a diagram of the
+    # architecture rather than a diagram of the translation units.
+    include:
+      elements:
+        - String::Pass
+        - string::render::GeometryScene
+        # Passes
+        - string::render::GeometryPass
+        - string::render::SkyPass
+        - string::render::FroxelPass
+        - string::render::IblPass
+        - string::render::GtaoPass
+        - string::render::GiPass
+        - string::render::ShadowPass
+        - string::render::HizBuildPass
+        - string::render::GeometryPhase2Pass
+        - string::render::TransparencyPass
+        - string::render::PostProcessPass
+        # Technique components each pass owns
+        - string::render::SkyComponent
+        - string::render::FroxelComponent
+        - string::render::IblComponent
+        - string::render::ShadowMaps
+        - string::render::GtaoChain
+        - string::render::ProbeGi
+        - string::render::SortedTransparency
+    exclude:
+      access:
+        - private
+        - protected
+    using_namespace:
+      - string::render
+    plantuml:
+      before:
+        - "title String — render pass architecture (structure only)"
+        - "hide members"
+        - "skinparam linetype ortho"
+        - "skinparam nodesep 25"
+        - "skinparam ranksep 45"
+
+  # ---------------------------------------------------------------------------------------------
+  # 2. GeometryScene + the components published into it, WITH public members. Use this to reason
+  #    about the shared-state coupling: everything on GeometryScene is state more than one
+  #    sub-domain reads, so this diagram is effectively the coupling surface of the geometry pass.
+  # ---------------------------------------------------------------------------------------------
+  geometry_scene:
+    type: class
+    glob:
+      - string-render-forward/src/geometry_pass.cpp
+      - string-render-forward/src/shadow_maps.cpp
+      - string-render-forward/src/gtao.cpp
+      - string-render-forward/src/probe_gi_component.cpp
+      - string-render-forward/src/sorted_transparency.cpp
+    include:
+      context:
+        # radius 1 = GeometryScene and its immediate neighbours only. Without this the transitive
+        # closure pulls in the whole engine and the image becomes a wall of boxes.
+        - match:
+            radius: 1
+            pattern: string::render::GeometryScene
+    exclude:
+      namespaces:
+        - std
+        - glm
+        - string::gpu
+        - string::asset
+      access:
+        - private
+        - protected
+    using_namespace:
+      - string::render
+    plantuml:
+      before:
+        - "title String — GeometryScene: the shared state and its owners"
+        - "skinparam linetype ortho"
+
+  # ---------------------------------------------------------------------------------------------
+  # 3. The frame graph core: authoring (FrameGraph/PassSpec), the plan, and the barrier tracker.
+  #    The executor side, as opposed to the pass side above.
+  # ---------------------------------------------------------------------------------------------
+  frame_graph:
+    type: class
+    glob:
+      - string-core/src/vulkan/renderer.cpp
+      - string-core/src/vulkan/graph_plan.cpp
+      - string-core/src/vulkan/resource_state.cpp
+    include:
+      namespaces:
+        - String
+    exclude:
+      namespaces:
+        - std
+        - glm
+        - string::gpu
+      access:
+        - private
+        - protected
+    using_namespace:
+      - String
+    plantuml:
+      before:
+        - "title String — frame graph core (authoring, plan, barrier derivation)"
+        - "skinparam linetype ortho"
+
+  # ---------------------------------------------------------------------------------------------
+  # 4. What one frame actually does, in call order. The diagram worth having for record-order
+  #    questions: which pass records in the compute prepass vs inside a render group.
+  # ---------------------------------------------------------------------------------------------
+  frame_sequence:
+    type: sequence
+    glob:
+      - string-core/src/vulkan/renderer.cpp
+    include:
+      namespaces:
+        - String
+        - string::render
+    exclude:
+      namespaces:
+        - std
+        - glm
+    using_namespace:
+      - String
+    combine_free_functions_into_file_participants: true
+    generate_message_comments: true
+    start_from:
+      - function: "String::Renderer::record_frame()"
+
+  # NOTE: an `include`-type diagram over this tree produces ~840 nodes and a 4 MB SVG that no one can
+  # read — the subproject + system headers dominate. If you want include structure, scope it to one
+  # library and set generate_system_headers: false first.
+
+  # ---------------------------------------------------------------------------------------------
+  # 6. THE WHOLE ENGINE, one diagram. Every library, grouped into PlantUML packages by namespace,
+  #    PlantUML lays the packages out itself — there are no explicit layout hints here. clang-uml does
+  #    support them (a `layout:` block with up/down/left/right per element) if you ever need to pin a
+  #    particular arrangement, but package grouping alone turned out to read well enough.
+  #
+  #    Necessarily curated — see the note on render_passes. A namespace filter over seven libraries
+  #    produces well over a thousand classes. The list below is "what you would draw on a whiteboard
+  #    to explain String", which is the only version of this diagram that is worth looking at.
+  #
+  #    generate_packages + package_type: namespace is what draws the library boxes. Set
+  #    package_type: directory instead to group by source tree rather than namespace.
+  # ---------------------------------------------------------------------------------------------
+  architecture:
+    type: class
+    glob:
+      - string-asset-tools/src/*.cpp
+      - string-core/src/vulkan/*.cpp
+      - string-core/src/gpu/*.cpp
+      - string-render-forward/src/*.cpp
+      - string-ui/src/*.cpp
+      - string-debug/src/*.cpp
+      - string-client/src/*.cpp
+    generate_packages: true
+    package_type: namespace
+    include:
+      elements:
+        # --- engine core: frame graph + execution -------------------------------------------
+        - String::Renderer
+        - String::FrameGraph
+        - String::CompiledFrame
+        - String::GraphPlan
+        - String::ResourceStateTracker
+        - String::Pass
+        - String::RenderPlan
+        - String::engine_context
+        # --- gpu abstraction ------------------------------------------------------------------
+        # device / resource_allocator / descriptor_table are deliberately OMITTED. Every pass holds
+        # a reference to all three, which is ~40 edges that say only "the renderer uses Vulkan" —
+        # they turn the picture into a hairball while carrying no architectural information.
+        - string::gpu::ResourceRegistry
+        - string::gpu::command_recorder
+        - string::gpu::FrameScratch
+        # --- renderer: scene + passes ---------------------------------------------------------
+        - string::render::GeometryScene
+        - string::render::GeometryPass
+        - string::render::SkyPass
+        - string::render::FroxelPass
+        - string::render::IblPass
+        - string::render::GtaoPass
+        - string::render::GiPass
+        - string::render::ShadowPass
+        - string::render::HizBuildPass
+        - string::render::GeometryPhase2Pass
+        - string::render::TransparencyPass
+        - string::render::PostProcessPass
+        - string::render::UIPass
+        - string::render::DebugLinePass
+        # --- renderer: technique components ---------------------------------------------------
+        - string::render::SkyComponent
+        - string::render::FroxelComponent
+        - string::render::IblComponent
+        - string::render::ShadowMaps
+        - string::render::GtaoChain
+        - string::render::ProbeGi
+        - string::render::SortedTransparency
+        # --- renderer: asset streaming --------------------------------------------------------
+        - string::render::TextureStreamer
+        - string::render::GeometryStreamer
+        # --- ui -------------------------------------------------------------------------------
+        - string::ui::Ui
+        - string::ui::Element
+        - string::ui::Workspace
+        - string::ui::PanelStore
+        - string::text_shape_cache
+        - string::dynamic_font_atlas
+        # --- debug + app ----------------------------------------------------------------------
+        - string::debug::DebugPanels
+        - string::debug::DebugConsole
+        # --- assets (cooked format + offline cook) ---------------------------------------------
+        - string::asset::CookedScene
+        - string::asset::CookedHeader
+        - string::asset::tools::GltfParsed
+        - string::client::UiSceneDriver
+    exclude:
+      access:
+        - private
+        - protected
+      # Dependencies (dashed) are mostly "this function takes that as a parameter" — at this scale
+      # they obscure the ownership edges that actually describe the architecture.
+      relationships:
+        - dependency
+    plantuml:
+      before:
+        - "title String — engine architecture"
+        - "hide members"
+        - "skinparam linetype ortho"
+        - "skinparam nodesep 20"
+        - "skinparam ranksep 60"
+        - "skinparam packageStyle rectangle"
+        - "skinparam packageBackgroundColor #FAFAFA"

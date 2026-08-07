@@ -9,15 +9,11 @@ namespace string::render
 {
 using namespace String;
 
-ShaderToyPass::ShaderToyPass(engine_context& context, std::filesystem::path shader)
-: device_(context.device)
+shadertoy_pass::shadertoy_pass(engine_context& ctx, std::filesystem::path shader,
+                               VkSampleCountFlagBits samples)
+: device_(ctx.device)
 , shader_(std::move(shader))
 {
-    usages = {
-        { context.color_target, Access::ColorWrite, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT },
-    };
-
-    VkSampleCountFlagBits samples = context.sample_count;
     auto builder = [samples](::string::gpu::device& dev,
                              const ::string::gpu::compiled_program& compiled) {
         ::string::gpu::pipeline p{};
@@ -52,7 +48,7 @@ ShaderToyPass::ShaderToyPass(engine_context& context, std::filesystem::path shad
     // loads, the error overlay shows why, and the next save fixes it.
     try
     {
-        program_ = context.shader_registry.create(shader_, builder);
+        program_ = ctx.shader_registry.create(shader_, builder);
     }
     catch (const std::exception& e)
     {
@@ -62,7 +58,7 @@ ShaderToyPass::ShaderToyPass(engine_context& context, std::filesystem::path shad
     }
 }
 
-ShaderToyPass::~ShaderToyPass()
+shadertoy_pass::~shadertoy_pass()
 {
     if (program_ == nullptr)
     {
@@ -73,15 +69,25 @@ ShaderToyPass::~ShaderToyPass()
     vkDestroyPipelineLayout(device_.get_device(), p.pipeline_layout, nullptr);
 }
 
-void ShaderToyPass::update(float delta_time, uint16_t /*current_frame*/)
+void shadertoy_pass::tick(float dt)
 {
-    time_ += delta_time;
-    dt_ = delta_time;
+    time_ += dt;
+    dt_ = dt;
     ++frame_;
 }
 
-void ShaderToyPass::record(::string::gpu::command_recorder& recorder, uint16_t /*current_frame*/)
+void shadertoy_pass::declare(::string::frame_graph& fg, ::string::gpu::image color,
+                             ::string::gpu::image depth)
 {
+    fg.pass("shadertoy")
+      .color(color)
+      .depth_read(depth)
+      .raster([this](::string::pass_context& ctx) { record(ctx); });
+}
+
+void shadertoy_pass::record(::string::pass_context& ctx)
+{
+    ::string::gpu::command_recorder& recorder = ctx.rec;
     if (program_ == nullptr)
     {
         return;   // never compiled; the overlay is the user's feedback, not a crash
@@ -89,7 +95,7 @@ void ShaderToyPass::record(::string::gpu::command_recorder& recorder, uint16_t /
     const ::string::gpu::pipeline& p = program_->current();
 
     const Push push{
-        { static_cast<float>(screen_size.width), static_cast<float>(screen_size.height) },
+        { static_cast<float>(ctx.extent.width), static_cast<float>(ctx.extent.height) },
         time_,
         dt_,
         { 0.0f, 0.0f, 0.0f, 0.0f },   // iMouse: wired to the input system in a later pass

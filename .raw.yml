@@ -1,0 +1,23 @@
+compilation_database_dir: build-uml
+output_directory: /tmp/rawdiag
+query_driver: clang++
+generate_method_arguments: none
+diagrams:
+  architecture_raw:
+    type: class
+    glob:
+      - string-core/src/vulkan/*.cpp
+      - string-core/src/gpu/*.cpp
+      - string-render-forward/src/*.cpp
+      - string-ui/src/*.cpp
+      - string-debug/src/*.cpp
+      - string-client/src/*.cpp
+      - string-asset-tools/src/*.cpp
+    generate_packages: true
+    package_type: namespace
+    include:
+      namespaces: [String, string]
+    exclude:
+      namespaces: [std, glm]
+    plantuml:
+      before: ["hide members"]

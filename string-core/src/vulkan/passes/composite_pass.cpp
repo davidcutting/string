@@ -154,7 +154,7 @@ uint16_t float_to_half(float f)
 
 // The active pass instance (there is exactly one, renderer-owned) + the published auto EV, for
 // the static exposure_scale()/encode_display() the capture writer shares.
-CompositePass* s_active = nullptr;
+composite_pass* s_active = nullptr;
 const std::vector<float>* s_lut = nullptr;
 uint32_t s_lut_size = 0;
 string::core::tonemap::Curve s_curve{};
@@ -166,15 +166,14 @@ bool s_override_active = false;
 
 }  // namespace
 
-CompositePass::CompositePass(string::gpu::device& device, string::gpu::resource_allocator& allocator,
-                             string::gpu::descriptor_table& descriptor_table,
-                             const std::filesystem::path& resources_path, VkFormat color_format,
-                             string::gpu::shader_program_registry& registry)
-: device_(device)
-, allocator_(allocator)
-, descriptor_table_(descriptor_table)
+composite_pass::composite_pass(String::engine_context& ctx, VkFormat color_format)
+: device_(ctx.device)
+, allocator_(ctx.allocator)
+, descriptor_table_(ctx.descriptor_table)
 {
-    VkDescriptorSetLayout global_layout = descriptor_table.get_layout();
+    const std::filesystem::path resources_path = ctx.resources_path;
+    string::gpu::shader_program_registry& registry = ctx.shader_registry;
+    VkDescriptorSetLayout global_layout = descriptor_table_.get_layout();
     // The pipeline is built from compiled Slang + reflection and owned by the shader_program, so a
     // save recompiles + swaps it. Set 0 stays the real bindless table layout (reflection can't
     // reproduce its update-after-bind/variable-count flags); reflection drives the push-constant
@@ -237,12 +236,12 @@ CompositePass::CompositePass(string::gpu::device& device, string::gpu::resource_
         .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
     };
     if (vkCreateSampler(device_.get_device(), &sampler_info, nullptr, &lut_sampler_) != VK_SUCCESS)
-        throw std::runtime_error("CompositePass: failed to create LUT sampler");
+        throw std::runtime_error("composite_pass: failed to create LUT sampler");
 
     s_active = this;
 }
 
-CompositePass::~CompositePass()
+composite_pass::~composite_pass()
 {
     s_active = nullptr;
     s_lut = nullptr;
@@ -253,11 +252,12 @@ CompositePass::~CompositePass()
     }
     vkDestroySampler(device_.get_device(), lut_sampler_, nullptr);
     const string::gpu::pipeline& p = program_->current();
+    const VkDescriptorSet set = descriptor_table_.get_set();
     vkDestroyPipeline(device_.get_device(), p.pipeline, nullptr);
     vkDestroyPipelineLayout(device_.get_device(), p.pipeline_layout, nullptr);
 }
 
-void CompositePass::bake_and_upload_lut(bool first)
+void composite_pass::bake_and_upload_lut(bool first)
 {
     using namespace string::core::tonemap;
     const auto t0 = std::chrono::steady_clock::now();
@@ -324,8 +324,7 @@ void CompositePass::bake_and_upload_lut(bool first)
         });
         descriptor_table_.bind(lut_image_, string::gpu::descriptor_type::TEXTURE);
         lut_slot_ = descriptor_table_.get_binding_slot(lut_image_, string::gpu::descriptor_type::TEXTURE);
-        descriptor_table_.update_texture(lut_slot_, allocator_.get_image(lut_image_).view, lut_sampler_);
-    }
+        }
 
     // Upload: RGBA16F staging (alpha = 1), one copy, park in SHADER_READ_ONLY. Init-time or
     // behind a device drain (rebake), so an immediate submit is fine.
@@ -396,7 +395,7 @@ void CompositePass::bake_and_upload_lut(bool first)
                     baked_grading_.neutral() ? "" : " (graded)");
 }
 
-float CompositePass::exposure_scale()
+float composite_pass::exposure_scale()
 {
     // Calibration override (white furnace) beats both auto and manual — the gate needs a pinned,
     // scene-independent exposure.
@@ -406,24 +405,24 @@ float CompositePass::exposure_scale()
     return 1000.0f / (1.2f * std::exp2(ev100));
 }
 
-void CompositePass::set_exposure_override(float ev100, bool active)
+void composite_pass::set_exposure_override(float ev100, bool active)
 {
     s_override_ev100 = ev100;
     s_override_active = active;
 }
 
-void CompositePass::set_auto_ev100(float ev100)
+void composite_pass::set_auto_ev100(float ev100)
 {
     s_auto_ev100 = ev100;
     s_auto_valid = true;
 }
 
-bool CompositePass::auto_exposure_enabled()
+bool composite_pass::auto_exposure_enabled()
 {
     return exposure_auto_cvar().get();
 }
 
-glm::vec3 CompositePass::encode_display(glm::vec3 hdr)
+glm::vec3 composite_pass::encode_display(glm::vec3 hdr)
 {
     const glm::vec3 exposed = glm::max(hdr, glm::vec3(0.0f)) * exposure_scale();
     if (s_lut && !s_lut->empty())
@@ -432,16 +431,8 @@ glm::vec3 CompositePass::encode_display(glm::vec3 hdr)
     return string::core::tonemap::transform(s_curve, s_grading, exposed);
 }
 
-void CompositePass::set_source(VkDescriptorSet descriptor_set, uint32_t source_slot)
+void composite_pass::tick()
 {
-    descriptor_set_ = descriptor_set;
-    source_slot_ = source_slot;
-}
-
-void CompositePass::update(float delta_time, uint16_t current_frame)
-{
-    (void)delta_time;
-    (void)current_frame;
     // First bake happens here (after apply_env: STRING_TONEMAP / STRING_GRADE_* honoured);
     // parameter changes re-bake behind a device drain — amortized like the sky IBL: nothing on
     // the steady-state frame, a logged hitch when a grading/tonemap CVar changes.
@@ -455,14 +446,26 @@ void CompositePass::update(float delta_time, uint16_t current_frame)
     bake_and_upload_lut(first);
 }
 
-void CompositePass::record(string::gpu::command_recorder& recorder, uint16_t current_frame)
+// Author onto the graph. The declaration says only WHAT is touched: a sampled read of the scene
+// colour and a colour write to the target. Load/store, the barrier that makes the read safe, and the
+// layout both images must be in are all derived from that plus where this pass lands in the order.
+void composite_pass::declare(string::frame_graph& fg, string::gpu::image hdr, string::gpu::image target)
 {
-    (void)current_frame;
+    fg.pass("composite")
+      .reads(hdr)
+      .color(target)
+      .raster([this, hdr](string::pass_context& ctx) { record(ctx, hdr); });
+}
+
+void composite_pass::record(string::pass_context& ctx, string::gpu::image hdr)
+{
+    string::gpu::command_recorder& recorder = ctx.rec;
     const string::gpu::pipeline& p = program_->current();
+    const VkDescriptorSet set = descriptor_table_.get_set();
 
     recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
     recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-        p.pipeline_layout, 0, 1, &descriptor_set_, 0, nullptr);
+        p.pipeline_layout, 0, 1, &set, 0, nullptr);
     // { source_slot, exposure, lut_slot, lut_size } — exposure scales the HDR into the LUT's
     // shaper domain; the LUT applies grading + the output transform (see composite.slang).
     //
@@ -480,7 +483,7 @@ void CompositePass::record(string::gpu::command_recorder& recorder, uint16_t cur
         uint32_t _pad[3];
         uint32_t lenses[LensState::kMaxLenses][4];
     } push{};
-    push.source_slot = source_slot_;
+    push.source_slot = ctx.slot(hdr);
     push.exposure = exposure_scale();
     push.lut_slot = lut_slot_;
     push.lut_size = lut_size_;

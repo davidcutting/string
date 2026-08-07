@@ -1,4 +1,4 @@
-// shadow cascade fit, HiZ pyramid, GTAO, local-light stress — split out of geometry_pass.cpp (brief 11 modularization). These remain GeometryPass
+// shadow cascade fit, HiZ pyramid, GTAO, local-light stress — split out of geometry_pass.cpp (brief 11 modularization). These remain geometry_pass
 // member functions (cohesive translation-unit split; the geometry core stays one class, its true
 // graph-pass decoupling is Phase 2). State lives in geometry_pass.hpp.
 #include <algorithm>
@@ -29,278 +29,29 @@ namespace string::render
 {
 using namespace String;
 
-void GeometryPass::ensure_hiz(uint16_t current_frame)
+// Brief 20: this used to allocate the depth + pyramid rings, create per-mip views, claim bindless
+// slots and build a sampler. All of that is the graph's now — the pyramid is an application-declared
+// transient and every slot comes from ctx.slot(pyramid.mip(m)) while the pass records. What is left
+// is the SHAPE, which the technique still needs to size its dispatches.
+void geometry_pass::ensure_hiz(uint16_t current_frame)
 {
+    (void)current_frame;
     if (screen_size.width == 0 || screen_size.height == 0) return;
-    // Conservative power-of-two base covering the screen (so a min-reduce never misses a texel).
-    auto next_pow2 = [](uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; };
-    const uint32_t base_w = next_pow2(screen_size.width) / 2;   // half-res mip0 is plenty for HiZ
-    const uint32_t base_h = next_pow2(screen_size.height) / 2;
-    if (base_w == hiz_screen_w_ && base_h == hiz_screen_h_ && hiz_[current_frame].image != 0) return;
-    hiz_screen_w_ = base_w;
-    hiz_screen_h_ = base_h;
+    const VkExtent2D base = hiz_extent(screen_size);
+    if (base.width == hiz_screen_w_ && base.height == hiz_screen_h_) return;
+    hiz_screen_w_ = base.width;
+    hiz_screen_h_ = base.height;
 
-    const uint32_t mips = static_cast<uint32_t>(std::floor(std::log2(std::max(base_w, base_h)))) + 1;
+    const uint32_t mips = hiz_mip_count(screen_size);
+    hiz_.assign(frames_in_flight_, HizPyramid{ mips, glm::uvec2(base.width, base.height) });
+    STRING_LOG_INFO("[hiz] pyramid {}x{}, {} mips", base.width, base.height, mips);
 
-    // Retire the old per-frame VIEWS + bindless SLOTS first (they reference the current physicals,
-    // which recreate_per_frame_image is about to free).
-    for (uint32_t f = 0; f < frames_in_flight_; ++f)
-    {
-        HizPyramid& hz = hiz_[f];
-        for (uint32_t s : hz.mip_storage_slots) descriptor_table_.unbind_storage_view(s);
-        for (VkImageView v : hz.mip_views) vkDestroyImageView(device_.get_device(), v, nullptr);
-        if (hz.image != 0) descriptor_table_.unbind(hz.image, ::string::gpu::descriptor_type::TEXTURE);
-        if (hz.depth != 0) descriptor_table_.unbind(hz.depth, ::string::gpu::descriptor_type::TEXTURE);
-    }
-
-    // Brief 16 M7 (#1): (re)allocate the depth + pyramid image RINGS via the registry (allocation
-    // authority + owns/frees them). First call creates; a resize recreates in place.
-    const ::string::gpu::image_info depth_info{
-        .extent = { screen_size.width, screen_size.height, 1 },
-        .format = VK_FORMAT_D32_SFLOAT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        .aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-    };
-    const ::string::gpu::image_info pyramid_info{
-        .extent = { base_w, base_h, 1 },
-        .format = VK_FORMAT_R32_SFLOAT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-        .mip_levels = mips,
-    };
-    if (hiz_depth_ring_.valid()) resources->recreate_per_frame_image(hiz_depth_ring_, depth_info);
-    else                         hiz_depth_ring_ = resources->create_per_frame_image(depth_info, frames_in_flight_);
-    if (hiz_pyramid_ring_.valid()) resources->recreate_per_frame_image(hiz_pyramid_ring_, pyramid_info);
-    else                           hiz_pyramid_ring_ = resources->create_per_frame_image(pyramid_info, frames_in_flight_);
-
-    for (uint32_t f = 0; f < frames_in_flight_; ++f)
-    {
-        HizPyramid& hz = hiz_[f];
-        hz = HizPyramid{};
-        hz.mips = mips;
-        hz.size = glm::uvec2(base_w, base_h);
-
-        // Single-sample D32 depth (registry-owned) for the camera prepass the pyramid reduces from.
-        hz.depth = resources->physical(hiz_depth_ring_, f);
-        descriptor_table_.bind(hz.depth, ::string::gpu::descriptor_type::TEXTURE);
-        hz.depth_slot = descriptor_table_.get_binding_slot(hz.depth, ::string::gpu::descriptor_type::TEXTURE);
-        descriptor_table_.update_texture(hz.depth_slot, allocator_.get_image(hz.depth).view, hiz_sampler_);
-        hz.image = resources->physical(hiz_pyramid_ring_, f);
-        const ::string::gpu::allocated_image& img = allocator_.get_image(hz.image);
-
-        // Whole-chain sampled slot (for SampleLevel in the task shader).
-        descriptor_table_.bind(hz.image, ::string::gpu::descriptor_type::TEXTURE);
-        hz.sample_slot = descriptor_table_.get_binding_slot(hz.image, ::string::gpu::descriptor_type::TEXTURE);
-        descriptor_table_.update_texture(hz.sample_slot, img.view, hiz_sampler_);
-
-        // Per-mip storage views + slots (downsample writes mip N+1 while sampling mip N).
-        for (uint32_t m = 0; m < mips; ++m)
-        {
-            VkImageViewCreateInfo vi = {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                .image = img.image,
-                .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                .format = VK_FORMAT_R32_SFLOAT,
-                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 0, 1 },
-            };
-            VkImageView view = VK_NULL_HANDLE;
-            vkCreateImageView(device_.get_device(), &vi, nullptr, &view);
-            hz.mip_views.push_back(view);
-            hz.mip_storage_slots.push_back(descriptor_table_.bind_storage_view(view));
-        }
-    }
-    STRING_LOG_INFO("[hiz] pyramid {}x{}, {} mips (x{} frames)", base_w, base_h, mips, frames_in_flight_);
-    // Brief 09: the hz.depth images were just recreated — every slot's resolved-depth content
-    // (GTAO's input) is gone.
-    std::fill(hz_depth_valid_.begin(), hz_depth_valid_.end(), uint8_t(0));
+    // The resolved-depth contents every slot held are gone with the resize, so GTAO's reprojection
+    // input is invalid until each slot is rendered again.
+    for (DepthHistorySlot& h : depth_history_) h.valid = 0;
 }
 
-void GeometryPass::ensure_gtao()
-{
-    if (screen_size.width == 0 || screen_size.height == 0) return;
-    const glm::uvec2 size((screen_size.width + 1) / 2, (screen_size.height + 1) / 2);
-    if (gtao_raw_ != 0 && size == gtao_size_) return;
-    gtao_size_ = size;
-
-    // Retire the old bindless slots (the registry frees the physicals via recreate below).
-    if (gtao_raw_storage_slot_ != UINT32_MAX)
-        descriptor_table_.unbind_storage_view(gtao_raw_storage_slot_);
-    for (uint32_t s : gtao_final_storage_slots_) descriptor_table_.unbind_storage_view(s);
-    if (gtao_raw_ != 0) descriptor_table_.unbind(gtao_raw_, ::string::gpu::descriptor_type::TEXTURE);
-    for (::string::gpu::resource_id id : gtao_final_)
-        if (id != 0) descriptor_table_.unbind(id, ::string::gpu::descriptor_type::TEXTURE);
-    gtao_final_storage_slots_.clear();
-    gtao_final_sampled_slots_.clear();
-    gtao_final_.assign(frames_in_flight_, 0);
-    gtao_final_ready_.assign(frames_in_flight_, 0);
-    gtao_raw_initialized_ = false;
-
-    // Brief 16 M7 (#1): (re)allocate the raw (shared, 1-deep) + final (per-frame) image rings via
-    // the registry. RGBA16F, not RGBA8: 8-bit visibility quantizes into wide soft bands on smooth
-    // slowly-curving receivers (the Sponza vaults). Half-res 16F is ~4 B/px extra; the bent normal
-    // rides along at the higher precision for free.
-    const ::string::gpu::image_info gtao_info{
-        .extent = { size.x, size.y, 1 },
-        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-    };
-    if (gtao_raw_ring_.valid()) resources->recreate_per_frame_image(gtao_raw_ring_, gtao_info);
-    else                        gtao_raw_ring_ = resources->create_per_frame_image(gtao_info, 1);
-    if (gtao_final_ring_.valid()) resources->recreate_per_frame_image(gtao_final_ring_, gtao_info);
-    else                          gtao_final_ring_ = resources->create_per_frame_image(gtao_info, frames_in_flight_);
-
-    const auto bind_target = [&](::string::gpu::resource_id id, uint32_t& sampled_slot, uint32_t& storage_slot) {
-        const ::string::gpu::allocated_image& img = allocator_.get_image(id);
-        descriptor_table_.bind(id, ::string::gpu::descriptor_type::TEXTURE);
-        sampled_slot = descriptor_table_.get_binding_slot(id, ::string::gpu::descriptor_type::TEXTURE);
-        descriptor_table_.update_texture(sampled_slot, img.view, gtao_sampler_);
-        storage_slot = descriptor_table_.bind_storage_view(img.view);
-    };
-    gtao_raw_ = resources->physical(gtao_raw_ring_, 0);
-    bind_target(gtao_raw_, gtao_raw_sampled_slot_, gtao_raw_storage_slot_);
-    gtao_final_sampled_slots_.resize(frames_in_flight_);
-    gtao_final_storage_slots_.resize(frames_in_flight_);
-    for (uint32_t f = 0; f < frames_in_flight_; ++f)
-    {
-        gtao_final_[f] = resources->physical(gtao_final_ring_, f);
-        bind_target(gtao_final_[f], gtao_final_sampled_slots_[f], gtao_final_storage_slots_[f]);
-    }
-    STRING_LOG_INFO("[gtao] half-res targets {}x{} (raw + {} final slots)", size.x, size.y,
-                    frames_in_flight_);
-}
-
-void GeometryPass::record_gtao(::string::gpu::command_recorder& recorder, uint16_t current_frame)
-{
-    const uint16_t prev = (current_frame + frames_in_flight_ - 1) % frames_in_flight_;
-    if (prev >= hiz_.size() || hiz_[prev].depth == 0 || gtao_raw_ == 0) return;
-    // Brief 16: GTAO is dense barrier + vku::transition_image + dispatch raw Vulkan — use the recorder's
-    // vk() escape for the transition/barrier tail; the clean dispatches below go through verbs.
-    VkCommandBuffer cb = recorder.vk();
-    const HizPyramid& hz = hiz_[prev];
-    const ::string::gpu::allocated_image& depth = allocator_.get_image(hz.depth);
-    const ::string::gpu::allocated_image& raw = allocator_.get_image(gtao_raw_);
-    const ::string::gpu::allocated_image& fin = allocator_.get_image(gtao_final_[current_frame]);
-
-    STRING_PROFILE_GPU_ZONE(gpu_ctx(), cb, "gtao")
-
-    // Prev-frame resolved depth: DEPTH_ATTACHMENT (where record_between parked it) -> sampled.
-    // Left in SHADER_READ_ONLY afterwards — the renderer's next resolve of this slot re-discards
-    // from UNDEFINED with a src scope that already names COMPUTE sampled reads.
-    vku::transition_image(cb, {
-        .image = depth.image,
-        .old_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .src_stage = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
-                   | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-        .src_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-        .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-        .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
-    });
-    if (!gtao_raw_initialized_)
-    {
-        gtao_raw_initialized_ = true;
-        vku::transition_image(cb, {
-            .image = raw.image,
-            .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-            .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
-            .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-        });
-    }
-    else
-    {
-        vku::transition_image(cb, {
-            .image = raw.image,
-            .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-            .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .src_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-            .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-        });
-    }
-    vku::transition_image(cb, {
-        .image = fin.image,
-        .old_layout = gtao_final_ready_[current_frame] ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                                       : VK_IMAGE_LAYOUT_UNDEFINED,
-        .new_layout = VK_IMAGE_LAYOUT_GENERAL,
-        .src_stage = gtao_final_ready_[current_frame]
-            ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-        .src_access = gtao_final_ready_[current_frame]
-            ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : VkAccessFlags2(0),
-        .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .dst_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-    });
-
-    const glm::mat4& proj = gtao_slot_proj_[prev];
-    GtaoPush push{};
-    push.view = gtao_slot_view_[prev];
-    push.inv_proj = glm::inverse(proj);
-    push.depth_slot = hz.depth_slot;
-    push.dst_slot = gtao_raw_storage_slot_;
-    push.dst_size = gtao_size_;
-    push.depth_size = glm::uvec2(screen_size.width, screen_size.height);
-    push.radius = std::max(cv_gtao_radius().get(), 0.01f);
-    push.proj00 = std::abs(proj[0][0]);
-    push.proj11 = std::abs(proj[1][1]);
-
-    VkDescriptorSet set = descriptor_table_.get_set();
-    const auto dispatch = [&](::string::gpu::shader_program* prog, const GtaoPush& p_push) {
-        const ::string::gpu::pipeline& p = prog->current();
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout,
-                                0, 1, &set, 0, nullptr);
-        vkCmdPushConstants(cb, p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(GtaoPush), &p_push);
-        vkCmdDispatch(cb, (gtao_size_.x + 7) / 8, (gtao_size_.y + 7) / 8, 1);
-    };
-    dispatch(gtao_program_, push);
-
-    // raw writes -> denoise sampled reads.
-    vku::transition_image(cb, {
-        .image = raw.image,
-        .old_layout = VK_IMAGE_LAYOUT_GENERAL,
-        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dst_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-    });
-    GtaoPush denoise = push;
-    denoise.src_slot = gtao_raw_sampled_slot_;
-    denoise.dst_slot = gtao_final_storage_slots_[current_frame];
-    dispatch(gtao_denoise_program_, denoise);
-
-    // Final -> sampled for this frame's lit fragments.
-    vku::transition_image(cb, {
-        .image = fin.image,
-        .old_layout = VK_IMAGE_LAYOUT_GENERAL,
-        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .src_stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-    });
-    gtao_final_ready_[current_frame] = 1;
-}
-
-void GeometryPass::compute_cascades()
+void geometry_pass::compute_cascades()
 {
     // Practical split scheme (Zhang): blend a logarithmic and a uniform split by cascade_split_lambda,
     // over [near, shadow_depth_range]. Each cascade's ortho box is fit to that view-space depth slice's
@@ -432,7 +183,7 @@ void GeometryPass::compute_cascades()
     }
 }
 
-void GeometryPass::build_light_stress_scene(const glm::vec3& aabb_min, const glm::vec3& aabb_max)
+void geometry_pass::build_light_stress_scene(const glm::vec3& aabb_min, const glm::vec3& aabb_max)
 {
     // Hundreds of colored point + spot lights orbiting over the model — the brief's light stress test
     // bed. Deterministic pseudo-random placement so runs are comparable. Radii/intensities sized to
@@ -478,7 +229,7 @@ void GeometryPass::build_light_stress_scene(const glm::vec3& aabb_min, const glm
                     lights_.size(), kStressLights / 4, light_range);
 }
 
-void GeometryPass::animate_lights(float delta_time)
+void geometry_pass::animate_lights(float delta_time)
 {
     static float t = 0.0f;
     t += delta_time;
@@ -490,6 +241,67 @@ void GeometryPass::animate_lights(float delta_time)
         lights_[i].position_radius.z = a.center.z + std::sin(ang) * a.radius;
         lights_[i].position_radius.y = a.center.y + std::sin(ang * 1.7f) * a.height;
     }
+}
+
+
+// The HiZ pyramid's shape, as a pure function of the viewport. Both the application (declaring the
+// transient) and geometry_pass::declare (authoring one pass per mip) must agree on this, and
+// authored-once means they compute it ONCE from the initial viewport rather than per frame. Mip 0 is
+// half of the next power of two, which keeps the reduction exact at every level.
+VkExtent2D geometry_pass::hiz_extent(VkExtent2D viewport)
+{
+    const auto next_pow2 = [](uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; };
+    return { std::max(1u, next_pow2(viewport.width) / 2), std::max(1u, next_pow2(viewport.height) / 2) };
+}
+
+uint32_t geometry_pass::hiz_mip_count(VkExtent2D viewport)
+{
+    const VkExtent2D base = hiz_extent(viewport);
+    return static_cast<uint32_t>(std::floor(std::log2(std::max(base.width, base.height)))) + 1;
+}
+
+// The per-frame parameter blocks the sky, froxel and IBL components latch. Every field is already
+// scene state; this is assembly, not policy.
+SkyParams GeometryScene::sky_params() const
+{
+    return SkyParams{
+        .view_proj = camera_.view_proj(),
+        .camera_pos = camera_.position(),
+        .sun_dir = sun_dir_,
+        .sky_zenith = sky_zenith_,
+        .sky_ground = sky_ground_,
+        .sun_color = sun_color_,
+        .sun_intensity = sun_intensity_,
+        .furnace = furnace_,
+    };
+}
+
+FroxelParams GeometryScene::froxel_params() const
+{
+    return FroxelParams{
+        .view = camera_.view(),
+        .inv_proj = glm::inverse(camera_.view_proj() * glm::inverse(camera_.view())),
+        .near_plane = camera_.near_plane(),
+        .far_plane = camera_.far_plane(),
+        .light_count = lights_enabled_ ? static_cast<uint32_t>(lights_.size()) : 0u,
+    };
+}
+
+IblLighting GeometryScene::ibl_lighting() const
+{
+    return IblLighting{
+        .sun_dir = sun_dir_,
+        .sky_zenith = sky_zenith_,
+        .sky_ground = sky_ground_,
+        .sun_color = sun_color_,
+        .sun_intensity = sun_intensity_,
+        .furnace = furnace_,
+    };
+}
+
+std::size_t geometry_pass::gi_capture_entries() const
+{
+    return probe_gi_component::capture_table(meshlet_model_).size();
 }
 
 }  // namespace string::render

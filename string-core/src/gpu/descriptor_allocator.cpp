@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 #include <string/gpu/descriptor_allocator.hpp>
@@ -251,68 +252,6 @@ void descriptor_table::bind_buffer(resource_id handle, VkDescriptorType type, ui
     };
 
     vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
-}
-
-void descriptor_table::update_texture(std::uint32_t slot, VkImageView view, VkSampler sampler)
-{
-    const VkDescriptorImageInfo image_info = {
-        .sampler = sampler,
-        .imageView = view,
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-    };
-    const VkWriteDescriptorSet write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .pNext = nullptr,
-        .dstSet = descriptor_set_,
-        .dstBinding = 1,  // combined image samplers (textures)
-        .dstArrayElement = slot,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .pImageInfo = &image_info,
-        .pBufferInfo = nullptr,
-        .pTexelBufferView = nullptr,
-    };
-    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
-}
-
-auto descriptor_table::bind_storage_view(VkImageView view) -> std::uint32_t
-{
-    // Synthetic keys above the real resource-id range so the storage-image slot allocator can track
-    // per-mip HiZ views (one image, several slots) without colliding with resource-backed binds.
-    static resource_id synthetic_key = 0xF0000000u;
-    const resource_id key = synthetic_key++;
-    const uint32_t slot = st_image_descriptor_allocator_.allocate(key);
-
-    const VkDescriptorImageInfo image_info = {
-        .sampler = VK_NULL_HANDLE,
-        .imageView = view,
-        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-    };
-    const VkWriteDescriptorSet write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .pNext = nullptr,
-        .dstSet = descriptor_set_,
-        .dstBinding = 2,  // storage images
-        .dstArrayElement = slot,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-        .pImageInfo = &image_info,
-        .pBufferInfo = nullptr,
-        .pTexelBufferView = nullptr,
-    };
-    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
-    slot_to_synthetic_[slot] = key;
-    return slot;
-}
-
-void descriptor_table::unbind_storage_view(std::uint32_t slot)
-{
-    auto it = slot_to_synthetic_.find(slot);
-    if (it == slot_to_synthetic_.end()) return;
-    // Same reasoning as unbind(): null it before releasing, or the set keeps the dead view.
-    write_null(slot, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-    st_image_descriptor_allocator_.release(it->second);
-    slot_to_synthetic_.erase(it);
 }
 
 // Point a released slot at nothing, using VK_EXT_robustness2's nullDescriptor: a VK_NULL_HANDLE

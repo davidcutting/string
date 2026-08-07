@@ -6,12 +6,14 @@
 #include <vector>
 
 #include <string/gpu/resource.hpp>
-#include <string/gpu/resource_registry.hpp>
 #include <string/scene/camera.hpp>
 #include <string/vulkan/frame_scratch.hpp>
 
 #include <string/render/gltf_types.hpp>
 #include <string/render/lighting_data.hpp>
+#include <string/render/geometry/sky_component.hpp>
+#include <string/render/geometry/froxel_component.hpp>
+#include <string/render/geometry/ibl_component.hpp>
 #include <string/render/meshlet_builder.hpp>
 #include <string/render/meshlet_data.hpp>
 
@@ -21,8 +23,50 @@
 namespace string::render
 {
 
-class FroxelComponent;   // owned by FroxelPass (brief 11 step 3); GeometryScene holds a non-owning ptr.
-class IblComponent;      // owned by IblPass (brief 11 step 3); GeometryScene holds a non-owning ptr.
+class froxel_component;   // app-owned (brief 20); GeometryScene holds a non-owning ptr.
+class ibl_component;      // app-owned; GeometryScene holds a non-owning ptr.
+class shadow_maps;        // app-owned; GeometryScene holds a non-owning ptr.
+class gtao_chain;         // app-owned; GeometryScene holds a non-owning ptr.
+class probe_gi_component; // app-owned; GeometryScene holds a non-owning ptr.
+
+// One frame slot's MIN-resolved scene depth, plus the camera it was rendered with. Shared because it
+// is the engine's DEPTH HISTORY: the resolve (geometry.phase1's group) writes it, the HiZ build reads
+// this frame's, and temporal effects read a PREVIOUS frame's through the matrices captured alongside
+// it. GTAO's reprojection is the first such consumer; anything temporal added later (TAA, SSR) wants
+// exactly this. Rendering uses the LIVE camera even under freeze-cull, so these are the true
+// depth-buffer transforms, not the (possibly frozen) cull ones.
+struct DepthHistorySlot
+{
+    ::string::gpu::resource_id image = 0;   // the slot's resolved single-sample depth
+    uint32_t bindless_slot = 0;             // its sampled descriptor slot
+    uint8_t valid = 0;                      // has this slot ever been resolved into?
+    glm::mat4 view{ 1.0f };
+    glm::mat4 proj{ 1.0f };
+    glm::mat4 view_proj{ 1.0f };
+};
+
+// One GPU work list: a suballocation of a frame slot's scratch buffer holding the draw-cull counts,
+// the scan scratch, the compacted indirect commands + records, and the surviving-draw count. The
+// camera lists live on GeometryPass; the per-cascade shadow lists are owned by ShadowMaps. The struct
+// is shared because the culler fills lists it does not own.
+struct Worklist
+{
+    ::string::gpu::resource_id buffer = 0;
+    VkDeviceSize offset = 0;
+};
+
+// Byte layout WITHIN one worklist region. Computed once during the meshlet build and shared, because
+// the producer (the cull/expand computes) and the consumers (the camera draws, the cascade draws)
+// must agree on it, and they no longer live in the same class.
+struct WorklistLayout
+{
+    VkDeviceSize offsets_off = 0;    // per-draw scan offsets[]
+    VkDeviceSize blocksums_off = 0;  // block-carry sums
+    VkDeviceSize commands_off = 0;   // compacted indirect commands[] (12B each)
+    VkDeviceSize records_off = 0;    // parallel records[] ({draw_index, LOD}, 8B each)
+    VkDeviceSize count_off = 0;      // surviving-draw count word
+    VkDeviceSize size = 0;           // total bytes per worklist region
+};
 
 // CVar-able lighting/shadow/froxel quality constants, grouped so a future CVar system binds them in
 // one place (per the brief's "as CVars" intent).
@@ -49,6 +93,14 @@ struct LightingSettings
 // GeometryPass — it belongs to one sub-pass, not the shared scene.
 struct GeometryScene
 {
+    // Brief 20: the per-frame parameter blocks the sky, froxel and IBL components latch in their
+    // tick(). They are built HERE because every field already lives here — this is the shared scene
+    // state those components read. Assembling them at the call site would mean the app reaching into
+    // renderer internals to restate what the scene already knows.
+    SkyParams sky_params() const;
+    FroxelParams froxel_params() const;
+    IblLighting ibl_lighting() const;
+
     // --- Geometry / draw tables ------------------------------------------------------------------
     std::vector<GltfMaterial> materials_;
     std::vector<GltfDraw> draws_;
@@ -71,6 +123,8 @@ struct GeometryScene
     // --- Camera ----------------------------------------------------------------------------------
     // Reusable engine fly camera (glTF space, Y-up). Framed to the model's AABB at load; update()
     // drives it through the InputMap's default fly controls + mouse-look.
+    // Current viewport. Was on the deleted Pass base; it is scene state, not a graph concept.
+    VkExtent2D screen_size{ 0, 0 };
     String::Camera camera_;
 
     // --- Cascaded shadow maps + environment lighting ---------------------------------------------
@@ -105,7 +159,9 @@ struct GeometryScene
     // Brief 16 M1: the resource-virtualization hub (set from engine_context in the GeometryPass ctor).
     // The per-frame SceneData ring + (M3) the light/stats rings are registry-owned handles resolved
     // through this per frame, replacing the hand-managed [frame] vectors of resource_ids.
-    ::string::gpu::ResourceRegistry* resources = nullptr;
+    // Brief 20: the ResourceRegistry is deleted. Buffers that used to resolve through it are graph
+    // resources now; a pass resolves them through pass_context at record time.
+
     // Per-frame SceneData SSBO (device-addressed, persistent-mapped ring): all the lighting/shadow/
     // froxel state the lit shader reads that overflows the push constant. Now a PerFrame registry
     // buffer — resolve the address/mapped pointer via resources->{address,mapped}(scene_buffer_, slot).
@@ -118,10 +174,10 @@ struct GeometryScene
     bool lights_enabled_ = true;   // L toggles the local-light stress set (shared: SceneData + froxel)
     // Brief 11 step 3: the froxel light-binning is its own FroxelPass now; it publishes its component
     // here (non-owning) so GeometryPass can read the froxel grid dims + buffer address for SceneData.
-    FroxelComponent* froxel = nullptr;
+    froxel_component* froxel = nullptr;
     // Brief 11 step 3: the dynamic sky IBL is its own IblPass (prepass compute); published here so
     // GeometryPass reads the SH address + shading slots for SceneData, and probe GI reads the SH.
-    IblComponent* ibl = nullptr;
+    ibl_component* ibl = nullptr;
 
     // --- Culling stats + frame infrastructure ----------------------------------------------------
     uint32_t frames_in_flight_ = 1;
@@ -134,6 +190,38 @@ struct GeometryScene
     // Brief 04e M3: per-frame transient buffers reserve into the renderer's scratch arena.
     ::string::gpu::FrameScratch* scratch_ = nullptr;
     bool scratch_bound_ = false;
+    // Shared worklist format + cull capacity: the cull/expand computes (GeometryPass) write lists that
+    // ShadowMaps owns, so both sides need the layout and the max-draw bound.
+    WorklistLayout wl_layout_;
+    uint32_t cull_max_draws_ = 0;
+    // The vertex heap. In the scene tables (not GeometryPass) because the cascade draws push its
+    // device address too, exactly like the meshlet heaps above.
+    ::string::gpu::resource_id vertex_buffer_ = 0;
+    // Cascaded shadow maps + their per-cascade work lists, owned by ShadowPass. Published here so
+    // GeometryPass's SceneData can read the bindless cascade slots and the culler can fill the lists.
+    shadow_maps* shadow = nullptr;
+    // Half-res GTAO + bent normals, owned by GtaoPass. Published so SceneData can read the AO slot
+    // and extent, and so the go/no-go decision has one home.
+    gtao_chain* gtao = nullptr;
+    // Relightable probe-GI volume + atlases, owned by GiPass.
+    probe_gi_component* gi = nullptr;
+    // Per-frame-slot resolved depth + the camera it was rendered with (see DepthHistorySlot).
+    std::vector<DepthHistorySlot> depth_history_;
+
+    // --- Meshlet cull view state -----------------------------------------------------------------
+    // Shared because EVERY meshlet draw path derives its cull inputs from these — the opaque phases
+    // and the sorted transparency draw alike. Freeze-cull in particular must freeze every camera-
+    // dependent input together (frustum planes, cone-cull eye, HiZ nearest-point, LOD select); a
+    // partial freeze mixes frozen and live inputs and produces bogus culling as the camera moves away.
+    bool cull_enabled_ = true;       // debug: GPU frustum culling off entirely (C)
+    bool mesh_cull_frozen_ = false;  // meshlet freeze-cull (F keybind)
+    glm::mat4 mesh_frozen_view_proj_{ 1.0f };
+    glm::vec3 mesh_frozen_camera_pos_{ 0.0f };
+    int debug_view_ = 0;             // 0 none, 1 meshlet colour, 2 LOD colour, 3 occlusion reject (V)
+    // Persistent per-meshlet visibility bitfield (1 bit per GLOBAL meshlet id), device-local. Owned by
+    // the two-phase occlusion path but named by every meshlet push constant — the transparency draw
+    // passes a valid pointer with freeze_bits set rather than a null one.
+    ::string::gpu::resource_id visbits_buffer_ = 0;
     // Shared overlay state written each frame for the UI (stats + which path is active), so the UI
     // author (built separately in the RenderPlan) can display it without a direct pass pointer.
     std::shared_ptr<MeshOverlayStats> overlay_stats_;

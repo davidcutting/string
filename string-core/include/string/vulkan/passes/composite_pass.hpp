@@ -5,7 +5,9 @@
 
 #include <string/core/tonemap.hpp>
 #include <string/vulkan/lens.hpp>
-#include <string/vulkan/render_pass.hpp>
+#include <string/vulkan/frame_graph.hpp>
+#include <string/vulkan/engine_context.hpp>
+#include <string/gpu/pass_context.hpp>
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource_allocator.hpp>
@@ -23,15 +25,22 @@ namespace String
 // Fullscreen pass that samples one bindless texture (the offscreen HDR target), applies exposure
 // and the brief-09 baked output-transform LUT (ACES 2.0-style DRT + HDR grading composed at bake
 // time), and writes to the swapchain. Runtime cost: one 2D-strip LUT sample (manual trilinear).
-class CompositePass final : public Pass
+//
+// Brief 20 — the reference shape for every pass in the engine:
+//   * NO base class. This is a plain object the application owns; the graph never sees the type.
+//   * It owns its own GPU state and nothing else's.
+//   * declare() authors it onto the app's frame_graph, capturing `this`. The declaration lives next
+//     to the state that knows what it touches, and the app decides whether and when to call it.
+//   * The recording callback resolves everything it needs through pass_context. NOTHING is pushed
+//     in from outside — no set_source(), no bind_color_source(), no slot handed over at init.
+//   * tick() is ordinary per-frame CPU work the app calls. It is not a graph concept.
+class composite_pass
 {
     string::gpu::device& device_;
     string::gpu::resource_allocator& allocator_;
     string::gpu::descriptor_table& descriptor_table_;
     // The pipeline is owned by the shader_program (hot-reloadable); the pass binds program_->current().
     string::gpu::shader_program* program_ = nullptr;
-    VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
-    uint32_t source_slot_ = 0;
 
     // Brief 09: the baked output-transform LUT (2D strip of lut_size_ slices; see tonemap.hpp for
     // the input-domain shaper). CPU copy kept for the capture writer (encode_display) so headless
@@ -46,15 +55,13 @@ class CompositePass final : public Pass
     void bake_and_upload_lut(bool first);
 
 public:
-    CompositePass(string::gpu::device& device, string::gpu::resource_allocator& allocator,
-                  string::gpu::descriptor_table& descriptor_table,
-                  const std::filesystem::path& resources_path, VkFormat color_format,
-                  string::gpu::shader_program_registry& registry);
-    virtual ~CompositePass() override;
+    composite_pass(String::engine_context& ctx, VkFormat color_format);
+    ~composite_pass();
 
-    // The renderer supplies the global set and the slot the HDR target is bound at
-    // (re-supplied on resize, when the target is re-created and re-bound).
-    void set_source(VkDescriptorSet descriptor_set, uint32_t source_slot);
+    // Author this pass onto the graph. `hdr` is the resolved scene colour it samples; `target` is
+    // what it writes (the swapchain). Both are logical handles the app declared — the pass resolves
+    // their bindless slots through pass_context while it records, never before.
+    void declare(string::frame_graph& fg, string::gpu::image hdr, string::gpu::image target);
 
     // The linear exposure scale the composite applies before its tonemap (EV100 CVar
     // r.exposure.ev100, or the auto-exposure value when r.exposure.auto is on, + the brief-07
@@ -79,9 +86,13 @@ public:
     // SAME baked LUT the composite samples (CPU trilinear). Returns display-linear [0,1].
     static glm::vec3 encode_display(glm::vec3 hdr);
 
-    std::string_view debug_name() const override { return "composite"; }
-    virtual void update(float delta_time, uint16_t current_frame) override;
-    virtual void record(string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+    // Per-frame CPU work: re-bake the output-transform LUT when a grading/tonemap CVar changed.
+    // Ordinary app code, called before the graph executes.
+    void tick();
+
+private:
+    // The recording callback, bound in declare(). Resolves `hdr` through the context.
+    void record(string::pass_context& ctx, string::gpu::image hdr);
 };
 
 }

@@ -6,14 +6,15 @@
 #include <string_view>
 #include <vector>
 
-#include <string/vulkan/render_plan.hpp>
+#include <string/application.hpp>
 
 namespace String
 {
 
 // The set of scenes an application can render, by name.
 //
-// A "scene" here is exactly what `RenderPlan::configure` returns — a pass set plus a graph author.
+// A "scene" here is exactly what an Application scene callback does: construct the app's pass
+// objects, declare them onto the graph, and hand back the per-frame tick.
 // That is the honest unit: the sandbox's scenes differ in WHICH PASSES EXIST (the ui-dev scene has no
 // GeometryPass at all), not merely in what content those passes load, so anything narrower would not
 // describe them.
@@ -24,7 +25,7 @@ namespace String
 // the app's plan builder, which is what lets a UI panel enumerate them and lets `STRING_SCENE` become
 // a lookup instead of a branch.
 //
-// LAYERING: this lives beside RenderPlan rather than in the sandbox because two different consumers
+// LAYERING: this lives beside Application rather than in the sandbox because two different consumers
 // need it — the app registers scenes, and the debug UI lists them. Putting it in the app would mean
 // the debug library reaching up into the application to enumerate them.
 class SceneRegistry
@@ -34,7 +35,9 @@ public:
     {
         std::string name;           // stable id, matches STRING_SCENE / dbg.scene
         std::string description;    // one line, for the UI
-        RenderPlan::ConfigureFn configure;
+        // Brief 20: a scene is now the app's single construct-and-declare callback (see Application),
+        // not a RenderPlan the renderer drove.
+        Application::scene_fn configure;
         // Source assets this scene loads, when it has any (content scenes and sponza). Empty for
         // scenes with nothing on disk behind them (ui, lookdev). Used by the texture cook.
         std::vector<std::filesystem::path> assets;
@@ -47,7 +50,7 @@ public:
 
     // Registration order is preserved — it is the order a UI lists them in, so the app controls it.
     // Re-registering a name REPLACES it, so a scene can be overridden without unregistering first.
-    void add(std::string name, std::string description, RenderPlan::ConfigureFn configure,
+    void add(std::string name, std::string description, Application::scene_fn configure,
              std::vector<std::filesystem::path> assets = {}, bool from_content = false);
 
     // --- rescan ----------------------------------------------------------------------------------

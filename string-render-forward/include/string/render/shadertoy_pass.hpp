@@ -3,10 +3,11 @@
 #include <filesystem>
 
 #include <string/gpu/device.hpp>
+#include <string/gpu/pass_context.hpp>
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/shader_program_registry.hpp>
 #include <string/vulkan/engine_context.hpp>
-#include <string/vulkan/render_pass.hpp>
+#include <string/vulkan/frame_graph.hpp>
 
 #include <volk.h>
 
@@ -27,33 +28,42 @@ namespace string::render
 // loads with the error overlay showing and recovers on the next save. `valid()` is false until then
 // and record() draws nothing.
 //
-// POST IS BYPASSED (user decision, brief 18): a shader scene registers no PostProcessPass, so there
-// is no exposure, bloom or GTAO between the shader and the screen — exactly as the `ui` scene works.
+// POST IS BYPASSED (user decision, brief 18): a shader scene declares no post chain, so there is no
+// exposure, bloom or GTAO between the shader and the screen — exactly as the `ui` scene works.
 //
 // PARTIAL, and worth knowing before porting a Shadertoy: the renderer's COMPOSITE still runs, and
 // composite tonemaps (ACES) + encodes sRGB. So what a shader writes here is scene-referred linear,
 // like ui_background.slang, NOT the display-referred 0..1 a Shadertoy shader emits. Bypassing
 // composite as well is the remaining piece of the brief's "what the shader writes is what you see" —
 // composite is authored by the renderer rather than the scene, so it is not a scene-side switch.
-class ShaderToyPass final : public String::Pass
+//
+// Brief 20: a plain app-owned object. declare() authors it onto the app's graph; tick() is ordinary
+// per-frame CPU work the app calls (it advances iTime/iFrame), not a graph concept.
+class shadertoy_pass
 {
 public:
-    ShaderToyPass(String::engine_context& context, std::filesystem::path shader);
-    ~ShaderToyPass() override;
+    // `samples` is the MSAA sample count of the attachments this draws into.
+    shadertoy_pass(String::engine_context& ctx, std::filesystem::path shader,
+                   VkSampleCountFlagBits samples);
+    ~shadertoy_pass();
 
-    ShaderToyPass(const ShaderToyPass&) = delete;
-    ShaderToyPass& operator=(const ShaderToyPass&) = delete;
+    shadertoy_pass(const shadertoy_pass&) = delete;
+    shadertoy_pass& operator=(const shadertoy_pass&) = delete;
 
-    std::string_view debug_name() const override { return "shadertoy"; }
+    // Author onto the graph: a colour write into the scene target, sharing the depth attachment
+    // read-only (the pipeline declares the D32 format but neither tests nor writes depth).
+    void declare(::string::frame_graph& fg, ::string::gpu::image color, ::string::gpu::image depth);
 
-    void update(float delta_time, uint16_t current_frame) override;
-    void record(::string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+    // Advance the Shadertoy clock. Ordinary app code, called before the graph executes.
+    void tick(float dt);
 
     // False when the user's shader has never compiled successfully (so there is no pipeline to
     // bind). Recovers on the next successful hot reload.
     [[nodiscard]] bool valid() const noexcept { return program_ != nullptr; }
 
 private:
+    void record(::string::pass_context& ctx);
+
     // The Shadertoy input set, by the names people expect. Kept to one push-constant block so a
     // shader needs no descriptors at all — the whole surface is `[[vk::push_constant]]`.
     struct Push

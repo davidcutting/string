@@ -1,6 +1,12 @@
-// meshlet task/mesh draw path + GPU draw-cull/expand + crowd — split out of geometry_pass.cpp (brief 11 modularization). These remain GeometryPass
+// meshlet task/mesh draw path + GPU draw-cull/expand + crowd — split out of geometry_pass.cpp (brief 11 modularization). These remain geometry_pass
 // member functions (cohesive translation-unit split; the geometry core stays one class, its true
 // graph-pass decoupling is Phase 2). State lives in geometry_pass.hpp.
+//
+// Brief 20: the cull/expand chain is DECLARED, one pass per dispatch. The four hand-rolled barriers
+// that used to sit between the dispatches (cull -> expand, scan_blocks -> scan_carry, scan_carry ->
+// fill, fill -> indirect draw) are gone: each pass says it writes the work-list buffer and the next
+// says it reads it, and the graph derives every edge from that. Nothing in this file emits a
+// hand-rolled barrier any more, and nothing in it names a pipeline-stage mask.
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -9,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include <string/core/logger.hpp>
@@ -29,7 +36,7 @@ namespace string::render
 {
 using namespace String;
 
-void GeometryPass::build_meshlet_gpu(engine_context& context)
+void geometry_pass::build_meshlet_gpu(engine_context& context)
 {
     if (meshlet_model_.total_meshlets == 0) return;
 
@@ -126,7 +133,7 @@ void GeometryPass::build_meshlet_gpu(engine_context& context)
             info.roughness = 1.0f;
             info.occlusion_slot = white_slot_;
         }
-        if (info.flags & kDrawFlagBlend) blend_draw_indices_.push_back(static_cast<uint32_t>(i));
+        // Brief 20: the BLEND draw list is built by sorted_transparency from the same flags.
     }
 
     // Size the DrawInfo table for base + the full crowd grid (extra copies referencing the same
@@ -145,14 +152,9 @@ void GeometryPass::build_meshlet_gpu(engine_context& context)
         allocator_.get_buffer(draw_info_buffer_).allocation_info.pMappedData);
     std::copy(meshlet_model_.draws.begin(), meshlet_model_.draws.end(), draw_info_mapped_);
 
-    // GPU-written stats, read back one frame late (registry-owned PerFrame host-visible ring; brief 16 M3).
+    // GPU-written stats, read back one frame late. Brief 20: the stats ring is an APP-DECLARED graph
+    // buffer; the passes that write it declare it and resolve its address through pass_context.
     stats_readback_.resize(frames_in_flight_);
-    stats_buffer_ = resources->create_per_frame(::string::gpu::buffer_info{
-        .size = sizeof(GpuMeshStats),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-        .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
-    }, frames_in_flight_);
 
     // --- Brief 04c (resolution b): GPU meshlet worklist buffers (per frame in flight). Each worklist
     // packs, at 16B-aligned regions: counts[max_draws] (uint), offsets[max_draws] (uint, scratch),
@@ -171,12 +173,14 @@ void GeometryPass::build_meshlet_gpu(engine_context& context)
     const VkDeviceSize blocksums_bytes = u32 * cull_max_blocks_;
     const VkDeviceSize commands_bytes  = VkDeviceSize(sizeof(uint32_t) * 3) * max_draws;   // 12B/cmd
     const VkDeviceSize records_bytes   = VkDeviceSize(sizeof(uint32_t) * 2) * max_draws;   // 8B/record
-    wl_offsets_off_   = align16(counts_bytes);
-    wl_blocksums_off_ = align16(wl_offsets_off_ + offsets_bytes);
-    wl_commands_off_  = align16(wl_blocksums_off_ + blocksums_bytes);
-    wl_records_off_   = align16(wl_commands_off_ + commands_bytes);
-    wl_count_off_     = align16(wl_records_off_ + records_bytes);
-    const VkDeviceSize worklist_size = wl_count_off_ + 16;   // count word (16B-padded)
+    // Shared with ShadowMaps, which reserves its own per-cascade regions of the same shape.
+    wl_layout_.offsets_off   = align16(counts_bytes);
+    wl_layout_.blocksums_off = align16(wl_layout_.offsets_off + offsets_bytes);
+    wl_layout_.commands_off  = align16(wl_layout_.blocksums_off + blocksums_bytes);
+    wl_layout_.records_off   = align16(wl_layout_.commands_off + commands_bytes);
+    wl_layout_.count_off     = align16(wl_layout_.records_off + records_bytes);
+    const VkDeviceSize worklist_size = wl_layout_.count_off + 16;   // count word (16B-padded)
+    wl_layout_.size = worklist_size;
 
     // Brief 04e M3: worklists + the shared draw_lod are per-frame TRANSIENTS (fully rebuilt by
     // the draw/expand computes every frame), so they live in the renderer's per-frame-slot
@@ -188,18 +192,14 @@ void GeometryPass::build_meshlet_gpu(engine_context& context)
     };
     wl_opaque_.resize(frames_in_flight_);
     wl_twosided_.resize(frames_in_flight_);
-    wl_shadow_.resize(frames_in_flight_);
     {
         const Worklist opaque = reserve_worklist();
         const Worklist twosided = reserve_worklist();
-        std::array<Worklist, kMaxCascades> shadow{};
-        for (uint32_t c = 0; c < kMaxCascades; ++c) shadow[c] = reserve_worklist();
         draw_lod_off_ = scratch_->reserve(u32 * max_draws);
         for (uint32_t f = 0; f < frames_in_flight_; ++f)
         {
             wl_opaque_[f] = opaque;
             wl_twosided_[f] = twosided;
-            wl_shadow_[f] = shadow;
         }
     }
 
@@ -224,40 +224,19 @@ void GeometryPass::build_meshlet_gpu(engine_context& context)
         .allocation_flags = {},
     });
 
-    // Brief 04c transparency list: host-visible (CPU sorts + fills each frame) in the SAME compacted
-    // per-draw shape the task shader consumes — commands[] (12B) @0, records[] (8B), then the count
-    // word. Draws written back-to-front (CPU sort preserved), one command+record per surviving draw.
-    transp_commands_off_ = 0;
-    transp_records_off_  = align16(VkDeviceSize(sizeof(uint32_t) * 3) * max_draws);
-    transp_count_off_    = align16(transp_records_off_ + VkDeviceSize(sizeof(uint32_t) * 2) * max_draws);
-    const VkDeviceSize transp_size = transp_count_off_ + 16;
-    transp_buffers_.resize(frames_in_flight_);
-    transp_mapped_.resize(frames_in_flight_);
-    for (uint32_t f = 0; f < frames_in_flight_; ++f)
-    {
-        transp_buffers_[f] = allocator_.create_resource(::string::gpu::buffer_info{
-            .size = transp_size,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                   | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-            .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
-        });
-        transp_mapped_[f] = static_cast<uint32_t*>(
-            allocator_.get_buffer(transp_buffers_[f]).allocation_info.pMappedData);
-    }
+    // Brief 20: the sorted-transparency list buffers are owned by sorted_transparency, which builds
+    // them in the same compacted shape from the same BLEND flags.
 
     // --- Pipelines (all through the hot-reload registry) ---
     VkDescriptorSetLayout layout = descriptor_table_.get_layout();
-    VkSampleCountFlagBits samples = context.sample_count;
+    VkSampleCountFlagBits samples = scene_samples_;
 
     // Task/mesh/fragment lit meshlet pipeline. Same fixed state as the lit vertex pipeline (back-face
     // cull, CCW, MSAA, reverse-Z depth, alpha blend), but built via build_mesh_pipeline (no VI state).
-    // Brief 04: three variants off the same source differ only in fixed state:
+    // Brief 04: two variants off the same source differ only in fixed state:
     //   - one-sided opaque: CULL_BACK, depth write ON;
-    //   - two-sided opaque: CULL_NONE, depth write ON;
-    //   - transparency:     CULL_NONE, depth TEST vs opaque depth but NO write (sorted back-to-front
-    //     on the CPU, so the blend order is correct without depth writes). blend_pass push flag makes
-    //     the fragment output base-color alpha.
+    //   - two-sided opaque: CULL_NONE, depth write ON.
+    // (The transparency variant belongs to sorted_transparency now.)
     const auto make_lit = [layout, samples](VkCullModeFlags cull_mode, bool depth_write) {
         return [layout, samples, cull_mode, depth_write](::string::gpu::device& dev, const ::string::gpu::compiled_program& compiled) {
             ::string::gpu::pipeline p{};
@@ -290,38 +269,8 @@ void GeometryPass::build_meshlet_gpu(engine_context& context)
         context.resources_path / "shaders" / "meshlet_mesh.slang", make_lit(VK_CULL_MODE_BACK_BIT, /*depth_write*/ true));
     meshlet_twosided_program_ = context.shader_registry.create(
         context.resources_path / "shaders" / "meshlet_mesh.slang", make_lit(VK_CULL_MODE_NONE, /*depth_write*/ true));
-    meshlet_transparent_program_ = context.shader_registry.create(
-        context.resources_path / "shaders" / "meshlet_mesh.slang", make_lit(VK_CULL_MODE_NONE, /*depth_write*/ false));
 
-    // Depth-only meshlet shadow pipeline (no cull; depth bias handles acne, off-frustum casters kept).
-    meshlet_shadow_program_ = context.shader_registry.create(
-        context.resources_path / "shaders" / "meshlet_shadow.slang",
-        [layout](::string::gpu::device& dev, const ::string::gpu::compiled_program& compiled) {
-            ::string::gpu::pipeline p{};
-            p.push_constants = compiled.layout.push_constant;
-            p.pipeline_layout = ::string::gpu::pipeline_layout_builder()
-                .set_descriptor_set_layout({ layout })
-                .set_push_constant_ranges({ compiled.layout.push_constant })
-                .build(dev);
-            ::string::gpu::pipeline_builder builder(dev);
-            for (const auto& stage : compiled.stages)
-            {
-                if (stage.stage == VK_SHADER_STAGE_TASK_BIT_EXT)
-                    builder.add_task_shader_spirv(stage.spirv, stage.entry_point);
-                else if (stage.stage == VK_SHADER_STAGE_MESH_BIT_EXT)
-                    builder.add_mesh_shader_spirv(stage.spirv, stage.entry_point);
-                else if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
-                    builder.add_fragment_shader_spirv(stage.spirv, stage.entry_point);  // brief 04: cutout clip()
-            }
-            p.pipeline = builder
-                .set_rasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
-                .set_multisampling()
-                .enable_depth_stencil()
-                .depth_only()
-                .build_mesh_pipeline(p.pipeline_layout);
-            p.pipeline_type = ::string::gpu::pipeline_type::GRAPHICS;
-            return p;
-        });
+    // The depth-only meshlet shadow pipeline belongs to shadow_maps now (brief 20).
 
     // HiZ pyramid downsample + stats reset compute pipelines.
     auto make_compute = [&](const char* file) {
@@ -371,24 +320,13 @@ void GeometryPass::build_meshlet_gpu(engine_context& context)
     expand_scan_carry_program_ = make_compute_entry("meshlet_expand.slang", "scan_carry");
     expand_fill_program_ = make_compute_entry("meshlet_expand.slang", "fill");
 
-    // HiZ sampler: nearest + clamp (min-reduced pyramid; we sample explicit mips).
-    const VkSamplerCreateInfo hiz_sampler_info = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_NEAREST,
-        .minFilter = VK_FILTER_NEAREST,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .maxLod = VK_LOD_CLAMP_NONE,
-        .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
-    };
-    if (vkCreateSampler(device_.get_device(), &hiz_sampler_info, nullptr, &hiz_sampler_) != VK_SUCCESS)
-        throw std::runtime_error("GeometryPass: failed to create HiZ sampler");
+    // Brief 20: the hand-rolled HiZ sampler is gone. The pyramid is an application-declared graph
+    // image whose sampler is configured on the declaration (nearest + clamp), so `bind()` is enough
+    // and this file never creates a VkSampler.
     hiz_.resize(frames_in_flight_);
 }
 
-void GeometryPass::build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_max)
+void geometry_pass::build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_max)
 {
     if (!draw_info_mapped_) return;
     if (!crowd_enabled_)
@@ -434,20 +372,131 @@ void GeometryPass::build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_
                     active_draw_count_, base_draw_count_, kCrowdGrid * kCrowdGrid);
 }
 
-void GeometryPass::record_draw_cull(::string::gpu::command_recorder& recorder, uint16_t current_frame, int cascade)
+// --- Brief 20: the cull/expand chain as declarations ----------------------------------------------
+//
+// Is the meshlet culler able to run at all this frame? Folded into every conditional in this file, so
+// a scene that has not finished loading SKIPS these passes instead of dispatching over nothing — and
+// their consumers degrade through the graph rather than through a hand-written guard.
+namespace
+{
+constexpr uint32_t kListOpaque = 0;
+constexpr uint32_t kListTwosided = 1;
+constexpr uint32_t kListCascade0 = 2;   // + cascade index
+}  // namespace
+
+// One declared pass per draw-cull dispatch: the camera list, then one per cascade. Each WRITES the
+// work-list buffer and the stats buffer; the expand passes below READ the work-list buffer, and that
+// pair of declarations is what replaced the hand-rolled memory barrier at the tail of the old
+// record_draw_cull (counts + draw_lod -> the expansion compute's storage read).
+void geometry_pass::declare_cull(string::frame_graph& fg, string::gpu::buffer worklists,
+                                 string::gpu::buffer stats)
+{
+    const auto ready = [this] {
+        return meshlet_program_ != nullptr && draw_info_mapped_ != nullptr
+            && draw_cull_program_ != nullptr && expand_fill_program_ != nullptr
+            && active_draw_count_ > 0;
+    };
+
+    fg.pass("meshlet.cull.camera")
+      .writes(worklists)
+      .writes(stats)
+      .toggle(ready)
+      .compute([this, worklists, stats](string::pass_context& ctx) {
+          record_draw_cull(ctx, worklists, stats, /*cascade*/ -1);
+      });
+
+    // One pass per POSSIBLE cascade: the declaration count is fixed (authored once), and a cascade the
+    // scene does not have is an in-graph conditional that is simply false.
+    for (uint32_t c = 0; c < kMaxCascades; ++c)
+    {
+        fg.pass("meshlet.cull.shadow" + std::to_string(c))
+          .writes(worklists)
+          .writes(stats)
+          .toggle([this, ready, c] {
+              return ready() && shadow != nullptr && c < shadow->cascade_count();
+          })
+          .compute([this, worklists, stats, c](string::pass_context& ctx) {
+              record_draw_cull(ctx, worklists, stats, static_cast<int>(c));
+          });
+    }
+}
+
+// Three declared passes per work list — scan_blocks, scan_carry, fill — because that is three
+// dependent dispatches over one buffer, and the two barriers that used to sit between them inside
+// record_expand are exactly what `.reads(worklists).writes(worklists)` derives. The trailing barrier
+// (fill -> the indirect draw + the task shader's records[] read) is derived from the draw passes'
+// own `.reads(worklists, indirect_read)` / `.reads(worklists, storage_read, TASK)` declarations.
+//
+// The per-list byte offset is resolved at RECORD time from ctx.frame_slot: the pass captures a list
+// SELECTOR, never an address, so a re-pointed scratch arena needs no re-declaration.
+void geometry_pass::declare_expand(string::frame_graph& fg, string::gpu::buffer worklists)
+{
+    const auto ready = [this] {
+        return meshlet_program_ != nullptr && draw_info_mapped_ != nullptr
+            && draw_cull_program_ != nullptr && expand_fill_program_ != nullptr
+            && active_draw_count_ > 0;
+    };
+    const auto offset_of = [this](uint32_t list, uint32_t slot) -> VkDeviceSize {
+        if (list == kListOpaque)
+            return slot < wl_opaque_.size() ? wl_opaque_[slot].offset : 0;
+        if (list == kListTwosided)
+            return slot < wl_twosided_.size() ? wl_twosided_[slot].offset : 0;
+        const uint32_t cascade = list - kListCascade0;
+        if (shadow == nullptr || cascade >= shadow->cascade_count()) return 0;
+        return shadow->worklist(static_cast<uint16_t>(slot), cascade).offset;
+    };
+
+    const auto declare_list = [&](uint32_t list, const std::string& name, enable_fn on) {
+        fg.pass("meshlet.expand." + name + ".scan_blocks")
+          .reads(worklists).writes(worklists)
+          .toggle(on)
+          .compute([this, worklists, offset_of, list](string::pass_context& ctx) {
+              record_expand_scan_blocks(ctx, worklists, offset_of(list, ctx.frame_slot));
+          });
+        fg.pass("meshlet.expand." + name + ".scan_carry")
+          .reads(worklists).writes(worklists)
+          .toggle(on)
+          .compute([this, worklists, offset_of, list](string::pass_context& ctx) {
+              record_expand_scan_carry(ctx, worklists, offset_of(list, ctx.frame_slot));
+          });
+        fg.pass("meshlet.expand." + name + ".fill")
+          .reads(worklists).writes(worklists)
+          .toggle(on)
+          .compute([this, worklists, offset_of, list](string::pass_context& ctx) {
+              record_expand_fill(ctx, worklists, offset_of(list, ctx.frame_slot));
+          });
+    };
+
+    declare_list(kListOpaque, "opaque", ready);
+    declare_list(kListTwosided, "twosided", ready);
+    for (uint32_t c = 0; c < kMaxCascades; ++c)
+        declare_list(kListCascade0 + c, "shadow" + std::to_string(c),
+                     [this, ready, c] {
+                         return ready() && shadow != nullptr && c < shadow->cascade_count();
+                     });
+}
+
+void geometry_pass::record_draw_cull(::string::pass_context& ctx, ::string::gpu::buffer worklists,
+                                     ::string::gpu::buffer stats, int cascade)
 {
     // Brief 04c DRAW PHASE. cascade < 0: camera — writes the opaque + two-sided per-draw meshlet
     // counts (into wl_opaque/wl_twosided counts@0) + the shared draw_lod. cascade >= 0: that
-    // cascade's shadow list — writes counts_shadow into wl_shadow[c] counts@0, rejecting whole draws
-    // outside the CASCADE's light sphere (never the camera frustum). (Brief 04d deleted the old
-    // depth-only HiZ camera prepass, so there is no forced-LOD0 prepass variant here anymore.)
-    const bool shadow = cascade >= 0;
-    const VkDeviceAddress opaque_base =
-        allocator_.get_buffer(wl_opaque_[current_frame].buffer).device_address + wl_opaque_[current_frame].offset;
-    const VkDeviceAddress twosided_base =
-        allocator_.get_buffer(wl_twosided_[current_frame].buffer).device_address + wl_twosided_[current_frame].offset;
-    const VkDeviceAddress shadow_base =
-        shadow ? allocator_.get_buffer(wl_shadow_[current_frame][cascade].buffer).device_address + wl_shadow_[current_frame][cascade].offset : 0;
+    // cascade's shadow list — writes counts_shadow into the cascade list's counts@0, rejecting whole
+    // draws outside the CASCADE's light sphere (never the camera frustum).
+    ::string::gpu::command_recorder& recorder = ctx.rec;
+    const uint32_t current_frame = ctx.frame_slot;
+    const VkDeviceAddress wl_base = ctx.address(worklists);
+    if (wl_base == 0) return;   // the arena is not pointed at the scratch buffer yet (frame 0)
+    if (current_frame >= wl_opaque_.size() || current_frame >= wl_twosided_.size()) return;
+
+    const bool shadow_pass = cascade >= 0;
+    if (shadow_pass && (shadow == nullptr || uint32_t(cascade) >= shadow->cascade_count())) return;
+
+    const VkDeviceAddress opaque_base = wl_base + wl_opaque_[current_frame].offset;
+    const VkDeviceAddress twosided_base = wl_base + wl_twosided_[current_frame].offset;
+    const VkDeviceAddress shadow_base = shadow_pass
+        ? wl_base + shadow->worklist(static_cast<uint16_t>(current_frame), uint32_t(cascade)).offset
+        : 0;
 
     const float lod_error_px = cv_lod_error_px().get();   // CVar r.lod.error_px (STRING_LOD_PX alias)
     const float half_h = screen_size.height * 0.5f;
@@ -458,29 +507,29 @@ void GeometryPass::record_draw_cull(::string::gpu::command_recorder& recorder, u
     // Freeze-aware inputs: when F is held EVERY camera-derived cull input comes from the frozen pose.
     cull.cull_view_proj = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : camera_.view_proj();
     cull.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
-    if (shadow)
+    if (shadow_pass)
     {
-        // Shadow only consumes counts_shadow (counts@0 of wl_shadow[c]); the opaque/two-sided writes
-        // land in this same buffer's scratch regions (overwritten by its own expand before use).
-        cull.counts_shadow    = shadow_base;                       // counts@0
-        cull.counts           = shadow_base + wl_offsets_off_;     // throwaway (expand recomputes)
-        cull.counts_twosided  = shadow_base + wl_blocksums_off_;   // throwaway
+        // Shadow only consumes counts_shadow (counts@0 of the cascade list); the opaque/two-sided
+        // writes land in this same region's scratch (overwritten by its own expand before use).
+        cull.counts_shadow    = shadow_base;                              // counts@0
+        cull.counts           = shadow_base + wl_layout_.offsets_off;     // throwaway (expand recomputes)
+        cull.counts_twosided  = shadow_base + wl_layout_.blocksums_off;   // throwaway
     }
     else
     {
         cull.counts          = opaque_base;      // counts@0 of the opaque worklist
         cull.counts_twosided = twosided_base;    // counts@0 of the two-sided worklist
-        cull.counts_shadow   = opaque_base + wl_offsets_off_;   // throwaway (camera pass ignores it)
+        cull.counts_shadow   = opaque_base + wl_layout_.offsets_off;   // throwaway (camera ignores it)
     }
     // Only the CAMERA opaque/two-sided pass writes the shared camera-selected draw_lod (the main pass +
     // shadow compaction records read it). The shadow passes must NOT re-write it — a redundant second
     // writer creates a write-after-write hazard on the shared buffer for no benefit (shadow compaction
     // reuses the camera draw_lod). Shadow writes its throwaway per-draw LODs into a scratch region (the
     // commands[] area, overwritten by its own fill before use) instead.
-    cull.draw_lod = shadow
-        ? shadow_base + wl_commands_off_   // shadow throwaway -> commands (fill overwrites)
-        : draw_lod_address(current_frame);
-    cull.stats = resources->address(stats_buffer_, current_frame);
+    cull.draw_lod = shadow_pass
+        ? shadow_base + wl_layout_.commands_off   // shadow throwaway -> commands (fill overwrites)
+        : wl_base + draw_lod_off_;
+    cull.stats = ctx.address(stats);
     cull.draw_count = active_draw_count_;
     cull.lod_enabled = lod_enabled_ ? 1u : 0u;
     cull.force_lod0 = 0u;                                       // (dead: brief 04d deleted the LOD0 prepass)
@@ -490,9 +539,9 @@ void GeometryPass::record_draw_cull(::string::gpu::command_recorder& recorder, u
     cull.lod_error_px = lod_error_px;
     cull.focal = focal;
     // Histogram only on the camera opaque/twosided pass (not shadow) — matches pre-04c meaning.
-    cull.stats_lod = shadow ? 0u : 1u;
-    cull.shadow_mode = (shadow && cull_enabled_) ? 1u : 0u;
-    if (shadow)
+    cull.stats_lod = shadow_pass ? 0u : 1u;
+    cull.shadow_mode = (shadow_pass && cull_enabled_) ? 1u : 0u;
+    if (shadow_pass)
     {
         cull.shadow_center = cascade_center_[cascade];
         cull.shadow_radius = cascade_cull_radius_[cascade];
@@ -501,92 +550,109 @@ void GeometryPass::record_draw_cull(::string::gpu::command_recorder& recorder, u
     recorder.push_constants(cp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(DrawCullPush), &cull);
     recorder.dispatch((active_draw_count_ + 63) / 64, 1, 1);
 
-    // Counts + draw_lod must be visible to the expansion compute (storage read).
-    const VkMemoryBarrier2 mb = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-    };
-    const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-    recorder.barrier(dep);
+    // NO barrier. counts[] + draw_lod reaching the expansion compute is derived from this pass's
+    // declared write of `worklists` against meshlet.expand.*.scan_blocks's declared read of it.
 }
 
-void GeometryPass::record_expand(::string::gpu::command_recorder& recorder, const Worklist& wl, VkDeviceAddress draw_lod)
+namespace
 {
-    const VkDeviceAddress base = allocator_.get_buffer(wl.buffer).device_address + wl.offset;
+// The push every expand stage shares. Built from the declared handle at record time — the pass owns a
+// list OFFSET, and the address it sits at is this frame's, resolved through the context.
+ExpandPush make_expand_push(::string::pass_context& ctx, ::string::gpu::buffer worklists,
+                            VkDeviceSize wl_offset, const WorklistLayout& layout,
+                            VkDeviceSize draw_lod_off, uint32_t draw_count, uint32_t max_draws)
+{
+    const VkDeviceAddress arena = ctx.address(worklists);
+    const VkDeviceAddress base = arena + wl_offset;
     ExpandPush push{};
-    push.counts     = base;
-    push.offsets    = base + wl_offsets_off_;
-    push.block_sums = base + wl_blocksums_off_;
-    push.draw_lod   = draw_lod;
-    push.commands   = base + wl_commands_off_;
-    push.records    = base + wl_records_off_;
-    push.count      = base + wl_count_off_;
-    push.draw_count = active_draw_count_;
-    push.block_count = (active_draw_count_ + kScanBlock - 1) / kScanBlock;
-    push.max_draws  = cull_max_draws_;
+    push.counts      = base;
+    push.offsets     = base + layout.offsets_off;
+    push.block_sums  = base + layout.blocksums_off;
+    push.draw_lod    = arena + draw_lod_off;
+    push.commands    = base + layout.commands_off;
+    push.records     = base + layout.records_off;
+    push.count       = base + layout.count_off;
+    push.draw_count  = draw_count;
+    push.block_count = (draw_count + kScanBlock - 1) / kScanBlock;
+    push.max_draws   = max_draws;
+    return push;
+}
+}  // namespace
 
-    const auto storage_barrier = [&]() {
-        const VkMemoryBarrier2 mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-        };
-        const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-            .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-        recorder.barrier(dep);
-    };
-
-    const auto dispatch = [&](::string::gpu::shader_program* prog, uint32_t groups) {
-        const ::string::gpu::pipeline& p = prog->current();
-        recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-        recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ExpandPush), &push);
-        recorder.dispatch(groups, 1, 1);
-    };
-
-    dispatch(expand_scan_blocks_program_, push.block_count);   // one workgroup per block
-    storage_barrier();
-    dispatch(expand_scan_carry_program_, 1);                   // single-workgroup block-carry scan
-    storage_barrier();
-    dispatch(expand_fill_program_, (active_draw_count_ + 63) / 64);
-    // Entries[] + command visible to the indirect draw + task shader.
-    const VkMemoryBarrier2 mb = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
-        .dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-    };
-    const VkDependencyInfo dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
-    recorder.barrier(dep);
+// Stage 1: one workgroup per block. Was the first dispatch of record_expand; the barrier that
+// followed it is now the scan_carry pass's declared read of the same buffer.
+void geometry_pass::record_expand_scan_blocks(::string::pass_context& ctx,
+                                              ::string::gpu::buffer worklists, VkDeviceSize wl_offset)
+{
+    if (ctx.address(worklists) == 0) return;
+    const ExpandPush push = make_expand_push(ctx, worklists, wl_offset, wl_layout_, draw_lod_off_,
+                                             active_draw_count_, cull_max_draws_);
+    const ::string::gpu::pipeline& p = expand_scan_blocks_program_->current();
+    ctx.rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+    ctx.rec.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ExpandPush), &push);
+    ctx.rec.dispatch(push.block_count, 1, 1);
 }
 
-void GeometryPass::record_meshlet_draws(::string::gpu::command_recorder& recorder, const ::string::gpu::pipeline& p,
-                                        uint16_t current_frame, const Worklist& wl, uint32_t phase)
+// Stage 2: the single-workgroup block-carry scan.
+void geometry_pass::record_expand_scan_carry(::string::pass_context& ctx,
+                                             ::string::gpu::buffer worklists, VkDeviceSize wl_offset)
 {
+    if (ctx.address(worklists) == 0) return;
+    const ExpandPush push = make_expand_push(ctx, worklists, wl_offset, wl_layout_, draw_lod_off_,
+                                             active_draw_count_, cull_max_draws_);
+    const ::string::gpu::pipeline& p = expand_scan_carry_program_->current();
+    ctx.rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+    ctx.rec.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ExpandPush), &push);
+    ctx.rec.dispatch(1, 1, 1);
+}
+
+// Stage 3: fill the dense commands[]/records[]/count. The barrier that used to follow this — making
+// them visible to the indirect draw and the task shader — is derived from the DRAW passes' declared
+// reads of the same buffer (indirect_read, and storage_read at the task stage).
+void geometry_pass::record_expand_fill(::string::pass_context& ctx,
+                                       ::string::gpu::buffer worklists, VkDeviceSize wl_offset)
+{
+    if (ctx.address(worklists) == 0) return;
+    const ExpandPush push = make_expand_push(ctx, worklists, wl_offset, wl_layout_, draw_lod_off_,
+                                             active_draw_count_, cull_max_draws_);
+    const ::string::gpu::pipeline& p = expand_fill_program_->current();
+    ctx.rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+    ctx.rec.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ExpandPush), &push);
+    ctx.rec.dispatch((active_draw_count_ + 63) / 64, 1, 1);
+}
+
+void geometry_pass::record_meshlet_draws(::string::pass_context& ctx, const ::string::gpu::pipeline& p,
+                                         VkDeviceSize wl_offset, uint32_t phase,
+                                         ::string::gpu::buffer worklists, ::string::gpu::image pyramid,
+                                         ::string::gpu::buffer scene_data, ::string::gpu::buffer stats)
+{
+    ::string::gpu::command_recorder& recorder = ctx.rec;
+    const uint32_t current_frame = ctx.frame_slot;
+    // The arena is only pointed at the scratch buffer after construction, so a zero id here is the
+    // legitimate first-frame state, not an error.
+    const ::string::gpu::resource_id wl_id = ctx.id(worklists);
+    if (wl_id == 0) return;
+    if (current_frame >= hiz_.size()) return;
+
     const glm::mat4 vp = camera_.view_proj();
     const glm::mat4 cull_vp = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : vp;
     const HizPyramid& hz = hiz_[current_frame];
-    const bool hiz_ready = hiz_enabled_ && hz.image != 0;
-    const VkDeviceAddress base = allocator_.get_buffer(wl.buffer).device_address + wl.offset;
+    const bool hiz_ready = hiz_enabled_ && hz.mips != 0;
+    const VkDeviceAddress base = ctx.address(worklists) + wl_offset;
 
     MeshletPush push{};
     push.view_proj = vp;
     push.cull_view_proj = cull_enabled_ ? cull_vp : vp;   // (frustum planes; C disables via wide test)
+    // The geometry heaps are NOT graph resources — they are load-time device buffers this pass owns,
+    // so they keep resolving through the allocator. Only the declared handles go through ctx.
     push.vertices = allocator_.get_buffer(vertex_buffer_).device_address;
     push.meshlets = allocator_.get_buffer(meshlet_buffer_).device_address;
     push.mverts = allocator_.get_buffer(meshlet_vertices_).device_address;
     push.mtris = allocator_.get_buffer(meshlet_triangles_).device_address;
     push.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
-    push.scene = resources->address(scene_buffer_, current_frame);
-    push.stats = resources->address(stats_buffer_, current_frame);
-    push.records = base + wl_records_off_;
+    push.scene = ctx.address(scene_data);
+    push.stats = ctx.address(stats);
+    push.records = base + wl_layout_.records_off;
     // Frozen-aware eye: cone backface + HiZ nearest-point tests must use the SAME eye the frustum
     // froze from, or freeze-cull mixes live/frozen inputs (visible as bogus culling when flying).
     push.camera_pos = mesh_cull_frozen_ ? mesh_frozen_camera_pos_ : camera_.position();
@@ -595,35 +661,52 @@ void GeometryPass::record_meshlet_draws(::string::gpu::command_recorder& recorde
     // isn't built yet); phase 2 tests the bit-clear complement against the freshly-built pyramid. Phase
     // 0 is the legacy single-pass (HiZ-off) path. Only phase 2 needs the pyramid slot.
     const bool use_hiz = hiz_ready && phase != 1u;
-    push.hiz_slot = use_hiz ? hz.sample_slot : 0;
+    push.hiz_slot = use_hiz ? ctx.slot(pyramid) : 0;
     push.hiz_mips = use_hiz ? hz.mips : 0;
     push.hiz_size = use_hiz ? hz.size : glm::uvec2(1, 1);
     push.blend_pass = 0u;
     push.phase = phase;
     push.bitfield = allocator_.get_buffer(visbits_buffer_).device_address;
     push.freeze_bits = mesh_cull_frozen_ ? 1u : 0u;
-    const VkBuffer buf = allocator_.get_buffer(wl.buffer).buffer;
+    const VkBuffer buf = allocator_.get_buffer(wl_id).buffer;
 
     recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletPush), &push);
-    recorder.draw_mesh_tasks_indirect_count(buf, wl.offset + wl_commands_off_, buf, wl.offset + wl_count_off_,
+    recorder.draw_mesh_tasks_indirect_count(buf, wl_offset + wl_layout_.commands_off,
+                                            buf, wl_offset + wl_layout_.count_off,
                                             cull_max_draws_, sizeof(uint32_t) * 3);
 }
 
-void GeometryPass::record_opaque_phase(::string::gpu::command_recorder& recorder, uint16_t current_frame, uint32_t phase)
+void geometry_pass::record_opaque_phase(::string::pass_context& ctx, uint32_t phase,
+                                        ::string::gpu::buffer worklists, ::string::gpu::image pyramid,
+                                        ::string::gpu::buffer scene_data, ::string::gpu::buffer stats)
 {
+    const uint32_t current_frame = ctx.frame_slot;
+    if (current_frame >= wl_opaque_.size() || current_frame >= wl_twosided_.size()) return;
+
+    // HANG GUARD. This issues draw_mesh_tasks_indirect_count against command records the CULL and
+    // EXPAND passes fill. Those are gated on readiness; this pass is gated only on r.pass.geometry.
+    // If the draw ran while they had not, it would read whatever the arena happened to contain and
+    // hand the driver an arbitrary task-group count — which is a GPU hang, then a TDR, then a lost
+    // device. maxDrawCount bounds the number of commands, NOT the group count inside one.
+    // The predicate below is deliberately the SAME one declare_cull/declare_expand toggle on.
+    if (meshlet_program_ == nullptr || !draw_info_mapped_ || active_draw_count_ == 0) return;
+
+    ::string::gpu::command_recorder& recorder = ctx.rec;
     const ::string::gpu::pipeline& mp = meshlet_program_->current();
     VkDescriptorSet mset = descriptor_table_.get_set();
     recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, mp.pipeline);
     recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                   mp.pipeline_layout, 0, 1, &mset, 0, nullptr);
-    record_meshlet_draws(recorder, mp, current_frame, wl_opaque_[current_frame], phase);
+    record_meshlet_draws(ctx, mp, wl_opaque_[current_frame].offset, phase,
+                         worklists, pyramid, scene_data, stats);
     if (meshlet_twosided_program_)
     {
         const ::string::gpu::pipeline& tp = meshlet_twosided_program_->current();
         recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline);
         recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                       tp.pipeline_layout, 0, 1, &mset, 0, nullptr);
-        record_meshlet_draws(recorder, tp, current_frame, wl_twosided_[current_frame], phase);
+        record_meshlet_draws(ctx, tp, wl_twosided_[current_frame].offset, phase,
+                             worklists, pyramid, scene_data, stats);
     }
 }
 

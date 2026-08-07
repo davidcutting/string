@@ -5,12 +5,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include <string/gpu/command_recorder.hpp>
 #include <string/gpu/device.hpp>
 #include <string/vulkan/render_data.hpp>
-#include <string/vulkan/render_pass.hpp>
+#include <string/vulkan/frame_graph.hpp>
+#include <string/gpu/pass_context.hpp>
 #include <string/vulkan/engine_context.hpp>
 #include <string/scene/camera.hpp>
 #include <string/gpu/pipeline.hpp>
@@ -29,6 +31,10 @@
 #include <string/render/scene_loader.hpp>
 #include <string/render/render_cvars.hpp>
 #include <string/render/geometry/geometry_scene.hpp>
+#include <string/render/shadow_maps.hpp>
+#include <string/render/sorted_transparency.hpp>
+#include <string/render/gtao.hpp>
+#include <string/render/probe_gi_component.hpp>
 #include <string/render/geometry/sky_component.hpp>
 #include <string/render/geometry/froxel_component.hpp>
 #include <string/render/geometry/ibl_component.hpp>
@@ -187,25 +193,8 @@ struct HizPush
 
 // Push for the brief-09 GTAO chain (matches Push in shaders/gtao.slang; std430: mat4s at 0/64,
 // scalars from 128, uint2s 8-aligned at 136/144).
-struct GtaoPush
-{
-    glm::mat4 view;         // 0    prev-frame world->view
-    glm::mat4 inv_proj;     // 64   prev-frame inverse projection
-    uint32_t depth_slot;    // 128  prev hz.depth sampled slot
-    uint32_t dst_slot;      // 132
-    glm::uvec2 dst_size;    // 136
-    glm::uvec2 depth_size;  // 144
-    float radius;           // 152
-    float proj00;           // 156
-    float proj11;           // 160
-    uint32_t src_slot;      // 164  denoise input (raw AO)
-    uint32_t _pad0;         // 168
-    uint32_t _pad1;         // 172
-};
-static_assert(offsetof(GtaoPush, depth_slot) == 128);
-static_assert(offsetof(GtaoPush, dst_size) == 136);
-static_assert(offsetof(GtaoPush, radius) == 152);
-static_assert(sizeof(GtaoPush) == 176);
+// GtaoPush moved to lighting_data.hpp (brief 20): gtao.hpp needs it, and geometry_pass.hpp includes
+// gtao.hpp, so keeping it here made a cycle.
 
 // Push for the per-frame stats reset (matches Push in shaders/meshlet_reset.slang).
 struct ResetPush
@@ -221,7 +210,9 @@ struct ResetPush
 // into a bindless slot), then issues one indexed draw per node-instanced primitive, pushing the
 // primitive's transform and material inline. Content-agnostic — the model path is supplied by
 // the application, resolved under context.resources_path.
-class GeometryPass final : public String::Pass, private GeometryScene
+// Brief 20: no base class. This is a plain object the application owns; its callbacks capture it.
+// It still privately inherits GeometryScene, which is shared technique state, not a graph concept.
+class geometry_pass final : private GeometryScene
 {
     ::string::gpu::device& device_;
     ::string::gpu::resource_allocator& allocator_;
@@ -229,16 +220,9 @@ class GeometryPass final : public String::Pass, private GeometryScene
     String::InputMap& input_map_;
     // Froxel light binning: extracted to FroxelComponent froxel_ (declared below, brief 11).
 
-    ::string::gpu::resource_id vertex_buffer_;
-    // Brief 11 step 2: the scene MSAA color/depth sentinels (from engine_context), cached so the
-    // geometry.phase2 sub-pass declares the SAME attachments to form the reopened MSAA group.
-    ::string::gpu::resource_id color_target_ = 0;
-    ::string::gpu::resource_id depth_target_ = 0;
+    // Brief 20: the colour/depth sentinels are gone. The scene attachments are viewport-scaled
+    // transients the application declares and hands to declare() as logical handles.
     // draw_count_ / frames_in_flight_ moved to GeometryScene (brief 11 P2).
-    // Brief 04e M2: number of fixed usages declared at construction; update() truncates back to
-    // this count and re-appends the current frame slot's buffer usages (worklists, froxels,
-    // visibility bitfield) so the frame graph sees per-frame-true declarations.
-    std::size_t static_usage_count_ = 0;
 
     // Geometry residency streaming: per-draw vertex/index ranges suballocate into heaps SMALLER than
     // the whole model as draws enter the view frustum, and are freed (reclaimed) on eviction. A
@@ -281,87 +265,9 @@ class GeometryPass final : public String::Pass, private GeometryScene
     // is published into GeometryScene (scene().ibl) — GeometryPass reads sh_address/env/dfg slots for
     // SceneData, and probe GI reads the SH. The shared sun/sky colours + furnace flag are in GeometryScene.
 
-    // --- Brief 09b: relightable irradiance probe volume (DDGI-style) -----------------------------
-    // A uniform probe grid fit to the scene AABB. Static per-probe capture G-buffer (albedo, normal,
-    // distance) + visibility (mean/mean^2 distance) octahedral atlases, rasterized once at load; a
-    // compute pass RELIGHTS them into an octahedral irradiance atlas whenever the sun moves (like the
-    // sky IBL). Shading samples the irradiance atlas (Chebyshev-visibility-gated 8-probe trilinear)
-    // for the ambient DIFFUSE term, falling back to the sky-SH ambient outside the volume. See
-    // probe_gi.hpp / probe_common.slang for the layout + math. r.gi toggles the whole feature.
-    // M1 capture: a single reused per-probe cube G-buffer (albedo + normal/dist + depth), rasterized
-    // per cube face then collapsed into this probe's octahedral atlases. K probes/frame, amortized.
-    static constexpr uint32_t kProbeCubeFace = 32;    // cube face size (cheap; > vis tile so no aliasing)
-    // Capture is a full-scene mesh render x6 faces x this many probes PER FRAME — the dominant
-    // load-time cost. 1 face/frame keeps every frame under the hitch budget (capture spreads over
-    // ~faces*probes frames; the scene is playable throughout). See record_probe_capture.
-    // Brief 09b (fast capture): all 6 cube faces render in ONE multiview pass, so the amortization
-    // unit is PROBES/frame (not faces): with the per-face CPU loop gone, a full probe is one
-    // vkCmdDrawMeshTasksEXT. ~10+ probes/frame finishes a ~250-probe bake in a couple of seconds.
-    static constexpr uint32_t kProbeCubeViewMask = 0x3Fu;   // 6-face multiview mask
-    // Probes captured per frame (amortized). Each probe is one multiview dispatch over the coarse-LOD
-    // meshlet domain (distance + face culled on GPU), so this bounds the per-frame bake burst. 2 keeps
-    // it under the hitch threshold; a ~750-probe bake still finishes in a few seconds.
-    static constexpr uint32_t kProbesPerFrame = 2;
-    ProbeVolume probe_volume_{};
-    ::string::gpu::resource_id probe_cube_albedo_ = 0;  // cube RGBA16F: captured base color
-    ::string::gpu::resource_id probe_cube_nd_ = 0;      // cube RGBA16F: world normal.xyz + linear dist(w)
-    ::string::gpu::resource_id probe_cube_depth_ = 0;   // cube D32: nearest-surface depth (per face)
-    uint32_t probe_cube_albedo_sample_slot_ = 0;      // SamplerCube (collapse read)
-    uint32_t probe_cube_nd_sample_slot_ = 0;
-    // 6-layer 2D_ARRAY views over the whole cube — the multiview render pass targets all 6 layers in
-    // one BeginRendering (SV_ViewID selects the layer/face).
-    VkImageView probe_cube_albedo_array_view_ = VK_NULL_HANDLE;
-    VkImageView probe_cube_nd_array_view_ = VK_NULL_HANDLE;
-    VkImageView probe_cube_depth_array_view_ = VK_NULL_HANDLE;
-    ::string::gpu::resource_id probe_active_ = 0;       // per-probe activation (uint: 1 active / 0 inside)
-    ::string::gpu::resource_id probe_offset_ = 0;       // per-probe relocation offset (float4: xyz world)
-    ::string::gpu::resource_id probe_meshlet_draw_ = 0; // global LOD0-meshlet-id -> owning draw index (uint)
-    uint32_t probe_total_lod0_meshlets_ = 0;          // total LOD0 meshlets (flat capture dispatch domain)
-    float probe_cull_far_ = 0.0f;                     // capture distance-cull radius (bounded ~= few cells)
-    ::string::gpu::shader_program* probe_capture_raster_program_ = nullptr;  // cube-face G-buffer raster
-    ::string::gpu::shader_program* probe_collapse_program_ = nullptr;        // cube -> octa atlases + classify
-    uint32_t probe_capture_cursor_ = 0;               // probe currently being captured (amortization)
-    bool probe_cube_layouts_initialized_ = false;     // cube G-buffer images: UNDEFINED -> first use
-    double probe_capture_ms_ = 0.0;                   // accumulated capture wall time (log on complete)
-    ::string::gpu::resource_id probe_irrad_ = 0;        // octa irradiance atlas (RGBA16F, relit)
-    ::string::gpu::resource_id probe_cap_gbuf_ = 0;     // octa capture normal.xyz + hit distance (w)
-    ::string::gpu::resource_id probe_cap_albedo_ = 0;   // octa capture albedo.rgb
-    ::string::gpu::resource_id probe_vis_ = 0;          // octa visibility mean/mean^2 (RG16F used)
-    uint32_t probe_irrad_sample_slot_ = 0;            // Sampler2D (shading + debug + bounce)
-    uint32_t probe_irrad_storage_slot_ = 0;           // RWTexture2D (relight write)
-    uint32_t probe_cap_gbuf_sample_slot_ = 0;
-    uint32_t probe_cap_gbuf_storage_slot_ = 0;
-    uint32_t probe_cap_albedo_sample_slot_ = 0;
-    uint32_t probe_cap_albedo_storage_slot_ = 0;
-    uint32_t probe_vis_sample_slot_ = 0;
-    uint32_t probe_vis_storage_slot_ = 0;
-    VkSampler probe_sampler_ = VK_NULL_HANDLE;        // linear clamp (atlas bilinear w/ gutter)
-    ::string::gpu::shader_program* probe_clear_program_ = nullptr;   // capture: clear/init (M0), raster (M1)
-    ::string::gpu::shader_program* probe_relight_program_ = nullptr; // relight + convolve
-    ::string::gpu::shader_program* probe_debug_program_ = nullptr;   // instanced debug spheres
-    bool probe_layouts_initialized_ = false;  // atlases moved UNDEFINED -> GENERAL once
-    bool probe_captured_ = false;             // static capture (clear/vis) recorded once
-    bool probe_primed_ = false;               // at least one FULL relight pass has completed
-    bool probe_relight_pending_ = false;      // armed passes remain -> record_compute runs relight
-    // M2 amortized relight: K probes per frame, round-robin cursor. A sun trigger arms N converge
-    // passes: each full wrap propagates the bounce one step further (infinite bounce) and the
-    // hysteresis EMA settles (h^N residual), then relight goes idle until the sun moves (~0 static).
-    static constexpr uint32_t kRelightProbesPerFrame = 128;
-    static constexpr uint32_t kRelightConvergePasses = 32;
-    uint32_t probe_relight_cursor_ = 0;       // next probe to relight within the current pass
-    uint32_t probe_relight_passes_left_ = 0;  // full passes remaining before relight goes idle
-    glm::vec3 probe_relit_sun_dir_{ 0.0f };
-    uint32_t probe_debug_mode_ = 0;           // r.gi.probe_debug snapshot for this frame's record()
-    void fit_probe_volume();                  // grid fit to the scene AABB (spacing CVar)
-    void create_probe_resources(String::engine_context& context);
-    void record_probe_capture(::string::gpu::command_recorder& recorder);   // static capture (once): init/raster + visibility
-    void record_probe_relight(::string::gpu::command_recorder& recorder, uint16_t current_frame);  // relight -> irradiance
-    void record_probe_debug(::string::gpu::command_recorder& recorder);     // instanced probe-debug spheres (into scene)
-    // Shadow depth images: [frame_in_flight][cascade]. One D32 map per cascade per frame in flight,
-    // so frame N+1's shadow render doesn't race N's sample and each cascade has its own map.
-    std::vector<std::array<::string::gpu::resource_id, kMaxCascades>> shadow_images_;
-    std::vector<std::array<uint32_t, kMaxCascades>> shadow_slots_;
-    VkSampler shadow_sampler_ = VK_NULL_HANDLE;             // nearest + clamp, for manual PCF
+    // Probe GI (brief 09b relightable irradiance volume): owned by GiPass (ProbeGi component),
+    // reached via GeometryScene::gi.
+    // Shadow maps: owned by ShadowPass (ShadowMaps component), reached via GeometryScene::shadow.
     // Recompute the per-cascade stabilized ortho fits from the live camera + sun (called per frame).
     void compute_cascades();
 
@@ -410,8 +316,7 @@ class GeometryPass final : public String::Pass, private GeometryScene
 
     // materials_/draws_ + camera_ moved to GeometryScene (brief 11 P2).
 
-    // Debug: toggle GPU frustum culling off entirely (C) — for isolating culling from geometry.
-    bool cull_enabled_ = true;
+    // cull_enabled_ moved to GeometryScene (shared by every meshlet draw path).
 
     // --- Brief 03: task/mesh meshlet pipeline --------------------------------------------------
     // Built at load from the flattened geometry: the GPU-side meshlet/vertex/triangle heaps + the
@@ -430,8 +335,6 @@ class GeometryPass final : public String::Pass, private GeometryScene
     // Mesh pipelines (hot-reloadable via the registry).
     ::string::gpu::shader_program* meshlet_program_ = nullptr;
     ::string::gpu::shader_program* meshlet_twosided_program_ = nullptr;  // brief 04: CULL_NONE variant
-    ::string::gpu::shader_program* meshlet_transparent_program_ = nullptr; // brief 04: blend, no depth write
-    ::string::gpu::shader_program* meshlet_shadow_program_ = nullptr;
     ::string::gpu::shader_program* hiz_program_ = nullptr;
     ::string::gpu::shader_program* reset_program_ = nullptr;
     // Brief 04c: two-phase GPU cull for the global meshlet worklists. (1) draw-cull compute writes each
@@ -451,16 +354,12 @@ class GeometryPass final : public String::Pass, private GeometryScene
     // Brief 04e M3: worklists are SCRATCH regions now — `offset` into the renderer's per-frame-
     // slot scratch arena, reserved once at load (same offset in every slot's buffer); `buffer`
     // is the slot's scratch buffer, bound lazily in update() once the arena is materialized.
-    struct Worklist { ::string::gpu::resource_id buffer = 0; VkDeviceSize offset = 0; };
     // scratch_/scratch_bound_ moved to GeometryScene (brief 11 P2).
     // Per-frame-in-flight (the GPU may still read last frame's list). Camera lists: opaque one-sided +
     // two-sided (brief 04d: shared by phase 1 and phase 2; the task shader partitions per phase — the
     // old forced-LOD0 depth-prepass lists are deleted along with the prepass itself).
     std::vector<Worklist> wl_opaque_;
     std::vector<Worklist> wl_twosided_;
-    // Brief 04 M4: one shadow worklist PER CASCADE per frame (resident-only; per-cascade light-sphere
-    // reject in the draw phase — off-camera casters that reach the cascade still cast in).
-    std::vector<std::array<Worklist, kMaxCascades>> wl_shadow_;
     // Shared per-draw selected LOD (one per frame; every camera-derived list + shadows read it).
     // Shared per-draw selected LOD: a scratch region (offset into each slot's arena buffer).
     VkDeviceSize draw_lod_off_ = 0;
@@ -468,20 +367,19 @@ class GeometryPass final : public String::Pass, private GeometryScene
     {
         return scratch_->address(frame) + draw_lod_off_;
     }
-    uint32_t cull_max_draws_ = 0;
     uint32_t cull_max_blocks_ = 0;      // ceil(max_draws / kScanBlock)
-    VkDeviceSize wl_offsets_off_ = 0;   // byte offset of offsets[] within a worklist buffer
-    VkDeviceSize wl_blocksums_off_ = 0; // byte offset of block_sums[]
-    VkDeviceSize wl_commands_off_ = 0;  // byte offset of the compacted indirect commands[] (12B each)
-    VkDeviceSize wl_records_off_ = 0;   // byte offset of the parallel records[] (8B each)
-    VkDeviceSize wl_count_off_ = 0;     // byte offset of the surviving-draw count word
     // Draw phase for one camera frame (writes opaque+twosided counts + draw_lod), or a shadow cascade
     // (cascade>=0: resident-only counts vs the cascade sphere).
-    void record_draw_cull(::string::gpu::command_recorder& recorder, uint16_t current_frame, int cascade = -1);
+    void record_draw_cull(::string::pass_context& ctx, ::string::gpu::buffer worklists,
+                          ::string::gpu::buffer stats, int cascade = -1);
     // Compaction phase for one worklist (scan + fill): compacts surviving draws into commands[]+records[]
     // + count, ready for one vkCmdDrawMeshTasksIndirectCountEXT. `draw_lod` is the per-draw selected-LOD
     // buffer the records[] inherit (camera-selected for camera+shadow lists, zeroed for the LOD0 prepass).
-    void record_expand(::string::gpu::command_recorder& recorder, const Worklist& wl, VkDeviceAddress draw_lod);
+    // Brief 20: the scan is THREE declared passes, one per dispatch, so the graph derives the two
+    // barriers that used to sit between them.
+    void record_expand_scan_blocks(::string::pass_context& ctx, ::string::gpu::buffer worklists, VkDeviceSize wl_offset);
+    void record_expand_scan_carry (::string::pass_context& ctx, ::string::gpu::buffer worklists, VkDeviceSize wl_offset);
+    void record_expand_fill       (::string::pass_context& ctx, ::string::gpu::buffer worklists, VkDeviceSize wl_offset);
 
     // Brief 04 sorted transparency pass. BLEND draws are excluded from the opaque lists (GPU compute)
     // and rendered here after opaque + sky: depth-tested vs opaque depth, NO depth write, alpha-blended,
@@ -489,39 +387,20 @@ class GeometryPass final : public String::Pass, private GeometryScene
     // count in a single host-visible buffer per frame — same shape as the GPU-compacted lists, so the
     // same task/mesh consumer + vkCmdDrawMeshTasksIndirectCountEXT draws it). Draw-order (back-to-front)
     // is preserved because the CPU writes commands/records in sorted order. Counts are small (no OIT).
-    std::vector<::string::gpu::resource_id> transp_buffers_;   // per-frame host-visible {commands[], records[], count}
-    std::vector<uint32_t*> transp_mapped_;
-    VkDeviceSize transp_commands_off_ = 0;
-    VkDeviceSize transp_records_off_ = 0;
-    VkDeviceSize transp_count_off_ = 0;
-    std::vector<uint32_t> blend_draw_indices_;               // draw indices flagged BLEND (built at load)
-    uint32_t build_transparency_list(uint16_t current_frame);  // sorts + fills the list; returns count
-    void record_transparency(::string::gpu::command_recorder& recorder, uint16_t current_frame, uint32_t count);
+    // Transparency list buffers + blend draw indices owned by TransparencyPass (SortedTransparency).
 
     // HiZ depth pyramid (R32F mip chain), one per frame in flight. Built each frame from the scene
     // depth via a MIN reduce (reverse-Z: min = farthest). Sampled by the pass-2 task shader.
+    // Brief 20: the HiZ pyramid is a GRAPH resource. What survives here is its SHAPE — the only part
+    // the technique still needs, to size its dispatches. The images, the per-mip views, the bindless
+    // slots and the hand-rolled sampler are all gone: the pyramid is declared by the application and
+    // every slot comes from ctx.slot(pyramid.mip(m)) at record time.
     struct HizPyramid
     {
-        ::string::gpu::resource_id image = 0;            // full mip chain, sampled slot
-        uint32_t sample_slot = 0;                      // bindless combined-image-sampler (whole chain)
-        std::vector<VkImageView> mip_views;            // per-mip storage views
-        std::vector<uint32_t> mip_storage_slots;       // per-mip STORAGE_IMAGE bindless slots
         uint32_t mips = 0;
         glm::uvec2 size{ 0, 0 };
-        // Single-sample depth the pyramid's mip 0 reduces from. The scene's shared depth target is
-        // 4x MSAA (can't be sampled with a plain Sampler2D), so brief 04d MIN-resolves the phase-1
-        // MSAA depth into this single-sample image (the renderer's depth-resolve target, filled at
-        // phase-1's EndRendering), and record_between() builds the pyramid from it.
-        ::string::gpu::resource_id depth = 0;
-        uint32_t depth_slot = 0;                       // sampled slot of the min-resolved phase-1 depth
     };
     std::vector<HizPyramid> hiz_;
-    // Brief 16 M7 (#1): the hiz depth + pyramid image RINGS are registry-owned PerFrame images now
-    // (the registry is the allocation authority — create/recreate/free). The pass keeps the technique
-    // descriptor wiring (per-mip views + sampled/storage bindless slots) over the resolved physicals.
-    ::string::gpu::image hiz_depth_ring_;
-    ::string::gpu::image hiz_pyramid_ring_;
-    VkSampler hiz_sampler_ = VK_NULL_HANDLE;
     uint32_t hiz_screen_w_ = 0, hiz_screen_h_ = 0;
     void ensure_hiz(uint16_t current_frame);
 
@@ -531,30 +410,7 @@ class GeometryPass final : public String::Pass, private GeometryScene
     // SceneData.prev_view_proj reprojection (exact for the static scene; 1-frame-late AO, zero
     // temporal accumulation so nothing can ghost). raw -> denoise -> per-slot final (RGBA8:
     // rgb bent world normal, a visibility). Requires the two-phase HiZ depth; auto-off otherwise.
-    // Brief 16 M7 (#1): the gtao raw (shared, 1-deep) + final (per-frame) image rings are registry-
-    // owned PerFrame images now; the pass keeps the sampled/storage bindless-slot wiring.
-    ::string::gpu::image gtao_raw_ring_;
-    ::string::gpu::image gtao_final_ring_;
-    ::string::gpu::resource_id gtao_raw_ = 0;
-    uint32_t gtao_raw_sampled_slot_ = 0;
-    uint32_t gtao_raw_storage_slot_ = UINT32_MAX;
-    bool gtao_raw_initialized_ = false;      // UNDEFINED -> first-layout transition done
-    std::vector<::string::gpu::resource_id> gtao_final_;
-    std::vector<uint32_t> gtao_final_sampled_slots_;
-    std::vector<uint32_t> gtao_final_storage_slots_;
-    std::vector<uint8_t> gtao_final_ready_;  // slot image holds data + sits in SHADER_READ_ONLY
-    glm::uvec2 gtao_size_{ 0, 0 };
-    VkSampler gtao_sampler_ = VK_NULL_HANDLE;   // linear clamp (half-res AO upsampled in the shader)
-    ::string::gpu::shader_program* gtao_program_ = nullptr;
-    ::string::gpu::shader_program* gtao_denoise_program_ = nullptr;
-    // Per-slot camera state captured when that slot's depth was resolved (reproject targets).
-    std::vector<uint8_t> hz_depth_valid_;    // slot's hz.depth holds a resolved frame
-    std::vector<glm::mat4> gtao_slot_view_;
-    std::vector<glm::mat4> gtao_slot_proj_;
-    std::vector<glm::mat4> gtao_slot_view_proj_;
-    bool gtao_runs_this_frame_ = false;      // decided in update() (SceneData needs it pre-record)
-    void ensure_gtao();
-    void record_gtao(::string::gpu::command_recorder& recorder, uint16_t current_frame);
+    // GTAO targets/slots/sampler/programs owned by GtaoPass (GtaoChain component).
 
     // Brief 06: address of the renderer's Tracy GPU context (from engine_context), for finer per-stage
     // GPU zones inside record_compute/record. Null when the renderer exposes none; the zone macros
@@ -571,9 +427,6 @@ class GeometryPass final : public String::Pass, private GeometryScene
     bool meshlet_readback_pending_ = false;  // STRING_MESHLET_READBACK: GPU-vs-CPU memcmp at frame 50
     bool hiz_enabled_ = true;        // O toggles two-pass HiZ occlusion on the meshlet path
     bool lod_enabled_ = true;        // (LOD select on by default)
-    int debug_view_ = 0;             // 0 none, 1 meshlet colour, 2 LOD colour, 3 occlusion reject (V cycles)
-    bool mesh_cull_frozen_ = false;  // meshlet freeze-cull (F keybind)
-    glm::mat4 mesh_frozen_view_proj_{ 1.0f };
     // dbg.orbit motion lever: continuously sways the camera around a captured base pose so headless
     // captures exercise per-frame disocclusion (the two-phase interleaved phase-1/phase-2 path).
     // Base pose is latched on the first orbiting frame; the sway is applied AFTER camera_.update.
@@ -582,11 +435,6 @@ class GeometryPass final : public String::Pass, private GeometryScene
     float orbit_base_yaw_ = 0.0f;
     float orbit_base_pitch_ = 0.0f;
     float orbit_phase_ = 0.0f;       // accumulated angle (rad)
-    // Freeze-cull must freeze EVERY camera-dependent cull input, not just the frustum planes:
-    // cone culling + the HiZ nearest-point test + LOD select all use the eye position, and the
-    // HiZ prepass/test use the view-projection. A partial freeze mixes frozen and live inputs
-    // and produces bogus culling as the real camera moves away.
-    glm::vec3 mesh_frozen_camera_pos_{ 0.0f };
     // Crowd stress scene (K): the base draws duplicated across a grid with varied transforms, to
     // prove 500+-crowd geometry throughput (brief M6). Crowd draws are extra DrawInfo entries that
     // reference the SAME meshlet buffers (only the transform differs); active_draw_count_ switches
@@ -598,15 +446,17 @@ class GeometryPass final : public String::Pass, private GeometryScene
     void build_meshlet_gpu(String::engine_context& context);
     // Brief 04d: `phase` (0 legacy/transparency, 1 = bit-set only, 2 = bit-clear+HiZ+update) is pushed
     // into MeshletPush so the task shader partitions the worklist's meshlets across the two phases.
-    void record_meshlet_draws(::string::gpu::command_recorder& recorder, const ::string::gpu::pipeline& p,
-                              uint16_t current_frame, const Worklist& wl, uint32_t phase = 0);
+    void record_meshlet_draws(::string::pass_context& ctx, const ::string::gpu::pipeline& p,
+                              VkDeviceSize wl_offset, uint32_t phase,
+                              ::string::gpu::buffer worklists, ::string::gpu::image pyramid,
+                              ::string::gpu::buffer scene_data, ::string::gpu::buffer stats);
 
     // --- Brief 04d two-phase occlusion state ---------------------------------------------------
     // Persistent per-meshlet visibility bitfield (1 bit per GLOBAL meshlet id, ceil(total/32) words),
     // device-local, zero-initialized on creation. NOT ring-buffered — the temporal visibility state
     // must accumulate across frames. Phase 1 reads it; phase 2 sets/clears it (atomics). A cleared bit
     // => the meshlet takes phase 2 for one frame (warmup = fallback = streaming/LOD-change path).
-    ::string::gpu::resource_id visbits_buffer_ = 0;
+    // visbits_buffer_ moved to GeometryScene (named by every meshlet push constant).
     uint32_t visbits_words_ = 0;
     // Per-draw LOD selected LAST frame (device-local, one word per draw). The draw-cull compute
     // compares it to this frame's selected LOD; a switch clears that draw's bitfield range (its
@@ -616,7 +466,9 @@ class GeometryPass final : public String::Pass, private GeometryScene
     // breaks_scene_group(): when false the pass renders single-pass (phase 0) in one group.
     bool two_phase_active_ = false;
     // Records phase-1 or phase-2 opaque+two-sided draws into the (already-open) MSAA render pass.
-    void record_opaque_phase(::string::gpu::command_recorder& recorder, uint16_t current_frame, uint32_t phase);
+    void record_opaque_phase(::string::pass_context& ctx, uint32_t phase,
+                             ::string::gpu::buffer worklists, ::string::gpu::image pyramid,
+                             ::string::gpu::buffer scene_data, ::string::gpu::buffer stats);
     // Zeroes visbits_buffer_ + prev_draw_lod_buffer_ (teleport/first-frame/streaming full clear).
     bool visbits_clear_pending_ = true;
 
@@ -633,20 +485,63 @@ public:
     // instead — a roughness x metallic sphere grid + a white/mirror pair over a neutral ground
     // slab, baked through the same cook library (one draw per sphere; factors drive the
     // materials, no textures). The permanent lookdev sandbox: STRING_SCENE=lookdev ./run.sh.
-    GeometryPass(String::engine_context& context, std::vector<std::filesystem::path> model_paths,
-                 std::shared_ptr<MeshOverlayStats> overlay_stats = nullptr, bool lookdev = false);
-    virtual ~GeometryPass() override;
+    geometry_pass(String::engine_context& context, VkSampleCountFlagBits samples,
+                  std::vector<std::filesystem::path> model_paths,
+                  std::shared_ptr<MeshOverlayStats> overlay_stats = nullptr, bool lookdev = false);
+    ~geometry_pass();
 
-    // Stable identity for tooling (Tracy zones, inspector). Brief 06. The renderer names the
-    // pass-level GPU/CPU zones from this; finer per-stage zones (draw-cull, HiZ, shadows, sky,
-    // transparency) are scoped inside record_compute/record via STRING_PROFILE_GPU_ZONE.
-    std::string_view debug_name() const override { return "geometry"; }
+    // Per-frame CPU work — camera, time-of-day, streaming feedback, SceneData fill, stats readback.
+    // Ordinary app code called before the graph executes; it was never a graph concept, it only
+    // looked like one because it arrived as a Pass virtual.
+    void tick(float delta_time, uint32_t frame_slot);
 
-    virtual void update(float delta_time, uint16_t current_frame) override;
-    virtual bool record_compute(::string::gpu::command_recorder& recorder, uint16_t current_frame) override;
-    virtual void record(::string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+    // Author every pass this subsystem owns onto the graph: phase 1, the HiZ mip chain, phase 2, the
+    // meshlet cull/expand chain and the draws. The attachments and worklists arrive as logical
+    // handles the application declared.
+    void declare(string::frame_graph& fg, string::gpu::image color, string::gpu::image resolve,
+                 string::gpu::image depth,
+                 string::gpu::image hiz_depth, string::gpu::image hiz_pyramid, uint32_t hiz_mips,
+                 string::gpu::buffer worklists, string::gpu::buffer scene_data,
+                 string::gpu::buffer lights, string::gpu::buffer stats,
+                 // Everything SceneData points at. Declaring them on scene.upload is what makes the
+                 // slots it writes resolvable at record time — and what derives the edges from each
+                 // producer to the draws that read SceneData.
+                 std::span<const string::gpu::image> cascades, string::gpu::image gtao_ao,
+                 string::gpu::image env_prefiltered, string::gpu::image dfg_lut,
+                 string::gpu::buffer ibl_sh, string::gpu::buffer froxels);
 
-    // Froxel light binning (the async-compute chain) is its own FroxelPass now (brief 11 step 3).
+    // The HiZ pyramid's extent and mip count, from the INITIAL viewport. Authored-once means the
+    // declaration count is fixed, so the app computes these when it declares the pyramid and passes
+    // the same number here — the same rule bloom follows.
+    // How many entries the probe-GI capture table needs for this scene's meshlets. The app sizes the
+    // table buffer from it, so the declaration and the fill agree by construction.
+    std::size_t gi_capture_entries() const;
+    static VkExtent2D hiz_extent(VkExtent2D viewport);
+    static uint32_t hiz_mip_count(VkExtent2D viewport);
+
+private:
+    // One declared pass per HiZ mip: mip 0 reduces the resolved scene depth, each later mip reduces
+    // the one above it. The graph derives the chain from the slice declarations.
+    // Graph handles this subsystem was declared against, latched in declare() so the record bodies
+    // can name them. They are LOGICAL — every resolution still happens through pass_context.
+    // MSAA sample count of the scene attachments. The APP declares those, so the app states this;
+    // the renderer no longer has an opinion to supply.
+    // Per-slot: has this frame slot's worklist arena been zeroed yet? See record_cull.
+    std::vector<bool> arena_zeroed_;
+    VkSampleCountFlagBits scene_samples_ = VK_SAMPLE_COUNT_1_BIT;
+    string::gpu::buffer scene_data_{}, lights_buffer_{}, stats_{}, worklists_{}, froxels_{}, ibl_sh_{};
+    string::gpu::image  pyramid_{}, gtao_ao_{}, env_prefiltered_{}, dfg_lut_{};
+    std::array<string::gpu::image, kMaxCascades> cascades_{};
+
+    // The GPU draw-cull + list-expansion chain (defined in geometry_pass_meshlet.cpp).
+    void declare_cull(string::frame_graph& fg, string::gpu::buffer worklists, string::gpu::buffer stats);
+    void declare_expand(string::frame_graph& fg, string::gpu::buffer worklists);
+    void declare_hiz(string::frame_graph& fg, string::gpu::image depth,
+                     string::gpu::image pyramid, uint32_t mips);
+    void record_hiz_mip(string::pass_context& ctx, uint32_t m, string::gpu::image depth,
+                        string::gpu::image pyramid);
+
+public:
 
     // Brief 04d/11-step-2 two-phase occlusion. record() draws PHASE 1 (sky + last-frame-visible opaque
     // into the MSAA targets; the group MIN-resolves depth into hz.depth via the DepthResolve usage).
@@ -655,42 +550,18 @@ public:
     // geometry.phase2 pass). When HiZ is off / warming up, two_phase_active_ is false: record() renders
     // everything single-pass and record_hiz()/record_phase2() no-op. These are ordinary public methods
     // now (the HizBuildPass / GeometryPhase2Pass sub-passes call them) — no base-Pass hooks.
-    void record_hiz(::string::gpu::command_recorder& recorder, uint16_t current_frame);
-    void record_phase2(::string::gpu::command_recorder& recorder, uint16_t current_frame);
+    void record_scene_upload(string::pass_context& ctx);
+    void record_phase1(string::pass_context& ctx);
+    void record_cull(string::pass_context& ctx);
+    void record_phase2(string::pass_context& ctx);
     // Brief 11 M2: the cascaded shadow-map depth render. Extracted from record_compute into its own
     // public method so the standalone ShadowPass (a scheduling seam, like GtaoPass) can schedule it —
-    // GeometryPass keeps the state (shadow images/slots, per-cascade worklists, the meshlet-shadow
-    // program), the pass just calls this in the compute prepass, AFTER this pass's draw-cull/expand
-    // produced the per-cascade worklists and BEFORE the MSAA group's lit draws sample the maps. The
-    // block is self-contained (it hand-transitions its own maps; record_expand already barriered the
-    // worklist reads), so relocating it leaves the command stream byte-identical. No-ops when shadows
-    // are unconfigured. Returns true if it recorded work (parity with record_gtao_if_enabled).
-    bool record_shadows_if_enabled(::string::gpu::command_recorder& recorder, uint16_t current_frame);
     // Brief 11 M2: probe-GI capture (run-once, load-time) + relight (amortized). Extracted from the
     // head of record_compute into its own public method so the standalone GiPass (a scheduling seam)
     // can schedule it in the compute prepass — ordered after IblPass (this frame's SH) and before
     // ShadowPass (the relight->shadow-write WAR edge). All barriers are internal; byte-identical.
     bool record_gi_if_enabled(::string::gpu::command_recorder& recorder, uint16_t current_frame);
-    // Brief 11 M2: the sorted transparency draw (CPU back-to-front list build + one indirect draw).
-    // Extracted from record()/record_phase2 into its own public method so the standalone
-    // TransparencyPass can draw it as the LAST pass of the reopened MSAA group (depth-tested vs the
-    // final opaque depth, no depth write, alpha-blended) — the same in-group position it held inside
-    // record_phase2, so the output is byte-identical. GeometryPass keeps the state (per-frame list
-    // buffers, the blend-draw indices, the transparent pipeline). No-ops when there's no scene.
-    void record_transparency_pass(::string::gpu::command_recorder& recorder, uint16_t current_frame);
-    // Brief 11 step 3: GTAO is woven into the geometry depth pipeline (it reads the prev-slot resolved
-    // hz.depth + the reprojection matrices record_hiz captures, and feeds SceneData). So GeometryPass
-    // keeps its state; the standalone GtaoPass (prepass) just schedules this — running the half-res AO
-    // chain iff the go/no-go decided in update() said so. Returns true if it recorded work.
-    bool record_gtao_if_enabled(::string::gpu::command_recorder& recorder, uint16_t current_frame)
-    {
-        if (!gtao_runs_this_frame_) return false;
-        record_gtao(recorder, current_frame);
-        return true;
-    }
     bool two_phase_active() const { return two_phase_active_; }
-    ::string::gpu::resource_id color_target() const { return color_target_; }
-    ::string::gpu::resource_id depth_target() const { return depth_target_; }
     // Brief 11 step 3: hand out the shared scene state (the privately-inherited GeometryScene) so the
     // decomposed sub-passes (sky, ... ) reference it directly instead of reaching back into GeometryPass.
     // GeometryPass keeps inheriting it (zero body churn); the upcast is legal from within this member.
@@ -698,357 +569,28 @@ public:
     // Brief 11 step 2b: per-slot HiZ resources + the visibility bitfield, so the hiz.build / phase2
     // sub-passes declare real usages and the graph derives their barriers (resolve->read, pyramid
     // producer->consumer, phase1->phase2 bitfield RMW) instead of record_hiz hand-rolling them.
-    ::string::gpu::resource_id hiz_depth_id(uint16_t frame) const
-    {
-        return frame < hiz_.size() ? hiz_[frame].depth : 0;
-    }
-    ::string::gpu::resource_id hiz_pyramid_id(uint16_t frame) const
-    {
-        return frame < hiz_.size() ? hiz_[frame].image : 0;
-    }
-    // Brief 16: the LOGICAL hiz depth + pyramid ring handles. The hiz.build/phase2 passes + the
-    // DepthResolve marker declare these; the executor resolves the per-frame physical.
-    ::string::gpu::image hiz_depth_ring() const { return hiz_depth_ring_; }
-    ::string::gpu::image hiz_pyramid_ring() const { return hiz_pyramid_ring_; }
+    // Brief 20: the hiz id/ring accessors are gone. The pyramid and the resolved depth are graph
+    // resources the application declares and hands to declare(); nothing outside needs their ids.
     ::string::gpu::resource_id visbits_id() const { return visbits_buffer_; }
+    // The probe irradiance atlas: relit by gi.probe, sampled by every lit fragment (and by next
+    // frame's bounce). The capture atlases (gbuf/albedo/vis) are written AND consumed inside gi.probe,
+    // so they stay intra-pass. 0 until the volume is built (r.gi off => never).
+    // Brief 20: the IBL SH buffer is an app-declared graph buffer; gi.relight declares .reads(sh)
+    // and the graph derives the edge. No id accessor needed.
 };
 
-// Brief 11 step 2: the two-phase occlusion path expressed as three ordinary registered passes sharing
-// the GeometryPass that owns the meshlet/HiZ subsystem. GeometryPass IS geometry.phase1 (its record()
-// draws phase 1); these two contribute the other scheduled points. They declare real usages so the
-// graph orders them (phase1 -> hiz.build -> phase2) and derives the group break — no special hooks.
-
-// sky: the fullscreen procedural background, drawn (color only, no depth) into the scene MSAA group
-// before the opaque geometry. Brief 11 step 3: a REAL registered pass now — it owns its SkyComponent
-// and reads the shared sun/sky/camera state through GeometryScene, rather than being drawn inside
-// GeometryPass::record(). Registered before geometry.phase1 so it's the first draw in the group.
-class SkyPass final : public String::Pass
-{
-    ::string::gpu::device& device_;
-    GeometryScene* scene_;
-    SkyComponent sky_;
-public:
-    SkyPass(String::engine_context& context, GeometryScene* scene)
-        : device_(context.device), scene_(scene)
-    {
-        sky_.init(context);
-        usages = { { context.color_target, String::Access::ColorWrite,
-                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT } };
-        // Brief 11 M3: r.pass.sky drops the sky pass -> the MSAA group's clear shows behind the scene.
-        enable_predicate = [] { return cv_pass_sky().get(); };
-    }
-    ~SkyPass() override
-    {
-        if (::string::gpu::shader_program* p = sky_.program())
-        {
-            const ::string::gpu::pipeline& pl = p->current();
-            vkDestroyPipeline(device_.get_device(), pl.pipeline, nullptr);
-            vkDestroyPipelineLayout(device_.get_device(), pl.pipeline_layout, nullptr);
-        }
-    }
-    std::string_view debug_name() const override { return "sky"; }
-    void record(::string::gpu::command_recorder& recorder, uint16_t) override
-    {
-        GeometryScene& s = *scene_;
-        if (s.draw_count_ == 0) return;   // matches GeometryPass::record's early-out (no scene, no sky)
-        sky_.record(recorder, SkyParams{
-            .view_proj = s.camera_.view_proj(),
-            .camera_pos = s.camera_.position(),
-            .sun_dir = s.sun_dir_,
-            .sky_zenith = s.sky_zenith_,
-            .sky_ground = s.sky_ground_,
-            .sun_color = s.sun_color_,
-            .sun_intensity = s.sun_intensity_,
-            .furnace = s.furnace_,
-        });
-    }
-};
-
-// froxel.cull: the Forward+ light-binning compute chain. Brief 11 step 3: a real registered pass that
-// OWNS its FroxelComponent and publishes it into GeometryScene (scene.froxel) so GeometryPass's
-// SceneData reads the grid dims + froxel buffer address. It is the frame's dependency-free async chain
-// (has_async_compute + async_usages); the renderer places it on an async lane or inline. compute_only
-// so it forms no render group — its record() is a no-op (all work is in record_async_compute).
-class FroxelPass final : public String::Pass
-{
-    ::string::gpu::device& device_;
-    GeometryScene* scene_;
-    FroxelComponent froxel_;
-public:
-    FroxelPass(String::engine_context& context, GeometryScene* scene)
-        : device_(context.device), scene_(scene)
-    {
-        froxel_.init(context, context.frames_in_flight);
-        scene_->froxel = &froxel_;
-    }
-    ~FroxelPass() override
-    {
-        if (::string::gpu::shader_program* p = froxel_.program())
-        {
-            const ::string::gpu::pipeline& pl = p->current();
-            vkDestroyPipeline(device_.get_device(), pl.pipeline, nullptr);
-            vkDestroyPipelineLayout(device_.get_device(), pl.pipeline_layout, nullptr);
-        }
-        froxel_.destroy();
-    }
-    std::string_view debug_name() const override { return "froxel.cull"; }
-    // Nature (compute-only + async) is declared fluently by the app when authoring the graph.
-    bool async_has_work() const { return froxel_.has_work(); }   // dynamic gate for PassSpec.async()
-    void record(::string::gpu::command_recorder&, uint16_t) override {}   // async-only; nothing inline
-    // Brief 16 M2: (re)allocate the registry-owned froxel ring at the DETERMINISTIC resize point
-    // (init + window resize, before any per-frame update) — not lazily in update() where it raced
-    // GeometryPass's SceneData read. The froxel address is now valid from frame 0 for any pass order.
-    void resize(VkExtent2D extent) override
-    {
-        String::Pass::resize(extent);
-        froxel_.ensure_capacity(screen_size);
-    }
-    void update(float, uint16_t current_frame) override
-    {
-        async_usages.clear();
-        if (froxel_.handle().valid())
-        {
-            // Brief 16: declare the LOGICAL froxel handle; the executor resolves the per-frame physical.
-            async_usages.push_back({ .access = String::Access::StorageWrite,
-                                     .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .buf = froxel_.handle() });
-            async_usages.push_back({ .access = String::Access::StorageRead,
-                                     .stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, .buf = froxel_.handle() });
-        }
-    }
-    void record_async_compute(::string::gpu::command_recorder& recorder, uint16_t current_frame) override
-    {
-        if (!froxel_.active(current_frame)) return;
-        GeometryScene& s = *scene_;
-        const uint32_t light_count = s.lights_enabled_ ? static_cast<uint32_t>(s.lights_.size()) : 0u;
-        const glm::mat4 proj = s.camera_.view_proj() * glm::inverse(s.camera_.view());  // == projection
-        froxel_.record(recorder, current_frame, FroxelParams{
-            .view = s.camera_.view(),
-            .inv_proj = glm::inverse(proj),
-            .screen = glm::uvec2(screen_size.width, screen_size.height),
-            .near_plane = s.camera_.near_plane(),
-            .far_plane = std::min(s.settings_.shadow_depth_range, s.camera_.far_plane()),
-            .light_count = light_count,
-            .lights = light_count > 0
-                    ? s.resources->address(s.light_buffer_, current_frame) : 0,
-        });
-    }
-};
-
-// ibl.update: the dynamic sky image-based-lighting compute chain (env capture -> mips -> SH +
-// prefilter + DFG). Brief 11 step 3: a real prepass-compute pass that OWNS its IblComponent and
-// publishes it into GeometryScene (scene.ibl) for SceneData + probe GI to read. Runs BEFORE the
-// geometry pass so this frame's draws + GI relight read this frame's environment. Amortized (only
-// records when the sun moved past the trigger); the whole chain updates in one frame.
-class IblPass final : public String::Pass
-{
-    GeometryScene* scene_;
-    IblComponent ibl_;
-    uint64_t frames_ = 0;   // local counter for the debug numeric-verification gate (STRING_IBL_VERIFY)
-public:
-    IblPass(String::engine_context& context, GeometryScene* scene) : scene_(scene)
-    {
-        ibl_.init(context);
-        scene_->ibl = &ibl_;
-    }
-    ~IblPass() override { ibl_.destroy(); }
-    std::string_view debug_name() const override { return "ibl.update"; }
-    void record(::string::gpu::command_recorder&, uint16_t) override {}   // prepass-only; no group work
-    void update(float, uint16_t) override
-    {
-        GeometryScene& s = *scene_;
-        // Trigger the amortized update (sun moved past the delta, furnace flip, first frame, or forced).
-        ibl_.begin_frame(s.sun_dir_, s.furnace_, cv_ibl_every_frame().get());
-        if (cv_ibl_verify().get() && ++frames_ == 40)
-            ibl_.run_verification(s.furnace_);
-        // Producer side of the SH buffer: declare the write only on frames the chain actually runs
-        // (the lit-fragment + GI read side is declared by GeometryPass). Empty otherwise.
-        usages.clear();
-        if (ibl_.sh_buffer() != 0 && ibl_.update_pending())
-            usages.push_back({ ibl_.sh_buffer(), String::Access::StorageWrite,
-                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT });
-    }
-    bool record_compute(::string::gpu::command_recorder& recorder, uint16_t) override
-    {
-        if (!ibl_.needs_update()) return false;
-        GeometryScene& s = *scene_;
-        ibl_.record_update(recorder, IblLighting{
-            .sun_dir = s.sun_dir_, .sky_zenith = s.sky_zenith_, .sky_ground = s.sky_ground_,
-            .sun_color = s.sun_color_, .sun_intensity = s.sun_intensity_, .furnace = s.furnace_ });
-        return true;
-    }
-};
-
-// gtao: the half-res GTAO + bent-normal chain (prev-frame depth -> this slot's AO). Brief 11 step 3:
-// a registered prepass pass, but a SCHEDULING SEAM over GeometryPass (which keeps the state) — gtao is
-// woven into the geometry depth pipeline (prev-slot hz.depth + record_hiz's reprojection matrices +
-// SceneData), so it is part of that cohesive subsystem, not an independent service like sky/froxel/ibl.
-// Runs in the prepass, before geometry, so this frame's lit fragments read a finished AO texture.
-class GtaoPass final : public String::Pass
-{
-    GeometryPass* geo_;
-public:
-    explicit GtaoPass(GeometryPass* geo) : geo_(geo)
-    {
-        // Brief 11 M3: r.gtao.enabled drops the AO pass AND (same cvar) makes SceneData.gtao_slot
-        // invalid (0xFFFFFFFF) so the lit shader skips AO — the graceful degrade is already data-level.
-        enable_predicate = [] { return cv_gtao_enabled().get(); };
-    }
-    std::string_view debug_name() const override { return "gtao"; }
-    void record(::string::gpu::command_recorder&, uint16_t) override {}   // prepass-only; no group work
-    bool record_compute(::string::gpu::command_recorder& recorder, uint16_t current_frame) override
-    {
-        return geo_->record_gtao_if_enabled(recorder, current_frame);
-    }
-};
-
-// gi.probe: relightable irradiance-probe capture (run-once) + relight (amortized). Brief 11 M2: a
-// registered pass, scheduling seam over GeometryPass (which keeps the probe volume + atlases + programs)
-// — probe GI is woven into the meshlet/lighting subsystem (relight reads this frame's sky SH + the CSM
-// shadow maps; shading samples the irradiance atlas), so it is a cohesive sub-stage, not an independent
-// service. Runs in the compute prepass, ordered after ibl.update (this frame's SH) and before
-// shadow.cascades (relight's shadow-map reads must precede this frame's shadow depth writes — the WAR
-// execution edge). Atlases stay local-class hand-managed this brief; it declares no framework usages.
-class GiPass final : public String::Pass
-{
-    GeometryPass* geo_;
-public:
-    explicit GiPass(GeometryPass* geo) : geo_(geo)
-    {
-        // Brief 11 M3: r.gi drops the probe-GI pass AND (via the same cvar) makes SceneData.probe_gi 0,
-        // so shading falls back to the sky-SH ambient — the graceful degrade is already data-level.
-        enable_predicate = [] { return cv_gi_enabled().get(); };
-    }
-    std::string_view debug_name() const override { return "gi.probe"; }
-    void record(::string::gpu::command_recorder&, uint16_t) override {}   // prepass-only; no group work
-    bool record_compute(::string::gpu::command_recorder& recorder, uint16_t current_frame) override
-    {
-        return geo_->record_gi_if_enabled(recorder, current_frame);
-    }
-};
-
-// shadow.cascades: the cascaded shadow-map depth render (one depth-only meshlet draw per cascade into
-// per-frame D32 maps). Brief 11 M2: a registered pass, but a SCHEDULING SEAM over GeometryPass (which
-// keeps the shadow images/worklists/program) — shadows are woven into the meshlet subsystem (the
-// per-cascade worklists come from GeometryPass's draw-cull/expand, the lit fragments sample the maps),
-// so this is a cohesive meshlet sub-stage, not an independent service like sky/froxel/ibl. Runs in the
-// compute prepass, AFTER geometry.phase1's record_compute produced the worklists and BEFORE the MSAA
-// group's lit draws — hence authored after geometry in the plan so its record_compute is ordered later.
-// Shadow maps stay local-class hand-managed this brief (documented brief-11 boundary), so it declares no
-// framework usages: the block hand-transitions its own maps and record_expand barriered the reads.
-class ShadowPass final : public String::Pass
-{
-    GeometryPass* geo_;
-public:
-    explicit ShadowPass(GeometryPass* geo) : geo_(geo)
-    {
-        // Brief 11 M3: r.pass.shadow drops the shadow render AND GeometryPass::update() sets SceneData
-        // cascade_count 0 off the same cvar -> the lit shader's shadow term cancels (unshadowed scene).
-        enable_predicate = [] { return cv_pass_shadow().get(); };
-    }
-    std::string_view debug_name() const override { return "shadow.cascades"; }
-    void record(::string::gpu::command_recorder&, uint16_t) override {}   // prepass-only; no group work
-    bool record_compute(::string::gpu::command_recorder& recorder, uint16_t current_frame) override
-    {
-        return geo_->record_shadows_if_enabled(recorder, current_frame);
-    }
-};
-
-// hiz.build: the compute step between the two MSAA groups (MIN-resolved depth -> HiZ pyramid).
-class HizBuildPass final : public String::Pass
-{
-    GeometryPass* geo_;
-public:
-    explicit HizBuildPass(GeometryPass* geo) : geo_(geo) {}
-    std::string_view debug_name() const override { return "hiz.build"; }
-    // Brief 11 step 2b: declare the per-slot HiZ I/O so the renderer derives the barriers — reads the
-    // MIN-resolved depth (seeded post-resolve), writes the whole pyramid. Refreshed each frame (the
-    // resources rotate per frame-in-flight slot). Empty until the pyramid exists (early frames).
-    void update(float, uint16_t current_frame) override
-    {
-        usages.clear();
-        // Brief 16: declare the LOGICAL hiz depth + pyramid handles; the executor resolves per frame.
-        if (geo_->hiz_depth_ring().valid())
-            usages.push_back({ .access = String::Access::SampledRead,
-                               .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .img = geo_->hiz_depth_ring() });
-        if (geo_->hiz_pyramid_ring().valid())
-            usages.push_back({ .access = String::Access::StorageImageWrite,
-                               .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .img = geo_->hiz_pyramid_ring() });
-    }
-    void record(::string::gpu::command_recorder& recorder, uint16_t current_frame) override
-    {
-        geo_->record_hiz(recorder, current_frame);
-    }
-};
-
-// geometry.phase2: the disocclusion-complement opaque + probe-debug + transparency draws into the
-// reloaded MSAA group. Declares Color/Depth so it forms that group (loads phase-1's MSAA, resolves
-// color at the chain's end); the record no-ops when the two-phase path is inactive.
-class GeometryPhase2Pass final : public String::Pass
-{
-    GeometryPass* geo_;
-public:
-    explicit GeometryPhase2Pass(GeometryPass* geo) : geo_(geo) { refresh(0); }
-    std::string_view debug_name() const override { return "geometry.phase2"; }
-    // Brief 11 step 2b: Color+Depth form the reloaded MSAA group; the per-slot pyramid SampledRead (task
-    // stage) derives the hiz.build->phase2 handoff; the visbits StorageWrite (task stage) derives the
-    // phase1-read -> phase2-RMW bitfield barrier. Refreshed each frame (pyramid rotates per slot).
-    void update(float, uint16_t current_frame) override { refresh(current_frame); }
-    void record(::string::gpu::command_recorder& recorder, uint16_t current_frame) override
-    {
-        geo_->record_phase2(recorder, current_frame);
-    }
-private:
-    void refresh(uint16_t frame)
-    {
-        usages.clear();
-        usages.push_back({ geo_->color_target(), String::Access::ColorWrite,
-                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT });
-        usages.push_back({ geo_->depth_target(), String::Access::DepthWrite,
-                           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT });
-        // Brief 16: pyramid via LOGICAL handle (executor resolves per frame); visbits is a persistent
-        // (non-ring) buffer, so it stays a raw id.
-        if (geo_->hiz_pyramid_ring().valid())
-            usages.push_back({ .access = String::Access::SampledRead,
-                               .stage = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT, .img = geo_->hiz_pyramid_ring() });
-        if (auto v = geo_->visbits_id())
-            usages.push_back({ v, String::Access::StorageWrite, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT });
-    }
-};
-
-// transparency: the sorted alpha-blended draw. Brief 11 M2: a registered pass, scheduling seam over
-// GeometryPass (which keeps the per-frame list buffers + transparent pipeline). Declares ColorWrite +
-// DepthRead so it joins the reopened MSAA group (same color target as geometry.phase2) as that group's
-// LAST pass — the exact in-group position it held inside record_phase2 (depth-tested vs the final opaque
-// depth, no depth write, blended). Authored right after phase2 so it's the last draw of that group.
-class TransparencyPass final : public String::Pass
-{
-    GeometryPass* geo_;
-public:
-    explicit TransparencyPass(GeometryPass* geo) : geo_(geo)
-    {
-        refresh();
-        // Brief 11 M3: r.pass.transparency drops the blended draw -> opaque geometry only (no degrade
-        // needed; transparency is a pure over-draw with no consumer).
-        enable_predicate = [] { return cv_pass_transparency().get(); };
-    }
-    std::string_view debug_name() const override { return "transparency"; }
-    void update(float, uint16_t) override { refresh(); }
-    void record(::string::gpu::command_recorder& recorder, uint16_t current_frame) override
-    {
-        geo_->record_transparency_pass(recorder, current_frame);
-    }
-private:
-    void refresh()
-    {
-        // ColorWrite = same COLOR_TARGET as phase2 -> the renderer groups this pass into the reopened
-        // MSAA group. DepthRead (test only) — the group already forces depth to write scope for its
-        // attachment, so this just declares the honest dependency (transparency reads the opaque depth).
-        usages.clear();
-        usages.push_back({ geo_->color_target(), String::Access::ColorWrite,
-                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT });
-        usages.push_back({ geo_->depth_target(), String::Access::DepthRead,
-                           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT });
-    }
-};
+// Brief 20: the nine wrapper `Pass` subclasses that used to live here — SkyPass, FroxelPass, IblPass,
+// GtaoPass, GiPass, ShadowPass, HizBuildPass, GeometryPhase2Pass, TransparencyPass — are DELETED.
+//
+// Every one of them existed only to give a component a place to hang two things the graph now owns:
+// a hand-written `usages` vector refreshed each frame, and an `enable_predicate`. Several were pure
+// scheduling seams with no state at all (HizBuildPass held a single `GeometryPass*` and forwarded
+// one call). The components they wrapped — sky_component, froxel_component, ibl_component,
+// gtao_chain, probe_gi_component, shadow_maps, sorted_transparency — are plain objects that declare
+// themselves onto the graph through their own declare(), and the application owns them.
+//
+// The `usages`-refreshed-in-update() pattern they all shared is precisely the second declaration
+// channel this brief deletes: a pass had to re-state, in a different format, what it had already
+// said fluently, and only the re-statement governed correctness.
 
 }  // namespace string::render

@@ -1,0 +1,32 @@
+# clang-tidy config for the COMPLEXITY REPORT only (tools/complexity.sh).
+#
+# Deliberately not the repo-root .clang-tidy: this enables nothing but the two size/complexity
+# metrics, so the report is a measurement rather than a lint run. Correctness/style checks belong in
+# a separate config so the two never dilute each other.
+Checks: >
+  -*,
+  readability-function-cognitive-complexity,
+  readability-function-size
+
+CheckOptions:
+  # Cognitive complexity (Campbell / SonarSource): counts how hard code is to FOLLOW, not how many
+  # paths it has. Nesting multiplies, a linear sequence of ifs does not, and short-circuit chains
+  # count once. That makes it a much better proxy for "mental effort" than cyclomatic complexity.
+  #
+  # 25 is the check's default and the usual industry line for "needs splitting". Kept as-is so the
+  # numbers are comparable to everyone else's rather than tuned to flatter this codebase.
+  readability-function-cognitive-complexity.Threshold: '25'
+  # Macro-heavy code (STRING_PROFILE_* zones, Vulkan struct initialisers) would otherwise inflate
+  # scores with complexity the author never wrote or reads.
+  readability-function-cognitive-complexity.IgnoreMacros: 'true'
+  # Report the per-construct breakdown, so a high score can be traced to the specific nesting that
+  # caused it instead of just being a number.
+  readability-function-cognitive-complexity.DescribeBasicIncrements: 'true'
+
+  # Raw size, as a cross-check. A function can be long but simple (a big flat initialiser) or short
+  # but dense — reading the two metrics together tells you which problem you have.
+  readability-function-size.LineThreshold: '120'
+  readability-function-size.StatementThreshold: '100'
+  readability-function-size.BranchThreshold: '25'
+  readability-function-size.NestingThreshold: '4'
+  readability-function-size.ParameterThreshold: '7'

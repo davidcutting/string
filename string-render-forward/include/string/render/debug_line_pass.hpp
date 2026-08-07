@@ -1,10 +1,12 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <vector>
 
-#include <string/vulkan/render_pass.hpp>
 #include <string/vulkan/engine_context.hpp>
+#include <string/vulkan/frame_graph.hpp>
+#include <string/gpu/pass_context.hpp>
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource_allocator.hpp>
@@ -25,19 +27,29 @@ namespace string::render
 // it as a world-space line list into the scene color target, AFTER geometry and BEFORE the UI (it
 // shares geometry's MSAA color+depth group). Two pipelines: depth-tested (occluded by geometry) and
 // overlay (always on top). The camera view_proj comes from the shared MeshOverlayStats the geometry
-// pass publishes, so this pass stays decoupled from GeometryPass internals.
-class DebugLinePass final : public String::Pass
+// pass publishes, so this pass stays decoupled from the geometry pass's internals.
+//
+// Brief 20: a plain app-owned object. declare() authors it onto the app's graph; the depth
+// attachment is declared READ-ONLY, which is exactly what the depth-tested pipeline does.
+class debug_line_pass
 {
 public:
-    DebugLinePass(String::engine_context& context, std::shared_ptr<const MeshOverlayStats> stats);
-    ~DebugLinePass() override;
+    // `samples` is the MSAA sample count of the scene attachments this shares with geometry.
+    debug_line_pass(String::engine_context& ctx, std::shared_ptr<const MeshOverlayStats> stats,
+                    VkSampleCountFlagBits samples);
+    ~debug_line_pass();
 
-    std::string_view debug_name() const override { return "debug_line"; }
+    debug_line_pass(const debug_line_pass&) = delete;
+    debug_line_pass& operator=(const debug_line_pass&) = delete;
 
-    void record(::string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+    // Author onto the graph: a colour write into the scene target and a read-only depth attachment
+    // (the depth-tested variant reads reverse-Z depth; neither variant writes it).
+    void declare(::string::frame_graph& fg, ::string::gpu::image color, ::string::gpu::image depth);
 
 private:
-    void upload(uint16_t frame,
+    void record(::string::pass_context& ctx);
+
+    void upload(std::uint32_t frame,
                 std::span<const ::string::debug::LineVertex> depth,
                 std::span<const ::string::debug::LineVertex> overlay);
 

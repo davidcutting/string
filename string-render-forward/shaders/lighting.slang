@@ -295,6 +295,22 @@ uint froxel_index_for(SceneData s, float4 frag_coord, float view_z)
 // sorted transparency pass. The base-color alpha is still read for the cutout clip() regardless.
 float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), bool blend_alpha = false)
 {
+    // r.debug.lighting 11: EARLY PAINT TEST — returns BEFORE any texture is sampled.
+    //
+    // This exists because mode 10 (the late paint test) is NOT the clean experiment it looks like:
+    // it returns at the END of this function, so every sample still executes and only the result is
+    // thrown away. If a sample is itself the fault — a bindless index that is out of range or
+    // divergent is undefined behaviour, and this engine reads the cascade maps through exactly such
+    // an index — then mode 10 stays broken and wrongly implicates everything upstream of shading.
+    //
+    // Mode 11 touches no descriptor at all, so it isolates cleanly:
+    //   MAGENTA under 11 but broken under 10  ->  the fault is a SAMPLE inside shading.
+    //   broken under BOTH                     ->  the fault really is upstream (geometry reaching
+    //                                             the rasteriser, resolve, post, present).
+    // Pre-divided by exposure so it survives the tonemap (see the note on mode 10).
+    if (((s.debug_flags >> 4) & 0xFu) == 11u)
+        return float4(float3(1.0, 0.0, 1.0) / max(s.exposure, 1e-8), 1.0);
+
     float4 base = lit_textures[surf.slots.x].Sample(surf.uv) * surf.base_color;
     // Brief 04 alpha-tested cutout: discard fragments whose base-color alpha is below the material's
     // threshold (foliage/curtains). Threshold < 0 disables (opaque/blend materials).
@@ -726,6 +742,36 @@ float4 shade_surface(SceneData s, Surface surf, float4 debug_tint = float4(0), b
     }
     // Meshlet / LOD / occlusion debug views: flat tint mixed over the shaded colour.
     if (debug_tint.a > 0.0) color = lerp(color, debug_tint.rgb, debug_tint.a);
+
+    // --- Two instruments for "is the image wrong, or is it being destroyed after shading?" -------
+    //
+    // Both return FLAT constants PRE-DIVIDED BY EXPOSURE, exactly as the other debug views do.
+    // That is load-bearing, not decoration: post multiplies this buffer by exposure_scale (~0.0335)
+    // before tonemapping, so a raw float3(1,0,1) arrives on screen as near-black — indistinguishable
+    // from the very symptom being diagnosed. Pre-dividing makes the constant round-trip and land as
+    // true full-brightness magenta. (Found by running it: the first version of this instrument
+    // rendered dark and would have produced a false "still broken" reading.)
+    const float dbg_inv_exposure = 1.0 / max(s.exposure, 1e-8);
+
+    // r.debug.lighting 10: PAINT TEST. Every shaded pixel returns flat mid-magenta, ignoring all
+    // lighting, shadows and materials. This separates the two possibilities that the debug views
+    // cannot: if the screen is solid magenta, then shading output reaches the display intact and
+    // the fault is in the VALUES this shader computes. If the screen is still black/speckled, then
+    // nothing this shader returns matters — the image is being destroyed downstream (resolve, post,
+    // composite) or the pixels are never written, and no amount of lighting work will fix it.
+    if (light_dbg == 10u) return float4(float3(1.0, 0.0, 1.0) * dbg_inv_exposure, 1.0);
+
+    // r.debug.lighting 9: NON-FINITE DETECTOR. A single NaN/Inf survives tonemapping as a dead
+    // value and the output dither scatters it into speckle-over-black. Invisible to the validation
+    // layers (bindless PARTIALLY_BOUND arrays defeat them), and vendor-dependent, so it is the bug
+    // class that renders correctly on one GPU and black on another.
+    //   MAGENTA = NaN   CYAN = +/-Inf   ORANGE = negative   otherwise the normal image.
+    if (light_dbg == 9u)
+    {
+        if (any(isnan(color))) return float4(float3(1.0, 0.0, 1.0) * dbg_inv_exposure, 1.0);
+        if (any(isinf(color))) return float4(float3(0.0, 1.0, 1.0) * dbg_inv_exposure, 1.0);
+        if (any(color < 0.0))  return float4(float3(1.0, 0.5, 0.0) * dbg_inv_exposure, 1.0);
+    }
 
     return float4(color, blend_alpha ? base.a : 1.0);
 }

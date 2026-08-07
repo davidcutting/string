@@ -409,7 +409,10 @@ CVar<int32_t>& cv_light_debug()
     // 4 sun shadow coverage (white = lit, black = in shadow / back-facing), 5 selected cascade,
     // 6 occluder probe (green = caster above pixel, red = pixel topmost in map / caster drop).
     static CVar<int32_t> v{"r.debug.lighting", 0,
-                           "lighting isolate: 0 off, 1 sun-direct, 2 ambient, 3 local, 4 shadow coverage, 5 cascade, 6 occluder-probe"};
+                           "lighting isolate: 0 off, 1 sun-direct, 2 ambient, 3 local, 4 shadow "
+                           "coverage, 5 cascade, 6 occluder-probe, 7/8 raw cascade 0/1 map, "
+                           "9 non-finite detector (magenta=NaN cyan=Inf orange=negative), "
+                           "10 paint test (flat magenta; proves shading output reaches the display)"};
     static const bool a = [] { v.add_alias("light_debug"); return true; }(); (void)a;
     return v;
 }
@@ -437,7 +440,12 @@ CVar<float>& cv_shadow_normal_offset()
 
 CVar<bool>& cv_gi_enabled()
 {
-    static CVar<bool> v{"r.gi", true, "probe GI: relightable irradiance volume (brief 09b)"};
+    // DEFAULT OFF. Probe GI is only acceptable at expensive fine spacing (its cost is the open item
+    // of brief 09b), and it is the heaviest, newest, least-portable thing in the frame — a raster
+    // cubemap capture over every probe. Shipping it on by default means every artist pays for it
+    // and any driver-specific defect in it looks like a defect in the renderer. Off by default,
+    // `r.gi 1` to opt in; the degrade is data-level (shading falls back to sky-SH ambient).
+    static CVar<bool> v{"r.gi", false, "probe GI: relightable irradiance volume (brief 09b)"};
     static const bool a = [] { v.add_alias("gi"); return true; }(); (void)a;
     return v;
 }

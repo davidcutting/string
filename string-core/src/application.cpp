@@ -13,7 +13,7 @@
 
 namespace String {
 
-void Application::initialize(const ApplicationInfo& info, const RenderPlan& plan)
+void Application::initialize(const ApplicationInfo& info, scene_fn scene)
 {
     event_handler_.sink<WindowEvent>().connect<&Application::on_window_event>(*this);
     // STRING_WINDOW_SIZE=WxH overrides the initial window size — headless repro tooling: bugs can
@@ -28,11 +28,34 @@ void Application::initialize(const ApplicationInfo& info, const RenderPlan& plan
     }
     window_ = std::make_shared<Window>(Window::Properties{.title = info.application_name, .extent = extent});
     init_signal_handling();
-    renderer_ = std::make_unique<Renderer>(info, window_, plan);
+    renderer_ = std::make_unique<string::renderer>(info, window_);
+
+    // Brief 20: the application authors its graph ONCE, here, and compiles it ONCE. Nothing after
+    // this point re-authors or re-plans — a toggle is an in-graph conditional and a resize is a
+    // backing swap, which is what makes an author callback unnecessary.
+    tick_ = scene(graph_, renderer_->context(), *renderer_);
+    // Every pass has now reserved its scratch regions; back them before anything records.
+    renderer_->materialize_scratch();
+    frame_ = graph_.compile(renderer_->context(), renderer_->extent());
+    renderer_->publish_introspection(frame_);
 }
 
 Application::~Application()
 {
+    // ORDER IS LOAD-BEARING. The application owns its pass objects (captured by the tick callback and
+    // by the graph's recording callbacks), and every one of them frees GPU resources through the
+    // renderer's allocator in its destructor. So the scene must die BEFORE the renderer: dropping the
+    // renderer first destroys the allocator out from under passes that are still about to use it.
+    //
+    // This is the cost of the app owning the graph — the lifetime that used to be the renderer's
+    // problem is now stated here, once, explicitly.
+    // Drain first: the pass destructors below free pipelines and images that submitted command
+    // buffers still reference, and this is the only place that waits for them.
+    if (renderer_) renderer_->wait_idle();
+    // The pass objects live in the tick callback's captures and in the graph's recording callbacks;
+    // dropping both is what releases them.
+    tick_ = nullptr;
+    frame_ = {};
     renderer_.reset();
     window_.reset();
     event_handler_.sink<WindowEvent>().disconnect();
@@ -131,20 +154,18 @@ void Application::run() {
         // command only records a request (SceneRegistry::request); this is the point where no
         // command buffer is being recorded and the passes about to be destroyed are not in use by
         // anything except already-submitted work, which load_scene() waits out.
-        if (SceneRegistry::instance().has_pending())
-        {
-            SceneRegistry& registry = SceneRegistry::instance();
-            if (const SceneRegistry::Scene* scene = registry.take_pending())
-            {
-                RenderPlan plan;
-                plan.configure(scene->configure);
-                renderer_->load_scene(plan);
-                registry.set_active(scene->name);
-            }
-        }
+        // TODO(brief 20, step 14b): scene switching needs re-expressing against an app-owned graph.
+        // It used to rebuild a RenderPlan and hand it to the renderer; now the APP owns the graph, so
+        // a switch means tearing down the pass objects and authoring a fresh frame_graph. Deliberately
+        // left unwired rather than half-wired: a scene switch that silently kept stale declarations
+        // would be the exact class of bug this brief exists to remove.
 
         if (!freeze_rendering_)
-            renderer_->draw();
+        {
+            const float dt = static_cast<float>(period.count());
+            if (tick_) tick_(dt);              // ordinary app code, before the graph runs
+            renderer_->render_frame(frame_, dt);
+        }
 
         const auto now = std::chrono::steady_clock::now();
         const auto iterations = (now - start) / period;

@@ -36,7 +36,10 @@ struct ImageTransition
     // individual levels as it blits down the chain).
     uint32_t base_mip = 0;
     uint32_t level_count = 1;
-    // Array layers to transition (6 for cube maps — brief 07's IBL environment).
+    // Array layers to transition (6 for cube maps — brief 07's IBL environment). `base_layer` lets a
+    // single face be transitioned on its own, which per-subresource state tracking needs: an IBL
+    // cubemap's faces are written one at a time and genuinely hold different states between them.
+    uint32_t base_layer = 0;
     uint32_t layer_count = 1;
 };
 
@@ -54,7 +57,7 @@ inline void transition_image(VkCommandBuffer command_buffer, const ImageTransiti
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = t.image,
-        .subresourceRange = { t.aspect, t.base_mip, t.level_count, 0, t.layer_count },
+        .subresourceRange = { t.aspect, t.base_mip, t.level_count, t.base_layer, t.layer_count },
     };
     const VkDependencyInfo dependency = {
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,

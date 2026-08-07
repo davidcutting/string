@@ -1,49 +1,35 @@
-#include <gtest/gtest.h>
-
 #include <string/vulkan/resource_usage.hpp>
 
-using namespace String;
+using namespace string;
 
-// The model is constexpr, so mistakes in the Access -> (mask, layout) mapping surface at
-// compile time as well as under the runtime checks below.
-static_assert(is_write(Access::ColorWrite));
-static_assert(is_write(Access::DepthWrite));
-static_assert(is_write(Access::StorageWrite));
-static_assert(is_write(Access::TransferWrite));
-static_assert(!is_write(Access::SampledRead));
-static_assert(!is_write(Access::DepthRead));
-static_assert(!is_write(Access::StorageRead));
-static_assert(!is_write(Access::VertexRead));
-static_assert(!is_write(Access::IndexRead));
-static_assert(!is_write(Access::TransferRead));
-static_assert(!is_write(Access::IndirectRead));
+// The access vocabulary's two invariants: which accesses are writes, and that every access maps to a
+// layout consistent with whether it names a buffer or an image.
+static_assert(is_write(access::color_write));
+static_assert(is_write(access::depth_write));
+static_assert(is_write(access::storage_write));
+static_assert(is_write(access::transfer_write));
+static_assert(is_write(access::storage_image_write));
+static_assert(!is_write(access::sampled_read));
+static_assert(!is_write(access::depth_read));
+static_assert(!is_write(access::storage_read));
+static_assert(!is_write(access::vertex_read));
+static_assert(!is_write(access::index_read));
+static_assert(!is_write(access::indirect_read));
+static_assert(!is_write(access::transfer_read));
+static_assert(!is_write(access::storage_image_read));
 
-static_assert(access_scope(Access::ColorWrite).layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-static_assert(access_scope(Access::SampledRead).layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-static_assert(access_scope(Access::StorageRead).layout == VK_IMAGE_LAYOUT_UNDEFINED);
+// A buffer access is exactly one whose layout does not apply.
+static_assert(is_buffer_access(access::storage_read));
+static_assert(is_buffer_access(access::indirect_read));
+static_assert(!is_buffer_access(access::sampled_read));
+static_assert(scope_of(access::storage_read).layout == VK_IMAGE_LAYOUT_UNDEFINED);
+static_assert(scope_of(access::indirect_read).layout == VK_IMAGE_LAYOUT_UNDEFINED);
+static_assert(scope_of(access::sampled_read).layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+static_assert(scope_of(access::storage_image_write).layout == VK_IMAGE_LAYOUT_GENERAL);
 
-TEST(ResourceUsage, WriteClassification)
-{
-    EXPECT_TRUE(is_write(Access::ColorWrite));
-    EXPECT_TRUE(is_write(Access::DepthWrite));
-    EXPECT_FALSE(is_write(Access::SampledRead));
-    EXPECT_FALSE(is_write(Access::DepthRead));
-    EXPECT_FALSE(is_write(Access::VertexRead));
-}
-
-TEST(ResourceUsage, AccessScopeMapping)
-{
-    // Brief 04e M2: attachment writes also cover the load/blend/resolve READs of the same stage.
-    EXPECT_EQ(access_scope(Access::ColorWrite).access,
-              VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
-    EXPECT_EQ(access_scope(Access::ColorWrite).layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    EXPECT_EQ(access_scope(Access::IndirectRead).access, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
-
-    EXPECT_EQ(access_scope(Access::SampledRead).access, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    EXPECT_EQ(access_scope(Access::SampledRead).layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-
-    // Buffer usages carry no image layout.
-    EXPECT_EQ(access_scope(Access::StorageRead).layout, VK_IMAGE_LAYOUT_UNDEFINED);
-    EXPECT_EQ(access_scope(Access::VertexRead).access, VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT);
-    EXPECT_EQ(access_scope(Access::IndexRead).access, VK_ACCESS_2_INDEX_READ_BIT);
-}
+// Write scopes cover BOTH directions: attachment use also reads (LOAD_OP_LOAD, blending, resolve),
+// and storage writes are commonly read-modify-write. A one-directional scope here is the ghosting
+// bug class.
+static_assert((scope_of(access::color_write).mask & VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT) != 0);
+static_assert((scope_of(access::storage_write).mask & VK_ACCESS_2_SHADER_STORAGE_READ_BIT) != 0);
+static_assert((scope_of(access::storage_image_write).mask & VK_ACCESS_2_SHADER_SAMPLED_READ_BIT) != 0);

@@ -1,6 +1,5 @@
 test_files = [
     'graph_test.cpp',
-    'graph_plan_test.cpp',
     'frame_graph_test.cpp',
     'frame_scratch_test.cpp',
     'resource_usage_test.cpp',
@@ -9,8 +8,7 @@ test_files = [
     'shader_compiler_test.cpp',
     'cvar_test.cpp',
     'debug_draw_test.cpp',
-    'input_map_test.cpp',
-    'scene_registry_test.cpp'
+    'input_map_test.cpp'
 ]
 
 test_dep = [

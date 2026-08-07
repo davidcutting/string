@@ -15,33 +15,35 @@ namespace sandbox
 
 // The renderer's vocabulary, unqualified for the app.
 //
-// The app is a CONSUMER of `string::render` — it authors a RenderPlan out of that renderer's
-// passes, drives its UI pass, and reads its per-frame stats for the debug surfaces. Re-exporting
-// the handful of names it touches keeps the call sites readable without a blanket
-// `using namespace`, and the list doubles as an honest inventory of the app→renderer surface:
-// if it grows, the app is reaching too far in.
+// The app is a CONSUMER of `string::render` — it constructs that renderer's pass objects, declares
+// them onto its own frame_graph, drives its UI pass, and reads per-frame stats for the debug
+// surfaces. Re-exporting the handful of names it touches keeps call sites readable without a blanket
+// `using namespace`, and the list doubles as an honest inventory of the app->renderer surface: if it
+// grows, the app is reaching too far in.
+//
+// Brief 20: the nine wrapper *Pass names are gone. What the app names now are the COMPONENTS —
+// plain objects it owns and declares — not pass subclasses the renderer drove.
 using string::render::GpuMeshStats;
 using string::render::InspectorDraw;
 using string::render::InspectorLight;
 using string::render::MeshOverlayStats;
-using string::render::DebugLinePass;
-using string::render::FroxelPass;
-using string::render::GeometryPass;
-using string::render::GeometryPhase2Pass;
-using string::render::GiPass;
-using string::render::Grid2DPass;
-using string::render::GtaoPass;
-using string::render::HizBuildPass;
-using string::render::IblPass;
-using string::render::PostProcessPass;
-using string::render::ShadowPass;
-using string::render::SkyPass;
-using string::render::TransparencyPass;
-using string::render::UIBackgroundPass;
+using string::render::debug_line_pass;
+using string::render::froxel_component;
+using string::render::geometry_pass;
+using string::render::grid_2d_pass;
+using string::render::gtao_chain;
+using string::render::ibl_component;
+using string::render::post_pass;
+using string::render::probe_gi_component;
+using string::render::shadow_maps;
+using string::render::shadertoy_pass;
+using string::render::sky_component;
+using string::render::sorted_transparency;
+using string::render::ui_background_pass;
 using string::client::UiAnchor;
 using string::client::UiScene;
 using string::client::UiSceneDriver;
-using string::render::UIPass;
+using string::render::ui_pass;
 
 // Two renderer CVars the app's debug UI drives: the draw-isolation bisection lever the inspector
 // writes, and the UI screen selector the headless dump gate reads.

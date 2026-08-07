@@ -3,10 +3,11 @@
 #include <memory>
 
 #include <string/gpu/device.hpp>
+#include <string/gpu/pass_context.hpp>
 #include <string/gpu/pipeline.hpp>
 #include <string/gpu/shader_program_registry.hpp>
 #include <string/vulkan/engine_context.hpp>
-#include <string/vulkan/render_pass.hpp>
+#include <string/vulkan/frame_graph.hpp>
 
 #include <volk.h>
 
@@ -16,22 +17,29 @@ namespace string::render
 
 // The ui-dev sandbox background (brief 05, milestone 0): a fullscreen flat-design gradient drawn
 // before the UI, standing in for the geometry pass's sky when the "ui" scene runs no geometry.
-// Hot-reloadable Slang (ui_background.slang) via the registry, like UIPass.
-class UIBackgroundPass final : public String::Pass
+// Hot-reloadable Slang (ui_background.slang) via the registry, like the UI pass.
+//
+// Brief 20: a plain app-owned object. declare() authors it onto the app's graph; tick() advances the
+// gradient's clock and is ordinary app code, not a graph concept.
+class ui_background_pass
 {
 public:
-    explicit UIBackgroundPass(String::engine_context& context);
-    ~UIBackgroundPass() override;
+    // `samples` is the MSAA sample count of the attachments this draws into.
+    ui_background_pass(String::engine_context& ctx, VkSampleCountFlagBits samples);
+    ~ui_background_pass();
 
-    UIBackgroundPass(const UIBackgroundPass&) = delete;
-    UIBackgroundPass& operator=(const UIBackgroundPass&) = delete;
+    ui_background_pass(const ui_background_pass&) = delete;
+    ui_background_pass& operator=(const ui_background_pass&) = delete;
 
-    std::string_view debug_name() const override { return "ui_background"; }
+    // Author onto the graph: a colour write into the scene target, sharing the depth attachment
+    // read-only (the pipeline declares the D32 format but neither tests nor writes depth).
+    void declare(::string::frame_graph& fg, ::string::gpu::image color, ::string::gpu::image depth);
 
-    void update(float delta_time, uint16_t current_frame) override;
-    void record(::string::gpu::command_recorder& recorder, uint16_t current_frame) override;
+    void tick(float dt);
 
 private:
+    void record(::string::pass_context& ctx);
+
     struct Push
     {
         float screen_size[2];

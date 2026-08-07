@@ -196,7 +196,11 @@ TextureStreamer::Registered TextureStreamer::add(const std::filesystem::path& pa
     // placeholder so nothing samples the empty image.)
     descriptor_table_.bind(image, ::string::gpu::descriptor_type::TEXTURE);
     t.slot = descriptor_table_.get_binding_slot(image, ::string::gpu::descriptor_type::TEXTURE);
-    descriptor_table_.update_texture(t.slot, placeholder_view_, placeholder_sampler_);
+    // BRIEF 20 REGRESSION — see the brief's "texture streaming" note. update_texture is deleted, and
+    // nothing replaces per-slot residency rebinding: the placeholder swap and the adjustable minLod
+    // both needed it. bind() writes the image's OWN view and sampler, which is correct once a texture
+    // is fully resident and wrong while it is streaming in.
+    descriptor_table_.bind(image, ::string::gpu::descriptor_type::TEXTURE);
 
     const std::uint32_t slot = t.slot;
     const std::uint32_t levels = t.levels;
@@ -290,11 +294,15 @@ void TextureStreamer::on_resident(::string::gpu::resource_id id, std::uint32_t d
     Texture& t = textures_.at(id);
     if (detail == 0)
     {
-        descriptor_table_.update_texture(t.slot, placeholder_view_, placeholder_sampler_);
+        // BRIEF 20 REGRESSION — see the brief's "texture streaming" note. update_texture is deleted, and
+    // nothing replaces per-slot residency rebinding: the placeholder swap and the adjustable minLod
+    // both needed it. bind() writes the image's OWN view and sampler, which is correct once a texture
+    // is fully resident and wrong while it is streaming in.
+    descriptor_table_.bind(id, ::string::gpu::descriptor_type::TEXTURE);
         return;
     }
     // Swap the slot from the placeholder to the real image at the new minLod.
-    descriptor_table_.update_texture(t.slot, t.view, sampler_for(base_of(t, detail)));
+    descriptor_table_.bind(id, ::string::gpu::descriptor_type::TEXTURE);   // see note above
 }
 
 void TextureStreamer::evict(::string::gpu::resource_id id, std::uint32_t /*from_detail*/, std::uint32_t to_detail)
@@ -303,11 +311,15 @@ void TextureStreamer::evict(::string::gpu::resource_id id, std::uint32_t /*from_
     Texture& t = textures_.at(id);
     if (to_detail == 0)
     {
-        descriptor_table_.update_texture(t.slot, placeholder_view_, placeholder_sampler_);
+        // BRIEF 20 REGRESSION — see the brief's "texture streaming" note. update_texture is deleted, and
+    // nothing replaces per-slot residency rebinding: the placeholder swap and the adjustable minLod
+    // both needed it. bind() writes the image's OWN view and sampler, which is correct once a texture
+    // is fully resident and wrong while it is streaming in.
+    descriptor_table_.bind(id, ::string::gpu::descriptor_type::TEXTURE);
     }
     else
     {
-        descriptor_table_.update_texture(t.slot, t.view, sampler_for(base_of(t, to_detail)));
+        descriptor_table_.bind(id, ::string::gpu::descriptor_type::TEXTURE);   // see note above
     }
 }
 
