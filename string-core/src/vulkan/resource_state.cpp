@@ -139,8 +139,19 @@ void resource_state_tracker::transition_scope(VkCommandBuffer cmd, VkImage image
                 after.last_write_stage = stage;
                 after.last_write_access = target.mask;
                 after.reader_stages = 0;
-                after.visible_stages = stage;
-                after.visible_access = target.mask;
+                // NOTHING IS VISIBLE AFTER A WRITE — visibility is established BY a memory
+                // dependency, and a later reader has not had one yet. Recording the write's own
+                // stage/mask here (as this used to) let the read path's "already visible, skip the
+                // barrier" shortcut fire on a read-after-write and emit nothing at all:
+                // scope_of(storage_image_write) is WRITE|STORAGE_READ|SAMPLED_READ — deliberately,
+                // for sample-then-write compute — which is a SUPERSET of storage_image_read's mask,
+                // so the shortcut's test always passed and the reader silently got the subresource
+                // as of the start of the frame. Only same-layout reads were affected; a read that
+                // also changes layout takes the branch above and always emitted its barrier.
+                // Found via a cubemap mip chain (write mip m, next pass reads mip m) that needed
+                // two bakes to converge. Sync validation does NOT flag this: zero hazards reported.
+                after.visible_stages = 0;
+                after.visible_access = 0;
             }
             for (std::uint32_t i = 0; i < run; ++i) t.at(mip + i, layer) = after;
             mip += run;

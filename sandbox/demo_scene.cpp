@@ -87,6 +87,19 @@ std::function<void(float)> make_geometry_scene(
     std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t np_stress, string::renderer& rr,
     bool lookdev = false);
 struct scene_resources;
+// Per-frame streaming uploads, INSIDE the frame (brief 21 step 5). Authored first so the copies land
+// before anything samples this frame; they touch resources the graph does not own — streamed
+// textures reached through bindless slots, the geometry heaps — so there is nothing for it to
+// declare, and the pass states that undeclarable edge itself with one conservative barrier (see
+// TransferBatch::record). It replaced a second submission path that ran beside the frame.
+//
+// EVERY SCENE MUST DECLARE THIS, which is why it is a shared helper rather than a block inside one
+// scene. It is engine plumbing, not geometry plumbing: TransferBatch is an engine service that
+// stages uploads for anyone, and this pass is the ONLY thing that records them. It used to live only
+// in make_geometry_scene, so the UI scene staged composite_pass's tonemap LUT and nothing ever
+// copied it — the composite sampled an empty LUT and presented BLACK. Captures hid it completely,
+// because declare_capture tonemaps on the CPU through lut_cpu_ and never touches the GPU LUT.
+void declare_stream_uploads(string::frame_graph& fg, string::engine_context& ctx);
 std::function<void(float)> make_shader_scene(
     string::frame_graph& fg, string::engine_context& ctx, const std::filesystem::path& shader,
     std::shared_ptr<string::dynamic_font_atlas> atlas, string::renderer& rr);
@@ -1003,6 +1016,14 @@ struct ui_scene_state
     scene_resources res;
 };
 
+void declare_stream_uploads(string::frame_graph& fg, string::engine_context& ctx)
+{
+    string::TransferBatch* transfer = &ctx.transfer;
+    fg.pass("uploads.stream")
+      .toggle([transfer] { return transfer->pending(); })
+      .transfer([transfer](string::pass_context& pc) { transfer->record(pc.rec.get_command_buffer()); });
+}
+
 std::function<void(float)> make_ui_scene(
     string::frame_graph& fg, string::engine_context& ctx,
     std::shared_ptr<string::dynamic_font_atlas> atlas, string::renderer& rr)
@@ -1014,8 +1035,20 @@ std::function<void(float)> make_ui_scene(
     const std::string screen = cv_ui_screen().get();
 
     auto s = std::make_shared<ui_scene_state>();
-    s->res = declare_resources(fg, scene_viewport(), kSceneSamples, 2048, 0, 256, 256, nullptr);
-    s->bg = std::make_unique<ui_background_pass>(ctx, kSceneSamples);
+    declare_stream_uploads(fg, ctx);
+    // SINGLE-SAMPLE, and the UI draws straight into scene.hdr — see the declare block below.
+    // `scene.hdr` is the RESOLVE target of the multisampled `scene.color`, and the only thing that
+    // ever declares that resolve pair is the geometry pass (`geo->declare(fg, color, hdr, ...)`:
+    // two colour writes at different sample counts IS the resolve, per derive_groups). A UI-only
+    // scene has no geometry pass, so at kSceneSamples nothing wrote hdr and composite tonemapped an
+    // untouched target — the whole scene rendered black.
+    //
+    // 1x rather than resolving because MSAA earns nothing here: there is no 3D geometry, and both
+    // UI shaders antialias themselves analytically (ui_shader's SDF rounded box takes ~1px coverage
+    // from smoothstep(-0.5, 0.5, d); text_shader uses a fwidth-wide smoothstep on the glyph
+    // distance). 4x would cost a full-res 4x colour + 4x depth to improve edges nothing rasterizes.
+    s->res = declare_resources(fg, scene_viewport(), VK_SAMPLE_COUNT_1_BIT, 2048, 0, 256, 256, nullptr);
+    s->bg = std::make_unique<ui_background_pass>(ctx, VK_SAMPLE_COUNT_1_BIT);
 
     // Shared between the author and the post-layout hook: the workspace is authored before layout
     // and observed after it, and both need the same instance.
@@ -1025,14 +1058,16 @@ std::function<void(float)> make_ui_scene(
     auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
     auto dbg_panels = std::make_shared<debug::DebugPanels>();
     s->ui = std::make_unique<ui_pass>(
-        ctx, kSceneSamples, atlas,
+        ctx, VK_SAMPLE_COUNT_1_BIT, atlas,
         make_ui_dev_author(std::make_shared<UiScene>(), anchor_count, dbg_panels, np_budget, screen,
                            ws, ui_slot),
         make_ui_observer(ui_slot, ws), make_deferred_author(ui_slot));
     s->composite = std::make_unique<string::composite_pass>(ctx, rr.swapchain_format());
 
-    s->bg->declare(fg, s->res.color, s->res.depth);
-    s->ui->declare(fg, s->res.color);
+    // Straight into hdr: it is what composite and the capture read, and with no geometry pass in
+    // this scene nothing else would ever write it.
+    s->bg->declare(fg, s->res.hdr, s->res.depth);
+    s->ui->declare(fg, s->res.hdr);
     s->composite->declare(fg, s->res.hdr, s->res.swapchain);
     rr.declare_capture(fg, s->res.hdr);
 
@@ -1094,17 +1129,7 @@ std::function<void(float)> make_geometry_scene(
         r.gi_cube_albedo, r.gi_cube_nd, r.gi_cube_depth,
         r.gi_active, r.gi_offset, r.gi_meshlet_table };
 
-    // Per-frame streaming uploads, INSIDE the frame (brief 21 step 5). Authored first so the copies
-    // land before anything samples this frame; they touch resources the graph does not own —
-    // streamed textures reached through bindless slots, the geometry heaps — so there is nothing for
-    // it to declare, and the pass states that undeclarable edge itself with one conservative barrier
-    // (see TransferBatch::record). It replaced a second submission path that ran beside the frame.
-    {
-        string::TransferBatch* transfer = &ctx.transfer;
-        fg.pass("uploads.stream")
-          .toggle([transfer] { return transfer->pending(); })
-          .transfer([transfer](string::pass_context& pc) { transfer->record(pc.rec.get_command_buffer()); });
-    }
+    declare_stream_uploads(fg, ctx);
 
     s->froxel->declare(fg, r.froxels, r.lights);
     s->ibl->declare(fg, r.env_capture, r.env_prefiltered, r.dfg_lut, r.ibl_sh);
