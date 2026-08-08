@@ -89,6 +89,48 @@ std::optional<View::Extent> scripted_resize()
     STRING_LOG_INFO("[resize] STRING_RESIZE_AT: {}x{} at frame {}", w, h, frame);
     return View::Extent{ w, h };
 }
+
+// STRING_MAXIMIZE_AT=frame — ask the WINDOW MANAGER to maximize on the nominated frame. Distinct
+// from STRING_RESIZE_AT, which calls renderer::resize directly and never touches the window: that
+// leaves the SDL window at its old size and only exercises the renderer half. Maximizing goes
+// through the platform, so the size change comes back as a real window event with compositor-chosen
+// geometry — which is the reported trigger and the one path nothing headless could reach.
+// STRING_RESIZE_STORM=<frames> — drag-resize simulation: a new window width every frame, through
+// the platform, for `frames` frames. A drag emits a continuous stream of window events, which is a
+// materially different path from one resize at rest: the swapchain goes OUT_OF_DATE repeatedly and
+// the presenter's own recreate path runs between the renderer's. Nothing else could reach it.
+std::optional<View::Extent> scripted_storm()
+{
+    static unsigned frames = 0;
+    static const bool parsed = [] {
+        if (const char* s = std::getenv("STRING_RESIZE_STORM")) std::sscanf(s, "%u", &frames);
+        return true;
+    }();
+    (void)parsed;
+    static std::uint64_t frame = 0;
+    if (frames == 0 || ++frame > frames) return std::nullopt;
+    // Deterministic, non-monotonic widths so the sequence both grows and shrinks (a shrink reuses
+    // memory a grow does not). Height fixed, matching a horizontal drag.
+    static const unsigned widths[] = { 900, 1338, 1000, 1351, 1180, 1415, 960, 1370, 1024, 1391 };
+    return View::Extent{ widths[frame % (sizeof(widths) / sizeof(widths[0]))], 800 };
+}
+
+bool scripted_maximize()
+{
+    static unsigned at = 0;
+    static const bool parsed = [] {
+        if (const char* s = std::getenv("STRING_MAXIMIZE_AT")) std::sscanf(s, "%u", &at);
+        return true;
+    }();
+    (void)parsed;
+    static std::uint64_t frame = 0;
+    static bool fired = false;
+    ++frame;
+    if (fired || at == 0 || frame < at) return false;
+    fired = true;
+    STRING_LOG_INFO("[resize] STRING_MAXIMIZE_AT: maximizing at frame {}", frame);
+    return true;
+}
 }  // namespace
 
 void Application::run() {
@@ -191,6 +233,8 @@ void Application::run() {
         // would be the exact class of bug this brief exists to remove.
 
         if (const std::optional<View::Extent> forced = scripted_resize()) pending_resize_ = *forced;
+        if (scripted_maximize()) window_->maximize();
+        if (const std::optional<View::Extent> storm = scripted_storm()) window_->set_size(*storm);
 
         // Apply a latched window resize between frames — no command buffer is recording and the
         // renderer waits the device idle before swapping any backing.

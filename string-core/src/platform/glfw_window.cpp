@@ -211,6 +211,17 @@ void Window::resize(const View::Extent& extent)
     }
 }
 
+void Window::maximize()
+{
+    glfwMaximizeWindow((GLFWwindow*)window_handle_);
+}
+
+void Window::set_size(const View::Extent& extent)
+{
+    glfwSetWindowSize((GLFWwindow*)window_handle_, static_cast<int>(extent.width),
+                      static_cast<int>(extent.height));
+}
+
 void Window::key_action(int key, int scancode, int action, int mods)
 {
     (void)key;

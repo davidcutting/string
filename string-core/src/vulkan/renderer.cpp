@@ -672,8 +672,6 @@ void renderer::capture(const std::string& path)
     // A D32 source (a shadow cascade, the resolved depth) captures as raw depth -> grayscale;
     // everything else is treated as the RGBA16F scene target.
     const bool depth_source = img.format == VK_FORMAT_D32_SFLOAT;
-    const VkImageAspectFlags aspect = depth_source ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                                   : VK_IMAGE_ASPECT_COLOR_BIT;
     const VkExtent2D size{ img.extent.width, img.extent.height };
     void* mapped = allocator_.get_buffer(capture_staging_).allocation_info.pMappedData;
     if (mapped == nullptr) return;

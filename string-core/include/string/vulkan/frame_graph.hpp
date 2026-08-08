@@ -424,6 +424,10 @@ private:
     static VkImageAspectFlags aspect_of(VkFormat format);
     // One-shot clear of each neutral fallback to its declared value, on the first executed frame.
     void init_fallbacks(VkCommandBuffer cmd);
+    // Transients queued for a one-shot clear to their declared neutral, because freshly allocated
+    // backing is undefined and a resize hands back RECYCLED memory. See init_fallbacks().
+    std::vector<gpu::image> pending_inits_;
+    std::vector<gpu::buffer> pending_buffer_inits_;
     VkSampleCountFlagBits samples_of(gpu::image h) const;
     // Is this resource produced by a pass that survived this frame's conditionals? Persistent
     // resources always count: their contents outlive the frame, so a skipped producer means "not

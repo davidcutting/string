@@ -449,7 +449,11 @@ void compiled_frame::materialize(string::engine_context& ctx, VkExtent2D viewpor
             }
             info.format = ti.format;
             info.tiling = VK_IMAGE_TILING_OPTIMAL;
-            info.usage = ti.usage;
+            // TRANSFER_DST is added by the GRAPH, not declared by the app: the graph owns transient
+            // backing and now guarantees its initial contents (the neutral init in init_fallbacks),
+            // which it can only do if it is allowed to clear the image. Declaring it at 20 call
+            // sites would be the app paying for the graph's own invariant.
+            info.usage = ti.usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             info.aspect_flags = ti.aspect;
             info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
             info.allocation_flags = 0;
@@ -501,6 +505,13 @@ void compiled_frame::materialize(string::engine_context& ctx, VkExtent2D viewpor
     };
 
     const auto image_count = static_cast<std::uint32_t>(graph_->images_.size());
+    // Every transient just got fresh backing whose contents are undefined — queue the one-shot
+    // neutral init. Done here rather than at the call sites so it cannot be forgotten by whichever
+    // path (compile or resize) materialised them.
+    pending_inits_.clear();
+    for (std::uint32_t i = 0; i < image_count; ++i)
+        if (graph_->images_[i].transient) pending_inits_.push_back(gpu::image{ i });
+
     for (std::uint32_t i = 0; i < image_count; ++i)
     {
         frame_graph::image_record& r = graph_->images_[i];
@@ -557,7 +568,9 @@ void compiled_frame::materialize(string::engine_context& ctx, VkExtent2D viewpor
         {
             info.size = r.info.bytes;
         }
-        info.usage = r.info.usage;
+        // TRANSFER_DST for the same reason the images get it: the graph guarantees the initial
+        // contents of backing it owns, and zero-filling is how.
+        info.usage = r.info.usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.memory_usage = r.info.memory_usage;
         info.allocation_flags = r.info.allocation_flags;
 
@@ -566,6 +579,16 @@ void compiled_frame::materialize(string::engine_context& ctx, VkExtent2D viewpor
         transient_bytes_ += info.size;
         ++transient_count_;
     }
+
+    // Transient BUFFERS need the same one-shot init as the images, and for a sharper reason: this
+    // graph is GPU-driven, so a transient buffer holds DRAW COUNTS and indirect dispatch arguments.
+    // Recycled memory there is not a speckle, it is an indirect dispatch over a garbage count —
+    // which is a GPUVM fault, not a visual artifact. Zero is the safe value for every one of them
+    // (a count of zero draws nothing), and zero is exactly what fresh pages give at startup, which
+    // is why this only ever bit after a resize.
+    pending_buffer_inits_.clear();
+    for (std::size_t i = 0; i < graph_->buffers_.size(); ++i)
+        if (graph_->buffers_[i].transient) pending_buffer_inits_.push_back(gpu::buffer{ static_cast<std::uint32_t>(i) });
 }
 
 // Tell the tracker what layout each persistent's backing is ALREADY in. Without this the first
@@ -582,8 +605,16 @@ void compiled_frame::bind_declared_slots()
     if (kTraceMap)
         for (const frame_graph::image_record& rec : graph_->images_)
             for (gpu::resource_id pid : rec.physical)
-                if (pid != 0) STRING_LOG_INFO("[map] {} vk={:#x}", rec.name,
-                    reinterpret_cast<std::uintptr_t>(ctx_->allocator.get_image(pid).image));
+                if (pid != 0)
+                {
+                    const gpu::allocated_image& ai = ctx_->allocator.get_image(pid);
+                    // The EXTENT is the point of this trace after a resize: a target that stopped
+                    // following the viewport is invisible in a handle-to-VkImage mapping alone.
+                    STRING_LOG_INFO("[map] {} vk={:#x} {}x{} mips={} samples={}", rec.name,
+                                    reinterpret_cast<std::uintptr_t>(ai.image),
+                                    ai.extent.width, ai.extent.height, ai.mip_levels,
+                                    static_cast<int>(ai.samples));
+                }
     const auto slots = static_cast<std::uint32_t>(ctx_->frames_in_flight);
     for (const pass_decl& p : graph_->passes_)
     {
@@ -839,6 +870,8 @@ void compiled_frame::resize(string::engine_context& ctx, VkExtent2D viewport)
         // The re-created transients hold nothing yet; content-existence restarts with the backing.
         if (r.transient) r.ever_written = false;
     }
+    // pending_inits_ was refilled by materialize() above — the new backing is undefined and the
+    // allocator will have handed back memory the OLD transients were still holding.
 }
 
 // ================================================================================================
@@ -1238,6 +1271,11 @@ void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std:
     const VkViewport viewport = { 0.0f, 0.0f, static_cast<float>(extent.width),
                                   static_cast<float>(extent.height), 0.0f, 1.0f };
     const VkRect2D scissor = { { 0, 0 }, extent };
+    if (kTracePass)
+        STRING_LOG_INFO("[group] open first='{}' renderArea {}x{} (frame {}x{}) colors={}",
+                        graph_->passes_[order_[g.first]].name,
+                        extent.width, extent.height, frame_extent.width, frame_extent.height,
+                        g.colors.size());
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 }
@@ -1248,6 +1286,83 @@ void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std:
 // Note: descriptor_for() is defined in the anonymous namespace above.
 void compiled_frame::init_fallbacks(VkCommandBuffer cmd)
 {
+    // FRESH TRANSIENT BACKING IS UNDEFINED, and undefined is not the same as harmless. A pass that
+    // only reads back what it wrote (GTAO's hysteresis, the bloom up-chain's accumulate) propagates
+    // whatever was in that memory forever, so the frame never converges away from it. At startup
+    // this is invisible — the driver hands out zeroed pages — but a RESIZE frees every transient and
+    // re-allocates, and the allocator hands the memory straight back with the previous contents
+    // still in it. That is the window-edge speckle: recycled memory, fed back by an accumulating
+    // consumer, which is why it appeared only after a resize and only from some starting sizes.
+    //
+    // Initialising to the declared NEUTRAL — already defined as "the value that cancels" for the
+    // degrade path — is the same answer this graph already gives for a resource whose producer did
+    // not run, so a transient's first frame reads the same value either way.
+    for (const gpu::image h : pending_inits_)
+    {
+        const frame_graph::image_record& r = graph_->images_[h.index];
+        for (const gpu::resource_id pid : r.physical)
+        {
+            if (pid == 0) continue;
+            const gpu::allocated_image& img = ctx_->allocator.get_image(pid);
+            const VkImageAspectFlags aspect = aspect_of(img.format);
+
+            // Track and clear the SAME subresource set. A cube transient (the probe capture) has 6
+            // layers; clearing all of them while tracking one leaves the other five in a layout the
+            // tracker never recorded, which surfaces as a submit-time layout mismatch rather than
+            // anything visible.
+            subresource sub;
+            sub.aspect = aspect;
+            sub.base_mip = 0;
+            sub.mip_count = img.mip_levels;
+            sub.base_layer = 0;
+            sub.layer_count = img.array_layers;
+            states_.track(img.image, aspect, img.mip_levels, img.array_layers);
+            states_.transition(cmd, img.image, sub, access::transfer_write,
+                               VK_PIPELINE_STAGE_2_CLEAR_BIT, /*discard=*/true);
+
+            const VkImageSubresourceRange range{ aspect, 0, img.mip_levels, 0, img.array_layers };
+            if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
+            {
+                const VkClearDepthStencilValue value{ r.neutral.float32[0], 0 };
+                vkCmdClearDepthStencilImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            &value, 1, &range);
+            }
+            else
+            {
+                vkCmdClearColorImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     &r.neutral, 1, &range);
+            }
+        }
+    }
+    pending_inits_.clear();
+
+    for (const gpu::buffer h : pending_buffer_inits_)
+    {
+        const frame_graph::buffer_record& r = graph_->buffers_[h.index];
+        for (const gpu::resource_id pid : r.physical)
+        {
+            if (pid == 0) continue;
+            const gpu::allocated_buffer& buf = ctx_->allocator.get_buffer(pid);
+            vkCmdFillBuffer(cmd, buf.buffer, 0, VK_WHOLE_SIZE, 0u);
+        }
+    }
+    // One barrier for the whole fill: everything downstream reads these as shader/indirect data.
+    if (!pending_buffer_inits_.empty())
+    {
+        VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        // ALL_TRANSFER, not COPY: vkCmdFillBuffer executes in the CLEAR stage, so a COPY-scoped
+        // source does not cover these writes and the first reset pass races the init.
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &dep);
+        pending_buffer_inits_.clear();
+    }
+
     if (pending_fallbacks_.empty()) return;
 
     for (gpu::image h : pending_fallbacks_)

@@ -54,6 +54,7 @@ public:
     void register_resize_event_callback(const ResizeEventCallbackFn& fn);
 
     const Properties& get_properties() const;
+    // LOGICAL window units — what the platform reports for window geometry and pointer coordinates.
     const View::Extent& get_extent() const;
     // Polled input state, refreshed by update() each frame (see Input). Stable for the window's
     // lifetime, so consumers can hold the reference. The non-const overload lets a driver (e.g. a
@@ -62,6 +63,14 @@ public:
     Input& get_input() { return input_; }
     bool should_close() const;
     void resize(const View::Extent& extent);
+    // Ask the window manager to maximize. Distinct from resize(): it goes through the PLATFORM, so
+    // the size change arrives as a real window event with whatever geometry the compositor picks.
+    // STRING_RESIZE_AT drives renderer::resize directly and never touches the window, so it cannot
+    // reach this path — and maximizing is the reported trigger for the window-edge artifact.
+    void maximize();
+    // Ask the window manager for a new size. Like maximize(), this goes through the PLATFORM, so the
+    // change comes back as a real window event — which is what drives the full renderer resize.
+    void set_size(const View::Extent& extent);
     void key_action(int key, int scancode, int action, int mods);
     void mouse_action(double xpos, double ypos);
 

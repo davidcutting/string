@@ -229,7 +229,7 @@ Window::Window(const Properties& properties)
     
     int width, height;
     SDL_GetWindowSize(window_handle, &width, &height);
-    
+
     properties_.extent.width = static_cast<uint32_t>(width);
     properties_.extent.height = static_cast<uint32_t>(height);
 
@@ -490,6 +490,17 @@ const View::Extent& Window::get_extent() const
 bool Window::should_close() const
 {
     return closing;
+}
+
+void Window::maximize()
+{
+    SDL_MaximizeWindow((SDL_Window*)window_handle_);
+}
+
+void Window::set_size(const View::Extent& extent)
+{
+    SDL_SetWindowSize((SDL_Window*)window_handle_, static_cast<int>(extent.width),
+                      static_cast<int>(extent.height));
 }
 
 void* Window::get_native_handle() const
