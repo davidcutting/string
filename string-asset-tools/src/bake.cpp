@@ -278,7 +278,7 @@ void split_recursive(const std::vector<uint32_t>& src, const std::vector<float>&
 
 }  // namespace
 
-uint64_t content_hash(const std::vector<String::Vertex>& vertices,
+uint64_t content_hash(const std::vector<string::Vertex>& vertices,
                       const std::vector<uint32_t>& indices,
                       const std::vector<GltfDraw>& draws)
 {
@@ -289,13 +289,13 @@ uint64_t content_hash(const std::vector<String::Vertex>& vertices,
     const uint32_t params[] = { kMeshletMaxVertices, kMeshletMaxTriangles, kMaxLods };
     h = fnv1a(params, sizeof(params), h);
     h = fnv1a(&kMeshletConeWeight, sizeof(kMeshletConeWeight), h);
-    h = fnv1a(vertices.data(), vertices.size() * sizeof(String::Vertex), h);
+    h = fnv1a(vertices.data(), vertices.size() * sizeof(string::Vertex), h);
     h = fnv1a(indices.data(), indices.size() * sizeof(uint32_t), h);
     h = fnv1a(draws.data(), draws.size() * sizeof(GltfDraw), h);
     return h;
 }
 
-CookedScene bake_scene(const std::vector<String::Vertex>& vertices,
+CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
                        const std::vector<uint32_t>& indices,
                        const std::vector<GltfDraw>& draws,
                        const BakeParams& params)
@@ -382,7 +382,7 @@ CookedScene bake_scene(const std::vector<String::Vertex>& vertices,
     //     => meshopt output is bit-identical to the old per-draw path — the budget-0 parity gate).
     //   - Split chunks gather their unique vertices in first-use order (deterministic).
     // Chunk indices are remapped into the packed stream; [vmin, vmax] becomes the packed range.
-    std::vector<String::Vertex> packed;
+    std::vector<string::Vertex> packed;
     packed.reserve(vertices.size());
     for (BakeChunk& c : chunks)
     {

@@ -25,7 +25,7 @@ class ui_background_pass
 {
 public:
     // `samples` is the MSAA sample count of the attachments this draws into.
-    ui_background_pass(String::engine_context& ctx, VkSampleCountFlagBits samples);
+    ui_background_pass(string::engine_context& ctx, VkSampleCountFlagBits samples);
     ~ui_background_pass();
 
     ui_background_pass(const ui_background_pass&) = delete;

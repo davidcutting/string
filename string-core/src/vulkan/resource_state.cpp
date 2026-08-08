@@ -42,6 +42,13 @@ void resource_state_tracker::track(VkImage image, VkImageAspectFlags aspect,
 void resource_state_tracker::transition(VkCommandBuffer cmd, VkImage image, const subresource& sub,
                                         access how, VkPipelineStageFlags2 stage, bool discard)
 {
+    transition_scope(cmd, image, sub, scope_of(how), stage, is_write(how), discard);
+}
+
+void resource_state_tracker::transition_scope(VkCommandBuffer cmd, VkImage image,
+                                              const subresource& sub, const access_scope& target,
+                                              VkPipelineStageFlags2 stage, bool write, bool discard)
+{
     image_track& t = images_[image];
     if (t.cells.empty())
     {
@@ -51,9 +58,6 @@ void resource_state_tracker::transition(VkCommandBuffer cmd, VkImage image, cons
         t.layers = std::max(sub.base_layer + sub.layer_count, 1u);
         t.cells.assign(static_cast<std::size_t>(t.mips) * t.layers, sync_state{});
     }
-
-    const access_scope target = scope_of(how);
-    const bool write = is_write(how);
 
     // Clamping to the tracked grid is only safe because track() grows it to fit — otherwise a
     // whole-image use silently covers a subset while recording that it covered everything.
@@ -72,7 +76,13 @@ void resource_state_tracker::transition(VkCommandBuffer cmd, VkImage image, cons
             std::uint32_t run = 1;
             while (mip + run < mip_end && t.at(mip + run, layer) == before) ++run;
 
-            if (std::getenv("STRING_TRACE_IMG") && reinterpret_cast<std::uintptr_t>(image) == std::strtoull(std::getenv("STRING_TRACE_IMG"), nullptr, 0))
+            // Resolved once: this sits in the per-subresource loop of every transition, so a getenv
+            // + strtoull per cell per frame was the cost of a lever that cannot change at runtime.
+            static const std::uintptr_t traced_image = [] {
+                const char* e = std::getenv("STRING_TRACE_IMG");
+                return e != nullptr ? std::strtoull(e, nullptr, 0) : 0ull;
+            }();
+            if (traced_image != 0 && reinterpret_cast<std::uintptr_t>(image) == traced_image)
                 STRING_LOG_INFO("[trk] mip={} run<= layer={} old={} want={} write={} discard={}", mip, layer, int(before.layout), int(target.layout), write, discard);
             const bool layout_change = discard || target.layout != before.layout;
             sync_state after = before;
@@ -86,13 +96,13 @@ void resource_state_tracker::transition(VkCommandBuffer cmd, VkImage image, cons
                 }
                 else
                 {
-                    String::vku::transition_image(cmd, {
+                    string::vku::transition_image(cmd, {
                         .image = image,
                         .old_layout = before.layout,
                         .new_layout = before.layout,
-                        .src_stage = before.last_write_stage,
+                        .src_stage = legalize(before.last_write_stage),
                         .src_access = before.last_write_access,
-                        .dst_stage = stage,
+                        .dst_stage = legalize(stage),
                         .dst_access = target.mask,
                         .aspect = t.aspect,
                         .base_mip = mip,
@@ -111,13 +121,13 @@ void resource_state_tracker::transition(VkCommandBuffer cmd, VkImage image, cons
                 // every reader since it (WAR — an execution dependency; readers need no availability).
                 VkPipelineStageFlags2 src_stage = before.last_write_stage | before.reader_stages;
                 if (src_stage == 0) src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-                String::vku::transition_image(cmd, {
+                string::vku::transition_image(cmd, {
                     .image = image,
                     .old_layout = discard ? VK_IMAGE_LAYOUT_UNDEFINED : before.layout,
                     .new_layout = target.layout,
-                    .src_stage = src_stage,
+                    .src_stage = legalize(src_stage),
                     .src_access = before.last_write_access,
-                    .dst_stage = stage,
+                    .dst_stage = legalize(stage),
                     .dst_access = target.mask,
                     .aspect = t.aspect,
                     .base_mip = mip,
@@ -184,15 +194,31 @@ void resource_state_tracker::buffer_access(gpu::resource_id resource, access how
     current.visible_access = target.mask;
 }
 
+// Widen stages a compute-only queue cannot name to ALL_COMMANDS. The cross-queue half of such an
+// edge is ordered by the lane timeline semaphores; this barrier only has to cover same-queue work,
+// and ALL_COMMANDS on the compute queue is exactly (and legally) that.
+VkPipelineStageFlags2 resource_state_tracker::legalize(VkPipelineStageFlags2 stages) const
+{
+    if (!compute_only_queue_ || stages == 0) return stages;
+    constexpr VkPipelineStageFlags2 kComputeLegal =
+        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT
+        | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+        | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT
+        | VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT
+        | VK_PIPELINE_STAGE_2_HOST_BIT;
+    if ((stages & ~kComputeLegal) == 0) return stages;
+    return (stages & kComputeLegal) | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+}
+
 void resource_state_tracker::flush_buffers(VkCommandBuffer cmd)
 {
     if (pending_dst_stage_ == 0) return;
     const VkMemoryBarrier2 barrier = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .pNext = nullptr,
-        .srcStageMask = pending_src_stage_,
+        .srcStageMask = legalize(pending_src_stage_),
         .srcAccessMask = pending_src_access_,
-        .dstStageMask = pending_dst_stage_,
+        .dstStageMask = legalize(pending_dst_stage_),
         .dstAccessMask = pending_dst_access_,
     };
     const VkDependencyInfo dependency = {

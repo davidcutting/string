@@ -19,7 +19,7 @@
 
 #include <volk.h>
 
-namespace String
+namespace string
 {
 
 // Fullscreen pass that samples one bindless texture (the offscreen HDR target), applies exposure
@@ -38,6 +38,8 @@ class composite_pass
 {
     string::gpu::device& device_;
     string::gpu::resource_allocator& allocator_;
+    // Uploads the baked LUT through the frame's declared uploads pass rather than its own submit.
+    string::TransferBatch& transfer_;
     string::gpu::descriptor_table& descriptor_table_;
     // The pipeline is owned by the shader_program (hot-reloadable); the pass binds program_->current().
     string::gpu::shader_program* program_ = nullptr;
@@ -48,14 +50,13 @@ class composite_pass
     string::gpu::resource_id lut_image_ = 0;
     uint32_t lut_slot_ = 0;
     uint32_t lut_size_ = 0;
-    VkSampler lut_sampler_ = VK_NULL_HANDLE;
     std::vector<float> lut_cpu_;
     string::core::tonemap::Curve baked_curve_{};
     string::core::tonemap::Grading baked_grading_{};
     void bake_and_upload_lut(bool first);
 
 public:
-    composite_pass(String::engine_context& ctx, VkFormat color_format);
+    composite_pass(string::engine_context& ctx, VkFormat color_format);
     ~composite_pass();
 
     // Author this pass onto the graph. `hdr` is the resolved scene colour it samples; `target` is

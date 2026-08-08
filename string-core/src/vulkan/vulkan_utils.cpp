@@ -6,7 +6,7 @@
 #define TINYOBJLOADER_IMPLEMENTATION
 #include <string/core/tiny_obj_loader.h>
 
-namespace String
+namespace string
 {
 namespace vku
 {

@@ -36,7 +36,7 @@ namespace string::render
 class gtao_chain
 {
 public:
-    gtao_chain(String::engine_context& ctx, GeometryScene* scene);
+    gtao_chain(string::engine_context& ctx, GeometryScene* scene);
     ~gtao_chain();
 
     gtao_chain(const gtao_chain&) = delete;
@@ -55,6 +55,12 @@ public:
     void tick(VkExtent2D extent, uint16_t current_frame);
 
     bool runs() const { return runs_this_frame_; }
+    // Has the chain EVER produced output? gtao.ao's contents persist across idle frames, but until
+    // the first run there is nothing to sample — and no constant neutral can stand in for an
+    // ENCODED bent normal (0.5s decode to the zero vector, which nukes the sun/spec terms). The
+    // shader's gtao_slot == ~0u branch is the only sound degrade, so SceneData must take it until
+    // this is true.
+    bool has_output() const { return has_output_; }
     glm::uvec2 size() const { return size_; }
     // The depth-history slot this frame reprojects FROM (the previous frame in flight). Published so
     // the application can rotate the depth-history handle's backing by the same rule.
@@ -80,6 +86,7 @@ private:
     ::string::gpu::shader_program* program_ = nullptr;
     ::string::gpu::shader_program* denoise_program_ = nullptr;
     bool runs_this_frame_ = false;
+    bool has_output_ = false;   // sticky: set on the chain's first surviving run
 };
 
 }  // namespace string::render

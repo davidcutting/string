@@ -6,7 +6,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 ui_background_pass::ui_background_pass(engine_context& ctx, VkSampleCountFlagBits samples)
 : device_(ctx.device)

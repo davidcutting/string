@@ -11,7 +11,7 @@
 #include <cstdlib>
 #include <thread>
 
-namespace String {
+namespace string {
 
 void Application::initialize(const ApplicationInfo& info, scene_fn scene)
 {
@@ -34,10 +34,16 @@ void Application::initialize(const ApplicationInfo& info, scene_fn scene)
     // this point re-authors or re-plans — a toggle is an in-graph conditional and a resize is a
     // backing swap, which is what makes an author callback unnecessary.
     tick_ = scene(graph_, renderer_->context(), *renderer_);
-    // Every pass has now reserved its scratch regions; back them before anything records.
-    renderer_->materialize_scratch();
+    // Everything the scene staged while it was being built goes to the GPU now, once, so the first
+    // frame does not carry a scene's worth of staging (brief 21 step 5). Per-frame uploads are the
+    // declared pass the scene authored, not this.
+    renderer_->flush_construction_uploads();
     frame_ = graph_.compile(renderer_->context(), renderer_->extent());
     renderer_->publish_introspection(frame_);
+
+    // Window resizes are LATCHED here and applied between frames (see run()): a resize mid-record
+    // would swap backing under a command buffer. Only the latest extent matters.
+    window_->register_resize_event_callback([this](const View::Extent& e) { pending_resize_ = e; });
 }
 
 Application::~Application()
@@ -60,6 +66,30 @@ Application::~Application()
     window_.reset();
     event_handler_.sink<WindowEvent>().disconnect();
 }
+
+// STRING_RESIZE_AT=frame:WxH — drive a resize from the frame counter instead of a window event.
+// Resize is the least-testable path in the renderer: an offscreen SDL window never emits one, so
+// nothing headless could reach it at all, and it is precisely where stale backing, leaked transients
+// and unbound descriptors surface. Answers the new extent exactly once, on the nominated frame.
+namespace
+{
+std::optional<View::Extent> scripted_resize()
+{
+    static unsigned at = 0, w = 0, h = 0;
+    static const bool parsed = [] {
+        if (const char* s = std::getenv("STRING_RESIZE_AT")) std::sscanf(s, "%u:%ux%u", &at, &w, &h);
+        return true;
+    }();
+    (void)parsed;
+    static std::uint64_t frame = 0;
+    static bool fired = false;
+    ++frame;
+    if (fired || at == 0 || frame < at || w < 64 || h < 64) return std::nullopt;
+    fired = true;
+    STRING_LOG_INFO("[resize] STRING_RESIZE_AT: {}x{} at frame {}", w, h, frame);
+    return View::Extent{ w, h };
+}
+}  // namespace
 
 void Application::run() {
     const auto start = std::chrono::steady_clock::now();
@@ -160,6 +190,16 @@ void Application::run() {
         // left unwired rather than half-wired: a scene switch that silently kept stale declarations
         // would be the exact class of bug this brief exists to remove.
 
+        if (const std::optional<View::Extent> forced = scripted_resize()) pending_resize_ = *forced;
+
+        // Apply a latched window resize between frames — no command buffer is recording and the
+        // renderer waits the device idle before swapping any backing.
+        if (pending_resize_)
+        {
+            renderer_->resize(frame_, *pending_resize_);
+            pending_resize_.reset();
+        }
+
         if (!freeze_rendering_)
         {
             const float dt = static_cast<float>(period.count());
@@ -193,4 +233,4 @@ void Application::on_window_event(const WindowEvent& event)
         freeze_rendering_ = false;
 }
 
-}  // namespace String
+}  // namespace string

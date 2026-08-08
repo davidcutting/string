@@ -9,7 +9,7 @@
 #include <string/platform/window.hpp>
 #include <string/device.hpp>
 
-namespace String
+namespace string
 {
 
 enum class FileEventType : std::uint8_t
@@ -70,7 +70,7 @@ public:
 
 /** Example usage
 int main() {
-    using namespace String;
+    using namespace string;
     
     // No platform-specific symbols pollute the user's namespace
     // No GLFW headers needed in user code

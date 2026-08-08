@@ -28,6 +28,26 @@ VkPipelineStageFlags2 pass_spec::main_stage(pass_kind kind)
     return VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
 }
 
+// Env-gated trace levers, resolved ONCE. These sat in per-frame (and per-subresource) loops, so every
+// frame paid a getenv + strcmp per pass and per degrade check for a lever that cannot change at
+// runtime.
+bool trace_enabled(const char* name)
+{
+    return std::getenv(name) != nullptr;
+}
+const bool kTraceMap = trace_enabled("STRING_TRACE_MAP");
+const bool kTraceDegrade = trace_enabled("STRING_TRACE_DEGRADE");
+const bool kTracePass = trace_enabled("STRING_TRACE_PASS");
+
+// Levels a full chain over `extent` has: floor(log2(max dimension)) + 1, down to 1x1.
+std::uint32_t mip_count_for(VkExtent3D extent)
+{
+    std::uint32_t largest = std::max(extent.width, extent.height);
+    std::uint32_t levels = 1;
+    while (largest > 1) { largest >>= 1; ++levels; }
+    return levels;
+}
+
 pass_spec& pass_spec::add(const resource_use& u, bool required)
 {
     building_.uses.push_back(u);
@@ -104,17 +124,37 @@ pass_spec& pass_spec::writes(gpu::buffer b, access how, VkPipelineStageFlags2 st
     return add({ {}, b, how, stage }, false);
 }
 
+// In-place RMW is ONE use, not a read + a write: storage_image_write's scope is already
+// WRITE|READ|SAMPLED at GENERAL (and storage_write's is WRITE|READ) precisely because
+// read-modify-write is what storage writes commonly are. Declaring it as two uses made the same
+// cells claim two layouts in one pass, with declaration ORDER deciding which one won.
+pass_spec& pass_spec::read_writes(gpu::image_view v)
+{
+    return add({ v, {}, access::storage_image_write, 0 }, false);
+}
+pass_spec& pass_spec::read_writes(gpu::buffer b)
+{
+    return add({ {}, b, access::storage_write, 0 }, false);
+}
+
 pass_spec& pass_spec::color(gpu::image_view v)
 {
     return add({ v, {}, access::color_write, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT }, false);
 }
+// EARLY *and* LATE. A depth attachment is touched at both: the loadOp clear and early-Z at
+// EARLY_FRAGMENT_TESTS, and the late-Z write — and the MIN depth resolve — complete at
+// LATE_FRAGMENT_TESTS. Naming only EARLY made every later reader's derived barrier miss the late
+// write, which sync validation reports as a WAW against vkCmdEndRendering the moment anything
+// samples the resolved depth (the HiZ chain does, every frame).
 pass_spec& pass_spec::depth(gpu::image_view v)
 {
-    return add({ v, {}, access::depth_write, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT }, false);
+    return add({ v, {}, access::depth_write, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
+                                             | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT }, false);
 }
 pass_spec& pass_spec::depth_read(gpu::image_view v)
 {
-    return add({ v, {}, access::depth_read, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT }, false);
+    return add({ v, {}, access::depth_read, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
+                                            | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT }, false);
 }
 
 void pass_spec::raster(record_fn fn)
@@ -168,8 +208,18 @@ gpu::buffer frame_graph::use_persistent(const persistent_buffer_info& info)
     return gpu::buffer{ static_cast<std::uint32_t>(buffers_.size() - 1) };
 }
 
+// Re-backing that changes the id SET is only ever part of a resize, and compiled_frame::resize
+// unbinds and re-binds every declared slot wholesale — so there is nothing for these to do beyond
+// swapping the ids and refusing to do it mid-frame.
 void frame_graph::set_images(gpu::image h, std::span<const gpu::resource_id> physical)
 {
+    if (executing_)
+    {
+        STRING_LOG_ERROR("[graph] set_images on '{}' during execute — a backing swap mid-frame pulls "
+                         "a resource out from under barriers already recorded against the old one",
+                         images_[h.index].name);
+        return;
+    }
     image_record& r = images_[h.index];
     r.physical.assign(physical.begin(), physical.end());
     r.per_frame = physical.size() > 1;
@@ -177,6 +227,11 @@ void frame_graph::set_images(gpu::image h, std::span<const gpu::resource_id> phy
 
 void frame_graph::set_buffers(gpu::buffer h, std::span<const gpu::resource_id> physical)
 {
+    if (executing_)
+    {
+        STRING_LOG_ERROR("[graph] set_buffers on '{}' during execute", buffers_[h.index].name);
+        return;
+    }
     buffer_record& r = buffers_[h.index];
     r.physical.assign(physical.begin(), physical.end());
     r.per_frame = physical.size() > 1;
@@ -187,7 +242,6 @@ gpu::image frame_graph::image(const transient_image_info& info)
     image_record r;
     r.name = info.name;
     r.transient = true;
-    r.per_frame = info.per_frame;
     r.info = info;
     r.neutral = info.neutral;
     images_.push_back(std::move(r));
@@ -199,7 +253,6 @@ gpu::buffer frame_graph::buffer(const transient_buffer_info& info)
     buffer_record r;
     r.name = info.name;
     r.transient = true;
-    r.per_frame = info.per_frame;
     r.info = info;
     buffers_.push_back(std::move(r));
     return gpu::buffer{ static_cast<std::uint32_t>(buffers_.size() - 1) };
@@ -268,7 +321,7 @@ bool collides(const resource_use& a, const resource_use& b)
 
 }  // namespace
 
-compiled_frame frame_graph::compile(String::engine_context& ctx, VkExtent2D viewport)
+compiled_frame frame_graph::compile(string::engine_context& ctx, VkExtent2D viewport)
 {
     compiled_frame frame;
     frame.graph_ = this;
@@ -333,18 +386,34 @@ compiled_frame frame_graph::compile(String::engine_context& ctx, VkExtent2D view
 
     for (std::uint32_t i = 0; i < frame.order_.size(); ++i)
         STRING_LOG_INFO("[order] {} {}", i, passes_[frame.order_[i]].name);
-    STRING_LOG_INFO("[graph] compiled {} passes, {} groups, {} KiB transients", n,
-                    frame.groups_.size(), frame.transient_bytes_ / 1024);
+    // The derived render-group plan: which attachments each group binds and — the part a wrong
+    // derivation silently corrupts — who clears vs loads. One line per group, at compile only.
+    for (std::size_t gi = 0; gi < frame.groups_.size(); ++gi)
+    {
+        const render_group& g = frame.groups_[gi];
+        const auto img_name = [&](const std::optional<gpu::image_view>& v) -> std::string {
+            return v ? images_[v->img.index].name : std::string("-");
+        };
+        std::string cols;
+        for (const gpu::image_view& c : g.colors) cols += images_[c.img.index].name + " ";
+        STRING_LOG_INFO("[group] {} first='{}' n={} colors=[{}] color={}{} depth={}{}{} resolve={}/{}",
+                        gi, passes_[frame.order_[g.first]].name, g.count, cols, img_name(g.color()),
+                        g.clears_color ? " CLEAR" : " load", img_name(g.depth),
+                        g.clears_depth ? " CLEAR" : " load", g.depth_writes ? " rw" : " ro",
+                        img_name(g.color_resolve), img_name(g.depth_resolve));
+    }
+    STRING_LOG_INFO("[graph] compiled {} passes, {} groups, {} transient resources, {:.1f} MiB "
+                    "(images + buffers; NO aliasing — every transient has its own allocation)",
+                    n, frame.groups_.size(), frame.transient_count_,
+                    static_cast<double>(frame.transient_bytes_) / (1024.0 * 1024.0));
     return frame;
 }
 
 // Allocate every transient, mint the neutral fallbacks, and register each declared sub-resource
 // slice as its own resource so bind() can give it a descriptor slot.
-void compiled_frame::materialize(String::engine_context& ctx, VkExtent2D viewport)
+void compiled_frame::materialize(string::engine_context& ctx, VkExtent2D viewport)
 {
     transient_bytes_ = 0;
-
-    const auto slots = static_cast<std::uint32_t>(ctx.frames_in_flight);
 
     for (frame_graph::image_record& r : graph_->images_)
     {
@@ -360,24 +429,51 @@ void compiled_frame::materialize(String::engine_context& ctx, VkExtent2D viewpor
                 const float f = static_cast<float>(v) * ti.viewport_scale;
                 return std::max(1u, static_cast<std::uint32_t>(std::ceil(f - 1e-4f)));
             };
-            info.extent = ti.viewport_scaled
-                ? VkExtent3D{ scaled(viewport.width), scaled(viewport.height), 1 }
-                : ti.extent;
+            // Half the next power of two — the exact-reduction pyramid base.
+            const auto half_pow2 = [](std::uint32_t v) {
+                std::uint32_t p = 1;
+                while (p < v) p <<= 1;
+                return std::max(1u, p / 2);
+            };
+            switch (ti.fit)
+            {
+                case viewport_fit::scaled:
+                    info.extent = { scaled(viewport.width), scaled(viewport.height), 1 };
+                    break;
+                case viewport_fit::half_pow2:
+                    info.extent = { half_pow2(viewport.width), half_pow2(viewport.height), 1 };
+                    break;
+                case viewport_fit::fixed:
+                    info.extent = ti.extent;
+                    break;
+            }
             info.format = ti.format;
             info.tiling = VK_IMAGE_TILING_OPTIMAL;
             info.usage = ti.usage;
             info.aspect_flags = ti.aspect;
             info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
             info.allocation_flags = 0;
-            info.mip_levels = ti.mip_levels;
+            // `all_mips`: as many levels as this extent supports. A viewport-derived pyramid's level
+            // count changes with the window, so it cannot be a declared constant — and the passes
+            // that build it are authored at the maximum and conditionally skipped (see mip_count).
+            info.mip_levels = ti.mip_levels == transient_image_info::all_mips
+                ? mip_count_for(info.extent)
+                : ti.mip_levels;
             info.samples = ti.samples;
             info.cube = ti.cube;
             info.sampler = ti.sampler;
 
-            const std::uint32_t count = r.per_frame ? slots : 1;
+            // A transient is single-backed by definition (brief 21 D3): ringed resources are
+            // persistents their owner backs per slot.
             r.physical.clear();
-            for (std::uint32_t s = 0; s < count; ++s)
-                r.physical.push_back(ctx.allocator.create_resource(info));
+            const gpu::resource_id id = ctx.allocator.create_resource(info);
+            r.physical.push_back(id);
+            // Count the IMAGES too. transient_bytes_ used to sum buffer sizes only, so the KiB it
+            // reported was a small fraction of what the graph actually allocated — and the number
+            // any future aliasing work would be measured against was fiction. VMA knows the real
+            // figure (padding and alignment included); ask it rather than recomputing.
+            transient_bytes_ += ctx.allocator.get_image(id).allocation_info.size;
+            ++transient_count_;
         }
     }
 
@@ -435,7 +531,13 @@ void compiled_frame::materialize(String::engine_context& ctx, VkExtent2D viewpor
         fb.transient = true;
         fb.neutral = r.neutral;
         fb.physical.push_back(ctx.allocator.create_resource(info));
+        // Store the FULL creation info: a resize re-materializes every transient from its record,
+        // and a fallback rebuilt from a format-only record would have zero usage flags.
         fb.info.format = format;
+        fb.info.extent = info.extent;
+        fb.info.usage = info.usage;
+        fb.info.aspect = aspect;
+        fb.info.sampler = sampler;
         graph_->images_.push_back(std::move(fb));
         r.fallback = gpu::image{ static_cast<std::uint32_t>(graph_->images_.size() - 1) };
         pending_fallbacks_.push_back(r.fallback);
@@ -445,16 +547,24 @@ void compiled_frame::materialize(String::engine_context& ctx, VkExtent2D viewpor
     {
         if (!r.transient) continue;
         gpu::buffer_info info{};
-        info.size = r.info.bytes_for ? r.info.bytes_for(viewport) : r.info.bytes;
+        if (r.info.tile_pixels != 0)
+        {
+            const std::uint64_t tx = (viewport.width + r.info.tile_pixels - 1) / r.info.tile_pixels;
+            const std::uint64_t ty = (viewport.height + r.info.tile_pixels - 1) / r.info.tile_pixels;
+            info.size = r.info.bytes_per_tile * std::max<std::uint64_t>(tx * ty, 1);
+        }
+        else
+        {
+            info.size = r.info.bytes;
+        }
         info.usage = r.info.usage;
         info.memory_usage = r.info.memory_usage;
         info.allocation_flags = r.info.allocation_flags;
 
-        const std::uint32_t count = r.per_frame ? slots : 1;
         r.physical.clear();
-        for (std::uint32_t s = 0; s < count; ++s)
-            r.physical.push_back(ctx.allocator.create_resource(info));
-        transient_bytes_ += info.size * count;
+        r.physical.push_back(ctx.allocator.create_resource(info));
+        transient_bytes_ += info.size;
+        ++transient_count_;
     }
 }
 
@@ -468,7 +578,8 @@ void compiled_frame::materialize(String::engine_context& ctx, VkExtent2D viewpor
 // code binding lazily at record time is what it replaces.
 void compiled_frame::bind_declared_slots()
 {
-    if (std::getenv("STRING_TRACE_MAP"))
+    bound_.clear();
+    if (kTraceMap)
         for (const frame_graph::image_record& rec : graph_->images_)
             for (gpu::resource_id pid : rec.physical)
                 if (pid != 0) STRING_LOG_INFO("[map] {} vk={:#x}", rec.name,
@@ -501,7 +612,19 @@ void compiled_frame::bind_declared_slots()
             {
                 const gpu::resource_id id = u.is_image() ? resolve_view(u.img, s)
                                                          : physical(u.buf, s);
-                if (id != 0) ctx_->descriptor_table.bind(id, type);
+                if (id == 0) continue;
+                ctx_->descriptor_table.bind(id, type);
+                bound_.emplace_back(id, type);
+                // A storage-image use's scope includes sampled reads (see scope_of) — a read_writes
+                // dispatch samples the prior contents it then storage-writes, and its filtered read
+                // goes through a combined-image-sampler descriptor. Bind BOTH types so the
+                // access-qualified slot() request for either resolves without a mid-frame bind.
+                if (u.is_image() && (u.how == access::storage_image_read
+                                     || u.how == access::storage_image_write))
+                {
+                    ctx_->descriptor_table.bind(id, gpu::descriptor_type::TEXTURE);
+                    bound_.emplace_back(id, gpu::descriptor_type::TEXTURE);
+                }
             }
         }
     }
@@ -510,7 +633,9 @@ void compiled_frame::bind_declared_slots()
     {
         if (!r.fallback.valid()) continue;
         const gpu::resource_id id = physical(r.fallback, 0);
-        if (id != 0) ctx_->descriptor_table.bind(id, gpu::descriptor_type::TEXTURE);
+        if (id == 0) continue;
+        ctx_->descriptor_table.bind(id, gpu::descriptor_type::TEXTURE);
+        bound_.emplace_back(id, gpu::descriptor_type::TEXTURE);
     }
 }
 
@@ -603,7 +728,6 @@ void compiled_frame::derive_groups()
         g.first = idx;
         g.count = 1;
         g.colors = color.targets;
-        g.color = first_of(color.targets);
         g.depth = first_of(depth.targets);
         g.color_resolve = color.resolve;
         g.depth_resolve = depth.resolve;
@@ -633,7 +757,7 @@ void compiled_frame::derive_groups()
         if (!groups_[gi].color_resolve) continue;
         std::size_t last = gi;
         for (std::size_t k = gi + 1; k < groups_.size(); ++k)
-            if (groups_[k].color == groups_[gi].color) last = k;
+            if (groups_[k].color() == groups_[gi].color()) last = k;
         if (last != gi)
         {
             groups_[last].color_resolve = groups_[gi].color_resolve;
@@ -650,43 +774,71 @@ void compiled_frame::derive_groups()
         const auto first_use = [&](const std::optional<gpu::image_view>& v) {
             if (!v) return false;
             for (std::size_t k = 0; k < gi; ++k)
-                if (groups_[k].color == v || groups_[k].depth == v) return false;
+                if (groups_[k].color() == v || groups_[k].depth == v) return false;
             return true;
         };
         const auto last_use = [&](const std::optional<gpu::image_view>& v) {
             if (!v) return false;
             for (std::size_t k = gi + 1; k < groups_.size(); ++k)
-                if (groups_[k].color == v || groups_[k].depth == v) return false;
+                if (groups_[k].color() == v || groups_[k].depth == v) return false;
             return true;
         };
-        g.clears_color = first_use(g.color);
+        g.clears_color = first_use(g.color());
         g.clears_depth = first_use(g.depth);
-        g.last_color = last_use(g.color);
+        g.last_color = last_use(g.color());
     }
 }
 
-void compiled_frame::resize(String::engine_context& ctx, VkExtent2D viewport)
+void compiled_frame::resize(string::engine_context& ctx, VkExtent2D viewport)
 {
-    // Destroy and re-create only what is sized from the viewport. The DECLARATIONS are untouched,
-    // so there is nothing to re-author and nothing to re-plan — the order, the groups and the
-    // derived barriers are all still correct against the new backing.
+    // A resize is a BACKING swap: the declarations, the order, the groups and the derived barriers
+    // are all untouched. What must be rebuilt, in dependency order:
+    //   1. every declared descriptor UNBINDS (the ids are about to be freed; without this the freed
+    //      ids leak slots and the new backing never gets any — get_binding_slot throws);
+    //   2. every cached sub-resource VIEW dies (views of destroyed — or owner-swapped persistent —
+    //      images dangle);
+    //   3. every transient's physical dies. ALL of them, not just the viewport-scaled ones:
+    //      materialize() re-creates every transient unconditionally, so a partial destroy leaked
+    //      the survivors' old backing on every resize;
+    //   4. tracked state resets (it described backing that no longer exists);
+    //   5. materialize + bind_declared_slots + seed_persistent_layouts re-run, exactly as at
+    //      compile — the persistents were already re-pointed by their owners (renderer::resize
+    //      runs the owner callback first), so binding picks up their new backing too;
+    //   6. the neutral fallbacks queue for their one-shot clear again.
+    // The caller holds device idle across this.
     viewport_ = viewport;
+
+    for (const auto& [id, type] : bound_) ctx.descriptor_table.unbind(id, type);
+    bound_.clear();
+
+    for (const auto& [key, view] : slices_) ctx.allocator.destroy_resource(view);
+    slices_.clear();
 
     for (frame_graph::image_record& r : graph_->images_)
     {
-        if (!r.transient || !r.info.viewport_scaled) continue;
+        if (!r.transient) continue;
         for (gpu::resource_id id : r.physical) ctx.allocator.destroy_resource(id);
         r.physical.clear();
     }
     for (frame_graph::buffer_record& r : graph_->buffers_)
     {
-        if (!r.transient || !r.info.bytes_for) continue;
+        if (!r.transient) continue;
         for (gpu::resource_id id : r.physical) ctx.allocator.destroy_resource(id);
         r.physical.clear();
     }
 
-    materialize(ctx, viewport);
     states_.clear();
+    materialize(ctx, viewport);
+    bind_declared_slots();
+    seed_persistent_layouts();
+
+    pending_fallbacks_.clear();
+    for (frame_graph::image_record& r : graph_->images_)
+    {
+        if (r.fallback.valid()) pending_fallbacks_.push_back(r.fallback);
+        // The re-created transients hold nothing yet; content-existence restarts with the backing.
+        if (r.transient) r.ever_written = false;
+    }
 }
 
 // ================================================================================================
@@ -748,7 +900,9 @@ gpu::resource_id compiled_frame::physical(gpu::image h, std::uint32_t slot) cons
 {
     if (!h.valid() || h.index >= graph_->images_.size()) return 0;
     const frame_graph::image_record& r = graph_->images_[h.index];
-    if (r.swapchain) return swapchain_;
+    // The swapchain has no allocator id — its backing is a VkImage the presenter owns, latched per
+    // frame. Nothing resolves it as a resource; the executor binds swapchain_image_/_view_ directly.
+    if (r.swapchain) return 0;
     if (r.physical.empty()) return 0;
     return r.physical[r.per_frame ? slot % r.physical.size() : 0];
 }
@@ -762,20 +916,6 @@ gpu::resource_id compiled_frame::physical(gpu::buffer h, std::uint32_t slot) con
 }
 
 gpu::resource_allocator& compiled_frame::allocator() const { return ctx_->allocator; }
-
-void compiled_frame::note_external_layout(gpu::image h, VkImageLayout layout)
-{
-    const frame_graph::image_record& r = graph_->images_[h.index];
-    for (gpu::resource_id id : r.physical)
-    {
-        if (id == 0) continue;
-        const gpu::allocated_image& img = ctx_->allocator.get_image(id);
-        const VkImageAspectFlags aspect = aspect_of(img.format);
-        states_.track(img.image, aspect, img.mip_levels, img.array_layers);
-        states_.set_layout(img.image, layout);
-    }
-}
-
 VkSampleCountFlagBits compiled_frame::samples_of(gpu::image h) const
 {
     const frame_graph::image_record& r = graph_->images_[h.index];
@@ -795,6 +935,11 @@ gpu::resource_id compiled_frame::resolve_view(gpu::image_view v, std::uint32_t s
     if (const auto it = slices_.find(key); it != slices_.end()) return it->second;
 
     const gpu::allocated_image& src = ctx_->allocator.get_image(base);
+    // A slice past the end of the image is NOT an error: a viewport-derived pyramid's chain is
+    // authored once at the maximum depth, and the levels the current extent does not reach are
+    // conditioned off. Answering 0 is what lets binding and slot resolution skip them — the
+    // alternative is creating a view of a level that does not exist.
+    if (v.base_mip >= src.mip_levels || v.base_layer >= src.array_layers) return 0;
     gpu::resource_allocator::view_range range;
     range.aspect = aspect_of(src.format);
     range.base_mip = v.base_mip;
@@ -839,7 +984,16 @@ std::uint32_t compiled_frame::slot_for(gpu::image_view v, std::uint32_t pass_ind
     // Graceful degrade: if nothing alive produced this resource, the consumer transparently gets the
     // neutral substitute declared with it. The pass does not branch and does not know.
     if (!producer_alive(v.img) && graph_->images_[v.img.index].fallback.valid())
+    {
         target = graph_->images_[v.img.index].fallback.whole();
+        static int degrade_logs = 0;
+        if (kTraceDegrade && degrade_logs < 64)
+        {
+            ++degrade_logs;
+            STRING_LOG_INFO("[degrade] '{}' substituted with its neutral fallback (pass '{}')",
+                            graph_->images_[v.img.index].name, graph_->passes_[pass_index].name);
+        }
+    }
 
     const gpu::resource_id id = resolve_view(target, slot);
     if (id == 0) return 0;
@@ -850,7 +1004,7 @@ std::uint32_t compiled_frame::slot_for(gpu::image_view v, std::uint32_t pass_ind
 
 // The slot under a SPECIFIC access, for a pass that declared the same image two ways. The access is
 // the disambiguator because it is what the pass already said; nothing new is being declared here.
-std::uint32_t compiled_frame::slot_for(gpu::image_view v, access how, std::uint32_t pass_index,
+std::uint32_t compiled_frame::slot_for(gpu::image_view v, access how,
                                        std::uint32_t slot) const
 {
     const gpu::descriptor_type type = descriptor_for(how);
@@ -867,10 +1021,9 @@ std::uint32_t compiled_frame::slot_for(gpu::image_view v, access how, std::uint3
     return ctx_->descriptor_table.get_binding_slot(id, type);
 }
 
-std::uint32_t compiled_frame::slot_for(gpu::buffer h, std::uint32_t pass_index,
+std::uint32_t compiled_frame::slot_for(gpu::buffer h,
                                        std::uint32_t slot) const
 {
-    (void)pass_index;
     const gpu::resource_id id = physical(h, slot);
     if (id == 0) return 0;
     return ctx_->descriptor_table.get_binding_slot(id, gpu::descriptor_type::STORAGE_BUFFER);
@@ -889,6 +1042,9 @@ std::uint32_t compiled_frame::slot_for(gpu::buffer h, std::uint32_t pass_index,
 bool compiled_frame::producer_alive(gpu::image h) const
 {
     if (!graph_->images_[h.index].transient) return true;
+    // Content written by ANY past frame's surviving producer still exists — an amortized producer
+    // (the IBL bake, GTAO's gated chain) idling this frame is "not refreshed", not "empty".
+    if (graph_->images_[h.index].ever_written) return true;
 
     bool written_by_anyone = false;
     for (std::uint32_t i = 0; i < graph_->passes_.size(); ++i)
@@ -972,7 +1128,7 @@ VkImageAspectFlags compiled_frame::aspect_of(VkFormat format)
 // lifetime decides load/store, and a multisampled attachment paired with a 1-sample image of the
 // same extent resolves into it. No pass hand-codes a clear, a load, or an MSAA resolve chain.
 void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std::uint32_t slot,
-                                VkExtent2D frame_extent)
+                                VkExtent2D frame_extent, bool clear_color, bool clear_depth)
 {
     std::vector<VkRenderingAttachmentInfo> colors;
     VkRenderingAttachmentInfo depth{};
@@ -984,12 +1140,14 @@ void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std:
     // graph knows every attachment's real extent, so it derives this rather than making each pass
     // set a viewport that would still leave renderArea wrong.
     VkExtent2D extent = frame_extent;
-    for (const std::optional<gpu::image_view>& v : { g.color, g.depth })
+    for (const std::optional<gpu::image_view>& v : { g.color(), g.depth })
     {
         if (!v) continue;
+        // Swapchain FIRST: it has no allocator id, so an `id == 0` test would skip the very case this
+        // break exists for (its extent is the frame's, which is already what `extent` holds).
+        if (graph_->images_[v->img.index].swapchain) break;
         const gpu::resource_id id = physical(v->img, slot);
         if (id == 0) continue;
-        if (graph_->images_[v->img.index].swapchain) break;   // late-latched: the frame extent is right
         const VkExtent3D e = ctx_->allocator.get_image(id).extent;
         extent = { e.width, e.height };
         break;
@@ -997,9 +1155,11 @@ void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std:
 
     for (const gpu::image_view& cv : g.colors)
     {
-        const gpu::resource_id id = physical(cv.img, slot);
-        if (id == 0) continue;
         const frame_graph::image_record& rec = graph_->images_[cv.img.index];
+        // The SWAPCHAIN has no allocator id — its backing is a VkImage the presenter owns — so it
+        // must not be skipped on `id == 0`, or the render pass opens with one fewer colour attachment
+        // than the pipeline was created for.
+        if (!rec.swapchain && physical(cv.img, slot) == 0) continue;
 
         VkRenderingAttachmentInfo color{};
         color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -1009,7 +1169,7 @@ void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std:
         color.imageView = rec.swapchain ? swapchain_view_
                                         : ctx_->allocator.get_image(resolve_view(cv, slot)).view;
         color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        color.loadOp = g.clears_color ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        color.loadOp = clear_color ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         // The clear value is the resource's declared NEUTRAL. It already means "the value that
         // cancels" for degrade, and that is exactly what an attachment should clear to — the probe
@@ -1033,12 +1193,14 @@ void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std:
         const gpu::resource_id id = physical(g.depth->img, slot);
         if (id != 0)
         {
-            const gpu::allocated_image& img = ctx_->allocator.get_image(id);
             depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
             depth.imageView = ctx_->allocator.get_image(resolve_view(*g.depth, slot)).view;
-            depth.imageLayout = g.depth_writes ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                                               : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-            depth.loadOp = g.clears_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+            // Clearing IS writing: a group that only tests depth but happens to be the first to bind
+            // it still has the framework write it through loadOp, so it cannot be bound read-only.
+            depth.imageLayout = (g.depth_writes || clear_depth)
+                ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            depth.loadOp = clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
             depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             depth.clearValue.depthStencil = { 0.0f, 0 };   // reverse-Z: far = 0
             if (g.depth_resolve)
@@ -1125,16 +1287,56 @@ void compiled_frame::init_fallbacks(VkCommandBuffer cmd)
 
 void compiled_frame::execute(const execute_info& info)
 {
-    swapchain_ = info.swapchain;
-    swapchain_image_ = info.swapchain_image;
-    swapchain_view_ = info.swapchain_view;
+    graph_->executing_ = true;
+    struct execute_guard
+    {
+        frame_graph* g;
+        ~execute_guard() { g->executing_ = false; }
+    } guard{ graph_ };
+
+
+    swapchain_image_ = info.swapchain.image;
+    swapchain_view_ = info.swapchain.view;
 
     compute_survivors();
+
+    // Latch content existence BEFORE any slot resolves: every image a SURVIVING pass writes this
+    // frame has content from here on, so later idle frames must not degrade it (producer_alive).
+    for (std::uint32_t i = 0; i < graph_->passes_.size(); ++i)
+    {
+        if (!alive_[i]) continue;
+        for (const resource_use& u : graph_->passes_[i].uses)
+            if (u.is_image() && is_write(u.how)) graph_->images_[u.img.img.index].ever_written = true;
+    }
 
     VkCommandBuffer cmd = info.rec.vk();
     const std::uint32_t slot = info.frame_slot;
 
     init_fallbacks(cmd);
+
+    // Clear ownership is decided PER FRAME, over the groups that actually survived. The compile-time
+    // facts assume every group opens; a toggled-off first writer (gi.debug owned the scene color +
+    // depth clears while defaulting OFF) silently turns every later group's CLEAR into a LOAD, and
+    // an attachment that never clears accumulates history: self-consistent — invisible — while the
+    // camera is still, and the union of every past pose's depth once it moves. The first SURVIVING
+    // group binding an attachment clears it this frame; everyone after loads.
+    std::vector<bool> group_alive(groups_.size(), false);
+    for (std::size_t gi = 0; gi < groups_.size(); ++gi)
+        for (std::uint32_t k = 0; k < groups_[gi].count && !group_alive[gi]; ++k)
+            group_alive[gi] = alive_[order_[groups_[gi].first + k]];
+    std::vector<std::pair<bool, bool>> frame_clears(groups_.size(), { false, false });
+    const auto first_alive_use = [&](std::size_t gi, const std::optional<gpu::image_view>& v) {
+        if (!v) return false;
+        for (std::size_t k = 0; k < gi; ++k)
+            if (group_alive[k] && (groups_[k].color() == v || groups_[k].depth == v)) return false;
+        return true;
+    };
+    for (std::size_t gi = 0; gi < groups_.size(); ++gi)
+    {
+        if (!group_alive[gi]) continue;
+        frame_clears[gi] = { first_alive_use(gi, groups_[gi].color()),
+                             first_alive_use(gi, groups_[gi].depth) };
+    }
 
     std::size_t group_i = 0;
     std::uint32_t idx = 0;
@@ -1152,7 +1354,7 @@ void compiled_frame::execute(const execute_info& info)
             for (std::uint32_t k = 0; k < g.count && !any_alive; ++k)
                 any_alive = alive_[order_[g.first + k]];
             if (!any_alive) { idx += g.count; ++group_i; continue; }
-            if (std::getenv("STRING_TRACE_PASS"))
+            if (kTracePass)
                 STRING_LOG_INFO("[group] first={} count={}", g.first, g.count);
 
             // Every barrier the whole group needs, derived and emitted BEFORE the render pass opens —
@@ -1193,10 +1395,21 @@ void compiled_frame::execute(const execute_info& info)
                     sub.mip_count = 1;
                     sub.layer_count = layers;
                     states_.track(vk_img, sub.aspect, mips, layers);
+                    // Does the FRAMEWORK clear this attachment when it opens the group? That is a
+                    // write the pass never declared — framework-opens means the framework owns
+                    // load/store/resolve, so it owns their synchronisation too.
+                    const bool is_color = (u.how == access::color_write);
+                    const bool cleared = is_color ? frame_clears[group_i].first
+                                                  : frame_clears[group_i].second;
                     // A cleared attachment discards: no need to preserve contents nobody will read.
-                    const bool discard = (u.how == access::color_write && g.clears_color)
-                                      || (u.how == access::depth_write && g.clears_depth);
-                    states_.transition(cmd, vk_img, sub, u.how, u.stage, discard);
+                    const bool discard = cleared;
+                    // ...and a read-only declaration is not enough to cover a clear. A group that
+                    // only TESTS depth can still be the first to bind it, and then vkCmdBeginRendering
+                    // writes it with loadOp CLEAR against a barrier that granted READ — a WAW hazard
+                    // against the framework's own clear.
+                    const access how = (cleared && u.how == access::depth_read) ? access::depth_write
+                                                                               : u.how;
+                    states_.transition(cmd, vk_img, sub, how, u.stage, discard);
                 }
             }
             // The resolve targets are written by the render pass itself, at EndRendering, so the
@@ -1215,19 +1428,32 @@ void compiled_frame::execute(const execute_info& info)
                 sub.aspect = aspect;
                 sub.layer_count = img.array_layers;
                 states_.track(img.image, aspect, img.mip_levels, img.array_layers);
-                // A depth resolve completes in the LATE_FRAGMENT_TESTS stage, not COLOR_ATTACHMENT_OUTPUT —
-                // the depth access flags are not even legal at the colour stage.
+                // The resolve write's scope is the framework's, not a declaration's. A DEPTH resolve
+                // lands in the depth-attachment LAYOUT and finishes at LATE_FRAGMENT_TESTS, but the
+                // write itself is attributed to COLOR_ATTACHMENT_WRITE at COLOR_ATTACHMENT_OUTPUT —
+                // so the scope has to be the union, or the barrier before the render pass does not
+                // permit the resolve and the barrier after does not cover it. Both stages are in the
+                // mask, so both access bits are legal.
                 const bool is_depth = (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
-                states_.transition(cmd, img.image, sub,
-                                   is_depth ? access::depth_write : access::color_write,
-                                   is_depth ? (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
-                                               | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
-                                            : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                const access_scope resolve_scope{
+                    (is_depth ? (VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                                 | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+                              : VkAccessFlags2{ 0 }) | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                             : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                };
+                states_.transition_scope(cmd, img.image, sub, resolve_scope,
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
+                                   | (is_depth ? (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
+                                                  | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
+                                               : VkPipelineStageFlags2{ 0 }),
+                                   /*write=*/true,
                                    /*discard=*/true);
             }
             states_.flush_buffers(cmd);
 
-            open_group(cmd, g, slot, info.extent);
+            open_group(cmd, g, slot, info.extent, frame_clears[group_i].first,
+                       frame_clears[group_i].second);
             for (std::uint32_t k = 0; k < g.count; ++k)
             {
                 const std::uint32_t pi = order_[g.first + k];
@@ -1246,7 +1472,7 @@ void compiled_frame::execute(const execute_info& info)
 
         const std::uint32_t pi = order_[idx];
         const pass_decl& p = graph_->passes_[pi];
-        if (std::getenv("STRING_TRACE_PASS")) STRING_LOG_INFO("[pass] {}", p.name);
+        if (kTracePass) STRING_LOG_INFO("[pass] {}", p.name);
         if (alive_[pi])
         {
             // An async-placed pass records onto the async lane's recorder when the hardware exposed
@@ -1255,8 +1481,13 @@ void compiled_frame::execute(const execute_info& info)
             gpu::command_recorder& rec = async ? *info.async_rec : info.rec;
             VkCommandBuffer target = rec.vk();
 
+            // Barriers recorded on the async lane land on a compute-only queue, which cannot name
+            // graphics stages; the tracker widens them (see set_queue_scope) — the cross-queue
+            // ordering itself is the lane timeline's job.
+            states_.set_queue_scope(async);
             barrier_for(target, p, slot, /*skip_attachments=*/false);
             states_.flush_buffers(target);
+            states_.set_queue_scope(false);
 
             pass_context pc{ rec, slot, info.extent };
             pc.frame = this;
@@ -1325,12 +1556,12 @@ std::uint32_t pass_context::slot(gpu::image_view v) const
 
 std::uint32_t pass_context::slot(gpu::image_view v, access how) const
 {
-    return frame->slot_for(v, how, pass_index, frame_slot);
+    return frame->slot_for(v, how, frame_slot);
 }
 
 std::uint32_t pass_context::slot(gpu::buffer h) const
 {
-    return frame->slot_for(h, pass_index, frame_slot);
+    return frame->slot_for(h, frame_slot);
 }
 
 }  // namespace string

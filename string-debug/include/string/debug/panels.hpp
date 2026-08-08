@@ -54,15 +54,15 @@ public:
     // `clipboard_write`) had to be remembered twice, which was silently forgotten twice.
     //
     // One Ui per frame is also what brief 12b's M1 surface registry needs to hang off something.
-    void update_and_author(::string::ui::Ui& u, ::String::Input& input,
-                           ::String::InputMap& input_map);
+    void update_and_author(::string::ui::Ui& u, ::string::Input& input,
+                           ::string::InputMap& input_map);
 
 private:
     // The ONE writer for the console's open state — it is mirrored in a CVar, so a direct member
     // assignment gets reconciled away a frame later. See the definition.
     void set_console_open(bool open);
-    void handle_toggles(const ::String::Input& in);
-    void handle_console_input(const ::String::Input& in);
+    void handle_toggles(const ::string::Input& in);
+    void handle_console_input(const ::string::Input& in);
     void author_menu_bar(::string::ui::Ui& u);
     void author_console(::string::ui::Ui& u);
     void author_logs(::string::ui::Ui& u);
@@ -72,10 +72,10 @@ private:
     void author_image(::string::ui::Ui& u);
     // Binding inspector + rebinder. Takes the raw Input as well as the map because "bind the next key
     // I press" is the one question that is genuinely about a KEY rather than an action.
-    void author_bindings(::string::ui::Ui& u, const ::String::Input& input,
-                         ::String::InputMap& map);
+    void author_bindings(::string::ui::Ui& u, const ::string::Input& input,
+                         ::string::InputMap& map);
     // System actions: the ones nothing may swallow. Runs before every surface.
-    void handle_system_actions(::String::InputMap& map);
+    void handle_system_actions(::string::InputMap& map);
     void author_lenses(::string::ui::Ui& u, ::string::dimension screen);
     void author_inspector(::string::ui::Ui& u);
 
@@ -88,7 +88,7 @@ private:
     // so the two highlight schemes can never overlap and mean different things at once.
     // Rebinder state: the action waiting for a key, and the input CONTEXT it pushes while waiting.
     // Zero id = not capturing.
-    ::String::ActionId rebinding_{};
+    ::string::ActionId rebinding_{};
     bool system_bound_ = false;
     int sel_pass_ = -1;
     int sel_res_ = -1;

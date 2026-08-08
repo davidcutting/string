@@ -41,7 +41,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 namespace
 {
@@ -51,17 +51,17 @@ namespace
 // failure mode a stringly-typed query has, and it is silent in both directions.
 namespace debug_actions
 {
-inline constexpr ::String::ActionId freeze_culling   = ::String::action_id("freeze_culling");
-inline constexpr ::String::ActionId toggle_culling   = ::String::action_id("toggle_culling");
-inline constexpr ::String::ActionId toggle_hiz       = ::String::action_id("toggle_hiz");
-inline constexpr ::String::ActionId cycle_debug_view = ::String::action_id("cycle_debug_view");
-inline constexpr ::String::ActionId toggle_crowd     = ::String::action_id("toggle_crowd");
-inline constexpr ::String::ActionId toggle_lod       = ::String::action_id("toggle_lod");
-inline constexpr ::String::ActionId sun_animate      = ::String::action_id("sun_animate");
-inline constexpr ::String::ActionId time_back        = ::String::action_id("time_back");
-inline constexpr ::String::ActionId time_fwd         = ::String::action_id("time_fwd");
-inline constexpr ::String::ActionId toggle_lights    = ::String::action_id("toggle_lights");
-inline constexpr ::String::ActionId toggle_heatmap   = ::String::action_id("toggle_heatmap");
+inline constexpr ::string::ActionId freeze_culling   = ::string::action_id("freeze_culling");
+inline constexpr ::string::ActionId toggle_culling   = ::string::action_id("toggle_culling");
+inline constexpr ::string::ActionId toggle_hiz       = ::string::action_id("toggle_hiz");
+inline constexpr ::string::ActionId cycle_debug_view = ::string::action_id("cycle_debug_view");
+inline constexpr ::string::ActionId toggle_crowd     = ::string::action_id("toggle_crowd");
+inline constexpr ::string::ActionId toggle_lod       = ::string::action_id("toggle_lod");
+inline constexpr ::string::ActionId sun_animate      = ::string::action_id("sun_animate");
+inline constexpr ::string::ActionId time_back        = ::string::action_id("time_back");
+inline constexpr ::string::ActionId time_fwd         = ::string::action_id("time_fwd");
+inline constexpr ::string::ActionId toggle_lights    = ::string::action_id("toggle_lights");
+inline constexpr ::string::ActionId toggle_heatmap   = ::string::action_id("toggle_heatmap");
 }  // namespace debug_actions
 
 // A texture decoded to RGBA8 on a worker thread, ready for a (single-threaded) GPU upload. The
@@ -244,14 +244,14 @@ uint32_t pack_tangent(const glm::vec3& t, float sign)
 // transforms) so DrawInfo.center stays world-space, matching the cooked-scene convention.
 LoadedScene build_lookdev_scene()
 {
-    std::vector<String::Vertex> vertices;
+    std::vector<string::Vertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<GltfDraw> draws;
     std::vector<GltfMaterial> materials;
 
     // Unit-sphere template (UV sphere; normal = position, tangent along +phi).
     constexpr int kStacks = 24, kSlices = 48;
-    std::vector<String::Vertex> sphere_verts;
+    std::vector<string::Vertex> sphere_verts;
     std::vector<uint32_t> sphere_indices;
     for (int st = 0; st <= kStacks; ++st)
     {
@@ -262,7 +262,7 @@ LoadedScene build_lookdev_scene()
             const glm::vec3 n(std::sin(theta) * std::cos(phi), std::cos(theta),
                               std::sin(theta) * std::sin(phi));
             const glm::vec3 t(-std::sin(phi), 0.0f, std::cos(phi));
-            sphere_verts.push_back(String::Vertex{ n, glm::vec3(1.0f),
+            sphere_verts.push_back(string::Vertex{ n, glm::vec3(1.0f),
                 { float(sl) / kSlices, float(st) / kStacks }, n, pack_tangent(t, 1.0f) });
         }
     }
@@ -278,7 +278,7 @@ LoadedScene build_lookdev_scene()
     const auto add_sphere = [&](const glm::vec3& center, float radius, int material) {
         const uint32_t v0 = static_cast<uint32_t>(vertices.size());
         const uint32_t i0 = static_cast<uint32_t>(indices.size());
-        for (String::Vertex v : sphere_verts)
+        for (string::Vertex v : sphere_verts)
         {
             v.pos = v.pos * radius + center;
             vertices.push_back(v);
@@ -331,7 +331,7 @@ LoadedScene build_lookdev_scene()
         const glm::vec3 corners[4] = { { -s, 0, -s }, { s, 0, -s }, { s, 0, s }, { -s, 0, s } };
         const glm::vec2 uvs[4] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
         for (int i = 0; i < 4; ++i)
-            vertices.push_back(String::Vertex{ corners[i], glm::vec3(1.0f), uvs[i], n, tan });
+            vertices.push_back(string::Vertex{ corners[i], glm::vec3(1.0f), uvs[i], n, tan });
         const uint32_t quad[6] = { v0, v0 + 2, v0 + 1, v0, v0 + 3, v0 + 2 };   // CCW from +Y
         for (uint32_t i : quad) indices.push_back(i);
         GltfDraw d;
@@ -391,7 +391,6 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
 , gpu_profiler_ctx_(context.gpu_profiler_ctx)
 {
     scene_samples_ = samples;
-    arena_zeroed_.assign(context.frames_in_flight, false);
     // frames_in_flight_ + overlay_stats_ moved to the GeometryScene base (brief 11 P2); a base
     // class's members can't sit in the derived init list, so seed them first thing in the body
     // (nothing above uses them).
@@ -406,9 +405,7 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     // Touch the CVar now so it self-registers before the env override is applied. The toggle itself
     // is declared fluently in declare(); there is no enable_predicate member any more.
     (void)cv_pass_geometry();
-    // Brief 04e M3: per-frame transient buffers (worklists, draw_lod) reserve into the
-    // renderer's scratch arena; buffers bind lazily in update() after materialization.
-    scratch_ = &context.scratch;
+    // Brief 21 D4: the work lists are graph transients the app declares; nothing is reserved here.
     // Brief 16 M1: the resource-virtualization hub, for the registry-owned SceneData ring (below)
     // and, later, the light/stats rings (M3).
     // Brief 04b: load the COOKED scenes (bake library did the parse/flatten/MikkTSpace/meshletize
@@ -466,7 +463,7 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
             { 1.0f, 0.2f, 0.2f, 0.5f }, { 0.2f, 1.0f, 0.2f, 0.5f }, { 0.2f, 0.2f, 1.0f, 0.5f },
             { 1.0f, 1.0f, 0.2f, 0.5f }, { 1.0f, 0.2f, 1.0f, 0.5f },
         };
-        std::vector<String::Vertex> qv;
+        std::vector<string::Vertex> qv;
         std::vector<uint32_t> qi;
         std::vector<GltfDraw> qd;
         for (int q = 0; q < 5; ++q)
@@ -489,7 +486,7 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
                 { x, cy + s, lateral + s }, { x, cy + s, lateral - s },
             };
             for (const glm::vec3& c : corners)
-                qv.push_back(String::Vertex{ c, col, { 0.0f, 0.0f }, nrm, 0u });
+                qv.push_back(string::Vertex{ c, col, { 0.0f, 0.0f }, nrm, 0u });
             const uint32_t idx0 = static_cast<uint32_t>(qi.size());
             const uint32_t quad[6] = { v0, v0 + 1, v0 + 2, v0, v0 + 2, v0 + 3 };
             for (uint32_t k : quad) qi.push_back(k);
@@ -563,7 +560,7 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     uint64_t vertex_units = 0;
     for (const GeometryStreamer::Window& w : draw_windows) vertex_units += w.count;
     const uint64_t vertex_capacity = std::max<uint64_t>(1, vertex_units * kGeometryResidentPercent / 100);
-    const VkDeviceSize vertex_size = VkDeviceSize(sizeof(String::Vertex)) * vertex_capacity;
+    const VkDeviceSize vertex_size = VkDeviceSize(sizeof(string::Vertex)) * vertex_capacity;
     // Brief 04 M3/04b: no GPU index heap AND no CPU index buffer — the task/mesh shaders pull vertices
     // via the meshlet-vertex remap heap (baked at cook); the streamer uploads per-draw vertex windows.
 
@@ -594,9 +591,7 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
         .allocation_flags = {},
     });
 
-    // 1x1 white fallback for draws without a base-color texture (the factor still tints it). Created
-    // first because the streamer also uses it as the placeholder shown for cooked textures until
-    // their deferred transcode+upload lands.
+    // 1x1 white fallback for draws without a base-color texture (the factor still tints it).
     const std::array<uint8_t, 4> white_pixel = { 255, 255, 255, 255 };
     white_image_ = allocator_.create_resource(::string::gpu::image_info{
         .extent = { 1, 1, 1 },
@@ -610,7 +605,6 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     context.transfer.upload_image(white_pixel.data(), white_pixel.size(), white_image_);
     descriptor_table_.bind(white_image_, ::string::gpu::descriptor_type::TEXTURE);
     white_slot_ = descriptor_table_.get_binding_slot(white_image_, ::string::gpu::descriptor_type::TEXTURE);
-    const ::string::gpu::allocated_image& white = allocator_.get_image(white_image_);
 
     // 1x1 flat-normal fallback (tangent-space +Z): draws with no normal map sample this and get the
     // geometric normal back, so the fragment shader never branches on "has a normal map".
@@ -647,7 +641,7 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     // Collect textures: cooked KTX2 register with the streamer (BC7 image + placeholder slot now,
     // mips streamed in on demand from the coarse tail up); stb fallbacks upload whole here.
     texture_streamer_ = std::make_unique<TextureStreamer>(
-        device_, allocator_, descriptor_table_, context.transfer, white.view, white.sampler);
+        allocator_, descriptor_table_, context.transfer);
     texture_images_.resize(textures.size());
     texture_slots_.resize(textures.size());
     texture_lod_.resize(textures.size());
@@ -733,7 +727,7 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
             // Doesn't fit: register with the manager and stream per-frame by visibility (update()).
             // Brief 04 M3: the budget is vertex-heap only now (the GPU index heap is gone), matching
             // the streamer's vertex-only cost() so eviction decisions stay coherent with what's uploaded.
-            const VkDeviceSize geometry_budget = VkDeviceSize(vertex_capacity) * sizeof(String::Vertex);
+            const VkDeviceSize geometry_budget = VkDeviceSize(vertex_capacity) * sizeof(string::Vertex);
             geometry_residency_ = std::make_unique<::string::gpu::residency_manager>(
                 geometry_budget, kGeometryStreamPerFrame);
             for (std::uint32_t d = 0; d < draw_count_; ++d)
@@ -757,19 +751,19 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     // Frame the whole model with the engine camera using the AABB computed above, then let it
     // position itself to fit. Bind the conventional fly controls (WASD + Space/Ctrl + Shift) onto
     // the shared InputMap so update() can read them by action name.
-    String::Camera::bind_default_controls(input_map_);
+    string::Camera::bind_default_controls(input_map_);
     // BIND BY NAME, QUERY BY ID. The string overload is what registers the human-readable name for
     // the rebinding UI and debug output; it interns to exactly the constants in `debug_actions`
     // above, which is what the per-frame queries use.
     // Debug: F freezes/unfreezes the culling frustum, C toggles culling off entirely (see update()).
-    input_map_.bind_button("freeze_culling", String::KeyCode::F);
-    input_map_.bind_button("toggle_culling", String::KeyCode::C);
+    input_map_.bind_button("freeze_culling", string::KeyCode::F);
+    input_map_.bind_button("toggle_culling", string::KeyCode::C);
     // Brief 03 debug keys: O toggles HiZ occlusion, V cycles debug views
     // (none/meshlet/LOD/occlusion-reject), K spawns the crowd stress scene, G toggles LOD select.
-    input_map_.bind_button("toggle_hiz", String::KeyCode::O);
-    input_map_.bind_button("cycle_debug_view", String::KeyCode::V);
-    input_map_.bind_button("toggle_crowd", String::KeyCode::K);
-    input_map_.bind_button("toggle_lod", String::KeyCode::G);
+    input_map_.bind_button("toggle_hiz", string::KeyCode::O);
+    input_map_.bind_button("cycle_debug_view", string::KeyCode::V);
+    input_map_.bind_button("toggle_crowd", string::KeyCode::K);
+    input_map_.bind_button("toggle_lod", string::KeyCode::G);
     camera_.frame_bounds(aabb_min, aabb_max);
 
     // Brief 06: the improvised STRING_* levers are now CVar-backed (legacy env names kept as aliases,
@@ -823,11 +817,11 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
 
         // Debug controls: T animate sun (time-of-day), [ / ] scrub it, L toggle local lights,
         // H toggle the froxel heatmap.
-        input_map_.bind_button("sun_animate", String::KeyCode::T);
-        input_map_.bind_button("time_back", String::KeyCode::LEFT_BRACKET);
-        input_map_.bind_button("time_fwd", String::KeyCode::RIGHT_BRACKET);
-        input_map_.bind_button("toggle_lights", String::KeyCode::L);
-        input_map_.bind_button("toggle_heatmap", String::KeyCode::H);
+        input_map_.bind_button("sun_animate", string::KeyCode::T);
+        input_map_.bind_button("time_back", string::KeyCode::LEFT_BRACKET);
+        input_map_.bind_button("time_fwd", string::KeyCode::RIGHT_BRACKET);
+        input_map_.bind_button("toggle_lights", string::KeyCode::L);
+        input_map_.bind_button("toggle_heatmap", string::KeyCode::H);
     }
 }
 
@@ -983,8 +977,7 @@ geometry_pass::~geometry_pass()
         }
         // GTAO targets + their bindless slots are released in GtaoPass.s destructor now.
         // stats_buffer_ ring is owned + destroyed by the ResourceRegistry now (brief 16 M3).
-        // Brief 04e M3: worklists + draw_lod live in the renderer-owned scratch arena — nothing
-        // to free here.
+        // Brief 21 D4: the work lists are graph transients — the graph frees them.
         allocator_.destroy_resource(draw_info_buffer_);
         allocator_.destroy_resource(meshlet_triangles_);
         allocator_.destroy_resource(meshlet_vertices_);
@@ -1029,18 +1022,15 @@ geometry_pass::~geometry_pass()
 
 void geometry_pass::tick(float delta_time, uint32_t current_frame)
 {
-    // Brief 04e M3: bind each frame slot's scratch buffer into the worklist handles once the
-    // renderer has materialized the arena (post-construction, pre-first-frame).
-    if (!scratch_bound_ && scratch_ != nullptr && scratch_->materialized())
-    {
-        for (uint32_t f = 0; f < wl_opaque_.size(); ++f)
-        {
-            const ::string::gpu::resource_id buf = scratch_->buffer(f);
-            wl_opaque_[f].buffer = buf;
-            wl_twosided_[f].buffer = buf;
-        }
-        scratch_bound_ = true;
-    }
+    // The HiZ dispatch shape and the two-phase decision are CPU state, and they belong HERE rather
+    // than inside a recording callback: the graph's toggles are evaluated at execute, which is after
+    // tick, so a predicate reading state that a record body sets is reading last frame's answer.
+    if (meshlet_program_ != nullptr && draw_info_mapped_ != nullptr)
+        ensure_hiz(static_cast<uint16_t>(current_frame));
+    // Active only when HiZ is enabled AND geometry is resident (warmup done). When inactive the pass
+    // renders single-pass (phase 0), everything unconditionally — exactly like HiZ-off.
+    two_phase_active_ = hiz_enabled_ && hiz_program_ != nullptr && stream_frame_ > 1;
+
     const float aspect = screen_size.height == 0
         ? 1.0f
         : screen_size.width / static_cast<float>(screen_size.height);
@@ -1205,7 +1195,7 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
     // light grey. Two stops above reference white lands the flat field at display white
     // (>= ~0.96 sRGB) through BOTH tonemap curves while staying on the shoulder rather than hard
     // clip, so non-uniformities (the gate's actual signal) remain visible.
-    String::composite_pass::set_exposure_override(std::log2(1000.0f / (1.2f * 4.0f)), furnace_);
+    string::composite_pass::set_exposure_override(std::log2(1000.0f / (1.2f * 4.0f)), furnace_);
     // Drive the sun direction + sky palette from the time of day, then refit the cascades to the live
     // camera + sun. Both move, so the cascades are recomputed every frame (stabilization keeps them
     // from shimmering).
@@ -1338,13 +1328,8 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
     // read back the stats the GPU wrote earlier + publish the overlay state. ---
     if (draw_info_mapped_)
     {
-        // Read back the stats the GPU wrote two frames ago (this slot's buffer was filled last time
-        // this frame index ran, i.e. frames_in_flight frames back — safe, no stall).
-        if (stats_buffer_.valid() && current_frame < frames_in_flight_)
-        {
-            const void* mapped = nullptr;   // TODO(brief 20): stats readback needs a pass_context; tick() has none
-            if (mapped) std::memcpy(&stats_latest_, mapped, sizeof(GpuMeshStats));
-        }
+        // stats_latest_ is refreshed at RECORD time by record_scene_upload (which has the
+        // pass_context this tick lacks); here we only publish it.
 
         // Publish the overlay state for the UI author (shared_ptr seam; same render thread).
         if (overlay_stats_)
@@ -1435,145 +1420,60 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
     // executor reads the live declarations each frame, so per-frame-slot resources need no restating.
 }
 
-void geometry_pass::record_cull(string::pass_context& ctx)
+// The three resets are three DECLARED PASSES, because they are three producer-consumer stages with
+// different consumers: the work lists feed the expand computes and the indirect draws, the stats block
+// feeds the cull's histogram atomics, the visibility bits feed the task shaders. As one pass they
+// needed two hand-written memory barriers to order themselves against what came next; as declarations
+// the graph derives both, and each can be conditioned on its own one-shot predicate.
+
+// Zero every work list ONCE, before anything reads one. They are device-local and therefore
+// uninitialised at allocation, and each `commands[]` region feeds draw_mesh_tasks_indirect_count — an
+// arbitrary task-group count out of uninitialised memory is a GPU hang, not a wrong picture. Once, not
+// once per slot: a transient is single-backed (D3).
+void geometry_pass::record_reset_lists(string::pass_context& ctx)
 {
-    ::string::gpu::command_recorder& recorder = ctx.rec;
-    const uint32_t current_frame = ctx.frame_slot;
-
-    // Zero this slot's worklist arena ONCE, before anything reads it. The arena is device-local and
-    // therefore uninitialised at allocation, and its `commands[]` region feeds
-    // draw_mesh_tasks_indirect_count — an arbitrary task-group count out of uninitialised memory is a
-    // GPU hang, not a wrong picture. The draw path also guards on readiness; this makes the bad state
-    // unrepresentable rather than merely unreachable.
-    if (const ::string::gpu::resource_id wl = ctx.id(worklists_);
-        wl != 0 && current_frame < arena_zeroed_.size() && !arena_zeroed_[current_frame])
-    {
-        vkCmdFillBuffer(recorder.get_command_buffer(), allocator_.get_buffer(wl).buffer,
-                        0, VK_WHOLE_SIZE, 0u);
-        arena_zeroed_[current_frame] = true;
-    }
-    if (draw_count_ == 0)
-    {
-        return;
-    }
-
-    VkCommandBuffer& command_buffer = recorder.get_command_buffer();
-
-    // HiZ (re)build's descriptor updates (per-mip storage views into the no-UPDATE_AFTER_BIND set)
-    // now land in update() (brief 11 step 3) — before IblPass binds the set. This idempotent call
-    // no-ops unless the screen changed since update() ran this frame.
-    if (meshlet_program_ && draw_info_mapped_) ensure_hiz(current_frame);
-
-    // GTAO now runs in the standalone GtaoPass (prepass, before this pass) via record_gtao_if_enabled
-    // — brief 11 step 3. ensure_gtao()'s descriptor updates still land in update() (before any bind).
-
-    // The sky-IBL update chain runs in the standalone IblPass (prepass compute, ordered before this
-    // pass so probe relight below reads this frame's SH) — brief 11 step 3.
-
-    // Brief 11 M2: the probe-GI capture + relight moved OUT to record_gi_if_enabled, scheduled by the
-    // standalone GiPass (compute prepass, ordered after IblPass so relight's SH source is this frame's,
-    // and before ShadowPass so relight's shadow-map reads precede this frame's shadow depth writes —
-    // the WAR execution edge in record_probe_relight relies on that order, preserved by authoring).
-
-    // (Brief 04e M2: the cross-frame visibility-bitfield barrier that lived here is now DERIVED
-    // by the renderer from this pass's declared {visbits, StorageWrite, TASK} usage — see the
-    // usage declarations at the end of update(). Intra-frame phase-1 -> phase-2 ordering is still
-    // handled locally in record_between.)
-
-    // --- Brief 03: meshlet-path per-frame prep (stats reset, HiZ pyramid) --------------------------
-    // Builds the GPU work lists, the HiZ pyramid, and the shadow cascades that record() then draws.
-    if (meshlet_program_ && draw_info_mapped_)
-    {
-        ensure_hiz(current_frame);
-
-        // Zero this frame's stats.
-        if (reset_program_)
-        {
-            const ::string::gpu::pipeline& rp = reset_program_->current();
-            const ResetPush rpush{
-                .stats = ctx.address(stats_),
-                .stats_words = sizeof(GpuMeshStats) / 4,
-                ._pad = 0,
-            };
-            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rp.pipeline);
-            vkCmdPushConstants(command_buffer, rp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ResetPush), &rpush);
-            vkCmdDispatch(command_buffer, 1, 1, 1);
-            // Barrier: the stats reset must land before the draw-cull compute's histogram atomics.
-            const VkMemoryBarrier2 sb = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            };
-            const VkDependencyInfo sdep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                .memoryBarrierCount = 1, .pMemoryBarriers = &sb };
-            vkCmdPipelineBarrier2(command_buffer, &sdep);
-        }
-
-        // Brief 04c: build the meshlet worklists for this frame in two phases. DRAW phase writes the
-        // per-draw counts + shared LOD; EXPANSION phase scans them into compacted worklists + indirect
-        // groupCounts. Camera worklists (opaque + two-sided) feed the main pass; prepass worklists
-        // (forced LOD0) feed the HiZ depth prepass; per-cascade shadow worklists feed the cascades.
-        if (draw_cull_program_ && expand_fill_program_ && active_draw_count_ > 0)
-        {
-            // Brief 04d: the depth-only HiZ prepass is DELETED. Phase 1 renders last-frame-visible
-            // meshlets directly into the MSAA targets; the pyramid is MIN-resolved from that depth in
-            // record_between(). So there are no prepass worklists — only the camera opaque/two-sided
-            // lists (shared by phase 1 and phase 2 — the task shader partitions them per phase) plus
-            // the per-cascade shadow lists.
-            // Brief 20: the draw-cull and expand dispatches are DECLARED PASSES now (declare_cull /
-            // declare_expand) — one per dispatch, so the four hand-rolled barriers between them are
-            // derived from their write/read declarations. Nothing to invoke from here.
-        }
-
-        // Brief 04d: the depth-only HiZ prepass + pyramid build are GONE from here. Phase 1 (record())
-        // renders last-frame-visible meshlets directly into the MSAA targets; the renderer then MIN-
-        // resolves that MSAA depth into hz.depth and calls record_between() to build the pyramid, then
-        // record_after_between() draws phase 2. This method only decides whether the two-phase path is
-        // active this frame and clears the persistent bitfield when required.
-        //
-        // two_phase_active_ gates breaks_scene_group(): active only when HiZ is enabled AND geometry is
-        // resident (warmup done). When inactive (HiZ off, or the first frames) the pass renders in ONE
-        // group, single-pass (phase 0) — everything unconditionally, exactly like HiZ-off before.
-        two_phase_active_ = hiz_enabled_ && hiz_program_ && stream_frame_ > 1;
-
-        // Brief 20: the Access::DepthResolve MARKER is gone with the enum value. The MSAA depth resolve
-        // is DERIVED: geometry.phase1 declares a multisampled depth write and a single-sample depth
-        // write, and a pass declaring two writes of one kind where one is multisampled has declared
-        // that the first resolves into the second. No marker, no hook, no late append.
-
-        // Clear the persistent visibility bitfield + last-LOD on demand (first frame, teleport, a full
-        // streaming reset). A cleared bitfield is CORRECT — every meshlet takes phase 2 for one frame.
-        // Freeze (F) must NOT clear (it would erase the frozen visibility the debug eye is inspecting).
-        if (visbits_clear_pending_ && visbits_buffer_ && !mesh_cull_frozen_)
-        {
-            const ::string::gpu::allocated_buffer& vb = allocator_.get_buffer(visbits_buffer_);
-            vkCmdFillBuffer(command_buffer, vb.buffer, 0, VK_WHOLE_SIZE, 0u);
-            const ::string::gpu::allocated_buffer& pl = allocator_.get_buffer(prev_draw_lod_buffer_);
-            vkCmdFillBuffer(command_buffer, pl.buffer, 0, VK_WHOLE_SIZE, 0u);
-            const VkMemoryBarrier2 fb = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT,
-                .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            };
-            const VkDependencyInfo fdep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                .memoryBarrierCount = 1, .pMemoryBarriers = &fb };
-            vkCmdPipelineBarrier2(command_buffer, &fdep);
-            visbits_clear_pending_ = false;
-        }
-    }
-
-    // (Brief 04e M4: the froxel light-binning dispatch moved to record_async_compute — it is
-    // dependency-free within the frame, so the renderer places it on an async compute lane when
-    // one exists, or records it inline on the main queue otherwise.)
-    // Brief 11 M2: the cascaded shadow-map depth render moved OUT to record_shadows_if_enabled,
-    // scheduled by the standalone ShadowPass (compute prepass, ordered after this pass so its
-    // record_compute runs after the draw-cull/expand above produced the per-cascade worklists).
-    // (record_cull is void now: whether it recorded work is a graph conditional, not a return value.)
+    const auto zero = [&](string::gpu::buffer b) {
+        if (const ::string::gpu::resource_id id = ctx.id(b); id != 0)
+            vkCmdFillBuffer(ctx.rec.get_command_buffer(), allocator_.get_buffer(id).buffer,
+                            0, VK_WHOLE_SIZE, 0u);
+        else
+            lists_zeroed_ = false;   // not backed yet — try again next frame
+    };
+    lists_zeroed_ = true;
+    zero(wl_.opaque);
+    zero(wl_.twosided);
+    zero(wl_.draw_lod);
+    for (const string::gpu::buffer& c : wl_.cascade) zero(c);
 }
+
+// Zero this frame's stats block. The barrier that used to follow — ordering it before the draw-cull
+// compute's histogram atomics — is the cull passes' own declared write of the same buffer.
+void geometry_pass::record_reset_stats(string::pass_context& ctx)
+{
+    const ::string::gpu::pipeline& rp = reset_program_->current();
+    const ResetPush rpush{
+        .stats = ctx.address(stats_),
+        .stats_words = sizeof(GpuMeshStats) / 4,
+        ._pad = 0,
+    };
+    VkCommandBuffer cmd = ctx.rec.get_command_buffer();
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rp.pipeline);
+    vkCmdPushConstants(cmd, rp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ResetPush), &rpush);
+    vkCmdDispatch(cmd, 1, 1, 1);
+}
+
+// Clear the persistent visibility bitfield + last-LOD on demand (first frame, teleport, a full
+// streaming reset). A cleared bitfield is CORRECT — every meshlet takes phase 2 for one frame. Freeze
+// (F) must NOT clear: it would erase the frozen visibility the debug eye is inspecting. The barrier
+// that used to follow is derived from the task shaders' declared reads of the same buffers.
+void geometry_pass::record_reset_visbits(string::pass_context& ctx)
+{
+    VkCommandBuffer cmd = ctx.rec.get_command_buffer();
+    vkCmdFillBuffer(cmd, allocator_.get_buffer(visbits_buffer_).buffer, 0, VK_WHOLE_SIZE, 0u);
+    vkCmdFillBuffer(cmd, allocator_.get_buffer(prev_draw_lod_buffer_).buffer, 0, VK_WHOLE_SIZE, 0u);
+    visbits_clear_pending_ = false;
+}
+
 
 // Brief 11 M2: probe-GI static capture (once) + dynamic relight (amortized). Extracted from
 // record_compute's head into its own public method, scheduled by the standalone GiPass in the compute
@@ -1617,7 +1517,7 @@ void geometry_pass::record_phase1(string::pass_context& ctx)
             // this depth -> hz.depth, record_between() builds the pyramid, record_after_between() draws
             // phase 2 (the disocclusion complement) + transparency.
             STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "main-draw")
-            record_opaque_phase(ctx, /*phase*/ 1u, worklists_, pyramid_, scene_data_, stats_);
+            record_opaque_phase(ctx, /*phase*/ 1u, pyramid_, scene_data_, stats_);
         }
         else
         {
@@ -1625,7 +1525,7 @@ void geometry_pass::record_phase1(string::pass_context& ctx)
             // legacy phase-0 flow. breaks_scene_group() is false so this all lands in one render group.
             {
                 STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "main-draw")
-                record_opaque_phase(ctx, /*phase*/ 0u, worklists_, pyramid_, scene_data_, stats_);
+                record_opaque_phase(ctx, /*phase*/ 0u, pyramid_, scene_data_, stats_);
             }
             // Brief 09b: probe-debug spheres after opaque. Brief 11 M2: transparency moved OUT to the
             // standalone TransparencyPass (drawn last in the reopened MSAA group — same position).
@@ -1652,8 +1552,8 @@ void geometry_pass::record_phase1(string::pass_context& ctx)
 // from a hook that told the renderer where to break the group.
 void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, string::gpu::image resolve,
                             string::gpu::image depth,
-                            string::gpu::image hiz_depth, string::gpu::image hiz_pyramid, uint32_t hiz_mips,
-                            string::gpu::buffer worklists, string::gpu::buffer scene_data,
+                            string::gpu::image hiz_depth, string::gpu::image hiz_pyramid,
+                            const WorklistSet& worklists, string::gpu::buffer scene_data,
                             string::gpu::buffer lights, string::gpu::buffer stats,
                             std::span<const string::gpu::image> cascades, string::gpu::image gtao_ao,
                             string::gpu::image env_prefiltered, string::gpu::image dfg_lut,
@@ -1662,7 +1562,7 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
     scene_data_ = scene_data;
     lights_buffer_ = lights;
     stats_ = stats;
-    worklists_ = worklists;
+    wl_ = worklists;
     pyramid_ = hiz_pyramid;
     gtao_ao_ = gtao_ao;
     env_prefiltered_ = env_prefiltered;
@@ -1670,6 +1570,21 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
     ibl_sh_ = ibl_sh;
     froxels_ = froxels;
     for (std::size_t c = 0; c < cascades.size() && c < cascades_.size(); ++c) cascades_[c] = cascades[c];
+
+    // The persistent per-meshlet visibility bitfield. This pass allocates and owns the buffer (it is
+    // deliberately NOT ring-buffered — the temporal state accumulates across frames), so the graph
+    // adopts it rather than allocating it: use_persistent manages usage only.
+    //
+    // Declaring it is LOAD-BEARING, not bookkeeping. The task shaders read-modify-write these bits
+    // every two-phase frame, and storage_write's scope is READ|WRITE, so one declaration on each
+    // phase derives BOTH edges that matter: the previous frame's phase-2 writes before this frame's
+    // phase-1 reads (the cross-frame RAW — brief 04d's flicker fix), and phase 1 before phase 2
+    // within the frame (the WAW/RMW). Without them the bitfield is raced, the "visible last frame"
+    // set goes stale or garbage, and phase 2 stops picking up newly disoccluded meshlets — which is
+    // invisible while the camera is still and tears the image apart the moment it moves.
+    if (visbits_buffer_ != 0)
+        visbits_ = fg.use_persistent(string::persistent_buffer_info{
+            .name = "meshlet.visbits", .physical = { visbits_buffer_ } });
 
     // SceneData + the light ring, written before anything reads them. Declaring this is what makes
     // the froxel/shadow-slot addresses inside SceneData safe: they are resolved while this records,
@@ -1688,44 +1603,88 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
     // Per-frame reset: zero the stats block and, on demand, the persistent visibility bitfield and
     // last-frame LOD. Authored BEFORE the cull so the graph derives reset->cull; without it the cull
     // accumulates into stats nothing cleared.
-    fg.pass("meshlet.reset")
+    // THREE passes, not one: three producer-consumer stages with three different consumers. As one
+    // pass they needed two hand-written memory barriers to order themselves against what came next.
+    string::pass_spec reset_lists = fg.pass("meshlet.reset.lists");
+    reset_lists.writes(wl_.opaque, string::access::transfer_write)
+               .writes(wl_.twosided, string::access::transfer_write)
+               .writes(wl_.draw_lod, string::access::transfer_write);
+    for (const string::gpu::buffer& c : wl_.cascade)
+        reset_lists.writes(c, string::access::transfer_write);
+    reset_lists.toggle([this] { return !lists_zeroed_; })
+               .transfer([this](string::pass_context& ctx) { record_reset_lists(ctx); });
+
+    fg.pass("meshlet.reset.stats")
       .writes(stats)
-      .writes(worklists)
-      .compute([this](string::pass_context& ctx) { record_cull(ctx); });
+      .toggle([this] { return reset_program_ != nullptr && draw_count_ > 0; })
+      .compute([this](string::pass_context& ctx) { record_reset_stats(ctx); });
+
+    if (visbits_.valid())
+    {
+        fg.pass("meshlet.reset.visbits")
+          .writes(visbits_, string::access::transfer_write)
+          .toggle([this] { return visbits_clear_pending_ && !mesh_cull_frozen_; })
+          .transfer([this](string::pass_context& ctx) { record_reset_visbits(ctx); });
+    }
 
     // GPU draw-cull + list expansion. Declared by the meshlet TU, which owns those dispatches.
-    declare_cull(fg, worklists, stats);
-    declare_expand(fg, worklists);
+    declare_cull(fg, stats);
+    declare_expand(fg);
 
     // geometry.phase1. It writes the multisampled depth AND the single-sample hz.depth: two depth
     // writes, one multisampled and one not, which IS the declaration that the first resolves into the
     // second (reverse-Z MIN, the conservative choice for a HiZ occluder). That pairing is what
     // replaced Access::DepthResolve.
-    fg.pass("geometry.phase1")
-      .color(color)
-      // The single-sample resolve target. Declaring BOTH a multisampled and a single-sample colour
-      // write IS the declaration that the first resolves into the second — see derive_groups.
-      .color(resolve)
-      .depth(depth)
-      .depth(hiz_depth)
-      .reads(worklists, string::access::indirect_read)
-      .reads(worklists, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
-      .reads(scene_data)
-      .writes(stats)
-      .toggle([] { return cv_pass_geometry().get(); })
-      .raster([this](string::pass_context& ctx) { record_phase1(ctx); });
+    string::pass_spec phase1 = fg.pass("geometry.phase1");
+    phase1.color(color)
+          // The single-sample resolve target. Declaring BOTH a multisampled and a single-sample
+          // colour write IS the declaration that the first resolves into the second — see
+          // derive_groups.
+          .color(resolve)
+          .depth(depth)
+          .depth(hiz_depth)
+          // The camera lists: the indirect commands, and the records[] the task shader indexes.
+          .reads(wl_.opaque, string::access::indirect_read)
+          .reads(wl_.opaque, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
+          .reads(wl_.twosided, string::access::indirect_read)
+          .reads(wl_.twosided, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
+          .reads(scene_data)
+          .writes(stats);
+    // The lit fragments SAMPLE the cascades, GTAO, the IBL products and the froxel list through
+    // SceneData's bindless slots — the slots are RESOLVED by scene.upload, but the contents are
+    // READ here, at the fragment stage. Declaring the read on the consuming pass is what makes the
+    // NEXT frame's producer rewrite derive a write-after-read edge against THIS frame's in-flight
+    // fragment work. scene.upload's compute-stage reads cannot stand in for that: a barrier whose
+    // source scope is COMPUTE does not wait for fragment sampling still in flight, which is why the
+    // shadow term flickered run-to-run — the cascade was rewritten mid-read. (This is the edge the
+    // deleted per-frame shadow/GTAO rings used to paper over with triple buffering.)
+    const auto lit_reads = [&](string::pass_spec& p) {
+        for (const string::gpu::image& c : cascades) p.reads(c);
+        p.reads(gtao_ao).reads(env_prefiltered).reads(dfg_lut).reads(ibl_sh).reads(froxels);
+    };
+    lit_reads(phase1);
+    if (visbits_.valid())
+        phase1.writes(visbits_, string::access::storage_write, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
+    phase1.toggle([] { return cv_pass_geometry().get(); })
+          .raster([this](string::pass_context& ctx) { record_phase1(ctx); });
 
-    declare_hiz(fg, hiz_depth, hiz_pyramid, hiz_mips);
+    declare_hiz(fg, hiz_depth, hiz_pyramid);
 
     // geometry.phase2 reads the pyramid at the TASK stage — genuinely ambiguous, so it says so — and
     // re-declares the attachments, which is what re-forms the reloaded MSAA group.
-    fg.pass("geometry.phase2")
-      .color(color)
-      .depth(depth)
-      .reads(hiz_pyramid, string::access::sampled_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
-      .reads(worklists, string::access::indirect_read)
-      .toggle([this] { return two_phase_active_ && cv_pass_geometry().get(); })
-      .raster([this](string::pass_context& ctx) { record_phase2(ctx); });
+    string::pass_spec phase2 = fg.pass("geometry.phase2");
+    phase2.color(color)
+          .depth(depth)
+          .reads(hiz_pyramid, string::access::sampled_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
+          .reads(wl_.opaque, string::access::indirect_read)
+          .reads(wl_.opaque, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
+          .reads(wl_.twosided, string::access::indirect_read)
+          .reads(wl_.twosided, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
+    lit_reads(phase2);   // phase-2 fragments shade exactly like phase 1's — same consumed set
+    if (visbits_.valid())
+        phase2.writes(visbits_, string::access::storage_write, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
+    phase2.toggle([this] { return two_phase_active_ && cv_pass_geometry().get(); })
+          .raster([this](string::pass_context& ctx) { record_phase2(ctx); });
 }
 
 // Brief 20: the HiZ reduction is one DECLARED PASS PER MIP, not a loop with hand-rolled barriers.
@@ -1733,16 +1692,22 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
 // is a first-class declaration, `.reads(pyramid.mip(m-1))` and `.writes(pyramid.mip(m))` do not
 // collide, so the graph derives the chain — and derives ONLY the chain, rather than serialising the
 // whole image the way a single-state tracker had to.
+// The chain is authored at kMaxHizMips and each level asks, every frame, whether the CURRENT
+// viewport's pyramid actually reaches it. That is the compiled-once answer to a variable-length
+// chain: the declaration count is fixed at author time, and the window decides which links survive.
 void geometry_pass::declare_hiz(string::frame_graph& fg, string::gpu::image depth,
-                                string::gpu::image pyramid, uint32_t mips)
+                                string::gpu::image pyramid)
 {
-    for (uint32_t m = 0; m < mips; ++m)
+    for (uint32_t m = 0; m < kMaxHizMips; ++m)
     {
         string::pass_spec spec = fg.pass("hiz.mip" + std::to_string(m));
         if (m == 0) spec.reads(depth);
         else        spec.reads(pyramid.mip(m - 1));
         spec.writes(pyramid.mip(m))
-            .toggle([this] { return two_phase_active_ && hiz_program_ != nullptr; })
+            .toggle([this, m] {
+                return two_phase_active_ && hiz_program_ != nullptr
+                    && m < hiz_mip_count(screen_size);
+            })
             .compute([this, m, depth, pyramid](string::pass_context& ctx) {
                 record_hiz_mip(ctx, m, depth, pyramid);
             });
@@ -1831,7 +1796,7 @@ void geometry_pass::record_phase2(string::pass_context& ctx)
     // run — else it double-draws. Only the two-phase path uses it.
     if (!two_phase_active_ || !meshlet_program_ || !draw_info_mapped_) return;
     VkCommandBuffer command_buffer = recorder.get_command_buffer();
-    record_opaque_phase(ctx, /*phase*/ 2u, worklists_, pyramid_, scene_data_, stats_);
+    record_opaque_phase(ctx, /*phase*/ 2u, pyramid_, scene_data_, stats_);
     // Brief 09b: probe-debug spheres after opaque, depth-tested. Brief 11 M2: transparency moved OUT to
     // the standalone TransparencyPass, which draws last in this same reopened MSAA group (byte-identical).
     // Brief 20: gi.debug is a declared pass; nothing to call from here.
@@ -1843,6 +1808,31 @@ void geometry_pass::record_phase2(string::pass_context& ctx)
 void geometry_pass::record_scene_upload(string::pass_context& ctx)
 {
     const uint32_t current_frame = ctx.frame_slot;
+
+    // Read back the stats the GPU wrote when this slot last ran (frames_in_flight frames ago —
+    // its fence passed in begin_frame, so no stall). This must happen at RECORD time because only
+    // pass_context can resolve the slot's mapped pointer; tick() publishes the value it finds in
+    // stats_latest_. (Restores the readback the brief-20 rewrite stubbed out — the HUD, the
+    // inspector and every culling number were silently zero without it.)
+    if (stats_.valid() && draw_count_ > 0)
+    {
+        if (const void* stats_mapped = ctx.mapped(stats_))
+        {
+            std::memcpy(&stats_latest_, stats_mapped, sizeof(GpuMeshStats));
+            // STRING_STATS_LOG=1: periodic cull-funnel dump, for diagnosing meshlet loss without a
+            // GPU capture — which stage kills geometry shows up directly in the funnel.
+            static const bool log_stats = std::getenv("STRING_STATS_LOG") != nullptr;
+            static uint32_t stats_log_frame = 0;
+            if (log_stats && (++stats_log_frame % 60u) == 0u)
+            {
+                const GpuMeshStats& s = stats_latest_;
+                STRING_LOG_INFO("[stats] f{} total {} frustum {} cone {} hiz(drawn) {} phase2 {} "
+                                "shadow {} tris {}",
+                                stats_log_frame, s.meshlets_total, s.after_frustum, s.after_cone,
+                                s.after_hiz, s.phase2_drawn, s.shadow_draws, s.triangles);
+            }
+        }
+    }
     // --- Forward+ per-frame GPU data (this frame's ring slot) ----------------------------------
     if (draw_count_ > 0 && scene_data_.valid() && current_frame < frames_in_flight_)
     {
@@ -1859,7 +1849,7 @@ void geometry_pass::record_scene_upload(string::pass_context& ctx)
         // Fill SceneData for this frame. The lit shader reads sun/ambient/CSM/froxel state from here.
         SceneData scene{};
         scene.camera_pos = camera_.position();
-        scene.exposure = String::composite_pass::exposure_scale();   // for display-referred debug views
+        scene.exposure = string::composite_pass::exposure_scale();   // for display-referred debug views
         scene.sun_dir = sun_dir_;
         scene.sun_intensity = sun_intensity_;
         scene.sun_color = sun_color_;
@@ -1882,11 +1872,25 @@ void geometry_pass::record_scene_upload(string::pass_context& ctx)
             scene.cascade_texel[c] = glm::vec4(cascade_world_texel_[c], 0, 0, 0);
             scene.cascade_slot[c] = glm::uvec4(shadow != nullptr ? ctx.slot(cascades_[c]) : 0u, 0, 0, 0);
         }
-        // Brief 11 M3 graceful degrade: when the shadow.cascades pass is toggled off (r.pass.shadow),
-        // report cascade_count 0 so the lit shader's shadow term cancels (select_cascade -> kNoCascade
-        // -> unshadowed) instead of sampling stale/undefined maps. Data-level degrade — the bindless
-        // shadow reads go through this SceneData field, not a graph-bound descriptor.
-        scene.cascade_count = cv_pass_shadow().get() ? settings_.cascade_count : 0u;
+        // No shadow-off special case. The cascades are TRANSIENTS declaring `neutral = 1.0`, so when
+        // the cascade passes are toggled off ctx.slot() above already resolves to the neutral
+        // fallback and the shadow term reads unshadowed — the graph's degrade, not a second one
+        // written by hand in the data (brief 21 step 4).
+        scene.cascade_count = settings_.cascade_count;
+        // STRING_STATS_LOG: one-shot cascade slot identity — distinct slots per cascade proves the
+        // consumers resolve three real maps; equal slots proves a collapse (fallback or slot mixup).
+        {
+            static const bool log_slots = std::getenv("STRING_STATS_LOG") != nullptr;
+            static bool slots_logged = false;
+            if (log_slots && !slots_logged)
+            {
+                slots_logged = true;
+                STRING_LOG_INFO("[slots] cascade slots {} {} {} count {} | gtao {} env {} dfg {}",
+                                scene.cascade_slot[0].x, scene.cascade_slot[1].x,
+                                scene.cascade_slot[2].x, scene.cascade_count, scene.gtao_slot,
+                                scene.env_slot, scene.dfg_slot);
+            }
+        }
         scene.shadow_texel = 1.0f / static_cast<float>(settings_.shadow_resolution);
         scene.shadow_bias = cv_shadow_bias().get();
         scene.shadow_normal_offset_scale = cv_shadow_normal_offset().get();
@@ -1901,13 +1905,16 @@ void geometry_pass::record_scene_upload(string::pass_context& ctx)
         scene.froxel_planes = glm::vec4(near_p, far_p, 1.0f / std::log(far_p / near_p),
                                         static_cast<float>(light_count));
         scene.lights = light_count > 0 ? ctx.address(lights_buffer_) : 0;
-        // scene.froxels is deliberately NOT set here — it is patched in record() instead. Reading it
-        // at update() time made this pass depend on FroxelPass having already updated, an ordering
-        // that nothing enforced (the frame graph derives RECORD order from declared usages, but the
-        // update loop just walks scene_passes_ in push order). Get that order wrong and this baked a
-        // null device address that lighting.slang dereferences unconditionally -> GPU fault ->
-        // DEVICE_LOST. By record() time every pass has updated, so the address is always valid and
-        // the ordering stops being load-bearing.
+        // The froxel list's address. This pass DECLARES it (`.reads(froxels)` above), so resolving it
+        // here is exactly what the declaration licenses — the address is this frame's backing, at
+        // record time, ordered against the froxel pass by the graph.
+        //
+        // It used to say "deliberately NOT set here — patched in record() instead", from an era when
+        // update() ran before the producers had. Nothing ever did the patching: the field stayed 0
+        // for the whole life of the renderer, and `lighting.slang` dereferences it the moment a scene
+        // has local lights (`froxel_planes.w > 0`). A null device address is a GPU fault, not a wrong
+        // colour. It survived only because the demo scenes light with the sun alone.
+        scene.froxels = ctx.address(froxels_);
         scene.max_lights_per_froxel = kMaxLightsPerFroxel;
         scene.debug_flags = (froxel_heatmap_ ? 1u : 0u) | (furnace_ ? 2u : 0u)
                           | (cv_gtao_spec_occ().get() ? 0u : 4u)    // bit2: disable bent-normal spec-occ
@@ -1939,7 +1946,11 @@ void geometry_pass::record_scene_upload(string::pass_context& ctx)
         const uint16_t gtao_prev = gtao != nullptr ? gtao->prev_slot(current_frame) : 0;
         scene.prev_view_proj = gtao_runs && gtao_prev < depth_history_.size()
             ? depth_history_[gtao_prev].view_proj : glm::mat4(1.0f);
-        scene.gtao_slot = gtao != nullptr ? ctx.slot(gtao_ao_) : 0xFFFFFFFFu;
+        // The ~0u sentinel is gtao's ONLY sound degrade — the shader branches to the clean no-AO
+        // path. A neutral texture cannot stand in: gtao.ao holds an ENCODED bent normal, and any
+        // constant decodes to a degenerate vector (0.5s -> the zero vector, which collapsed the
+        // sun/spec terms into the giant black regions that presented as broken shadows).
+        scene.gtao_slot = gtao != nullptr && gtao->has_output() ? ctx.slot(gtao_ao_) : 0xFFFFFFFFu;
         scene.gtao_strength = std::clamp(cv_gtao_strength().get(), 0.0f, 1.0f);
         const glm::uvec2 gtao_extent = gtao != nullptr ? gtao->size() : glm::uvec2(0);
         scene.gtao_w = gtao_extent.x;   // half-res AO extent for the lit shader.s joint upsample

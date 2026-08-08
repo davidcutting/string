@@ -19,7 +19,7 @@ struct SecPlan { uint64_t count; uint32_t elem; const void* data; };
 std::vector<uint8_t> write_cooked(const CookedScene& scene)
 {
     SecPlan plan[kSecCount];
-    plan[kSecVertices]      = { scene.vertices.size(),          sizeof(String::Vertex), scene.vertices.data() };
+    plan[kSecVertices]      = { scene.vertices.size(),          sizeof(string::Vertex), scene.vertices.data() };
     plan[kSecMeshlets]      = { scene.meshlets.size(),          sizeof(GpuMeshlet),     scene.meshlets.data() };
     plan[kSecMeshletVerts]  = { scene.meshlet_vertices.size(),  sizeof(uint32_t),       scene.meshlet_vertices.data() };
     plan[kSecMeshletTris]   = { scene.meshlet_triangles.size(), sizeof(uint32_t),       scene.meshlet_triangles.data() };

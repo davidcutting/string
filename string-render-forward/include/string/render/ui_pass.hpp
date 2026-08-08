@@ -95,11 +95,11 @@ public:
     {
         // Non-const so a modal surface (the debug console) can set Input::text_capture to suppress
         // gameplay input while it is open. Read-only for every other author.
-        String::Input& input;
+        string::Input& input;
         // The remappable action map. Non-const so a surface can push/pop its own input CONTEXT (a
         // modal claiming everything, a rebinder claiming keys while it captures one) and so a
         // bindings UI can actually rebind. Everything else should read actions, not raw keys.
-        String::InputMap& input_map;
+        string::InputMap& input_map;
         // Resolved interaction (brief 12 M0b): hovered/focused/pressed ids, drag state, dt. Owned by
         // the engine (`::string::ui`) — the pass PRODUCES it and hands it over, it does not define it.
         // Replaces the loose fields this struct used to duplicate.
@@ -119,7 +119,7 @@ public:
     // glyphs are seen. `author` declares the whole UI (shapes + text) each frame. `samples` is the
     // MSAA sample count of the scene target this overlay draws into: pipeline fixed state, supplied
     // by the app exactly like composite_pass's colour format (engine_context no longer carries it).
-    ui_pass(String::engine_context& context, VkSampleCountFlagBits samples,
+    ui_pass(string::engine_context& context, VkSampleCountFlagBits samples,
             std::shared_ptr<::string::dynamic_font_atlas> atlas,
             Author author, PostLayout post_layout = {}, DeferredAuthor deferred = {});
     ~ui_pass();
@@ -199,10 +199,10 @@ private:
     Author author_;
     PostLayout post_layout_;
     DeferredAuthor deferred_;
-    String::Input& input_;  // non-const: the pass requests game/UI capture mode
+    string::Input& input_;  // non-const: the pass requests game/UI capture mode
     // The UI's own actions are bound here like any other, so which key means "cancel" is a player
     // setting rather than a hardcoded key_pressed() in the crossing below.
-    String::InputMap& input_map_;
+    string::InputMap& input_map_;
     // Read each frame for the shader-compile error overlay (brief 01, M4): when a hot-reload fails,
     // the registry holds the diagnostics; the pass draws them over the UI until the next success.
     ::string::gpu::shader_program_registry& shader_registry_;
@@ -219,7 +219,7 @@ private:
 
     // THE ONE CROSSING (brief 12 M0b, load-bearing): the only place sandbox translates platform
     // input into engine UI vocabulary. Option (3) — engine owns a `ui::host` — is then "move this
-    // function", not a redesign. Do not spread `String::Input` reads into other UI code.
+    // function", not a redesign. Do not spread `string::Input` reads into other UI code.
     ::string::ui::interaction_input populate_interaction(float delta_time);
     // Applies the engine's mode REQUESTS (click on empty space -> game, focus-nav -> UI) back to
     // the platform. Separate from the resolvers because capture is the host's decision, not theirs.

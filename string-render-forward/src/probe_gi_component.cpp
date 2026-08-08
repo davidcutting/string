@@ -27,7 +27,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 // --- the grid fit (pure; the app sizes its declarations with it) ---------------------------------
 
@@ -401,12 +401,11 @@ void probe_gi_component::declare(::string::frame_graph& fg, const resources& res
     //    probe_irradiance is TEMPORAL and stays ONE logical image: the dispatch reads the previous
     //    contents (hysteresis EMA + a neighbour-bounce term over probes last written on an EARLIER
     //    frame) and writes them back, for the 128 probes in this frame's round-robin slice. That is a
-    //    read-modify-write, not a ping-pong and not a ring — declared as a sampled read plus a
-    //    storage write of the same image. The two uses name the same subresource, so per-slice
-    //    tracking coalesces them; the write is named as the mip-0 SLICE purely so the two
-    //    descriptors it needs (Sampler2D for the bounce, RWTexture2D for the store) resolve
-    //    separately through ctx.slot(). Declaration ORDER matters here and is deliberate: the read is
-    //    declared first so the pass ends up in GENERAL, which is the layout the store requires.
+    //    read-modify-write — ONE declaration, `.read_writes()` (brief 11's verb, restored by brief
+    //    21 D3): combined read|write scope at GENERAL, no declaration-order dependence. The two
+    //    descriptors the shader needs (Sampler2D for the filtered bounce, RWTexture2D for the
+    //    store) both resolve through the access-qualified ctx.slot(); the graph binds both types
+    //    for a read_writes use at compile.
     //
     //    Three barriers die here. :673 made the IBL's SH write visible to this compute read, and the
     //    IBL chain is declared now, so the RAW derives. :689 was the cross-frame WAR against last
@@ -418,8 +417,7 @@ void probe_gi_component::declare(::string::frame_graph& fg, const resources& res
     relight.reads(res_.capture_gbuf)
            .reads(res_.capture_albedo)
            .reads(res_.visibility)
-           .reads(res_.irradiance)
-           .writes(res_.irradiance)
+           .read_writes(res_.irradiance)
            .reads(sky_sh_)
            .reads(scene_data_)
            .reads(res_.active)

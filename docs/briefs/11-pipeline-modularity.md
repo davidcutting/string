@@ -36,6 +36,10 @@ authoring facade over them and making the graph persistent + introspectable.
   cached where nothing structural changed.
 - **Invalidation** (forces a recompile — rare, cheap): a `.toggle()` flip, resize, or pipeline
   hot-reload. Everything else reuses the plan.
+  > **SUPERSEDED (user, 2026-08-07 — brief 21 D2):** none of these recompile any more. A toggle is
+  > an in-graph conditional, resize is a backing swap, hot-reload swaps pipelines inside passes.
+  > Authored once, compiled once — softly stated: recompile isn't forbidden, it's unnecessary
+  > unless runtime graph *editing* becomes a feature.
 
 ### Fluent Daxa-style builder (the top-level API)
 
@@ -81,7 +85,12 @@ rg.execute(frame);     // per frame — cheap re-record from the cached plan
   The debug UI's pass checkbox (brief 14) writes the **same** CVar handle → toggling a pass from
   the panel is the live proof of modularity.
 - `.queue()` is a hint; the scheduler is still the only placement decider (04e guardrail).
+  > SUPERSEDED: landed as `.async()` (brief 20), a per-pass lane marker; on 1-lane hardware the
+  > executor records inline — same graph, serialized placement.
 - `.run_if()` folds the IBL/GI amortization pattern into the graph as a per-pass run-condition.
+  > SUBSUMED: `.toggle(predicate)` is re-evaluated at execute every frame and covers run-conditions;
+  > no separate verb landed. `.read_writes()` (below) was silently dropped by brief 20 and
+  > **RESTORED by brief 21 D3** (user, 2026-08-07) — one combined access for in-place RMW.
 - **Disabled-pass-consumer policy (RESOLVED 2026-07-25):** a pass runs as long as its *required*
   inputs exist — a single missing input does NOT skip the pass. Reads **degrade gracefully by
   default**: when a producer is toggled off, the reader binds a **neutral fallback** resource
@@ -114,6 +123,10 @@ rg.execute(frame);     // per frame — cheap re-record from the cached plan
 
 Engine (`string::gpu`) owns the graph, handle pools, registry, and introspection API (all
 generic). Sandbox owns the concrete passes and the scene-specific resource/state stores.
+
+> **SUPERSEDED (user, 2026-08-06 — brief 20's app seam):** the APP constructs and owns the
+> `frame_graph` and every declaration in it; the library owns only what is *derived* (acquire,
+> queue placement, present). The registry was deleted entirely (brief 20).
 
 ### Process + scope guardrails
 

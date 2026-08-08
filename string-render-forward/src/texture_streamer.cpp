@@ -11,7 +11,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 namespace
 {
@@ -46,16 +46,11 @@ ktxTexture2* load_ktx2_bc7(const std::filesystem::path& path)
 
 }  // namespace
 
-TextureStreamer::TextureStreamer(::string::gpu::device& device, ::string::gpu::resource_allocator& allocator,
-                                 ::string::gpu::descriptor_table& descriptor_table, TransferBatch& transfer,
-                                 VkImageView placeholder_view, VkSampler placeholder_sampler)
-: device_(device)
-, allocator_(allocator)
+TextureStreamer::TextureStreamer(::string::gpu::resource_allocator& allocator,
+                                 ::string::gpu::descriptor_table& descriptor_table, TransferBatch& transfer)
+: allocator_(allocator)
 , descriptor_table_(descriptor_table)
 , transfer_(transfer)
-, placeholder_view_(placeholder_view)
-, placeholder_sampler_(placeholder_sampler)
-, max_anisotropy_(device.get_physical_device_limits().maxSamplerAnisotropy)
 {
 }
 
@@ -87,46 +82,8 @@ TextureStreamer::~TextureStreamer()
             allocator_.destroy_resource(t.image);
         }
     }
-    for (auto& [base, sampler] : samplers_)
-    {
-        vkDestroySampler(device_.get_device(), sampler, nullptr);
-    }
-}
-
-VkSampler TextureStreamer::sampler_for(std::uint32_t base)
-{
-    auto it = samplers_.find(base);
-    if (it != samplers_.end())
-    {
-        return it->second;
-    }
-    const VkSamplerCreateInfo info = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .mipLodBias = 0.f,
-        .anisotropyEnable = VK_TRUE,
-        .maxAnisotropy = max_anisotropy_,
-        .compareEnable = VK_FALSE,
-        .compareOp = VK_COMPARE_OP_ALWAYS,
-        .minLod = static_cast<float>(base),
-        .maxLod = VK_LOD_CLAMP_NONE,
-        .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
-        .unnormalizedCoordinates = VK_FALSE,
-    };
-    VkSampler sampler = VK_NULL_HANDLE;
-    if (vkCreateSampler(device_.get_device(), &info, nullptr, &sampler) != VK_SUCCESS)
-    {
-        throw std::runtime_error("TextureStreamer: failed to create minLod sampler");
-    }
-    samplers_[base] = sampler;
-    return sampler;
+    // No samplers to destroy: minLod samplers are shared out of the allocator's cache now (see
+    // rebind), so the streamer creates no Vulkan objects of its own beyond its images.
 }
 
 std::uint64_t TextureStreamer::upload_levels(Texture& t, ktxTexture2* ktx, std::uint32_t first_level,
@@ -186,21 +143,18 @@ TextureStreamer::Registered TextureStreamer::add(const std::filesystem::path& pa
         .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
+        // Nothing is uploaded yet, so pin sampling to the coarsest level — the one the very first
+        // stream (the coarse tail) fills. rebind() lowers this as finer levels land.
+        .sampler = { .min_lod = static_cast<float>(t.levels - 1) },
         .mip_levels = t.levels,
     });
     t.image = image;
     t.view = allocator_.get_image(image).view;
 
-    // Allocate the bindless slot and point it at the placeholder until the real texture streams in.
-    // (bind() writes the image's own — still UNDEFINED — view; immediately overwrite with the
-    // placeholder so nothing samples the empty image.)
+    // Allocate the bindless slot. bind() writes the image's own view and its current sampler, so the
+    // minLod above is what the slot carries until the first on_resident.
     descriptor_table_.bind(image, ::string::gpu::descriptor_type::TEXTURE);
     t.slot = descriptor_table_.get_binding_slot(image, ::string::gpu::descriptor_type::TEXTURE);
-    // BRIEF 20 REGRESSION — see the brief's "texture streaming" note. update_texture is deleted, and
-    // nothing replaces per-slot residency rebinding: the placeholder swap and the adjustable minLod
-    // both needed it. bind() writes the image's OWN view and sampler, which is correct once a texture
-    // is fully resident and wrong while it is streaming in.
-    descriptor_table_.bind(image, ::string::gpu::descriptor_type::TEXTURE);
 
     const std::uint32_t slot = t.slot;
     const std::uint32_t levels = t.levels;
@@ -289,38 +243,43 @@ bool TextureStreamer::is_complete(std::uint64_t token)
     return done;
 }
 
+// Point the slot at the mip range that is actually on the GPU. `phys_base` is the truth (the finest
+// level physically uploaded); `detail` is the residency manager's currency and agrees with it once a
+// stream completes, so the coarser of the two is always the safe floor.
+//
+// This is the residency rebinding brief 20 left without a verb (brief 21's G8): the sampler is a
+// property of the image now, so raising detail is a sampler swap plus a rebind, not a descriptor
+// write from outside. Without it every streamed texture sampled from mip 0 — memory no upload had
+// ever touched — which is why large near-camera surfaces read as black albedo and zero roughness
+// (a sky mirror) while distant ones, sampling the coarse mips that WERE uploaded, looked right.
+void TextureStreamer::rebind(Texture& t, std::uint32_t detail)
+{
+    const std::uint32_t resident_base = std::max(base_of(t, detail), t.phys_base);
+    const float min_lod = static_cast<float>(std::min(resident_base, t.levels - 1));
+    allocator_.set_sampler(t.image, ::string::gpu::sampler_info{ .min_lod = min_lod });
+    descriptor_table_.bind(t.image, ::string::gpu::descriptor_type::TEXTURE);
+
+    // STRING_STREAM_LOG=1: what each texture's slot is actually allowed to sample. A texture stuck at
+    // a coarse minLod is a residency-feedback problem; one whose minLod is finer than phys_base would
+    // be an upload-ordering problem. Both used to be invisible.
+    static const bool log_stream = std::getenv("STRING_STREAM_LOG") != nullptr;
+    if (log_stream)
+    {
+        STRING_LOG_INFO("[stream] slot {} ({}): detail {}/{} phys_base {} -> minLod {}", t.slot,
+                        t.path.filename().string(), detail, t.levels, t.phys_base, min_lod);
+    }
+}
+
 void TextureStreamer::on_resident(::string::gpu::resource_id id, std::uint32_t detail)
 {
-    Texture& t = textures_.at(id);
-    if (detail == 0)
-    {
-        // BRIEF 20 REGRESSION — see the brief's "texture streaming" note. update_texture is deleted, and
-    // nothing replaces per-slot residency rebinding: the placeholder swap and the adjustable minLod
-    // both needed it. bind() writes the image's OWN view and sampler, which is correct once a texture
-    // is fully resident and wrong while it is streaming in.
-    descriptor_table_.bind(id, ::string::gpu::descriptor_type::TEXTURE);
-        return;
-    }
-    // Swap the slot from the placeholder to the real image at the new minLod.
-    descriptor_table_.bind(id, ::string::gpu::descriptor_type::TEXTURE);   // see note above
+    rebind(textures_.at(id), detail);
 }
 
 void TextureStreamer::evict(::string::gpu::resource_id id, std::uint32_t /*from_detail*/, std::uint32_t to_detail)
 {
-    // v1: logical only. Revert to the placeholder at detail 0, else raise minLod.
-    Texture& t = textures_.at(id);
-    if (to_detail == 0)
-    {
-        // BRIEF 20 REGRESSION — see the brief's "texture streaming" note. update_texture is deleted, and
-    // nothing replaces per-slot residency rebinding: the placeholder swap and the adjustable minLod
-    // both needed it. bind() writes the image's OWN view and sampler, which is correct once a texture
-    // is fully resident and wrong while it is streaming in.
-    descriptor_table_.bind(id, ::string::gpu::descriptor_type::TEXTURE);
-    }
-    else
-    {
-        descriptor_table_.bind(id, ::string::gpu::descriptor_type::TEXTURE);   // see note above
-    }
+    // v1: logical only — no VRAM is reclaimed, so this just raises minLod back up. phys_base keeps
+    // the physically-uploaded levels, which is why re-wanting the detail later uploads nothing.
+    rebind(textures_.at(id), to_detail);
 }
 
 VkDeviceSize TextureStreamer::cost(::string::gpu::resource_id id, std::uint32_t detail)

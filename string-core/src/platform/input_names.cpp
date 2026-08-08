@@ -8,7 +8,7 @@
 // A switch rather than a table, because `KeyCode` is deliberately sparse (it follows the GLFW/SDL
 // numbering, so it runs to 347 with large gaps). A 348-entry array to name ~100 keys would be mostly
 // holes, and every gap would be a silent empty string rather than a visible fallback.
-namespace String
+namespace string
 {
 
 std::string_view key_name(KeyCode k) noexcept
@@ -149,4 +149,4 @@ std::string_view button_name(GamepadButton b) noexcept
     return "pad?";
 }
 
-}  // namespace String
+}  // namespace string

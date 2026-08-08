@@ -32,7 +32,7 @@
 
 #include <volk.h>
 
-namespace String { struct engine_context; }
+namespace string { struct engine_context; }
 
 namespace string
 {
@@ -48,9 +48,6 @@ using record_fn = std::function<void(pass_context&)>;
 // Re-evaluated at EXECUTE, every frame. Empty => always enabled. This is the in-graph conditional:
 // flipping it does not recompile anything.
 using enable_fn = std::function<bool()>;
-// Recomputes a viewport-derived size. Declared, not computed at author time — that is what lets a
-// resize be a backing swap instead of a re-author.
-using size_fn = std::function<VkDeviceSize(VkExtent2D)>;
 
 enum class pass_kind : std::uint8_t { raster, compute, transfer };
 
@@ -91,15 +88,30 @@ struct persistent_buffer_info
 
 // A frame-scoped image the graph allocates, owns and may alias against other transients whose
 // lifetimes do not overlap.
+// How an image's extent follows the viewport. Declaring the RELATIONSHIP rather than the numbers is
+// what keeps the graph authored-once: a resize recomputes the backing, and no declaration changes.
+// These are the relationships the engine actually has — not a callback, so a reader of the
+// declaration can see the shape without running anything.
+enum class viewport_fit
+{
+    fixed,      // `extent` as declared
+    scaled,     // viewport * viewport_scale (half-res AO, quarter-res bloom, ...)
+    // Half the next power of two of the viewport: the base of an exact reduction pyramid, where
+    // every level is exactly half its parent. A linear scale cannot express it, which is how the HiZ
+    // pyramid came to be declared at a FIXED extent and stopped following the window.
+    half_pow2,
+};
+
 struct transient_image_info
 {
     std::string name;
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkExtent3D extent{ 1, 1, 1 };
-    // Sized from the viewport rather than fixed: extent = viewport * scale, recomputed on resize
-    // without re-authoring. Declaring the RELATIONSHIP is what keeps the graph authored-once.
-    bool viewport_scaled = false;
+    viewport_fit fit = viewport_fit::fixed;
     float viewport_scale = 1.0f;
+    // Number of mips, or `all_mips` for as many as the extent supports — the only sound answer for a
+    // viewport-derived pyramid, whose level count changes with the window.
+    static constexpr std::uint32_t all_mips = ~std::uint32_t{ 0 };
     std::uint32_t mip_levels = 1;
     std::uint32_t array_layers = 1;
     bool cube = false;
@@ -108,23 +120,26 @@ struct transient_image_info
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     gpu::sampler_info sampler{};
     VkClearColorValue neutral{};
-    // One physical per frame-in-flight. Needed only when a resource is read one frame after it is
-    // written (temporal reprojection); everything else is single-buffered and the graph derives the
-    // within-frame edge instead of spending memory on it.
-    bool per_frame = false;
+    // A transient is single-backed BY DEFINITION: its contents are frame-scoped. Anything whose
+    // contents must outlive the frame — history, host-write pacing rings — has a lifetime beyond
+    // the graph's scope and is therefore a PERSISTENT its owner backs (multi-slot when ringed),
+    // per brief 21 D3. The per_frame flag that used to live here was that misfiling.
 };
 
 struct transient_buffer_info
 {
     std::string name;
     VkDeviceSize bytes = 0;
-    // Declared viewport relationship (see transient_image_info::viewport_scaled). When set, `bytes`
-    // is recomputed by this function on resize.
-    size_fn bytes_for;
+    // The one viewport relationship a BUFFER actually has in this engine: so many bytes per screen
+    // TILE — bytes = bytes_per_tile * ceil(w / tile_pixels) * ceil(h / tile_pixels). Two declared
+    // numbers rather than a callback, so a reader of the declaration can see the shape without
+    // running anything, and a resize recomputes it without re-authoring. `tile_pixels == 0` means
+    // fixed size: use `bytes`.
+    std::uint32_t tile_pixels = 0;
+    VkDeviceSize bytes_per_tile = 0;
     VkBufferUsageFlags usage = 0;
     VmaMemoryUsage memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
     VmaAllocationCreateFlags allocation_flags = 0;
-    bool per_frame = false;
 };
 
 // --- pass declaration ---------------------------------------------------------------------------
@@ -176,6 +191,14 @@ public:
     pass_spec& writes(gpu::image_view v, access how, VkPipelineStageFlags2 stage = 0);
     pass_spec& writes(gpu::image i, access how, VkPipelineStageFlags2 stage = 0) { return writes(i.whole(), how, stage); }
     pass_spec& writes(gpu::buffer b, access how, VkPipelineStageFlags2 stage = 0);
+
+    // --- in-place read-modify-write (brief 11's verb, restored by brief 21 D3). ONE declaration for
+    //     a dispatch that reads a resource's prior contents and writes it back — hysteresis EMAs,
+    //     atomics-accumulated state. Not a ping-pong and not a ring: one logical resource, GENERAL
+    //     layout, combined read|write scope. -----------------------------------------------------
+    pass_spec& read_writes(gpu::image_view v);
+    pass_spec& read_writes(gpu::image i) { return read_writes(i.whole()); }
+    pass_spec& read_writes(gpu::buffer b);
 
     // --- attachments. Load/store/resolve are DERIVED from the graph's lifetime facts, never
     //     declared: the first writer clears, later writers load, the last before a resolve
@@ -232,11 +255,22 @@ public:
     pass_spec pass(std::string name) { return pass_spec(*this, std::move(name)); }
 
     // Allocate transients, pack aliasable ones, toposort, derive render-pass groups. Called ONCE.
-    compiled_frame compile(String::engine_context& ctx, VkExtent2D viewport);
+    compiled_frame compile(string::engine_context& ctx, VkExtent2D viewport);
 
     std::vector<pass_info> passes() const;
 
-    // --- resource records (the graph is the single resolution authority) -------------------------
+    const std::vector<pass_decl>& declarations() const { return passes_; }
+
+private:
+    friend class pass_spec;
+    friend class compiled_frame;
+    void add(pass_decl&& p) { passes_.push_back(std::move(p)); }
+
+    // --- resource records. PRIVATE: the graph is the single resolution authority, and a caller that
+    //     can read a record can read `physical` — which is how the app came to reach past
+    //     set_images() and hand the renderer raw ids (brief 21, audit finding 7). Resolution goes
+    //     through pass_context; re-backing goes through set_images. compiled_frame is a friend
+    //     because it IS the resolution machinery, not a client of it. --------------------------
     struct image_record
     {
         std::string name;
@@ -248,6 +282,12 @@ public:
         transient_image_info info{};              // transient only (re-created on resize)
         VkClearColorValue neutral{};
         gpu::image fallback{};                    // 1x1 neutral substitute, minted at compile
+        // Has ANY frame's surviving pass written this image? Amortized producers (the IBL bake,
+        // GTAO's gated chain) idle on most frames, but their content PERSISTS — substituting the
+        // neutral on idle frames replaced a finished bake with a 1x1 fallback. Degrade is for
+        // content that never existed, not content not refreshed this frame. Reset on resize (the
+        // backing, and so the contents, are new).
+        bool ever_written = false;
     };
 
     struct buffer_record
@@ -261,16 +301,13 @@ public:
 
     const image_record&  record_of(gpu::image h)  const { return images_[h.index]; }
     const buffer_record& record_of(gpu::buffer h) const { return buffers_[h.index]; }
-    const std::vector<pass_decl>& declarations() const { return passes_; }
-
-private:
-    friend class pass_spec;
-    friend class compiled_frame;
-    void add(pass_decl&& p) { passes_.push_back(std::move(p)); }
 
     std::vector<pass_decl> passes_;
     std::vector<image_record> images_;
     std::vector<buffer_record> buffers_;
+    // Set for the duration of execute(). A backing swap from inside a pass callback would pull a
+    // resource out from under barriers already recorded against the old one, silently.
+    bool executing_ = false;
 };
 
 // --- the compiled graph (COMPILED) ---------------------------------------------------------------
@@ -291,7 +328,13 @@ struct render_group
     // All faces/layers of a layered attachment rendered in one pass (viewMask). Derived from the
     // declared slice: a 6-layer colour slice is a cubemap capture.
     std::uint32_t view_mask = 0;
-    std::optional<gpu::image_view> color;
+    // The primary colour attachment — DERIVED from `colors`, not stored beside it. It is what the
+    // per-attachment lifetime bookkeeping (first writer clears, last writer resolves) keys on, and
+    // as a second stored field it was one more thing that had to agree with `colors`.
+    std::optional<gpu::image_view> color() const
+    {
+        return colors.empty() ? std::nullopt : std::optional<gpu::image_view>{ colors.front() };
+    }
     std::optional<gpu::image_view> depth;
     // MSAA resolve targets, derived from the attachments' sample counts: a multisampled attachment
     // paired with a 1-sample image of the same size resolves into it at EndRendering.
@@ -311,10 +354,16 @@ struct execute_info
     gpu::command_recorder* async_rec = nullptr;   // null => async passes record inline on `rec`
     std::uint32_t frame_slot = 0;
     VkExtent2D extent{};
-    // Late-latched swapchain backing for this frame (persistent_image_info::swapchain).
-    gpu::resource_id swapchain = 0;
-    VkImage swapchain_image = VK_NULL_HANDLE;
-    VkImageView swapchain_view = VK_NULL_HANDLE;
+    // The image this frame acquired, for the one persistent declared `swapchain = true`. Named ONCE:
+    // the graph already knows WHICH resource it is (from the declaration), so the frame supplies only
+    // the backing. It used to also carry a `resource_id` sentinel for the same resource — a third
+    // name for one thing, and one that no allocator could ever resolve.
+    struct acquired_image
+    {
+        VkImage image = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+    };
+    acquired_image swapchain{};
 };
 
 class compiled_frame
@@ -329,7 +378,7 @@ public:
 
     // Re-size viewport-scaled transients and forget tracked state. Does NOT re-author or re-plan:
     // the declarations are unchanged, only the backing. Caller waits for device idle first.
-    void resize(String::engine_context& ctx, VkExtent2D viewport);
+    void resize(string::engine_context& ctx, VkExtent2D viewport);
 
     // Did the executor skip `pass_index` (order index) this frame? For introspection/timing.
     bool ran(std::uint32_t order_index) const;
@@ -346,19 +395,15 @@ public:
     gpu::resource_id physical_of(gpu::image h, std::uint32_t slot) const { return physical(h, slot); }
     gpu::resource_id physical_of(gpu::buffer h, std::uint32_t slot) const { return physical(h, slot); }
 
-    // Tell the tracker an image's layout was changed OUTSIDE the graph. The debug capture drains the
-    // device and transitions its source directly, so without this the tracker's belief goes stale and
-    // the next frame's derived barrier is wrong. Announcing it is what keeps the tracker the single
-    // authority even when a debug path has to step around it.
-    void note_external_layout(gpu::image h, VkImageLayout layout);
 
 private:
     friend class frame_graph;
 
+
     friend struct pass_context;
 
     // Allocate every transient from its declaration (viewport-scaled ones against `viewport`).
-    void materialize(String::engine_context& ctx, VkExtent2D viewport);
+    void materialize(string::engine_context& ctx, VkExtent2D viewport);
     // Group adjacent raster passes sharing attachments, and derive each group's clear/load/store
     // facts from that attachment's lifetime across the frame.
     void derive_groups();
@@ -371,7 +416,11 @@ private:
     void barrier_for(VkCommandBuffer cmd, const pass_decl& p, std::uint32_t slot,
                      bool skip_attachments);
     // Open a render-pass instance with load/store/resolve derived from the group's lifetime facts.
-    void open_group(VkCommandBuffer cmd, const render_group& g, std::uint32_t slot, VkExtent2D extent);
+    // clear_color/clear_depth are THIS FRAME's clear ownership, derived in execute() over the
+    // groups that actually survived the conditionals — not the compile-time facts, which assume
+    // every group opens (a skipped first-writer would silently turn every clear into a load).
+    void open_group(VkCommandBuffer cmd, const render_group& g, std::uint32_t slot, VkExtent2D extent,
+                    bool clear_color, bool clear_depth);
     static VkImageAspectFlags aspect_of(VkFormat format);
     // One-shot clear of each neutral fallback to its declared value, on the first executed frame.
     void init_fallbacks(VkCommandBuffer cmd);
@@ -389,8 +438,10 @@ private:
     // The bindless slot for a handle THIS pass declared, with the descriptor type derived from that
     // declaration — and the neutral fallback substituted when the producer did not survive.
     std::uint32_t slot_for(gpu::image_view v, std::uint32_t pass_index, std::uint32_t slot) const;
-    std::uint32_t slot_for(gpu::image_view v, access how, std::uint32_t pass_index, std::uint32_t slot) const;
-    std::uint32_t slot_for(gpu::buffer h, std::uint32_t pass_index, std::uint32_t slot) const;
+    // No pass_index: the ACCESS is the disambiguator here, which is the whole point of the overload.
+    std::uint32_t slot_for(gpu::image_view v, access how, std::uint32_t slot) const;
+    // No pass_index: a buffer has one slot, so there is nothing for a pass to disambiguate.
+    std::uint32_t slot_for(gpu::buffer h, std::uint32_t slot) const;
 
     gpu::resource_allocator& allocator() const;
 
@@ -400,15 +451,17 @@ private:
     void compute_survivors();
 
     frame_graph* graph_ = nullptr;
-    String::engine_context* ctx_ = nullptr;
+    string::engine_context* ctx_ = nullptr;
     std::vector<std::uint32_t> order_;          // toposorted pass indices
     std::vector<render_group> groups_;
     std::vector<bool> alive_;                   // per declared pass, this frame
     resource_state_tracker states_;
     VkDeviceSize transient_bytes_ = 0;
+    // How many transients that total covers — the aliasing denominator, if aliasing is ever done.
+    std::uint32_t transient_count_ = 0;
     VkExtent2D viewport_{};
     // This frame's late-latched swapchain backing (see persistent_image_info::swapchain).
-    gpu::resource_id swapchain_ = 0;
+
     VkImage swapchain_image_ = VK_NULL_HANDLE;
     VkImageView swapchain_view_ = VK_NULL_HANDLE;
 
@@ -432,6 +485,10 @@ private:
     mutable std::unordered_map<slice_key, gpu::resource_id, slice_hash> slices_;
     // Fallbacks created by materialize(), awaiting their one-shot clear.
     std::vector<gpu::image> pending_fallbacks_;
+    // Every (id, type) bind_declared_slots wrote, so resize can UNBIND them before the backing is
+    // destroyed and re-bind the new backing — without this, freed ids leak descriptor slots and the
+    // re-created transients have none (get_binding_slot throws on first use).
+    std::vector<std::pair<gpu::resource_id, gpu::descriptor_type>> bound_;
 };
 
 }  // namespace string

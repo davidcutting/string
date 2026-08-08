@@ -16,7 +16,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 ibl_component::ibl_component(engine_context& ctx)
 : device_(ctx.device)
@@ -309,7 +309,7 @@ void ibl_component::run_verification(bool furnace, ::string::gpu::resource_id sh
         vkCmdCopyBuffer(cb, allocator_.get_buffer(sh_buffer).buffer,
                         allocator_.get_buffer(staging).buffer, 1, &sh_region);
         const ::string::gpu::allocated_image& dfg = allocator_.get_image(dfg_lut);
-        String::vku::transition_image(cb, {
+        string::vku::transition_image(cb, {
             .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .new_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             .src_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
@@ -325,7 +325,7 @@ void ibl_component::run_verification(bool furnace, ::string::gpu::resource_id sh
         };
         vkCmdCopyImageToBuffer(cb, dfg.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                allocator_.get_buffer(staging).buffer, 1, &dfg_region);
-        String::vku::transition_image(cb, {
+        string::vku::transition_image(cb, {
             .image = dfg.image, .old_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .src_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,

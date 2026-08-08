@@ -8,7 +8,7 @@
 #include <string/core/logger.hpp>
 #include <string/platform/window.hpp>
 
-namespace String
+namespace string
 {
 
 struct GLFWError {
@@ -252,4 +252,4 @@ std::vector<const char*> Window::get_platform_extensions(bool enable_validation_
     return extensions;
 }
 
-}  // namespace String
+}  // namespace string

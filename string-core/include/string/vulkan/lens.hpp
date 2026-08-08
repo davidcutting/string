@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace String
+namespace string
 {
 
 // Brief 14 M5 — the lens: a screen region the composite substitutes, either magnified (a pixel
@@ -52,4 +52,4 @@ public:
     static LensState& instance();
 };
 
-}  // namespace String
+}  // namespace string

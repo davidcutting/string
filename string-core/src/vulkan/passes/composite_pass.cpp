@@ -13,7 +13,7 @@
 #include <string/core/cvar.hpp>
 #include <string/core/logger.hpp>
 
-namespace String
+namespace string
 {
 
 namespace
@@ -166,10 +166,11 @@ bool s_override_active = false;
 
 }  // namespace
 
-composite_pass::composite_pass(String::engine_context& ctx, VkFormat color_format)
+composite_pass::composite_pass(string::engine_context& ctx, VkFormat color_format)
 : device_(ctx.device)
 , allocator_(ctx.allocator)
 , descriptor_table_(ctx.descriptor_table)
+, transfer_(ctx.transfer)
 {
     const std::filesystem::path resources_path = ctx.resources_path;
     string::gpu::shader_program_registry& registry = ctx.shader_registry;
@@ -224,19 +225,6 @@ composite_pass::composite_pass(String::engine_context& ctx, VkFormat color_forma
     lut_size_cvar();
     grading_from_cvars();
 
-    // LUT sampler: linear, clamp (the strip must not wrap at slice edges beyond the manual
-    // within-slice coordinate math in composite.slang).
-    const VkSamplerCreateInfo sampler_info = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-    };
-    if (vkCreateSampler(device_.get_device(), &sampler_info, nullptr, &lut_sampler_) != VK_SUCCESS)
-        throw std::runtime_error("composite_pass: failed to create LUT sampler");
 
     s_active = this;
 }
@@ -250,7 +238,6 @@ composite_pass::~composite_pass()
         descriptor_table_.unbind(lut_image_, string::gpu::descriptor_type::TEXTURE);
         allocator_.destroy_resource(lut_image_);
     }
-    vkDestroySampler(device_.get_device(), lut_sampler_, nullptr);
     const string::gpu::pipeline& p = program_->current();
     const VkDescriptorSet set = descriptor_table_.get_set();
     vkDestroyPipeline(device_.get_device(), p.pipeline, nullptr);
@@ -321,65 +308,33 @@ void composite_pass::bake_and_upload_lut(bool first)
             .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
             .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
             .allocation_flags = {},
+            // CLAMP, not the default REPEAT: the LUT is a slice strip, and composite.slang does the
+            // within-slice coordinate math itself — wrapping at a slice edge samples the neighbouring
+            // slice. Declared WITH the image (brief 20), which is what retires the hand-made sampler
+            // this pass used to create and then never bind.
+            .sampler = { .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
+                         .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                         .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                         .anisotropy = false },
         });
         descriptor_table_.bind(lut_image_, string::gpu::descriptor_type::TEXTURE);
         lut_slot_ = descriptor_table_.get_binding_slot(lut_image_, string::gpu::descriptor_type::TEXTURE);
         }
 
-    // Upload: RGBA16F staging (alpha = 1), one copy, park in SHADER_READ_ONLY. Init-time or
-    // behind a device drain (rebake), so an immediate submit is fine.
-    const VkDeviceSize bytes = VkDeviceSize(width) * height * 8;
-    const string::gpu::resource_id staging = allocator_.create_resource(string::gpu::buffer_info{
-        .size = bytes,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-        .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
-                          | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-    });
-    uint16_t* dst = static_cast<uint16_t*>(allocator_.get_buffer(staging).allocation_info.pMappedData);
+    // Widen the baked RGB LUT to the RGBA16F the image wants, then hand it to the transfer batch —
+    // which stages it and lets the declared uploads pass record the copy inside the frame. This used
+    // to open its own command buffer, write its own pair of transitions and immediate_submit (a
+    // device-wide stall, on a LUT re-bake that a CVar edit can trigger at any moment).
+    std::vector<uint16_t> rgba(size_t(width) * height * 4);
     const uint16_t one = float_to_half(1.0f);
     for (size_t i = 0; i < size_t(width) * height; ++i)
     {
-        dst[i * 4 + 0] = float_to_half(lut_cpu_[i * 3 + 0]);
-        dst[i * 4 + 1] = float_to_half(lut_cpu_[i * 3 + 1]);
-        dst[i * 4 + 2] = float_to_half(lut_cpu_[i * 3 + 2]);
-        dst[i * 4 + 3] = one;
+        rgba[i * 4 + 0] = float_to_half(lut_cpu_[i * 3 + 0]);
+        rgba[i * 4 + 1] = float_to_half(lut_cpu_[i * 3 + 1]);
+        rgba[i * 4 + 2] = float_to_half(lut_cpu_[i * 3 + 2]);
+        rgba[i * 4 + 3] = one;
     }
-
-    string::gpu::command_recorder recorder;
-    recorder.init(device_.get_device(), device_.get_queue(string::gpu::queue_type::GRAPHICS));
-    VkCommandBuffer cb = recorder.begin();
-    const string::gpu::allocated_image& img = allocator_.get_image(lut_image_);
-    vku::transition_image(cb, {
-        .image = img.image,
-        .old_layout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .new_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, .src_access = 0,
-        .dst_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-        .dst_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-    });
-    const VkBufferImageCopy region = {
-        .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageOffset = { 0, 0, 0 },
-        .imageExtent = { width, height, 1 },
-    };
-    vkCmdCopyBufferToImage(cb, allocator_.get_buffer(staging).buffer, img.image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    vku::transition_image(cb, {
-        .image = img.image,
-        .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .src_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-        .src_access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-        .dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-    });
-    recorder.end().immediate_submit();
-    recorder.destroy();
-    allocator_.destroy_resource(staging);
+    transfer_.upload_image(rgba.data(), rgba.size() * sizeof(uint16_t), lut_image_);
 
     s_lut = &lut_cpu_;
     s_lut_size = lut_size_;
@@ -516,4 +471,4 @@ LensState& LensState::instance()
     return state;
 }
 
-}  // namespace String
+}  // namespace string

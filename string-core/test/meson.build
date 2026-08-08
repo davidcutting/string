@@ -1,7 +1,6 @@
 test_files = [
     'graph_test.cpp',
     'frame_graph_test.cpp',
-    'frame_scratch_test.cpp',
     'resource_usage_test.cpp',
     'residency_manager_test.cpp',
     'file_watch_service_test.cpp',

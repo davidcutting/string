@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <string/gpu/resource_allocator.hpp>
 
-namespace String
+namespace string
 {
 
 class Scene

@@ -36,7 +36,7 @@ using ::string::asset::CookedScene;
 //                          — what the pass keeps in draws_ for per-frame culling + streamer set_draws
 struct LoadedScene
 {
-    std::vector<String::Vertex> vertices;
+    std::vector<string::Vertex> vertices;
     std::vector<GpuMeshlet> meshlets;
     std::vector<uint32_t> meshlet_vertices;
     std::vector<uint32_t> meshlet_triangles;

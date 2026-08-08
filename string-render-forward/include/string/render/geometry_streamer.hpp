@@ -102,17 +102,17 @@ private:
 class GeometryStreamer final : public ::string::gpu::residency_provider
 {
 public:
-    GeometryStreamer(::string::gpu::resource_allocator& allocator, String::TransferBatch& transfer,
+    GeometryStreamer(::string::gpu::resource_allocator& allocator, string::TransferBatch& transfer,
                      ::string::gpu::resource_id vertex_buffer,
-                     std::vector<String::Vertex> vertices, std::vector<std::uint32_t> indices,
+                     std::vector<string::Vertex> vertices, std::vector<std::uint32_t> indices,
                      std::uint64_t vertex_capacity,
                      std::uint32_t frames_in_flight);
 
     // Cooked-scene ctor (brief 04b): no CPU index buffer exists (the cook consumed indices into
     // meshlets); per-draw vertex windows come from set_windows() instead of an index scan.
-    GeometryStreamer(::string::gpu::resource_allocator& allocator, String::TransferBatch& transfer,
+    GeometryStreamer(::string::gpu::resource_allocator& allocator, string::TransferBatch& transfer,
                      ::string::gpu::resource_id vertex_buffer,
-                     std::vector<String::Vertex> vertices,
+                     std::vector<string::Vertex> vertices,
                      std::uint64_t vertex_capacity,
                      std::uint32_t frames_in_flight);
 
@@ -166,13 +166,13 @@ private:
 
 public:
     // Debug: read a vertex from the CPU-side copy (headless meshlet diagnostics).
-    const String::Vertex& cpu_vertex(std::uint32_t i) const { return vertices_[i]; }
+    const string::Vertex& cpu_vertex(std::uint32_t i) const { return vertices_[i]; }
 
 private:
     ::string::gpu::resource_allocator& allocator_;
-    String::TransferBatch& transfer_;
+    string::TransferBatch& transfer_;
     ::string::gpu::resource_id vertex_buffer_;
-    std::vector<String::Vertex> vertices_;
+    std::vector<string::Vertex> vertices_;
     std::vector<std::uint32_t> indices_;  // CPU-side, kept for meshlet_builder (no GPU index heap)
     std::vector<DrawRange> ranges_;  // indexed by draw
     std::vector<Alloc> allocs_;      // indexed by draw

@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <unordered_map>
+#include <vector>
 
 #include <string/gpu/resource.hpp>
 #include <utility>
@@ -59,9 +60,28 @@ public:
     auto get_buffer(resource_id id) const -> const allocated_buffer&;
     auto get_image(resource_id id) const -> const allocated_image&;
 
+    // Re-point an existing image at a different sampler configuration. The one caller that needs it
+    // is texture streaming: `min_lod` tracks how much of a partially-resident mip chain has actually
+    // been uploaded, so it changes over the image's life while everything else about the image stays
+    // put. `descriptor_table::bind(id, TEXTURE)` afterwards is what publishes the change to the
+    // bindless set — bind() reads the sampler straight off the image, so those two calls together are
+    // the whole residency-rebinding verb.
+    //
+    // Safe to call with frames in flight: samplers are CACHED and shared (see sampler_for), never
+    // destroyed until the allocator is, so the outgoing sampler stays valid for any command buffer
+    // still holding a descriptor set that references it.
+    void set_sampler(resource_id id, const sampler_info& info);
+
     void copy_data_to_buffer(const void* data, resource_id resource) const;
 
 private:
+    // Samplers are immutable configuration, so they are shared rather than owned per image: every
+    // distinct sampler_info maps to exactly one VkSampler for the allocator's lifetime. That is what
+    // makes set_sampler safe mid-flight, and it removes the per-image sampler lifetime that the
+    // sub-resource-view sharing rule had to keep stepping around.
+    std::vector<std::pair<sampler_info, VkSampler>> samplers_;
+    auto sampler_for(const sampler_info& info) -> VkSampler;
+
     void create_image_sampler(allocated_image& allocated_image, const sampler_info& info);
     void create_image_view(allocated_image& allocated_image, VkImageAspectFlags aspect_flags);
 };

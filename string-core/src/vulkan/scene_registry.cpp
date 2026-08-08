@@ -2,7 +2,7 @@
 
 #include <string/vulkan/scene_registry.hpp>
 
-namespace String
+namespace string
 {
 
 SceneRegistry& SceneRegistry::instance()
@@ -64,4 +64,4 @@ const SceneRegistry::Scene* SceneRegistry::find(std::string_view name) const noe
     return it == scenes_.end() ? nullptr : &*it;
 }
 
-}  // namespace String
+}  // namespace string

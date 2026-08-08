@@ -42,15 +42,15 @@ namespace
     }
 }
 
-::string::color severity_color(::String::LogLevel lvl)
+::string::color severity_color(::string::LogLevel lvl)
 {
     switch (lvl)
     {
-        case ::String::LogLevel::WARN:     return theme().accent_warm;
-        case ::String::LogLevel::ERROR:
-        case ::String::LogLevel::CRITICAL: return theme().bad;
-        case ::String::LogLevel::DEBUG:
-        case ::String::LogLevel::TRACE:    return theme().text_dim;
+        case ::string::LogLevel::WARN:     return theme().accent_warm;
+        case ::string::LogLevel::ERROR:
+        case ::string::LogLevel::CRITICAL: return theme().bad;
+        case ::string::LogLevel::DEBUG:
+        case ::string::LogLevel::TRACE:    return theme().text_dim;
         default:                         return theme().text;
     }
 }
@@ -58,8 +58,8 @@ namespace
 
 DebugPanels::DebugPanels() = default;
 
-void DebugPanels::update_and_author(::string::ui::Ui& u, ::String::Input& input,
-                                    ::String::InputMap& input_map)
+void DebugPanels::update_and_author(::string::ui::Ui& u, ::string::Input& input,
+                                    ::string::InputMap& input_map)
 {
     // begin_frame/end_frame belong to the APP now: one Ui per frame means one owner of its frame
     // boundary, and these surfaces are authored inside it like any other.
@@ -123,7 +123,7 @@ void DebugPanels::set_console_open(bool open)
     cv_console_open().set(open);
 }
 
-void DebugPanels::handle_toggles(const ::String::Input& in)
+void DebugPanels::handle_toggles(const ::string::Input& in)
 {
 
     // The console open state is mirrored in dbg.console so a headless capture (STRING_CONSOLE=1) or a
@@ -134,7 +134,7 @@ void DebugPanels::handle_toggles(const ::String::Input& in)
     // this reconcile stomped the close back the very next frame.
     if (cv_console_open().get() != console_open_) console_open_ = cv_console_open().get();
     // Grave/backtick toggles the console (raw key, not InputMap, so it works while text_capture on).
-    const bool grave = in.key_down(::String::KeyCode::GRAVE_ACCENT);
+    const bool grave = in.key_down(::string::KeyCode::GRAVE_ACCENT);
     if (grave && !prev_grave_)
     {
         set_console_open(!console_open_);
@@ -149,33 +149,33 @@ void DebugPanels::handle_toggles(const ::String::Input& in)
     cv_console_open().set(console_open_);
 
     // F2 -> HUD, F3 -> inspector, driving the CVars so console `dbg.hud`/`dbg.inspector` stay in sync.
-    const bool f2 = in.key_down(::String::KeyCode::F2);
+    const bool f2 = in.key_down(::string::KeyCode::F2);
     if (f2 && !prev_f2_) cv_hud_enabled().set(!cv_hud_enabled().get());
     prev_f2_ = f2;
-    const bool f3 = in.key_down(::String::KeyCode::F3);
+    const bool f3 = in.key_down(::string::KeyCode::F3);
     if (f3 && !prev_f3_) cv_inspector_enabled().set(!cv_inspector_enabled().get());
     prev_f3_ = f3;
-    const bool f4 = in.key_down(::String::KeyCode::F4);
+    const bool f4 = in.key_down(::string::KeyCode::F4);
     if (f4 && !prev_f4_) cv_logs_enabled().set(!cv_logs_enabled().get());
     prev_f4_ = f4;
-    const bool f5 = in.key_down(::String::KeyCode::F5);
+    const bool f5 = in.key_down(::string::KeyCode::F5);
     if (f5 && !prev_f5_) cv_graph_enabled().set(!cv_graph_enabled().get());
     prev_f5_ = f5;
-    const bool f6 = in.key_down(::String::KeyCode::F6);
+    const bool f6 = in.key_down(::string::KeyCode::F6);
     if (f6 && !prev_f6_) cv_dag_enabled().set(!cv_dag_enabled().get());
     prev_f6_ = f6;
-    const bool f7 = in.key_down(::String::KeyCode::F7);
+    const bool f7 = in.key_down(::string::KeyCode::F7);
     if (f7 && !prev_f7_) cv_image_enabled().set(!cv_image_enabled().get());
     prev_f7_ = f7;
-    const bool f8 = in.key_down(::String::KeyCode::F8);
+    const bool f8 = in.key_down(::string::KeyCode::F8);
     if (f8 && !prev_f8_) cv_bindings_enabled().set(!cv_bindings_enabled().get());
     prev_f8_ = f8;
-    const bool f1 = in.key_down(::String::KeyCode::F1);
+    const bool f1 = in.key_down(::string::KeyCode::F1);
     if (f1 && !prev_f1_) cv_menu_enabled().set(!cv_menu_enabled().get());
     prev_f1_ = f1;
 }
 
-void DebugPanels::handle_console_input(const ::String::Input& in)
+void DebugPanels::handle_console_input(const ::string::Input& in)
 {
 
 
@@ -188,7 +188,7 @@ void DebugPanels::handle_console_input(const ::String::Input& in)
     // implementation of a shared problem drifts to the worse one; it just took a user reporting
     // "arrows don't work" to notice that the console was never using the widget at all.
 
-    const bool enter = in.key_down(::String::KeyCode::ENTER);
+    const bool enter = in.key_down(::string::KeyCode::ENTER);
     if (enter && !prev_enter_ && !input_.empty())
     {
         console_.execute(input_);
@@ -196,7 +196,7 @@ void DebugPanels::handle_console_input(const ::String::Input& in)
     }
     prev_enter_ = enter;
 
-    const bool tab = in.key_down(::String::KeyCode::TAB);
+    const bool tab = in.key_down(::string::KeyCode::TAB);
     if (tab && !prev_tab_ && !input_.empty())
     {
         std::vector<std::string> matches = console_.complete(input_);
@@ -222,10 +222,10 @@ void DebugPanels::handle_console_input(const ::String::Input& in)
     }
     prev_tab_ = tab;
 
-    const bool up = in.key_down(::String::KeyCode::UP);
+    const bool up = in.key_down(::string::KeyCode::UP);
     if (up && !prev_up_) { std::string h = console_.history_prev(); if (!h.empty()) input_ = h; }
     prev_up_ = up;
-    const bool down = in.key_down(::String::KeyCode::DOWN);
+    const bool down = in.key_down(::string::KeyCode::DOWN);
     if (down && !prev_down_) input_ = console_.history_next();
     prev_down_ = down;
 }
@@ -251,11 +251,11 @@ void DebugPanels::author_menu_bar(::string::ui::Ui& u)
         // switch on. Silently no-ops at the cap rather than disappearing — a control that vanishes
         // reads as a bug.
         m.item("New lens", [] {
-            ::String::LensState& ls = ::String::LensState::instance();
-            if (ls.count >= ::String::LensState::kMaxLenses) return;
+            ::string::LensState& ls = ::string::LensState::instance();
+            if (ls.count >= ::string::LensState::kMaxLenses) return;
             // Created at 1x: correspondence is the default and zoom is opt-in, so a new lens shows
             // exactly what it covers until asked to do otherwise.
-            ls.lenses[ls.count] = ::String::Lens{};
+            ls.lenses[ls.count] = ::string::Lens{};
             ++ls.count;
         });
         m.separator();
@@ -274,14 +274,14 @@ void DebugPanels::author_menu_bar(::string::ui::Ui& u)
     // Nothing here knows what a scene IS or how one loads; clicking records a request that the frame
     // loop applies between frames (see SceneRegistry::request).
     bar.menu("Scene", [&](Menu& m) {
-        ::String::SceneRegistry& registry = ::String::SceneRegistry::instance();
-        for (const ::String::SceneRegistry::Scene& scene : registry.scenes())
+        ::string::SceneRegistry& registry = ::string::SceneRegistry::instance();
+        for (const ::string::SceneRegistry::Scene& scene : registry.scenes())
         {
             const bool active = scene.name == registry.active();
             // The marker column is always present, so the labels stay aligned whichever is active
             // and the list does not reflow as you switch.
             m.item(u.format("{} {} — {}", active ? "*" : " ", scene.name, scene.description),
-                   [name = scene.name] { ::String::SceneRegistry::instance().request(name); });
+                   [name = scene.name] { ::string::SceneRegistry::instance().request(name); });
         }
         // Pick up an asset dropped into the content folder without restarting. Cheap (a directory
         // walk), so it is a plain item rather than anything staged.
@@ -289,17 +289,17 @@ void DebugPanels::author_menu_bar(::string::ui::Ui& u)
         {
             m.separator();
             m.item("Rescan content folder",
-                   [] { ::String::SceneRegistry::instance().rescan(); });
+                   [] { ::string::SceneRegistry::instance().rescan(); });
         }
         // Cooking is minutes of BC7 encoding and blocks the frame loop, so it is deliberately an
         // explicit action on the ACTIVE scene, labelled with what it costs.
         if (registry.can_cook())
         {
-            const ::String::SceneRegistry::Scene* act = registry.find(registry.active());
+            const ::string::SceneRegistry::Scene* act = registry.find(registry.active());
             if (act != nullptr && !act->assets.empty())
             {
                 m.item(u.format("Cook textures for '{}' (slow, freezes)", act->name),
-                       [name = act->name] { ::String::SceneRegistry::instance().cook(name); });
+                       [name = act->name] { ::string::SceneRegistry::instance().cook(name); });
             }
         }
     });
@@ -368,18 +368,18 @@ void DebugPanels::author_console(::string::ui::Ui& u)
 // Claiming SELECTIVELY (not the exclusive overload) is equally load-bearing: this context must take
 // its own actions off everyone below and nothing else. Reaching for the one-argument push here would
 // suppress every gameplay key in the game, silently, from above.
-void DebugPanels::handle_system_actions(::String::InputMap& map)
+void DebugPanels::handle_system_actions(::string::InputMap& map)
 {
-    using namespace ::String::literals;
-    static constexpr ::String::ActionId kSystemContext = ::String::action_id("ctx.system");
-    static constexpr ::String::ActionId kScreenshot    = ::String::action_id("system.screenshot");
+    using namespace ::string::literals;
+    static constexpr ::string::ActionId kSystemContext = ::string::action_id("ctx.system");
+    static constexpr ::string::ActionId kScreenshot    = ::string::action_id("system.screenshot");
 
     if (!system_bound_)
     {
         system_bound_ = true;
-        map.bind_button("system.screenshot", ::String::KeyCode::F12);
-        const ::String::ActionId claims[] = { kScreenshot };
-        map.push_context(kSystemContext, claims, ::String::InputMap::kSystemPriority);
+        map.bind_button("system.screenshot", ::string::KeyCode::F12);
+        const ::string::ActionId claims[] = { kScreenshot };
+        map.push_context(kSystemContext, claims, ::string::InputMap::kSystemPriority);
     }
 
     // Read AS the system context, so it fires through a modal, through text capture, through
@@ -398,11 +398,11 @@ void DebugPanels::handle_system_actions(::String::InputMap& map)
 // knows it by, what it is currently bound to, and whether some context above the base is CURRENTLY
 // taking it — the last being the thing that is otherwise invisible: a binding that looks correct and
 // silently does nothing because a surface above claimed it.
-void DebugPanels::author_bindings(::string::ui::Ui& u, const ::String::Input& input,
-                                  ::String::InputMap& map)
+void DebugPanels::author_bindings(::string::ui::Ui& u, const ::string::Input& input,
+                                  ::string::InputMap& map)
 {
     using namespace string::ui;
-    static constexpr ::String::ActionId kRebindContext = ::String::action_id("ctx.rebind");
+    static constexpr ::string::ActionId kRebindContext = ::string::action_id("ctx.rebind");
 
     // WHILE CAPTURING A KEY, CLAIM EVERYTHING. Binding "W" would otherwise also walk the camera, and
     // binding Escape would close the panel you are binding from. This is the per-surface claim doing
@@ -412,18 +412,18 @@ void DebugPanels::author_bindings(::string::ui::Ui& u, const ::String::Input& in
     if (rebinding_.valid())
     {
         map.push_context(kRebindContext);   // exclusive: nothing below acts while we listen
-        const ::String::KeyCode k = input.first_key_pressed();
-        if (k != ::String::KeyCode::UNKNOWN)
+        const ::string::KeyCode k = input.first_key_pressed();
+        if (k != ::string::KeyCode::UNKNOWN)
         {
             // Escape cancels rather than binding — binding an escape hatch to Escape is how you lose
             // the ability to cancel.
-            if (k != ::String::KeyCode::ESCAPE)
+            if (k != ::string::KeyCode::ESCAPE)
             {
                 const std::string name{ map.name_of(rebinding_) };
                 map.clear(rebinding_);
                 if (!name.empty()) map.bind_button(name, k);
                 else               map.bind_button(rebinding_, k);
-                STRING_LOG_INFO("[bindings] {} -> {}", name, ::String::key_name(k));
+                STRING_LOG_INFO("[bindings] {} -> {}", name, ::string::key_name(k));
             }
             rebinding_ = {};
             map.pop_context(kRebindContext);
@@ -443,18 +443,18 @@ void DebugPanels::author_bindings(::string::ui::Ui& u, const ::String::Input& in
                 p.text("Click a binding to rebind it · blocked = a surface above is taking it")
                  .color(theme().text_dim).font(13).width(grow());
 
-            const std::vector<::String::InputMap::action_info> all = map.actions();
+            const std::vector<::string::InputMap::action_info> all = map.actions();
             for (const auto& a : all)
             {
                 // Describe every bound source, not just the first: an action bound to both a key and
                 // a pad button is normal, and showing one of them would misreport the other as absent.
                 std::string bound;
-                for (const ::String::KeyCode k : a.keys)
-                    bound += (bound.empty() ? "" : ", ") + std::string(::String::key_name(k));
-                for (const ::String::MouseButton m : a.buttons)
-                    bound += (bound.empty() ? "" : ", ") + std::string(::String::button_name(m));
-                for (const ::String::GamepadButton g : a.pad)
-                    bound += (bound.empty() ? "" : ", ") + std::string(::String::button_name(g));
+                for (const ::string::KeyCode k : a.keys)
+                    bound += (bound.empty() ? "" : ", ") + std::string(::string::key_name(k));
+                for (const ::string::MouseButton m : a.buttons)
+                    bound += (bound.empty() ? "" : ", ") + std::string(::string::button_name(m));
+                for (const ::string::GamepadButton g : a.pad)
+                    bound += (bound.empty() ? "" : ", ") + std::string(::string::button_name(g));
                 if (a.axis) bound = "(axis)";
                 if (bound.empty()) bound = "unbound";
 
@@ -498,8 +498,8 @@ void DebugPanels::author_logs(::string::ui::Ui& u)
         .limits({ 320.0f, 120.0f })
         .content([&](Ui& p) {
             constexpr std::size_t kLogRows = 14;
-            const std::vector<::String::LogRingBuffer::Line> log =
-                ::String::LogRingBuffer::instance().tail(kLogRows);
+            const std::vector<::string::LogRingBuffer::Line> log =
+                ::string::LogRingBuffer::instance().tail(kLogRows);
             for (std::size_t i = 0; i < kLogRows; ++i)
             {
                 // Newest first: index from the back of the tail. Missing rows render as empty lines
@@ -532,7 +532,7 @@ void DebugPanels::author_logs(::string::ui::Ui& u)
 void DebugPanels::author_graph(::string::ui::Ui& u)
 {
     using namespace string::ui;
-    const ::String::GraphIntrospect* gi = ::String::GraphIntrospect::global();
+    const ::string::GraphIntrospect* gi = ::string::GraphIntrospect::global();
 
     constexpr std::uint16_t kLabelW = 190;
     constexpr std::uint16_t kRowH = 15;
@@ -575,7 +575,7 @@ void DebugPanels::author_graph(::string::ui::Ui& u)
                      .fixed(static_cast<std::uint16_t>(col), kRowH);
             });
 
-            for (const ::String::GraphIntrospect::Resource& res : gi->resources)
+            for (const ::string::GraphIntrospect::Resource& res : gi->resources)
             {
                 p.element().row().gap(0).height(fixed(kRowH)).content([&](Ui& r) {
                     r.text(res.label)
@@ -621,7 +621,7 @@ void DebugPanels::author_hud(::string::ui::Ui& u)
         .limits({ 220.0f, 120.0f })
         .content([&](Ui& p) {
             // Per-pass GPU ms from the engine's always-on timestamp readback (global handle).
-            const ::String::GpuProfiler* prof = ::String::GpuProfiler::global();
+            const ::string::GpuProfiler* prof = ::string::GpuProfiler::global();
             char buf[96];
             if (prof && prof->enabled())
             {
@@ -675,7 +675,7 @@ void DebugPanels::author_inspector(::string::ui::Ui& u)
 void DebugPanels::author_dag(::string::ui::Ui& u)
 {
     using namespace ::string::ui;
-    const ::String::GraphIntrospect* gi = ::String::GraphIntrospect::global();
+    const ::string::GraphIntrospect* gi = ::string::GraphIntrospect::global();
 
     // Panel width drives the node width, so read the stored rect before authoring — one frame stale
     // during an active resize drag, invisible at drag speed (same class as the timeline panel).
@@ -747,7 +747,7 @@ void DebugPanels::author_dag(::string::ui::Ui& u)
                 return std::find(pr.begin(), pr.end(), static_cast<std::uint32_t>(i)) != pr.end();
             };
 
-            const ::String::GpuProfiler* prof = ::String::GpuProfiler::global();
+            const ::string::GpuProfiler* prof = ::string::GpuProfiler::global();
             const auto ms_of = [&](const std::string& name) -> float {
                 if (!prof || !prof->enabled()) return -1.0f;
                 for (const auto& s : prof->stats())
@@ -1015,7 +1015,7 @@ void DebugPanels::author_image(::string::ui::Ui& u)
 void DebugPanels::author_lenses(::string::ui::Ui& u, ::string::dimension screen)
 {
     using namespace ::string::ui;
-    ::String::LensState& ls = ::String::LensState::instance();
+    ::string::LensState& ls = ::string::LensState::instance();
 
     // Headless verification lever (dbg.lens_test): one deterministic lens, so a capture can prove
     // the composite actually substitutes. Seeded ONCE — a starting state, not a per-frame override,
@@ -1024,7 +1024,7 @@ void DebugPanels::author_lenses(::string::ui::Ui& u, ::string::dimension screen)
     if (cv_lens_test().get() > 0 && !lens_test_seeded && ls.count == 0)
     {
         lens_test_seeded = true;
-        ls.lenses[0] = ::String::Lens{ 300.0f, 200.0f, 300.0f, 240.0f,
+        ls.lenses[0] = ::string::Lens{ 300.0f, 200.0f, 300.0f, 240.0f,
                                        static_cast<float>(cv_lens_test().get()), 0u, false };
         ls.count = 1;
         u.panels().panel(make_id("lens0").hash, { 300.0f, 200.0f, 300.0f, 240.0f });
@@ -1123,9 +1123,9 @@ void DebugPanels::author_lenses(::string::ui::Ui& u, ::string::dimension screen)
             {
                 const std::string base = "lens" + std::to_string(i);
                 p.text(p.own("lens " + std::to_string(i))).color(theme().accent).font(13).width(grow());
-                slider(p, p.own(base + ".mag"), bind(ls.lenses[i], &::String::Lens::magnification))
+                slider(p, p.own(base + ".mag"), bind(ls.lenses[i], &::string::Lens::magnification))
                     .label("Magnify").range(1.0f, 16.0f).precision(1);
-                checkbox(p, p.own(base + ".raw"), bind(ls.lenses[i], &::String::Lens::bypass_tonemap))
+                checkbox(p, p.own(base + ".raw"), bind(ls.lenses[i], &::string::Lens::bypass_tonemap))
                     .label("Bypass tonemap");
                 Element close(p, make_id(p.own(base + ".close")));
                 close.color(theme().panel_alt).stroke(theme().stroke, 1).radius(3)
@@ -1142,7 +1142,7 @@ void DebugPanels::author_lenses(::string::ui::Ui& u, ::string::dimension screen)
                 }
             }
             p.text(p.own(std::to_string(ls.count) + " / "
-                         + std::to_string(::String::LensState::kMaxLenses) + " — View ▸ New lens"))
+                         + std::to_string(::string::LensState::kMaxLenses) + " — View ▸ New lens"))
              .color(theme().text_dim).font(12).width(grow());
         });
 }

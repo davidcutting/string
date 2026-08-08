@@ -15,9 +15,9 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
-shadow_maps::shadow_maps(String::engine_context& ctx, GeometryScene* scene)
+shadow_maps::shadow_maps(string::engine_context& ctx, GeometryScene* scene)
 : device_(&ctx.device)
 , allocator_(&ctx.allocator)
 , descriptors_(&ctx.descriptor_table)
@@ -60,18 +60,8 @@ shadow_maps::shadow_maps(String::engine_context& ctx, GeometryScene* scene)
             return p;
         });
 
-    // Per-cascade work lists, reserved from the frame scratch arena. Same region size as the camera
-    // lists (the meshlet build published the layout), and reserved HERE rather than alongside them —
-    // FrameScratch::reserve is a construction-time API. The regions are per-frame transients rebuilt
-    // by the cull/expand computes every frame, so their offsets carry no state.
-    lists_.resize(frames_in_flight_);
-    if (scene_->scratch_ != nullptr && scene_->wl_layout_.size > 0)
-    {
-        std::array<Worklist, kMaxCascades> shadow{};
-        for (uint32_t c = 0; c < kMaxCascades; ++c)
-            shadow[c] = Worklist{ 0, scene_->scratch_->reserve(scene_->wl_layout_.size) };
-        for (uint32_t f = 0; f < frames_in_flight_; ++f) lists_[f] = shadow;
-    }
+    // Brief 21 D4: the per-cascade work lists are graph transients the app declares and hands to
+    // declare(). Nothing to reserve, nothing to bind, no arena to wait for.
 }
 
 shadow_maps::~shadow_maps()
@@ -86,26 +76,9 @@ shadow_maps::~shadow_maps()
     }
 }
 
-void shadow_maps::tick()
-{
-    if (scene_ == nullptr) return;
-
-    // Bind this run's work lists to the scratch slot buffers once the renderer has materialized the
-    // arena (post-construction, pre-first-frame) — mirrors GeometryPass's own camera-list binding.
-    if (!lists_bound_ && scene_->scratch_ != nullptr && scene_->scratch_->materialized())
-    {
-        for (uint32_t f = 0; f < frames_in_flight_ && f < lists_.size(); ++f)
-        {
-            const ::string::gpu::resource_id buf = scene_->scratch_->buffer(f);
-            for (Worklist& wl : lists_[f]) wl.buffer = buf;
-        }
-        lists_bound_ = true;
-    }
-}
-
 bool shadow_maps::ready() const
 {
-    return program_ != nullptr && scene_ != nullptr && lists_bound_
+    return program_ != nullptr && scene_ != nullptr
         && scene_->draw_count_ != 0 && scene_->draw_info_mapped_ != nullptr;
 }
 
@@ -116,28 +89,30 @@ bool shadow_maps::ready() const
 // Every layout, every barrier and the write-after-read edge against the previous frame's samples
 // derive from that.
 void shadow_maps::declare(::string::frame_graph& fg, std::span<const ::string::gpu::image> cascades,
-                          ::string::gpu::buffer worklists)
+                          const WorklistSet& worklists)
 {
     for (uint32_t c = 0; c < cascades.size() && c < kMaxCascades; ++c)
     {
+        const ::string::gpu::buffer list = worklists.cascade[c];
         fg.pass("shadow.cascade" + std::to_string(c))
           .depth(cascades[c])
           // The two stages the work list is consumed at are genuinely different and the graph cannot
           // recover them from the pass kind: the indirect draw/count words are fetched at
           // DRAW_INDIRECT, the compacted records[] are read by the task shader. GeometryPass declares
           // the matching compute-stage write of the same buffer, which is what makes the
-          // cull -> cascade edge causal rather than incidental.
-          .reads(worklists, access::indirect_read)
-          .reads(worklists, access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
+          // cull -> cascade edge causal rather than incidental. Naming THIS cascade's list (not a
+          // shared arena) is what keeps the cascades independent of each other in the graph.
+          .reads(list, access::indirect_read)
+          .reads(list, access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
           // r.pass.shadow, plus "is there anything to draw". A skipped cascade is not a black screen:
           // its consumers read the declared neutral (1.0, unshadowed) fallback.
           .toggle([this] { return cv_pass_shadow().get() && ready(); })
-          .raster([this, c, worklists](::string::pass_context& ctx) { record_cascade(ctx, c, worklists); });
+          .raster([this, c, list](::string::pass_context& ctx) { record_cascade(ctx, c, list); });
     }
 }
 
 void shadow_maps::record_cascade(::string::pass_context& ctx, uint32_t cascade,
-                                 ::string::gpu::buffer worklists)
+                                 ::string::gpu::buffer list)
 {
     if (cascade >= cascade_count()) return;
     GeometryScene& s = *scene_;
@@ -165,12 +140,13 @@ void shadow_maps::record_cascade(::string::pass_context& ctx, uint32_t cascade,
     mspush.draws = allocator_->get_buffer(s.draw_info_buffer_).device_address;
     // Brief 04c: each cascade draws its OWN worklist (resident-only, draw-culled vs THIS cascade's
     // light sphere; camera-selected LOD via the shared draw_lod). One indirect draw.
-    const VkDeviceSize offset = lists_[ctx.frame_slot][cascade].offset;
-    mspush.records = ctx.address(worklists) + offset + wl.records_off;
-    const VkBuffer sh_buf = allocator_->get_buffer(ctx.id(worklists)).buffer;
+    const ::string::gpu::resource_id list_id = ctx.id(list);
+    if (list_id == 0) return;
+    mspush.records = ctx.address(list) + wl.records_off;
+    const VkBuffer sh_buf = allocator_->get_buffer(list_id).buffer;
     recorder.push_constants(msh.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletShadowPush), &mspush);
-    recorder.draw_mesh_tasks_indirect_count(sh_buf, offset + wl.commands_off,
-                                            sh_buf, offset + wl.count_off,
+    recorder.draw_mesh_tasks_indirect_count(sh_buf, wl.commands_off,
+                                            sh_buf, wl.count_off,
                                             s.cull_max_draws_, sizeof(uint32_t) * 3);
 }
 

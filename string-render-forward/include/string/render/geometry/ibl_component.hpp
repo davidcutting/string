@@ -80,7 +80,7 @@ public:
 
     // Builds the five ibl.slang compute pipelines. It allocates nothing: every image and buffer the
     // chain touches is declared to the graph by the app and resolved through pass_context.
-    explicit ibl_component(String::engine_context& ctx);
+    explicit ibl_component(string::engine_context& ctx);
     ~ibl_component();
 
     ibl_component(const ibl_component&) = delete;

@@ -19,9 +19,6 @@ static_assert(!is_write(access::transfer_read));
 static_assert(!is_write(access::storage_image_read));
 
 // A buffer access is exactly one whose layout does not apply.
-static_assert(is_buffer_access(access::storage_read));
-static_assert(is_buffer_access(access::indirect_read));
-static_assert(!is_buffer_access(access::sampled_read));
 static_assert(scope_of(access::storage_read).layout == VK_IMAGE_LAYOUT_UNDEFINED);
 static_assert(scope_of(access::indirect_read).layout == VK_IMAGE_LAYOUT_UNDEFINED);
 static_assert(scope_of(access::sampled_read).layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

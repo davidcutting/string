@@ -14,7 +14,7 @@
 namespace string::gpu
 {
 
-presenter::presenter(device& device, const std::shared_ptr<String::Window>& window, uint32_t frames_in_flight)
+presenter::presenter(device& device, const std::shared_ptr<string::Window>& window, uint32_t frames_in_flight)
 : wait_for_image_available_semaphores_{VK_NULL_HANDLE}
 , signal_when_ready_to_present_semaphores_{VK_NULL_HANDLE}
 , device_(device)

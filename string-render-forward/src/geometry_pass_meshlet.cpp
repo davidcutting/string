@@ -34,7 +34,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 void geometry_pass::build_meshlet_gpu(engine_context& context)
 {
@@ -182,26 +182,11 @@ void geometry_pass::build_meshlet_gpu(engine_context& context)
     const VkDeviceSize worklist_size = wl_layout_.count_off + 16;   // count word (16B-padded)
     wl_layout_.size = worklist_size;
 
-    // Brief 04e M3: worklists + the shared draw_lod are per-frame TRANSIENTS (fully rebuilt by
-    // the draw/expand computes every frame), so they live in the renderer's per-frame-slot
-    // scratch arena instead of 21 dedicated allocations (6 worklists + draw_lod, x3 slots).
-    // reserve() returns the region's offset (identical in every slot's buffer); the slot buffer
-    // ids are bound lazily in update() once the renderer materializes the arena.
-    const auto reserve_worklist = [&]() -> Worklist {
-        return Worklist{ 0, scratch_->reserve(worklist_size) };
-    };
-    wl_opaque_.resize(frames_in_flight_);
-    wl_twosided_.resize(frames_in_flight_);
-    {
-        const Worklist opaque = reserve_worklist();
-        const Worklist twosided = reserve_worklist();
-        draw_lod_off_ = scratch_->reserve(u32 * max_draws);
-        for (uint32_t f = 0; f < frames_in_flight_; ++f)
-        {
-            wl_opaque_[f] = opaque;
-            wl_twosided_[f] = twosided;
-        }
-    }
+    // Brief 21 D4: the work lists are graph TRANSIENTS the app declares (one buffer each, sized from
+    // worklist_bytes()/draw_lod_bytes() below) and hands to declare(). Nothing is reserved, bound or
+    // materialized here any more — that whole dance was the scratch arena working around the graph
+    // not owning its own transients.
+    (void)worklist_size;
 
     // Brief 04d: persistent per-meshlet visibility bitfield (1 bit per GLOBAL meshlet id). Sized to
     // total meshlet capacity, zero-initialized (a cleared bit -> that meshlet takes phase 2 for one
@@ -388,8 +373,15 @@ constexpr uint32_t kListCascade0 = 2;   // + cascade index
 // work-list buffer and the stats buffer; the expand passes below READ the work-list buffer, and that
 // pair of declarations is what replaced the hand-rolled memory barrier at the tail of the old
 // record_draw_cull (counts + draw_lod -> the expansion compute's storage read).
-void geometry_pass::declare_cull(string::frame_graph& fg, string::gpu::buffer worklists,
-                                 string::gpu::buffer stats)
+string::gpu::buffer geometry_pass::list_of(uint32_t list) const
+{
+    if (list == kListOpaque) return wl_.opaque;
+    if (list == kListTwosided) return wl_.twosided;
+    const uint32_t cascade = list - kListCascade0;
+    return cascade < wl_.cascade.size() ? wl_.cascade[cascade] : string::gpu::buffer{};
+}
+
+void geometry_pass::declare_cull(string::frame_graph& fg, string::gpu::buffer stats)
 {
     const auto ready = [this] {
         return meshlet_program_ != nullptr && draw_info_mapped_ != nullptr
@@ -397,26 +389,32 @@ void geometry_pass::declare_cull(string::frame_graph& fg, string::gpu::buffer wo
             && active_draw_count_ > 0;
     };
 
+    // The camera dispatch writes BOTH camera lists and the shared draw_lod — three declarations,
+    // because it is three buffers. Naming them individually is what lets the graph order the cascade
+    // chains independently of the camera's instead of serialising everything through one arena.
     fg.pass("meshlet.cull.camera")
-      .writes(worklists)
+      .writes(wl_.opaque)
+      .writes(wl_.twosided)
+      .writes(wl_.draw_lod)
       .writes(stats)
       .toggle(ready)
-      .compute([this, worklists, stats](string::pass_context& ctx) {
-          record_draw_cull(ctx, worklists, stats, /*cascade*/ -1);
+      .compute([this, stats](string::pass_context& ctx) {
+          record_draw_cull(ctx, stats, /*cascade*/ -1);
       });
 
     // One pass per POSSIBLE cascade: the declaration count is fixed (authored once), and a cascade the
-    // scene does not have is an in-graph conditional that is simply false.
+    // scene does not have is an in-graph conditional that is simply false. A cascade dispatch writes
+    // ONLY its own list — it deliberately does not re-write draw_lod (see record_draw_cull).
     for (uint32_t c = 0; c < kMaxCascades; ++c)
     {
         fg.pass("meshlet.cull.shadow" + std::to_string(c))
-          .writes(worklists)
+          .writes(wl_.cascade[c])
           .writes(stats)
           .toggle([this, ready, c] {
               return ready() && shadow != nullptr && c < shadow->cascade_count();
           })
-          .compute([this, worklists, stats, c](string::pass_context& ctx) {
-              record_draw_cull(ctx, worklists, stats, static_cast<int>(c));
+          .compute([this, stats, c](string::pass_context& ctx) {
+              record_draw_cull(ctx, stats, static_cast<int>(c));
           });
     }
 }
@@ -427,44 +425,31 @@ void geometry_pass::declare_cull(string::frame_graph& fg, string::gpu::buffer wo
 // (fill -> the indirect draw + the task shader's records[] read) is derived from the draw passes'
 // own `.reads(worklists, indirect_read)` / `.reads(worklists, storage_read, TASK)` declarations.
 //
-// The per-list byte offset is resolved at RECORD time from ctx.frame_slot: the pass captures a list
-// SELECTOR, never an address, so a re-pointed scratch arena needs no re-declaration.
-void geometry_pass::declare_expand(string::frame_graph& fg, string::gpu::buffer worklists)
+// Each stage names ITS OWN list's buffer, so the three chains (camera, two-sided, each cascade) are
+// independent in the graph and no longer serialise against each other through a shared arena.
+void geometry_pass::declare_expand(string::frame_graph& fg)
 {
     const auto ready = [this] {
         return meshlet_program_ != nullptr && draw_info_mapped_ != nullptr
             && draw_cull_program_ != nullptr && expand_fill_program_ != nullptr
             && active_draw_count_ > 0;
     };
-    const auto offset_of = [this](uint32_t list, uint32_t slot) -> VkDeviceSize {
-        if (list == kListOpaque)
-            return slot < wl_opaque_.size() ? wl_opaque_[slot].offset : 0;
-        if (list == kListTwosided)
-            return slot < wl_twosided_.size() ? wl_twosided_[slot].offset : 0;
-        const uint32_t cascade = list - kListCascade0;
-        if (shadow == nullptr || cascade >= shadow->cascade_count()) return 0;
-        return shadow->worklist(static_cast<uint16_t>(slot), cascade).offset;
-    };
 
     const auto declare_list = [&](uint32_t list, const std::string& name, enable_fn on) {
+        const string::gpu::buffer b = list_of(list);
+        // Every stage also READS draw_lod: the records[] it fills inherit the camera-selected LOD.
         fg.pass("meshlet.expand." + name + ".scan_blocks")
-          .reads(worklists).writes(worklists)
+          .reads(b).writes(b).reads(wl_.draw_lod)
           .toggle(on)
-          .compute([this, worklists, offset_of, list](string::pass_context& ctx) {
-              record_expand_scan_blocks(ctx, worklists, offset_of(list, ctx.frame_slot));
-          });
+          .compute([this, b](string::pass_context& ctx) { record_expand_scan_blocks(ctx, b); });
         fg.pass("meshlet.expand." + name + ".scan_carry")
-          .reads(worklists).writes(worklists)
+          .reads(b).writes(b).reads(wl_.draw_lod)
           .toggle(on)
-          .compute([this, worklists, offset_of, list](string::pass_context& ctx) {
-              record_expand_scan_carry(ctx, worklists, offset_of(list, ctx.frame_slot));
-          });
+          .compute([this, b](string::pass_context& ctx) { record_expand_scan_carry(ctx, b); });
         fg.pass("meshlet.expand." + name + ".fill")
-          .reads(worklists).writes(worklists)
+          .reads(b).writes(b).reads(wl_.draw_lod)
           .toggle(on)
-          .compute([this, worklists, offset_of, list](string::pass_context& ctx) {
-              record_expand_fill(ctx, worklists, offset_of(list, ctx.frame_slot));
-          });
+          .compute([this, b](string::pass_context& ctx) { record_expand_fill(ctx, b); });
     };
 
     declare_list(kListOpaque, "opaque", ready);
@@ -476,27 +461,22 @@ void geometry_pass::declare_expand(string::frame_graph& fg, string::gpu::buffer 
                      });
 }
 
-void geometry_pass::record_draw_cull(::string::pass_context& ctx, ::string::gpu::buffer worklists,
-                                     ::string::gpu::buffer stats, int cascade)
+void geometry_pass::record_draw_cull(::string::pass_context& ctx, ::string::gpu::buffer stats,
+                                     int cascade)
 {
     // Brief 04c DRAW PHASE. cascade < 0: camera — writes the opaque + two-sided per-draw meshlet
     // counts (into wl_opaque/wl_twosided counts@0) + the shared draw_lod. cascade >= 0: that
     // cascade's shadow list — writes counts_shadow into the cascade list's counts@0, rejecting whole
     // draws outside the CASCADE's light sphere (never the camera frustum).
     ::string::gpu::command_recorder& recorder = ctx.rec;
-    const uint32_t current_frame = ctx.frame_slot;
-    const VkDeviceAddress wl_base = ctx.address(worklists);
-    if (wl_base == 0) return;   // the arena is not pointed at the scratch buffer yet (frame 0)
-    if (current_frame >= wl_opaque_.size() || current_frame >= wl_twosided_.size()) return;
-
     const bool shadow_pass = cascade >= 0;
     if (shadow_pass && (shadow == nullptr || uint32_t(cascade) >= shadow->cascade_count())) return;
 
-    const VkDeviceAddress opaque_base = wl_base + wl_opaque_[current_frame].offset;
-    const VkDeviceAddress twosided_base = wl_base + wl_twosided_[current_frame].offset;
+    const VkDeviceAddress opaque_base = ctx.address(wl_.opaque);
+    const VkDeviceAddress twosided_base = ctx.address(wl_.twosided);
     const VkDeviceAddress shadow_base = shadow_pass
-        ? wl_base + shadow->worklist(static_cast<uint16_t>(current_frame), uint32_t(cascade)).offset
-        : 0;
+        ? ctx.address(list_of(kListCascade0 + uint32_t(cascade))) : 0;
+    if (opaque_base == 0 || twosided_base == 0 || (shadow_pass && shadow_base == 0)) return;
 
     const float lod_error_px = cv_lod_error_px().get();   // CVar r.lod.error_px (STRING_LOD_PX alias)
     const float half_h = screen_size.height * 0.5f;
@@ -528,7 +508,7 @@ void geometry_pass::record_draw_cull(::string::pass_context& ctx, ::string::gpu:
     // commands[] area, overwritten by its own fill before use) instead.
     cull.draw_lod = shadow_pass
         ? shadow_base + wl_layout_.commands_off   // shadow throwaway -> commands (fill overwrites)
-        : wl_base + draw_lod_off_;
+        : ctx.address(wl_.draw_lod);
     cull.stats = ctx.address(stats);
     cull.draw_count = active_draw_count_;
     cull.lod_enabled = lod_enabled_ ? 1u : 0u;
@@ -556,19 +536,18 @@ void geometry_pass::record_draw_cull(::string::pass_context& ctx, ::string::gpu:
 
 namespace
 {
-// The push every expand stage shares. Built from the declared handle at record time — the pass owns a
-// list OFFSET, and the address it sits at is this frame's, resolved through the context.
-ExpandPush make_expand_push(::string::pass_context& ctx, ::string::gpu::buffer worklists,
-                            VkDeviceSize wl_offset, const WorklistLayout& layout,
-                            VkDeviceSize draw_lod_off, uint32_t draw_count, uint32_t max_draws)
+// The push every expand stage shares. Every address is resolved from a DECLARED handle at record
+// time — the pass owns handles, never addresses.
+ExpandPush make_expand_push(::string::pass_context& ctx, ::string::gpu::buffer list,
+                            const WorklistLayout& layout, ::string::gpu::buffer draw_lod,
+                            uint32_t draw_count, uint32_t max_draws)
 {
-    const VkDeviceAddress arena = ctx.address(worklists);
-    const VkDeviceAddress base = arena + wl_offset;
+    const VkDeviceAddress base = ctx.address(list);
     ExpandPush push{};
     push.counts      = base;
     push.offsets     = base + layout.offsets_off;
     push.block_sums  = base + layout.blocksums_off;
-    push.draw_lod    = arena + draw_lod_off;
+    push.draw_lod    = ctx.address(draw_lod);
     push.commands    = base + layout.commands_off;
     push.records     = base + layout.records_off;
     push.count       = base + layout.count_off;
@@ -581,11 +560,10 @@ ExpandPush make_expand_push(::string::pass_context& ctx, ::string::gpu::buffer w
 
 // Stage 1: one workgroup per block. Was the first dispatch of record_expand; the barrier that
 // followed it is now the scan_carry pass's declared read of the same buffer.
-void geometry_pass::record_expand_scan_blocks(::string::pass_context& ctx,
-                                              ::string::gpu::buffer worklists, VkDeviceSize wl_offset)
+void geometry_pass::record_expand_scan_blocks(::string::pass_context& ctx, ::string::gpu::buffer list)
 {
-    if (ctx.address(worklists) == 0) return;
-    const ExpandPush push = make_expand_push(ctx, worklists, wl_offset, wl_layout_, draw_lod_off_,
+    if (ctx.address(list) == 0) return;
+    const ExpandPush push = make_expand_push(ctx, list, wl_layout_, wl_.draw_lod,
                                              active_draw_count_, cull_max_draws_);
     const ::string::gpu::pipeline& p = expand_scan_blocks_program_->current();
     ctx.rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
@@ -594,11 +572,10 @@ void geometry_pass::record_expand_scan_blocks(::string::pass_context& ctx,
 }
 
 // Stage 2: the single-workgroup block-carry scan.
-void geometry_pass::record_expand_scan_carry(::string::pass_context& ctx,
-                                             ::string::gpu::buffer worklists, VkDeviceSize wl_offset)
+void geometry_pass::record_expand_scan_carry(::string::pass_context& ctx, ::string::gpu::buffer list)
 {
-    if (ctx.address(worklists) == 0) return;
-    const ExpandPush push = make_expand_push(ctx, worklists, wl_offset, wl_layout_, draw_lod_off_,
+    if (ctx.address(list) == 0) return;
+    const ExpandPush push = make_expand_push(ctx, list, wl_layout_, wl_.draw_lod,
                                              active_draw_count_, cull_max_draws_);
     const ::string::gpu::pipeline& p = expand_scan_carry_program_->current();
     ctx.rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
@@ -609,11 +586,10 @@ void geometry_pass::record_expand_scan_carry(::string::pass_context& ctx,
 // Stage 3: fill the dense commands[]/records[]/count. The barrier that used to follow this — making
 // them visible to the indirect draw and the task shader — is derived from the DRAW passes' declared
 // reads of the same buffer (indirect_read, and storage_read at the task stage).
-void geometry_pass::record_expand_fill(::string::pass_context& ctx,
-                                       ::string::gpu::buffer worklists, VkDeviceSize wl_offset)
+void geometry_pass::record_expand_fill(::string::pass_context& ctx, ::string::gpu::buffer list)
 {
-    if (ctx.address(worklists) == 0) return;
-    const ExpandPush push = make_expand_push(ctx, worklists, wl_offset, wl_layout_, draw_lod_off_,
+    if (ctx.address(list) == 0) return;
+    const ExpandPush push = make_expand_push(ctx, list, wl_layout_, wl_.draw_lod,
                                              active_draw_count_, cull_max_draws_);
     const ::string::gpu::pipeline& p = expand_fill_program_->current();
     ctx.rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
@@ -622,15 +598,13 @@ void geometry_pass::record_expand_fill(::string::pass_context& ctx,
 }
 
 void geometry_pass::record_meshlet_draws(::string::pass_context& ctx, const ::string::gpu::pipeline& p,
-                                         VkDeviceSize wl_offset, uint32_t phase,
-                                         ::string::gpu::buffer worklists, ::string::gpu::image pyramid,
+                                         ::string::gpu::buffer list, uint32_t phase,
+                                         ::string::gpu::image pyramid,
                                          ::string::gpu::buffer scene_data, ::string::gpu::buffer stats)
 {
     ::string::gpu::command_recorder& recorder = ctx.rec;
     const uint32_t current_frame = ctx.frame_slot;
-    // The arena is only pointed at the scratch buffer after construction, so a zero id here is the
-    // legitimate first-frame state, not an error.
-    const ::string::gpu::resource_id wl_id = ctx.id(worklists);
+    const ::string::gpu::resource_id wl_id = ctx.id(list);
     if (wl_id == 0) return;
     if (current_frame >= hiz_.size()) return;
 
@@ -638,7 +612,7 @@ void geometry_pass::record_meshlet_draws(::string::pass_context& ctx, const ::st
     const glm::mat4 cull_vp = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : vp;
     const HizPyramid& hz = hiz_[current_frame];
     const bool hiz_ready = hiz_enabled_ && hz.mips != 0;
-    const VkDeviceAddress base = ctx.address(worklists) + wl_offset;
+    const VkDeviceAddress base = ctx.address(list);
 
     MeshletPush push{};
     push.view_proj = vp;
@@ -671,18 +645,15 @@ void geometry_pass::record_meshlet_draws(::string::pass_context& ctx, const ::st
     const VkBuffer buf = allocator_.get_buffer(wl_id).buffer;
 
     recorder.push_constants(p.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(MeshletPush), &push);
-    recorder.draw_mesh_tasks_indirect_count(buf, wl_offset + wl_layout_.commands_off,
-                                            buf, wl_offset + wl_layout_.count_off,
+    recorder.draw_mesh_tasks_indirect_count(buf, wl_layout_.commands_off,
+                                            buf, wl_layout_.count_off,
                                             cull_max_draws_, sizeof(uint32_t) * 3);
 }
 
 void geometry_pass::record_opaque_phase(::string::pass_context& ctx, uint32_t phase,
-                                        ::string::gpu::buffer worklists, ::string::gpu::image pyramid,
+                                        ::string::gpu::image pyramid,
                                         ::string::gpu::buffer scene_data, ::string::gpu::buffer stats)
 {
-    const uint32_t current_frame = ctx.frame_slot;
-    if (current_frame >= wl_opaque_.size() || current_frame >= wl_twosided_.size()) return;
-
     // HANG GUARD. This issues draw_mesh_tasks_indirect_count against command records the CULL and
     // EXPAND passes fill. Those are gated on readiness; this pass is gated only on r.pass.geometry.
     // If the draw ran while they had not, it would read whatever the arena happened to contain and
@@ -697,16 +668,14 @@ void geometry_pass::record_opaque_phase(::string::pass_context& ctx, uint32_t ph
     recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, mp.pipeline);
     recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                   mp.pipeline_layout, 0, 1, &mset, 0, nullptr);
-    record_meshlet_draws(ctx, mp, wl_opaque_[current_frame].offset, phase,
-                         worklists, pyramid, scene_data, stats);
+    record_meshlet_draws(ctx, mp, wl_.opaque, phase, pyramid, scene_data, stats);
     if (meshlet_twosided_program_)
     {
         const ::string::gpu::pipeline& tp = meshlet_twosided_program_->current();
         recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, tp.pipeline);
         recorder.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                       tp.pipeline_layout, 0, 1, &mset, 0, nullptr);
-        record_meshlet_draws(ctx, tp, wl_twosided_[current_frame].offset, phase,
-                             worklists, pyramid, scene_data, stats);
+        record_meshlet_draws(ctx, tp, wl_.twosided, phase, pyramid, scene_data, stats);
     }
 }
 

@@ -71,6 +71,18 @@ public:
     void transition(VkCommandBuffer cmd, VkImage image, const subresource& sub, access how,
                     VkPipelineStageFlags2 stage, bool discard = false);
 
+    // Same, for a write the FRAMEWORK performs rather than a pass declaring it — currently only the
+    // multisample resolve at vkCmdEndRendering, whose scope no declared access describes: a DEPTH
+    // resolve lands in the depth-attachment layout, but the validation layer (and the spec's
+    // render-pass model) attribute the write itself to COLOR_ATTACHMENT_WRITE at
+    // COLOR_ATTACHMENT_OUTPUT. A barrier that names only the depth stages therefore neither permits
+    // the resolve nor covers it for the next reader. This is not new declaration vocabulary — no
+    // pass can name it; it is the framework describing its own write to the tracker, which is
+    // exactly what deleting `Access::DepthResolve` from the DECLARED surface presumed.
+    void transition_scope(VkCommandBuffer cmd, VkImage image, const subresource& sub,
+                          const access_scope& target, VkPipelineStageFlags2 stage,
+                          bool write, bool discard = false);
+
     // Note a buffer access, accumulating any required global memory-barrier scopes into the pending
     // merge. flush_buffers() emits it before the consuming commands are recorded.
     void buffer_access(gpu::resource_id resource, access how, VkPipelineStageFlags2 stage);
@@ -84,6 +96,13 @@ public:
     // NOTIFICATION, not a back door for deriving sync — the tracker stays the single authority.
     void set_layout(VkImage image, VkImageLayout layout);
 
+    // While set, emitted barriers are recorded on a COMPUTE-ONLY queue's command buffer, so any
+    // graphics-only source/destination stage (fragment, attachment output, task/mesh…) is widened to
+    // ALL_COMMANDS — that stage cannot be named on this queue, and the cross-QUEUE half of the edge
+    // is carried by the lane timeline semaphores, not by this barrier. Tracked state keeps the REAL
+    // stages; only the emission is legalized.
+    void set_queue_scope(bool compute_only) { compute_only_queue_ = compute_only; }
+
 private:
     struct image_track
     {
@@ -93,6 +112,9 @@ private:
         std::vector<sync_state> cells;   // mips * layers, mip-major
         sync_state& at(std::uint32_t mip, std::uint32_t layer) { return cells[mip * layers + layer]; }
     };
+
+    VkPipelineStageFlags2 legalize(VkPipelineStageFlags2 stages) const;
+    bool compute_only_queue_ = false;
 
     std::unordered_map<VkImage, image_track> images_;
     std::unordered_map<gpu::resource_id, sync_state> buffers_;

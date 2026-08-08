@@ -116,7 +116,7 @@ class post_pass
                             ::string::gpu::image bloom);
 
 public:
-    explicit post_pass(String::engine_context& ctx);
+    explicit post_pass(string::engine_context& ctx);
     ~post_pass();
 
     // The bloom pyramid's mip count for a given viewport: r.bloom.mips clamped to [1,8], then

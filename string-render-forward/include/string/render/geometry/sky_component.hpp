@@ -53,7 +53,7 @@ class sky_component
 public:
     // `samples` is the MSAA sample count of the attachments this draws into (engine_context no longer
     // carries a sample count).
-    sky_component(String::engine_context& ctx, VkSampleCountFlagBits samples);
+    sky_component(string::engine_context& ctx, VkSampleCountFlagBits samples);
     ~sky_component();
 
     sky_component(const sky_component&) = delete;

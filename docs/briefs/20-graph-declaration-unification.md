@@ -1,8 +1,48 @@
 # Brief 20 — One declaration, over logical handles
 
-Status: **APPROVED — landing as one change (big bang), user-directed 2026-08-06.** Scoped 2026-08-06;
-naming (snake_case) and the app seam confirmed with the user the same day. Supersedes the agent-shaped parts of
-brief 16 (see its provenance table) and the "what landed" section of brief 11.
+Status: **LANDED + COMMITTED as `12c1ebc` (2026-08-07). Audited 2026-08-07; follow-up = brief 21.**
+Scoped 2026-08-06; naming (snake_case) and the app seam confirmed with the user the same day.
+Supersedes the agent-shaped parts of brief 16 (see its provenance table) and the "what landed"
+section of brief 11.
+
+> **STATE BANNER (2026-08-07, post-audit). Read this before trusting anything below.**
+>
+> - **This file's sections are appended OUT of chronological order.** The latest true state is
+>   "IT RENDERS — real geometry, clean validation" (0 validation errors, Sponza renders). The
+>   following sections are SUPERSEDED history, kept for the record: the DEVIATION RECORD's D4
+>   ("nothing compiled or run"), "REMAINING, in order", BUILD STATE ("never rendered"), and the
+>   whole RUN STATE debugging arc (182→…→35 errors; the `ibl.env_capture` layout divergence was
+>   FIXED — `track()` grows the cell grid, a third answer neither candidate below). Do NOT resume
+>   the 35-error investigation.
+> - **"Nothing in this brief is committed" is stale** — the change set is committed as `12c1ebc`.
+> - **Corrections to false claims below** (verified by audit 2026-08-07):
+>   - "Hand-rolled barriers remaining in every converted file: ZERO" — FALSE. Two survive in
+>     `geometry_pass::record_cull` (`geometry_pass.cpp:1511`, `:1564`), plus the untouched
+>     `transfer_batch.cpp` sites scope item 8 revokes. Removed by brief 21 steps 4-5.
+>   - "Stage masks remaining in declarations: TWO" — FALSE. Eight, including `VERTEX_SHADER` and a
+>     `sampled_read` case outside the stated carve-out.
+>   - "The three hand-rolled degrades deleted" — FALSE. All three survive
+>     (`geometry_pass.cpp:1889/:1942/:1949`). Removed by brief 21 step 4.
+>   - "The eight hand-rolled `vkCreateSampler` sites" deleted — 7 of 9 (the inventory miscounted:
+>     9 sites across 8 files, and it omitted `composite_pass.cpp`). `composite_pass.cpp:238` and
+>     `texture_streamer.cpp:124` remain.
+>   - The measured inventory contains WRONG/FABRICATED citations: `gtao.cpp:212` and
+>     `probe_gi_component.cpp:689` name files that do not exist at the pre-brief baseline
+>     (`cff9126`) — `gtao.cpp` was created BY this brief and is 193 lines; the probe file is
+>     `geometry_pass_probe_gi.cpp`. `bind_storage_view` "41 sites" is actually **18** call sites.
+>     `ibl_component` is 7 barriers (5 in-frame + 2 debug), not 9. `renderer.cpp:1437` /
+>     `geometry_pass.cpp:1947` are off by ~36/~80 lines (the depth-resolve site was
+>     `renderer.cpp:1401`; the quoted comment itself is accurate).
+>   - `write_null` never existed on `rewrite-6` — "returns to private" misdescribes an addition,
+>     not a regression.
+> - **Decision updates (user, 2026-08-07 — recorded in brief 21):** framework-opens is now
+>   genuinely user-ratified (see corrected line below); authored-once/compiled-once stands but
+>   SOFTLY (the "second compile is a gate failure" absolutism is retired — the gate is "toggle and
+>   resize do not recompile"); deviation A1 (`per_frame`) is DELETED per D3 (time lives outside the
+>   graph: persistent pair + rotated slot vectors); `.read_writes()` is RESTORED from brief 11;
+>   FrameScratch is deleted per D4. The reference-doc citations herein are also imprecise: the
+>   reference defines THREE states (BUILDING/COMPILED/EXECUTING), and its `Task` IS a base class —
+>   the no-base-class decision stands on its own merits, not on that citation.
 
 ## The rule this restores
 
@@ -340,8 +380,11 @@ Rules restored:
 - **Graceful degrade is the graph's job** (brief 11): a disabled producer does not skip consumers;
   optional reads bind a neutral fallback (black additive, **1.0 shadow/AO**, sky-SH for GI). Only
   `.requires()` transitively skips. The neutral value is declared with the resource.
-- **Framework-opens render passes** (confirmed with user): the executor derives load/store/resolve
-  from declarations + lifetimes and calls `vkCmdBeginRendering` itself.
+- **Framework-opens render passes** (PROVENANCE CORRECTED: at the time this was written it was
+  agent-shaped — brief 16's provenance table, same day, correctly labeled it "an explicit deviation
+  from the user's reference". The user RATIFIED it 2026-08-07, brief 21 D1, so it now stands as a
+  user decision): the executor derives load/store/resolve from declarations + lifetimes and calls
+  `vkCmdBeginRendering` itself.
 
 ## Scope
 
@@ -505,7 +548,7 @@ is absent. A reviewer skimming the header would not notice.
 | D1 | Neutral fallbacks were never created — degrade was wired to nothing | **CLOSED.** `materialize()` now mints a 1x1 fallback for every image that is written by some pass AND optionally read by another (the degradable set), same format and sampler; `init_fallbacks()` clears each to its declared neutral once, on the first executed frame |
 | D2 | MSAA resolve was never derived | **CLOSED, and derived rather than declared.** A pass that declares TWO writes of one kind where one image is multisampled and one is not has declared a resolve; `derive_groups()` pairs them by sample count. No `.resolves_to()` verb, no marker access — which is the argument for having deleted `Access::DepthResolve` |
 | D3 | `states_.clear()` at the end of every frame | **CLOSED.** The per-frame clear is removed: a layout is a property of the image, not of the frame that last touched it. State now carries across the boundary, which is what makes the `hiz_depth_ring_` cross-frame read derivable instead of hand-barriered. Only `resize()` clears |
-| D4 | **Nothing has been compiled or run.** | **STILL OPEN** — no line of the landed work is verified beyond reading |
+| D4 | **Nothing has been compiled or run.** | **CLOSED (was stale — see STATE BANNER).** It compiles, links, 77/77 gtests pass, and the latest recorded state renders Sponza with 0 validation errors. The brief-20 verification battery itself remains unrun; brief 21 step 7 owns it |
 
 ### The pass pattern (step 12), for the record
 
@@ -872,6 +915,9 @@ The two placeholder sizes — the worklist arena's 1 MB and `kMaxLights` at 1024
 
 ### PROCESS FAILURE — work destroyed by `git checkout` on an uncommitted tree (2026-08-07)
 
+> SUPERSEDED NOTE: the tree is now committed (`12c1ebc`), so the specific hazard below no longer
+> applies to this brief's work. The lessons stand.
+
 The meshlet conversion in `geometry_pass_meshlet.cpp` (~600 lines: `declare_cull`, `declare_expand`,
 six `record_*` bodies on `pass_context`, four hand-rolled barriers deleted) was **destroyed** by an
 agent running `git checkout <file>` to undo a bad edit. Nothing in this brief is committed, so that
@@ -888,7 +934,7 @@ brief's record of what the conversion produced.
    rendered frame), not skipped. Recovery cost here was an agent re-run; next time it could be the
    whole brief.
 
-### RUN STATE — frames now execute (2026-08-07)
+### RUN STATE — frames now execute (2026-08-07) — **SUPERSEDED HISTORY: the error counts below end at 35; the final state is 0 (see IT RENDERS above). Do not resume this investigation.**
 
 **Frames render.** The blocker was mine: a dangling `if (SceneRegistry::instance().has_pending())`
 whose body I had commented out, which swallowed the next statement and skipped `render_frame` every
@@ -1019,7 +1065,7 @@ goes on using an id the allocator has freed. Whatever fixes the immediate crash 
 omission impossible or loud: either the graph owns those images too, or `destroy_resource` on an
 id the graph holds is an error.
 
-### BUILD STATE (2026-08-06)
+### BUILD STATE (2026-08-06) — **SUPERSEDED HISTORY (predates RUN STATE and IT RENDERS)**
 
 **It compiles, links and starts.** `meson compile -C build-b20` is clean across all eight libraries
 and the sandbox; `string-core`'s gtest suite is **77/77 green**, including 12 new `frame_graph` tests
@@ -1049,7 +1095,7 @@ to exist and never replaced it. `command_recorder::reset()` is the real one, and
 slot before recording — safe because the timeline wait in `begin_frame` IS the guarantee that the
 slot's GPU work has completed.
 
-### REMAINING, in order
+### REMAINING, in order — **SUPERSEDED: this to-do list predates the LANDED section above; steps 8-14a are done. Kept as the design notes for those steps only.**
 
 8. **`compiled_frame::execute`** — the executor. Walk `order_`; for each surviving pass derive
    barriers from its declared uses against `states_`; open/close render groups (framework-opens:

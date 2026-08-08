@@ -21,11 +21,11 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 // The UI's context on the engine input stack. Pushed once and left there: the UI is always present
 // as a potential claimant, and WHAT it claims is decided per-surface, not by this being on or off.
-static constexpr ::String::ActionId kUiContext = ::String::action_id("ctx.ui");
+static constexpr ::string::ActionId kUiContext = ::string::action_id("ctx.ui");
 
 namespace
 {
@@ -275,9 +275,9 @@ ui_pass::ui_pass(engine_context& context, VkSampleCountFlagBits samples,
     // The UI's OWN bindings. Defaults only — an app or a player profile may rebind them, which is
     // the entire point of routing UI input through the same map gameplay uses. Bound by NAME so the
     // rebinding UI can show them; read by interned id in populate_interaction.
-    input_map_.bind_button("ui.activate", String::GamepadButton::A);
-    input_map_.bind_button("ui.submit", String::KeyCode::ENTER);
-    input_map_.bind_button("ui.cancel", String::KeyCode::ESCAPE);
+    input_map_.bind_button("ui.activate", string::GamepadButton::A);
+    input_map_.bind_button("ui.submit", string::KeyCode::ENTER);
+    input_map_.bind_button("ui.cancel", string::KeyCode::ESCAPE);
     // The UI reads its actions as its OWN context, pushed above base. Two consequences, both wanted:
     // gameplay keeps receiving anything the UI does not claim, and a text surface raising
     // text_capture (which suppresses BASE) does not stop the UI acting on its own Escape.
@@ -288,7 +288,7 @@ ui_pass::ui_pass(engine_context& context, VkSampleCountFlagBits samples,
     // working, so nothing looked broken from the UI side. The context exists to give the UI a
     // POSITION on the stack to read from, not to take anything; what gets claimed is a per-surface
     // decision.
-    input_map_.push_context(kUiContext, std::span<const ::String::ActionId>{});
+    input_map_.push_context(kUiContext, std::span<const ::string::ActionId>{});
 
     const std::filesystem::path& resources_path = context.resources_path;
 
@@ -489,12 +489,12 @@ void ui_pass::author_error_overlay()
 
     // Directional focus-nav intent: d-pad, or a left-stick flick rearmed when the stick recentres
     // (so a held stick navigates once, like a d-pad). De-edging is the host's job.
-    if (input_.gamepad_pressed(String::GamepadButton::LEFT))  in.nav_x = -1;
-    if (input_.gamepad_pressed(String::GamepadButton::RIGHT)) in.nav_x = 1;
-    if (input_.gamepad_pressed(String::GamepadButton::UP))    in.nav_y = -1;
-    if (input_.gamepad_pressed(String::GamepadButton::DOWN))  in.nav_y = 1;
-    const float sx = input_.gamepad_axis(String::GamepadAxis::LEFT_X);
-    const float sy = input_.gamepad_axis(String::GamepadAxis::LEFT_Y);
+    if (input_.gamepad_pressed(string::GamepadButton::LEFT))  in.nav_x = -1;
+    if (input_.gamepad_pressed(string::GamepadButton::RIGHT)) in.nav_x = 1;
+    if (input_.gamepad_pressed(string::GamepadButton::UP))    in.nav_y = -1;
+    if (input_.gamepad_pressed(string::GamepadButton::DOWN))  in.nav_y = 1;
+    const float sx = input_.gamepad_axis(string::GamepadAxis::LEFT_X);
+    const float sy = input_.gamepad_axis(string::GamepadAxis::LEFT_Y);
     constexpr float kStick = 0.6f;
     if (in.nav_x == 0 && in.nav_y == 0 && stick_armed_)
     {
@@ -516,22 +516,22 @@ void ui_pass::author_error_overlay()
     // repeat delay/rate are the platform's, not ours to invent. Modifier CONVENTIONS are resolved
     // here — which chord means copy is a platform matter (Cmd on macOS), so the kit never learns
     // what Ctrl is.
-    const bool ctrl = input_.key_down(String::KeyCode::LEFT_CONTROL) ||
-                      input_.key_down(String::KeyCode::RIGHT_CONTROL);
-    const bool shift = input_.key_down(String::KeyCode::LEFT_SHIFT) ||
-                       input_.key_down(String::KeyCode::RIGHT_SHIFT);
-    in.backspace = input_.key_edit(String::KeyCode::BACKSPACE);
-    in.del = input_.key_edit(String::KeyCode::DELETE);
-    in.caret_left = input_.key_edit(String::KeyCode::LEFT);
-    in.caret_right = input_.key_edit(String::KeyCode::RIGHT);
-    in.caret_home = input_.key_edit(String::KeyCode::HOME);
-    in.caret_end = input_.key_edit(String::KeyCode::END);
+    const bool ctrl = input_.key_down(string::KeyCode::LEFT_CONTROL) ||
+                      input_.key_down(string::KeyCode::RIGHT_CONTROL);
+    const bool shift = input_.key_down(string::KeyCode::LEFT_SHIFT) ||
+                       input_.key_down(string::KeyCode::RIGHT_SHIFT);
+    in.backspace = input_.key_edit(string::KeyCode::BACKSPACE);
+    in.del = input_.key_edit(string::KeyCode::DELETE);
+    in.caret_left = input_.key_edit(string::KeyCode::LEFT);
+    in.caret_right = input_.key_edit(string::KeyCode::RIGHT);
+    in.caret_home = input_.key_edit(string::KeyCode::HOME);
+    in.caret_end = input_.key_edit(string::KeyCode::END);
     in.select_mod = shift;
     in.word_mod = ctrl;
-    in.copy = ctrl && input_.key_pressed(String::KeyCode::C);
-    in.cut = ctrl && input_.key_pressed(String::KeyCode::X);
-    in.paste = ctrl && input_.key_pressed(String::KeyCode::V);
-    in.select_all = ctrl && input_.key_pressed(String::KeyCode::A);
+    in.copy = ctrl && input_.key_pressed(string::KeyCode::C);
+    in.cut = ctrl && input_.key_pressed(string::KeyCode::X);
+    in.paste = ctrl && input_.key_pressed(string::KeyCode::V);
+    in.select_all = ctrl && input_.key_pressed(string::KeyCode::A);
     in.clipboard = input_.clipboard_text();
 
     // --- UI ACTIONS, resolved through the SAME remappable map gameplay uses. The kit never learns
@@ -539,10 +539,10 @@ void ui_pass::author_error_overlay()
     // NOT claim these away from gameplay just by existing — a surface that wants exclusivity pushes
     // its own context (which is what the console does via text_capture).
     using ::string::ui_action;
-    static constexpr ::String::ActionId kActivate = ::String::action_id("ui.activate");
-    static constexpr ::String::ActionId kSubmit   = ::String::action_id("ui.submit");
-    static constexpr ::String::ActionId kCancel   = ::String::action_id("ui.cancel");
-    const auto offer = [&](ui_action a, ::String::ActionId bound) {
+    static constexpr ::string::ActionId kActivate = ::string::action_id("ui.activate");
+    static constexpr ::string::ActionId kSubmit   = ::string::action_id("ui.submit");
+    static constexpr ::string::ActionId kCancel   = ::string::action_id("ui.cancel");
+    const auto offer = [&](ui_action a, ::string::ActionId bound) {
         if (input_map_.pressed(bound, kUiContext)) in.actions |= ::string::action_bit(a);
     };
     offer(ui_action::activate, kActivate);
@@ -912,7 +912,7 @@ void ui_pass::record(::string::pass_context& ctx)
     // multiply the whole frame by the EV100 exposure scale before the tonemap LUT. Pre-divide the
     // UI colors by that same scale (same frame, same value the composite's record() reads) so the
     // exposure cancels and the console/HUD keep their authored brightness at any scene EV.
-    const float inv_exposure = 1.0f / String::composite_pass::exposure_scale();
+    const float inv_exposure = 1.0f / string::composite_pass::exposure_scale();
 
     // The atlas's bindless slot, resolved from THIS pass's own declaration of it (.reads(atlas_handle_)) —
     // never handed in from outside, never latched at init.

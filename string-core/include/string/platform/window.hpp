@@ -9,7 +9,7 @@
 
 #include <string/platform/input.hpp>
 
-namespace String
+namespace string
 {
 
 namespace View
@@ -90,4 +90,4 @@ private:
     void* gamepad_ = nullptr;
 };
 
-}  // namespace String
+}  // namespace string

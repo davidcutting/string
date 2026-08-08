@@ -23,7 +23,7 @@ struct swap_chain_support_details {
 class device
 {
 public:
-    explicit device(driver& driver, std::shared_ptr<String::Window> window);
+    explicit device(driver& driver, std::shared_ptr<string::Window> window);
     ~device();
 
     swap_chain_support_details get_swap_chain_support();
@@ -56,7 +56,7 @@ public:
     bool supports_device_fault() const { return device_fault_enabled_; }
 
 private:
-    std::shared_ptr<String::Window> window_;
+    std::shared_ptr<string::Window> window_;
     driver& driver_;
     VkSurfaceKHR surface_;
     VkPhysicalDevice physical_device_{VK_NULL_HANDLE};

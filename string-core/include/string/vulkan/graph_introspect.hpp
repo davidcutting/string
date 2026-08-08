@@ -15,7 +15,7 @@
 //
 // NOT a live view into the planner: a plain value refilled when the graph recompiles (toggle flip /
 // resize), which is the only time any of it changes.
-namespace String
+namespace string
 {
 
 class GraphIntrospect
@@ -72,4 +72,4 @@ public:
     static const GraphIntrospect* global();
 };
 
-}  // namespace String
+}  // namespace string

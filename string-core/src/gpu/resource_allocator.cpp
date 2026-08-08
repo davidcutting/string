@@ -49,14 +49,18 @@ resource_allocator::~resource_allocator()
     for (auto&[id, image] : images_)
     {
         vkDestroyImageView(device_, image.view, nullptr);
-        // A sub-resource view SHARES its source's VkImage, allocation and sampler — it owns only its
-        // own view. Freeing them here as well is a double free, and it faults inside VMA rather than
-        // where the mistake is. destroy_resource() has always honoured this; the destructor did not.
+        // A sub-resource view SHARES its source's VkImage and allocation — it owns only its own view.
+        // Freeing them here as well is a double free, and it faults inside VMA rather than where the
+        // mistake is. destroy_resource() has always honoured this; the destructor did not.
+        // (Samplers are not per-image any more — they are shared out of samplers_ and destroyed below.)
         if (!image.is_view)
         {
-            vkDestroySampler(device_, image.sampler, nullptr);
             vmaDestroyImage(allocator_, image.image, image.allocation);
         }
+    }
+    for (const auto& [info, sampler] : samplers_)
+    {
+        vkDestroySampler(device_, sampler, nullptr);
     }
     if (allocator_ != VK_NULL_HANDLE)
     {
@@ -217,11 +221,10 @@ void resource_allocator::destroy_resource(resource_id id)
     {
         allocated_image& garbage = images_.at(id);
         vkDestroyImageView(device_, garbage.view, nullptr);
-        // A sub-resource view owns nothing but its VkImageView — the image, allocation and sampler
-        // belong to the source image it slices.
+        // A sub-resource view owns nothing but its VkImageView — the image and allocation belong to
+        // the source image it slices. The sampler belongs to neither: it is shared out of samplers_.
         if (!garbage.is_view)
         {
-            vkDestroySampler(device_, garbage.sampler, nullptr);
             vmaDestroyImage(allocator_, garbage.image, garbage.allocation);
         }
         images_.erase(id);
@@ -271,6 +274,33 @@ void resource_allocator::copy_data_to_buffer(const void* data, resource_id resou
 // rather than creating its own VkSampler and forcing it into the descriptor set afterwards.
 void resource_allocator::create_image_sampler(allocated_image& allocated_image, const sampler_info& info)
 {
+    allocated_image.sampler = sampler_for(info);
+}
+
+void resource_allocator::set_sampler(resource_id id, const sampler_info& info)
+{
+    const auto it = images_.find(id);
+    if (it == images_.end())
+    {
+        STRING_LOG_WARN("set_sampler: id {} is not a live image", id);
+        return;
+    }
+    it->second.sampler = sampler_for(info);
+}
+
+// One VkSampler per distinct configuration, for the allocator's lifetime. Sharing is what lets
+// set_sampler swap an image's sampler with frames in flight: the outgoing handle is still referenced
+// by descriptor sets in recorded command buffers, and it stays valid because nobody owns it alone.
+auto resource_allocator::sampler_for(const sampler_info& info) -> VkSampler
+{
+    for (const auto& [cached, sampler] : samplers_)
+    {
+        if (cached == info)
+        {
+            return sampler;
+        }
+    }
+
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(physical_device_, &properties);
 
@@ -290,7 +320,8 @@ void resource_allocator::create_image_sampler(allocated_image& allocated_image, 
         .maxAnisotropy = info.anisotropy ? properties.limits.maxSamplerAnisotropy : 1.f,
         .compareEnable = info.compare_enable ? VK_TRUE : VK_FALSE,
         .compareOp = info.compare_op,
-        .minLod = 0.f,
+        // Non-zero only for a partially-resident image: everything finer than this has no contents.
+        .minLod = info.min_lod,
         // Sample across the whole mip chain (trilinear). VK_LOD_CLAMP_NONE lets the hardware pick
         // the level from the derivative regardless of how many levels the image actually has.
         .maxLod = VK_LOD_CLAMP_NONE,
@@ -298,10 +329,13 @@ void resource_allocator::create_image_sampler(allocated_image& allocated_image, 
         .unnormalizedCoordinates = VK_FALSE
     };
 
-    if (vkCreateSampler(device_, &sampler_info, nullptr, &allocated_image.sampler) != VK_SUCCESS)
+    VkSampler sampler = VK_NULL_HANDLE;
+    if (vkCreateSampler(device_, &sampler_info, nullptr, &sampler) != VK_SUCCESS)
     {
         throw std::runtime_error("Failed to create image sampler!");
     }
+    samplers_.emplace_back(info, sampler);
+    return sampler;
 }
 
 void resource_allocator::create_image_view(allocated_image& allocated_image, VkImageAspectFlags aspect_flags)

@@ -9,7 +9,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 sky_component::sky_component(engine_context& ctx, VkSampleCountFlagBits samples)
 : device_(ctx.device)

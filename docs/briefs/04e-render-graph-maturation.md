@@ -116,6 +116,16 @@ hand-rolled barriers.
 
 ## How to declare a pass (M5 doc — the post-04e authoring contract)
 
+> **SUPERSEDED (2026-08-07, briefs 20/21). DO NOT FOLLOW THIS SECTION.** Every API it instructs
+> you to use — `Pass::usages`, `ResourceUsage`, `record_compute()`, `Access::` + stage masks,
+> `async_usages`/`has_async_compute()`, `PassContext::scratch` reservation, per-slot re-appending
+> in `update()` — was DELETED by brief 20. Passes are now declared once through the fluent
+> `frame_graph` API over logical handles (`fg.pass("name").reads(x).writes(y).raster(cb)`); see
+> brief 20's End state and brief 21. The intra-pass-scratch / uploaded-inputs / host-ring
+> exemptions in item 1 were explicitly REVOKED by brief 20. Only the top paragraph's rule ("a pass
+> declares WHAT it touches; the renderer derives") survives — it is the rule everything else now
+> implements.
+
 A pass declares WHAT it touches; the renderer derives ordering, barriers,
 layouts, attachments, and queue placement from the declarations. Do not write
 `vkCmdPipelineBarrier2` for anything that crosses your pass's boundary.

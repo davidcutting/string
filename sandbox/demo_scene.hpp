@@ -14,6 +14,6 @@ namespace sandbox
 // — what it declares is its own, and only what is DERIVED from those declarations (acquire, resize,
 // queue placement, present) stays behind the renderer. `resources_dir` locates the font asset for
 // the UI overlay's atlas.
-String::Application::scene_fn build_demo_scene(const std::filesystem::path& resources_dir);
+string::Application::scene_fn build_demo_scene(const std::filesystem::path& resources_dir);
 
 }  // namespace sandbox

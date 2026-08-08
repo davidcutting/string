@@ -18,9 +18,9 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
-gtao_chain::gtao_chain(String::engine_context& ctx, GeometryScene* scene)
+gtao_chain::gtao_chain(string::engine_context& ctx, GeometryScene* scene)
 : device_(&ctx.device)
 , descriptors_(&ctx.descriptor_table)
 , scene_(scene)
@@ -100,6 +100,14 @@ void gtao_chain::tick(VkExtent2D extent, uint16_t current_frame)
     runs_this_frame_ = allowed && program_ != nullptr && denoise_program_ != nullptr
         && size_.x != 0 && size_.y != 0
         && prev < scene_->depth_history_.size() && scene_->depth_history_[prev].valid != 0;
+    if (runs_this_frame_) has_output_ = true;
+    // STRING_STATS_LOG: name the conjunct keeping GTAO off (one line per second at 60fps).
+    static uint32_t gtao_log_frame = 0;
+    if (std::getenv("STRING_STATS_LOG") != nullptr && !runs_this_frame_ && (++gtao_log_frame % 60u) == 0u)
+        STRING_LOG_INFO("[gtao] OFF: allowed {} program {} denoise {} size {}x{} prev {} hist_size {} valid {}",
+                        allowed, program_ != nullptr, denoise_program_ != nullptr, size_.x, size_.y,
+                        prev, scene_->depth_history_.size(),
+                        prev < scene_->depth_history_.size() ? scene_->depth_history_[prev].valid : 999);
 }
 
 // Author both halves of the chain.

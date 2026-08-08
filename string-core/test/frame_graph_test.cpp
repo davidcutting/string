@@ -153,7 +153,11 @@ TEST(FrameGraphDeclarations, AttachmentsCarryTheirOwnStages)
     EXPECT_EQ(p.uses[0].how, access::color_write);
     EXPECT_EQ(p.uses[0].stage, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
     EXPECT_EQ(p.uses[1].how, access::depth_write);
-    EXPECT_EQ(p.uses[1].stage, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT);
+    // BOTH depth stages: the loadOp clear and early-Z land at EARLY_FRAGMENT_TESTS, the late-Z write
+    // and the MIN depth resolve complete at LATE. Naming only EARLY left every later reader's
+    // derived barrier missing the late write (sync validation: WAW against vkCmdEndRendering).
+    EXPECT_EQ(p.uses[1].stage, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
+                               | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT);
 }
 
 TEST(FrameGraphDeclarations, LaneIsDeclaredNotInferred)

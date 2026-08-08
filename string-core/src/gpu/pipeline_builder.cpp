@@ -108,7 +108,7 @@ pipeline_builder::~pipeline_builder()
 
 pipeline_builder& pipeline_builder::add_compute_shader(const std::filesystem::path& resource_path)
 {
-    compute_shader_module_ = String::vku::load_shader_from_disk(device_.get_device(), resource_path);
+    compute_shader_module_ = string::vku::load_shader_from_disk(device_.get_device(), resource_path);
 
     // clang-format off
     VkPipelineShaderStageCreateInfo compute_shader_stage_info = {
@@ -127,7 +127,7 @@ pipeline_builder& pipeline_builder::add_compute_shader(const std::filesystem::pa
 
 pipeline_builder& pipeline_builder::add_vertex_shader(const std::filesystem::path& resource_path)
 {
-    vertex_shader_module_ = String::vku::load_shader_from_disk(device_.get_device(), resource_path);
+    vertex_shader_module_ = string::vku::load_shader_from_disk(device_.get_device(), resource_path);
 
     // clang-format off
     VkPipelineShaderStageCreateInfo vertex_shader_stage_info = {
@@ -146,7 +146,7 @@ pipeline_builder& pipeline_builder::add_vertex_shader(const std::filesystem::pat
 
 pipeline_builder& pipeline_builder::add_fragment_shader(const std::filesystem::path& resource_path)
 {
-    fragment_shader_module_ = String::vku::load_shader_from_disk(device_.get_device(), resource_path);
+    fragment_shader_module_ = string::vku::load_shader_from_disk(device_.get_device(), resource_path);
 
     // clang-format off
     VkPipelineShaderStageCreateInfo fragment_shader_stage_info = {
@@ -166,7 +166,7 @@ pipeline_builder& pipeline_builder::add_fragment_shader(const std::filesystem::p
 pipeline_builder& pipeline_builder::add_compute_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
 {
     compute_entry_point_ = entry_point;
-    compute_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+    compute_shader_module_ = string::vku::create_shader_module_spirv(device_.get_device(), spirv);
 
     VkPipelineShaderStageCreateInfo compute_shader_stage_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -184,7 +184,7 @@ pipeline_builder& pipeline_builder::add_compute_shader_spirv(const std::vector<u
 pipeline_builder& pipeline_builder::add_vertex_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
 {
     vertex_entry_point_ = entry_point;
-    vertex_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+    vertex_shader_module_ = string::vku::create_shader_module_spirv(device_.get_device(), spirv);
 
     VkPipelineShaderStageCreateInfo vertex_shader_stage_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -202,7 +202,7 @@ pipeline_builder& pipeline_builder::add_vertex_shader_spirv(const std::vector<ui
 pipeline_builder& pipeline_builder::add_fragment_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
 {
     fragment_entry_point_ = entry_point;
-    fragment_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+    fragment_shader_module_ = string::vku::create_shader_module_spirv(device_.get_device(), spirv);
 
     VkPipelineShaderStageCreateInfo fragment_shader_stage_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -220,7 +220,7 @@ pipeline_builder& pipeline_builder::add_fragment_shader_spirv(const std::vector<
 pipeline_builder& pipeline_builder::add_task_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
 {
     task_entry_point_ = entry_point;
-    task_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+    task_shader_module_ = string::vku::create_shader_module_spirv(device_.get_device(), spirv);
 
     VkPipelineShaderStageCreateInfo task_shader_stage_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -238,7 +238,7 @@ pipeline_builder& pipeline_builder::add_task_shader_spirv(const std::vector<uint
 pipeline_builder& pipeline_builder::add_mesh_shader_spirv(const std::vector<uint32_t>& spirv, const std::string& entry_point)
 {
     mesh_entry_point_ = entry_point;
-    mesh_shader_module_ = String::vku::create_shader_module_spirv(device_.get_device(), spirv);
+    mesh_shader_module_ = string::vku::create_shader_module_spirv(device_.get_device(), spirv);
 
     VkPipelineShaderStageCreateInfo mesh_shader_stage_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,

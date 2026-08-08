@@ -43,7 +43,7 @@ class shadertoy_pass
 {
 public:
     // `samples` is the MSAA sample count of the attachments this draws into.
-    shadertoy_pass(String::engine_context& ctx, std::filesystem::path shader,
+    shadertoy_pass(string::engine_context& ctx, std::filesystem::path shader,
                    VkSampleCountFlagBits samples);
     ~shadertoy_pass();
 

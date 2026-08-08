@@ -217,7 +217,7 @@ class geometry_pass final : private GeometryScene
     ::string::gpu::device& device_;
     ::string::gpu::resource_allocator& allocator_;
     ::string::gpu::descriptor_table& descriptor_table_;
-    String::InputMap& input_map_;
+    string::InputMap& input_map_;
     // Froxel light binning: extracted to FroxelComponent froxel_ (declared below, brief 11).
 
     // Brief 20: the colour/depth sentinels are gone. The scene attachments are viewport-scaled
@@ -351,35 +351,20 @@ class geometry_pass final : private GeometryScene
     // (12B VkDrawMeshTasksIndirectCommandEXT), records[max_draws] (8B {draw_index, lod}), and the
     // surviving-draw count word (for vkCmdDrawMeshTasksIndirectCountEXT). One command per surviving
     // draw (empty slots compacted out): removes the fan-out cost while keeping command ordering.
-    // Brief 04e M3: worklists are SCRATCH regions now — `offset` into the renderer's per-frame-
-    // slot scratch arena, reserved once at load (same offset in every slot's buffer); `buffer`
-    // is the slot's scratch buffer, bound lazily in update() once the arena is materialized.
-    // scratch_/scratch_bound_ moved to GeometryScene (brief 11 P2).
-    // Per-frame-in-flight (the GPU may still read last frame's list). Camera lists: opaque one-sided +
-    // two-sided (brief 04d: shared by phase 1 and phase 2; the task shader partitions per phase — the
-    // old forced-LOD0 depth-prepass lists are deleted along with the prepass itself).
-    std::vector<Worklist> wl_opaque_;
-    std::vector<Worklist> wl_twosided_;
-    // Shared per-draw selected LOD (one per frame; every camera-derived list + shadows read it).
-    // Shared per-draw selected LOD: a scratch region (offset into each slot's arena buffer).
-    VkDeviceSize draw_lod_off_ = 0;
-    VkDeviceAddress draw_lod_address(uint16_t frame) const
-    {
-        return scratch_->address(frame) + draw_lod_off_;
-    }
+    // Brief 21 D4: one graph TRANSIENT per list, declared by the app and latched here. Single-backed,
+    // as every transient is — the cross-frame edge against the previous frame's still-reading draws
+    // is derived from the declarations, which is exactly the memory the per-slot arena was spending.
+    WorklistSet wl_{};
     uint32_t cull_max_blocks_ = 0;      // ceil(max_draws / kScanBlock)
     // Draw phase for one camera frame (writes opaque+twosided counts + draw_lod), or a shadow cascade
     // (cascade>=0: resident-only counts vs the cascade sphere).
-    void record_draw_cull(::string::pass_context& ctx, ::string::gpu::buffer worklists,
-                          ::string::gpu::buffer stats, int cascade = -1);
+    void record_draw_cull(::string::pass_context& ctx, ::string::gpu::buffer stats, int cascade = -1);
     // Compaction phase for one worklist (scan + fill): compacts surviving draws into commands[]+records[]
-    // + count, ready for one vkCmdDrawMeshTasksIndirectCountEXT. `draw_lod` is the per-draw selected-LOD
-    // buffer the records[] inherit (camera-selected for camera+shadow lists, zeroed for the LOD0 prepass).
-    // Brief 20: the scan is THREE declared passes, one per dispatch, so the graph derives the two
-    // barriers that used to sit between them.
-    void record_expand_scan_blocks(::string::pass_context& ctx, ::string::gpu::buffer worklists, VkDeviceSize wl_offset);
-    void record_expand_scan_carry (::string::pass_context& ctx, ::string::gpu::buffer worklists, VkDeviceSize wl_offset);
-    void record_expand_fill       (::string::pass_context& ctx, ::string::gpu::buffer worklists, VkDeviceSize wl_offset);
+    // + count, ready for one vkCmdDrawMeshTasksIndirectCountEXT. Brief 20: the scan is THREE declared
+    // passes, one per dispatch, so the graph derives the two barriers that used to sit between them.
+    void record_expand_scan_blocks(::string::pass_context& ctx, ::string::gpu::buffer list);
+    void record_expand_scan_carry (::string::pass_context& ctx, ::string::gpu::buffer list);
+    void record_expand_fill       (::string::pass_context& ctx, ::string::gpu::buffer list);
 
     // Brief 04 sorted transparency pass. BLEND draws are excluded from the opaque lists (GPU compute)
     // and rendered here after opaque + sky: depth-tested vs opaque depth, NO depth write, alpha-blended,
@@ -443,12 +428,12 @@ class geometry_pass final : private GeometryScene
     bool crowd_enabled_ = false;
     // base_draw_count_/active_draw_count_ moved to GeometryScene (brief 11 P2).
     void build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_max);
-    void build_meshlet_gpu(String::engine_context& context);
+    void build_meshlet_gpu(string::engine_context& context);
     // Brief 04d: `phase` (0 legacy/transparency, 1 = bit-set only, 2 = bit-clear+HiZ+update) is pushed
     // into MeshletPush so the task shader partitions the worklist's meshlets across the two phases.
     void record_meshlet_draws(::string::pass_context& ctx, const ::string::gpu::pipeline& p,
-                              VkDeviceSize wl_offset, uint32_t phase,
-                              ::string::gpu::buffer worklists, ::string::gpu::image pyramid,
+                              ::string::gpu::buffer list, uint32_t phase,
+                              ::string::gpu::image pyramid,
                               ::string::gpu::buffer scene_data, ::string::gpu::buffer stats);
 
     // --- Brief 04d two-phase occlusion state ---------------------------------------------------
@@ -467,7 +452,7 @@ class geometry_pass final : private GeometryScene
     bool two_phase_active_ = false;
     // Records phase-1 or phase-2 opaque+two-sided draws into the (already-open) MSAA render pass.
     void record_opaque_phase(::string::pass_context& ctx, uint32_t phase,
-                             ::string::gpu::buffer worklists, ::string::gpu::image pyramid,
+                             ::string::gpu::image pyramid,
                              ::string::gpu::buffer scene_data, ::string::gpu::buffer stats);
     // Zeroes visbits_buffer_ + prev_draw_lod_buffer_ (teleport/first-frame/streaming full clear).
     bool visbits_clear_pending_ = true;
@@ -485,7 +470,7 @@ public:
     // instead — a roughness x metallic sphere grid + a white/mirror pair over a neutral ground
     // slab, baked through the same cook library (one draw per sphere; factors drive the
     // materials, no textures). The permanent lookdev sandbox: STRING_SCENE=lookdev ./run.sh.
-    geometry_pass(String::engine_context& context, VkSampleCountFlagBits samples,
+    geometry_pass(string::engine_context& context, VkSampleCountFlagBits samples,
                   std::vector<std::filesystem::path> model_paths,
                   std::shared_ptr<MeshOverlayStats> overlay_stats = nullptr, bool lookdev = false);
     ~geometry_pass();
@@ -500,8 +485,8 @@ public:
     // handles the application declared.
     void declare(string::frame_graph& fg, string::gpu::image color, string::gpu::image resolve,
                  string::gpu::image depth,
-                 string::gpu::image hiz_depth, string::gpu::image hiz_pyramid, uint32_t hiz_mips,
-                 string::gpu::buffer worklists, string::gpu::buffer scene_data,
+                 string::gpu::image hiz_depth, string::gpu::image hiz_pyramid,
+                 const WorklistSet& worklists, string::gpu::buffer scene_data,
                  string::gpu::buffer lights, string::gpu::buffer stats,
                  // Everything SceneData points at. Declaring them on scene.upload is what makes the
                  // slots it writes resolvable at record time — and what derives the edges from each
@@ -510,14 +495,21 @@ public:
                  string::gpu::image env_prefiltered, string::gpu::image dfg_lut,
                  string::gpu::buffer ibl_sh, string::gpu::buffer froxels);
 
-    // The HiZ pyramid's extent and mip count, from the INITIAL viewport. Authored-once means the
-    // declaration count is fixed, so the app computes these when it declares the pyramid and passes
-    // the same number here — the same rule bloom follows.
     // How many entries the probe-GI capture table needs for this scene's meshlets. The app sizes the
     // table buffer from it, so the declaration and the fill agree by construction.
     std::size_t gi_capture_entries() const;
+
+    // The HiZ pyramid's shape for a given viewport. The graph derives the IMAGE from the same
+    // relationship (viewport_fit::half_pow2 + all_mips); this is what the dispatch shape and the
+    // per-mip conditionals are computed from, so both halves stay in agreement by construction
+    // rather than by the app passing a number twice.
     static VkExtent2D hiz_extent(VkExtent2D viewport);
     static uint32_t hiz_mip_count(VkExtent2D viewport);
+    // Levels the reduction chain is AUTHORED at. Fixed, and larger than any real viewport needs
+    // (2^15 px); the levels a given extent does not reach are conditioned off rather than
+    // re-authored. This is what "authored once" costs for a variable-length chain: a handful of
+    // declarations that never survive.
+    static constexpr uint32_t kMaxHizMips = 16;
 
 private:
     // One declared pass per HiZ mip: mip 0 reduces the resolved scene depth, each later mip reduces
@@ -527,17 +519,24 @@ private:
     // MSAA sample count of the scene attachments. The APP declares those, so the app states this;
     // the renderer no longer has an opinion to supply.
     // Per-slot: has this frame slot's worklist arena been zeroed yet? See record_cull.
-    std::vector<bool> arena_zeroed_;
+    // One-shot zero of every declared work list (see record_cull). Transients are single-backed, so
+    // this is one flag, not one per frame slot.
+    bool lists_zeroed_ = false;
     VkSampleCountFlagBits scene_samples_ = VK_SAMPLE_COUNT_1_BIT;
-    string::gpu::buffer scene_data_{}, lights_buffer_{}, stats_{}, worklists_{}, froxels_{}, ibl_sh_{};
+    string::gpu::buffer scene_data_{}, lights_buffer_{}, stats_{}, froxels_{}, ibl_sh_{};
+    // The persistent visibility bitfield, as a GRAPH handle over the buffer this pass owns. It is
+    // not a graph-allocated resource — use_persistent lets the graph manage its USAGE only, which is
+    // the whole point: the cross-frame task-stage RMW edge has to be derived from a declaration.
+    string::gpu::buffer visbits_{};
     string::gpu::image  pyramid_{}, gtao_ao_{}, env_prefiltered_{}, dfg_lut_{};
     std::array<string::gpu::image, kMaxCascades> cascades_{};
 
     // The GPU draw-cull + list-expansion chain (defined in geometry_pass_meshlet.cpp).
-    void declare_cull(string::frame_graph& fg, string::gpu::buffer worklists, string::gpu::buffer stats);
-    void declare_expand(string::frame_graph& fg, string::gpu::buffer worklists);
-    void declare_hiz(string::frame_graph& fg, string::gpu::image depth,
-                     string::gpu::image pyramid, uint32_t mips);
+    void declare_cull(string::frame_graph& fg, string::gpu::buffer stats);
+    void declare_expand(string::frame_graph& fg);
+    // The list a cull/expand pass index names. kListOpaque / kListTwosided / kListCascade0 + c.
+    string::gpu::buffer list_of(uint32_t list) const;
+    void declare_hiz(string::frame_graph& fg, string::gpu::image depth, string::gpu::image pyramid);
     void record_hiz_mip(string::pass_context& ctx, uint32_t m, string::gpu::image depth,
                         string::gpu::image pyramid);
 
@@ -552,7 +551,10 @@ public:
     // now (the HizBuildPass / GeometryPhase2Pass sub-passes call them) — no base-Pass hooks.
     void record_scene_upload(string::pass_context& ctx);
     void record_phase1(string::pass_context& ctx);
-    void record_cull(string::pass_context& ctx);
+    // The three per-frame resets, one declared pass each (see declare()).
+    void record_reset_lists(string::pass_context& ctx);
+    void record_reset_stats(string::pass_context& ctx);
+    void record_reset_visbits(string::pass_context& ctx);
     void record_phase2(string::pass_context& ctx);
     // Brief 11 M2: the cascaded shadow-map depth render. Extracted from record_compute into its own
     // public method so the standalone ShadowPass (a scheduling seam, like GtaoPass) can schedule it —

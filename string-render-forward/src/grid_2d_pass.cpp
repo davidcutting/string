@@ -4,7 +4,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 grid_2d_pass::grid_2d_pass(engine_context& ctx, VkSampleCountFlagBits samples)
 : device_(ctx.device)

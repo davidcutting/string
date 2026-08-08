@@ -17,7 +17,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 // Host-visible list block in the SAME compacted per-draw shape the task shader consumes — commands[]
 // (12 B) @0, records[] (8 B), then the count word. One function, called by the application when it
@@ -33,7 +33,7 @@ sorted_transparency::list_layout sorted_transparency::layout_for(uint32_t max_dr
     return l;
 }
 
-sorted_transparency::sorted_transparency(String::engine_context& ctx, GeometryScene* scene, VkSampleCountFlagBits samples)
+sorted_transparency::sorted_transparency(string::engine_context& ctx, GeometryScene* scene, VkSampleCountFlagBits samples)
 : device_(&ctx.device)
 , allocator_(&ctx.allocator)
 , descriptors_(&ctx.descriptor_table)

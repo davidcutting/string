@@ -16,7 +16,7 @@
 namespace string::gpu
 {
 
-device::device(driver& driver, std::shared_ptr<String::Window> window)
+device::device(driver& driver, std::shared_ptr<string::Window> window)
 : window_(std::move(window))
 , driver_(driver)
 , surface_(window_->create_surface(driver_.get_instance()))
@@ -374,7 +374,7 @@ void device::create_logical_device()
     // count from a GPU buffer written by the draw-cull compute.
     vulkan12_features.drawIndirectCount = VK_TRUE;
     // Scalar block layout: lets the 3D vertex shader's buffer_reference Vertex struct pack to match
-    // the tightly-packed C++ String::Vertex (vec3/vec2 mix) instead of std430's vec3->vec4 padding.
+    // the tightly-packed C++ string::Vertex (vec3/vec2 mix) instead of std430's vec3->vec4 padding.
     vulkan12_features.scalarBlockLayout = VK_TRUE;
     vulkan12_features.descriptorBindingPartiallyBound = VK_TRUE;
     vulkan12_features.descriptorBindingVariableDescriptorCount = VK_TRUE;

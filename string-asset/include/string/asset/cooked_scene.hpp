@@ -27,7 +27,7 @@ namespace string::asset
 // binding those is the renderer's job at load (see the note in geometry.hpp on where the line sits).
 struct CookedScene
 {
-    std::vector<String::Vertex> vertices;        // shared vertex heap
+    std::vector<string::Vertex> vertices;        // shared vertex heap
     std::vector<GpuMeshlet> meshlets;            // global meshlet table
     std::vector<uint32_t> meshlet_vertices;      // global vertex-index remap
     std::vector<uint32_t> meshlet_triangles;     // packed local triangle words

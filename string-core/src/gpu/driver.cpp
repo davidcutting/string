@@ -43,7 +43,7 @@ bool are_validation_layer_supported(const std::vector<const char*>& validation_l
 namespace string::gpu
 {
 
-driver::driver(const String::ApplicationInfo& info, const std::shared_ptr<String::Window>& window)
+driver::driver(const string::ApplicationInfo& info, const std::shared_ptr<string::Window>& window)
 {
     if (volkInitialize() != VK_SUCCESS)
     {
@@ -114,7 +114,7 @@ driver::driver(const String::ApplicationInfo& info, const std::shared_ptr<String
     create_info.enabledLayerCount = static_cast<uint32_t>(validation_layers.size());
     create_info.ppEnabledLayerNames = validation_layers.data();
 
-    String::vku::default_debug_messenger_create_info(instance_debug_create_info);
+    string::vku::default_debug_messenger_create_info(instance_debug_create_info);
     create_info.pNext = (VkDebugUtilsMessengerCreateInfoEXT*)&instance_debug_create_info;
 
     // STRING_SYNC_VALIDATION=1: turn on SYNCHRONIZATION validation.
@@ -150,9 +150,9 @@ driver::driver(const String::ApplicationInfo& info, const std::shared_ptr<String
 
 #ifdef STRING_DEBUG
     VkDebugUtilsMessengerCreateInfoEXT debug_create_info;
-    String::vku::default_debug_messenger_create_info(debug_create_info);
+    string::vku::default_debug_messenger_create_info(debug_create_info);
 
-    if (String::vku::CreateDebugUtilsMessengerEXT(instance_, &debug_create_info, nullptr, &debug_messenger_) != VK_SUCCESS) {
+    if (string::vku::CreateDebugUtilsMessengerEXT(instance_, &debug_create_info, nullptr, &debug_messenger_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to set up Vulkan debug messenger!");
     }
 #endif
@@ -161,7 +161,7 @@ driver::driver(const String::ApplicationInfo& info, const std::shared_ptr<String
 driver::~driver()
 {
     if (debug_messenger_ != VK_NULL_HANDLE)
-        String::vku::DestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
+        string::vku::DestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
     if (instance_ != VK_NULL_HANDLE)
         vkDestroyInstance(instance_, nullptr);
 }

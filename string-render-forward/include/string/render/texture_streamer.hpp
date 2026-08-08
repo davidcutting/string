@@ -49,9 +49,10 @@ namespace string::render
 class TextureStreamer final : public ::string::gpu::residency_provider
 {
 public:
-    TextureStreamer(::string::gpu::device& device, ::string::gpu::resource_allocator& allocator,
-                    ::string::gpu::descriptor_table& descriptor_table, String::TransferBatch& transfer,
-                    VkImageView placeholder_view, VkSampler placeholder_sampler);
+    // No placeholder image any more: a streamed texture is pinned to its coarsest mip until finer
+    // levels land (see rebind), so its own image is always something legal to sample.
+    TextureStreamer(::string::gpu::resource_allocator& allocator,
+                    ::string::gpu::descriptor_table& descriptor_table, string::TransferBatch& transfer);
     ~TextureStreamer() override;
 
     TextureStreamer(const TextureStreamer&) = delete;
@@ -107,25 +108,22 @@ private:
     std::uint64_t upload_levels(Texture& t, ktxTexture2* ktx, std::uint32_t first_level,
                                 std::uint32_t last_level);
     static std::uint32_t base_of(const Texture& t, std::uint32_t detail) { return t.levels - detail; }
-    VkSampler sampler_for(std::uint32_t base);
+    // Publish a texture's resident mip range to its bindless slot: swap the image's sampler to the
+    // matching minLod, then rebind. Every residency transition (in or out) goes through here.
+    void rebind(Texture& t, std::uint32_t detail);
     // Once a texture's load future is ready: collect the blob, record the uploads it needs (down to
     // pending_base), free the blob, and set gpu_ticket. Returns true if the blob is ready.
     bool finish_load(Texture& t);
 
-    ::string::gpu::device& device_;
     ::string::gpu::resource_allocator& allocator_;
     ::string::gpu::descriptor_table& descriptor_table_;
-    String::TransferBatch& transfer_;
-    VkImageView placeholder_view_;
-    VkSampler placeholder_sampler_;
-    float max_anisotropy_ = 1.0f;
+    string::TransferBatch& transfer_;
 
     // Background file-load workers (zstd inflate, and a UASTC->BC7 transcode on the fallback path;
     // keep the I/O + CPU off the render thread).
     ::string::core::job_system load_pool_;
 
     std::unordered_map<::string::gpu::resource_id, Texture> textures_;
-    std::unordered_map<std::uint32_t, VkSampler> samplers_;      // keyed by minLod base mip
     std::unordered_map<std::uint64_t, ::string::gpu::resource_id> token_to_id_;
     std::uint64_t next_token_ = 1;
 };

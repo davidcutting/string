@@ -63,7 +63,7 @@ struct GltfDraw
 // space (Y-up, right-handed).
 struct GltfGeometry
 {
-    std::vector<String::Vertex> vertices;
+    std::vector<string::Vertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<GltfDraw> draws;
 };

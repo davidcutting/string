@@ -42,7 +42,7 @@ struct BakeParams
 // consumed here, never serialized). Returns a CookedScene with geometry sections filled and
 // source_content_hash set; the CALLER fills materials/textures (front-end policy). Deterministic:
 // identical inputs -> identical output arrays (padding zeroed, no iteration-order nondeterminism).
-CookedScene bake_scene(const std::vector<String::Vertex>& vertices,
+CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
                        const std::vector<uint32_t>& indices,
                        const std::vector<GltfDraw>& draws,
                        const BakeParams& params);
@@ -62,7 +62,7 @@ void write_cooked_file(const CookedScene& scene, const std::filesystem::path& ou
 
 // FNV-1a content hash of the flatten output (vertices+indices+draws) — the source_content_hash the
 // cook stamps and the loader compares for staleness. Exposed so the manifest can carry it.
-uint64_t content_hash(const std::vector<String::Vertex>& vertices,
+uint64_t content_hash(const std::vector<string::Vertex>& vertices,
                       const std::vector<uint32_t>& indices,
                       const std::vector<GltfDraw>& draws);
 

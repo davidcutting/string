@@ -5,7 +5,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 GeometryStreamer::GeometryStreamer(::string::gpu::resource_allocator& allocator, TransferBatch& transfer,
                                    ::string::gpu::resource_id vertex_buffer,

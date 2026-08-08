@@ -5,7 +5,7 @@
 
 namespace string::core { template <typename T> class CVar; }
 
-namespace String
+namespace string
 {
 
 // `content.root` — the console/env handle on the folder below. Declared here so both the resolver
@@ -45,4 +45,4 @@ private:
     static std::filesystem::path resolve();
 };
 
-}  // namespace String
+}  // namespace string

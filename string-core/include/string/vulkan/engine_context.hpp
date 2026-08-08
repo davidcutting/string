@@ -7,13 +7,12 @@
 #include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
 #include <string/gpu/shader_program_registry.hpp>
-#include <string/vulkan/frame_scratch.hpp>
 #include <string/vulkan/transfer_batch.hpp>
 #include <string/platform/input.hpp>
 #include <string/platform/input_map.hpp>
 #include <string/core/profiler.hpp>
 
-namespace String
+namespace string
 {
 
 // The GPU-side services a pass object needs at CONSTRUCTION (the reference doc has no analogue —
@@ -48,8 +47,6 @@ struct engine_context
     // built — the pass stores the address and dereferences it at record time, by which point the
     // context is live. Without -Dtracy the type is void* and the zone macros are no-ops.
     STRING_PROFILE_GPU_CONTEXT_TYPE* gpu_profiler_ctx;
-    // The per-frame-slot scratch arena passes reserve transient byte regions from at construction.
-    string::gpu::FrameScratch& scratch;
 };
 
-}  // namespace String
+}  // namespace string

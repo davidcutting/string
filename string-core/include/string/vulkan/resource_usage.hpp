@@ -51,21 +51,6 @@ constexpr bool is_write(access a)
     }
 }
 
-// Does this access name a buffer? (Layout is UNDEFINED exactly for the buffer accesses.)
-constexpr bool is_buffer_access(access a)
-{
-    switch (a)
-    {
-        case access::storage_read:
-        case access::storage_write:
-        case access::vertex_read:
-        case access::index_read:
-        case access::indirect_read:
-            return true;
-        default:
-            return false;
-    }
-}
 
 // The access mask + required image layout implied by an access. `layout` is
 // VK_IMAGE_LAYOUT_UNDEFINED where it doesn't apply (buffers). Combined with a declaration's stage to

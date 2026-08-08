@@ -55,7 +55,7 @@ glm::uvec2 bloom_mip_size(const glm::uvec2& base, uint32_t m)
 
 }  // namespace
 
-post_pass::post_pass(String::engine_context& ctx)
+post_pass::post_pass(string::engine_context& ctx)
 : device_(ctx.device)
 , allocator_(ctx.allocator)
 , descriptor_table_(ctx.descriptor_table)
@@ -295,7 +295,7 @@ void post_pass::tick(float dt)
                 // requires the settled state to be history-free.
                 if (std::abs(target - ev100_) < 1e-3f) ev100_ = target;
             }
-            String::composite_pass::set_auto_ev100(ev100_);
+            string::composite_pass::set_auto_ev100(ev100_);
         }
     }
     ++frame_index_;

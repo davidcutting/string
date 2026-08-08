@@ -35,7 +35,7 @@ class debug_line_pass
 {
 public:
     // `samples` is the MSAA sample count of the scene attachments this shares with geometry.
-    debug_line_pass(String::engine_context& ctx, std::shared_ptr<const MeshOverlayStats> stats,
+    debug_line_pass(string::engine_context& ctx, std::shared_ptr<const MeshOverlayStats> stats,
                     VkSampleCountFlagBits samples);
     ~debug_line_pass();
 

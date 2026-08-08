@@ -5,7 +5,7 @@
 #include <string/platform/input.hpp>
 #include <cmath>
 
-namespace String
+namespace string
 {
 
 struct KeyEvent

@@ -5,8 +5,8 @@
 
 #include <string/platform/input_map.hpp>
 
-using namespace String;
-using namespace String::literals;
+using namespace string;
+using namespace string::literals;
 
 namespace
 {

@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace String
+namespace string
 {
 
 enum class PlatformType : std::uint8_t

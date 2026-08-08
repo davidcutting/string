@@ -5,7 +5,7 @@
 
 #include <string/platform/input_map.hpp>
 
-namespace String
+namespace string
 {
 
 // A reusable fly camera (yaw/pitch, Y-up). Movement is driven through named InputMap actions so
@@ -75,4 +75,4 @@ private:
     glm::mat4 view_proj_{ 1.0f };
 };
 
-}  // namespace String
+}  // namespace string

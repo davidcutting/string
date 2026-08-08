@@ -49,7 +49,7 @@ std::filesystem::path resolve_resources_directory()
 
 int main()
 {
-    String::Application app;
+    string::Application app;
 
     // Register every library's CVars, THEN apply the STRING_* env bridge once — all before the
     // plan/passes are built, so they read already-overridden values at construction.
@@ -70,7 +70,7 @@ int main()
     const std::filesystem::path resources_directory = resolve_resources_directory();
     STRING_LOG_INFO("Using resources directory: {}", resources_directory.string());
 
-    String::ApplicationInfo app_info = {
+    string::ApplicationInfo app_info = {
         .application_name = "String Sandbox",
         .resources_directory = resources_directory,
     };

@@ -8,7 +8,7 @@
 
 #include <glm/glm.hpp>
 
-namespace String
+namespace string
 {
 
 enum class KeyCode : std::uint16_t

@@ -11,7 +11,7 @@
 
 #include <volk.h>
 
-namespace String
+namespace string
 {
 
 namespace vku
@@ -205,4 +205,4 @@ inline bool hasStencilComponent(VkFormat format)
 }
 
 }  // namespace vku
-}  // namespace String
+}  // namespace string

@@ -23,7 +23,23 @@
 > Do not treat this file as authority until the open topics in
 > `docs/briefs/20-graph-declaration-unification.md` are settled with the user.
 
-Status: **UNDER AUDIT** (was: "DESIGN LOCKED"). Architecture partly settled with user 2026-07-26; see
+Status: **SUPERSEDED by briefs 20 + 21** (2026-08-07; was "UNDER AUDIT"). The user-confirmed
+NAMING survives (`string::gpu::image`/`buffer`, `pass_context`, `engine_context`); the
+registry-centric architecture does not — `ResourceRegistry` and `Lifetime` were deleted by brief 20.
+Three corrections a reader must know:
+- **The ownership inversion this file introduced:** the user's original decision (their own sketch,
+  and this file's own provenance row "graph owns transients, app hands in persistents") is that a
+  PERSISTENT resource is created and managed OUTSIDE the graph. This file's `Lifetime` table
+  inverted that — `Persistent` became registry-owned, with only `Imported` externally-owned. Brief
+  20 restored the words; brief 21 D3 restores the filing (time lives outside the graph).
+- **The VUID-09600 "structurally impossible" claim below is RETRACTED** — brief 20's G11/G15 were
+  exactly that class (182, then 206 recording-state errors from `ctx.slot()` binding during
+  recording). Slots-bound-once-at-compile is the surviving mitigation; it is a discipline the code
+  enforces, not a structural impossibility.
+- **Framework-opens** (labeled AGENT-SHAPED in the table above — correctly, at the time) was
+  ratified by the user 2026-08-07 (brief 21 D1).
+
+Original status text: Architecture partly settled with user 2026-07-26; see
 the provenance table above. This is the **completion of the brief-11 render-graph vision** and the concrete
 realization of the "Stage 3 render-graph target" sketched in `docs/taskgraph_reference.md` (the Daxa-style
 TaskGraph). Brief 11 delivered the *scheduling* half of a task graph (declare I/O → derive sync + order →

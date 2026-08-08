@@ -12,7 +12,6 @@
 #include <string/gpu/resource.hpp>
 #include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/descriptor_allocator.hpp>
-#include <string/vulkan/frame_scratch.hpp>
 #include <string/vulkan/frame_graph.hpp>
 #include <string/vulkan/engine_context.hpp>
 #include <string/vulkan/transfer_batch.hpp>
@@ -54,12 +53,12 @@ namespace string
 class renderer
 {
 public:
-    renderer(const String::ApplicationInfo& application_info, std::shared_ptr<String::Window> window);
+    renderer(const string::ApplicationInfo& application_info, std::shared_ptr<string::Window> window);
     ~renderer();
 
     // The build-time services an application's pass objects are constructed from. Stable for the
     // renderer's lifetime.
-    String::engine_context& context() { return context_; }
+    string::engine_context& context() { return context_; }
 
     // The acquired swapchain image, declared by the app as a persistent with `swapchain = true`.
     // Its backing is late-latched per frame; the graph substitutes it at execute.
@@ -71,7 +70,7 @@ public:
 
     // The window was resized. Recreates the swapchain and hands the new extent to the graph, which
     // re-sizes its viewport-scaled transients. No re-authoring and no recompile.
-    void resize(compiled_frame& frame, const String::View::Extent& extent);
+    void resize(compiled_frame& frame, const string::View::Extent& extent);
 
     VkExtent2D extent() const { return presenter_.get_extent(); }
 
@@ -88,19 +87,29 @@ public:
     // against a guess — a mismatch is a validation error at first draw and nothing before it.
     VkFormat swapchain_format() const { return presenter_.get_format(); }
 
-    const String::GpuProfiler& gpu_timing() const { return gpu_timing_; }
-    const String::GraphIntrospect& introspection() const { return introspect_; }
-    // Back the per-frame scratch arena, once every pass has reserved its regions at construction.
-    // Must run AFTER the scene is built and BEFORE the first frame: reserve() is construction-time
-    // only, and the regions are addressed per slot from here on.
-    void materialize_scratch() { scratch_.materialize(allocator_, frames_in_flight_); }
+    const string::GpuProfiler& gpu_timing() const { return gpu_timing_; }
+    const string::GraphIntrospect& introspection() const { return introspect_; }
+
+    // Record and submit everything the SCENE staged while it was being built (vertex/meshlet heaps,
+    // the CPU-decoded textures, the UI atlas), and wait for it. The one acceptable wait: it runs once,
+    // after construction and before the first frame, and it exists to bound peak staging — otherwise
+    // a scene's whole upload set sits in host memory until frame 1's uploads pass records it.
+    // Per-FRAME uploads never come here; they are a declared pass inside the graph.
+    void flush_construction_uploads();
 
     // Refill the debug snapshot from a compiled graph. Called by the app after it compiles.
     void publish_introspection(const compiled_frame& frame);
 
-    // Declare which logical image the headless capture gates read. The renderer cannot know this —
-    // the scene's HDR target is an app-declared transient — so the app states it once.
-    void capture_source(gpu::image source) { capture_source_ = source; }
+    // Declare the headless capture onto the app's graph: which logical image it reads, and the pass
+    // that copies it. The transitions around that copy are DERIVED from the declaration, which is
+    // what retired the pair of hand-written ones that had to assume a layout.
+    void declare_capture(frame_graph& fg, gpu::image source);
+
+    // The OWNER half of a resize (brief 21 D3): the app re-backs its viewport-sized persistents
+    // (the hiz depth-history ring) and re-points their handles via set_images. Called by resize()
+    // under device idle, BEFORE the graph half re-materializes and re-binds — so the rebind picks
+    // up the new backing. Declarations never change; this is a backing swap.
+    void on_resize(std::function<void(VkExtent2D)> cb) { resize_cb_ = std::move(cb); }
 
     // Write the frame's presented image to `path` (PNG when it ends .png, else BMP), for the
     // headless capture gates.
@@ -108,9 +117,9 @@ public:
 
 private:
     static constexpr uint32_t frames_in_flight_ = 3;
-    String::ApplicationInfo application_info_;
-    std::shared_ptr<String::Window> window_;
-    String::InputMap input_map_{ window_->get_input() };
+    string::ApplicationInfo application_info_;
+    std::shared_ptr<string::Window> window_;
+    string::InputMap input_map_{ window_->get_input() };
     gpu::driver driver_;
     gpu::device device_;
     gpu::queue graphics_queue_;
@@ -125,8 +134,8 @@ private:
     std::vector<VkSemaphoreSubmitInfo> async_waits_;
     gpu::presenter presenter_;
     gpu::resource_allocator allocator_;
-    // Persistent upload ring on the graphics queue, flushed each frame in render_frame.
-    String::TransferBatch transfer_batch_;
+    // Stages uploads and hands them to the declared uploads pass; owns no queue and no timeline.
+    string::TransferBatch transfer_batch_;
     gpu::descriptor_table global_descriptor_table_;
     // Shader hot-reload plumbing: an off-thread mtime scan + Slang recompile pool, the watcher the
     // frame polls, the in-process compiler, and the registry that swaps rebuilt pipelines at the
@@ -135,9 +144,7 @@ private:
     core::file_watch_service file_watcher_;
     gpu::shader_compiler shader_compiler_;
     gpu::shader_program_registry shader_registry_;
-    // The per-frame-slot scratch arena passes reserve from at construction.
-    gpu::FrameScratch scratch_;
-    String::engine_context context_;
+    string::engine_context context_;
 
     VkSemaphore frame_semaphore_ = VK_NULL_HANDLE;
 
@@ -147,7 +154,7 @@ private:
     VkSemaphore acquired_signal_semaphore_ = VK_NULL_HANDLE;
     uint64_t frame_count_ = 1;
     uint64_t current_frame_ = 0;
-    std::array<String::Frame, frames_in_flight_> frames_;
+    std::array<string::Frame, frames_in_flight_> frames_;
 
     // Tracy GPU contexts, one per submission lane so multi-queue overlap is visible in traces.
     std::vector<STRING_PROFILE_GPU_CONTEXT_TYPE> lane_profiler_ctxs_;
@@ -162,9 +169,15 @@ private:
     // Always-on per-pass GPU timing feeding the in-game profiler HUD and the periodic
     // [frametime] log line. Independent of Tracy.
     gpu::image capture_source_{};
+    // Filled by the declared capture pass; read (and written to disk) after that frame retires.
+    gpu::resource_id capture_staging_ = 0;
+    VkDeviceSize capture_staging_bytes_ = 0;
+    bool capture_armed() const;
+    void record_capture(pass_context& ctx);
+    std::function<void(VkExtent2D)> resize_cb_;
     compiled_frame* capture_frame_ = nullptr;
-    String::GpuProfiler gpu_timing_;
-    String::GraphIntrospect introspect_;
+    string::GpuProfiler gpu_timing_;
+    string::GraphIntrospect introspect_;
 
     void submit_lane(uint32_t lane, std::uint32_t slot, uint64_t value);
     void begin_frame();

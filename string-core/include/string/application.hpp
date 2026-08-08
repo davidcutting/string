@@ -9,7 +9,7 @@
 #include <string/core/app_info.hpp>
 #include <entt/entt.hpp>
 
-namespace String {
+namespace string {
 
 /// Represents the application's state.
 /// This handles the initialization of all of the application's major systems, as well as
@@ -47,6 +47,8 @@ private:
     string::compiled_frame frame_;
     /// Per-frame CPU work the scene returned from its construction callback.
     std::function<void(float)> tick_;
+    /// A window resize latched by the event callback, applied between frames in run().
+    std::optional<View::Extent> pending_resize_;
     /// Whether or not the application is/should be running.
     bool application_running_ = true;
     /// Whether or not a frame should be rendered
@@ -57,4 +59,4 @@ private:
     void on_window_event(const WindowEvent& event);
 };
 
-}  // namespace String
+}  // namespace string

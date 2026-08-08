@@ -27,7 +27,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 // Brief 20: this used to allocate the depth + pyramid rings, create per-mip views, claim bindless
 // slots and build a sampler. All of that is the graph's now — the pyramid is an application-declared
@@ -42,13 +42,20 @@ void geometry_pass::ensure_hiz(uint16_t current_frame)
     hiz_screen_w_ = base.width;
     hiz_screen_h_ = base.height;
 
+    // The pyramid IMAGE follows the viewport by declaration now (viewport_fit::half_pow2 + all_mips,
+    // brief 21 step 2), so the dispatch shape is just the same relationship computed here — no clamp,
+    // because there is no longer a fixed declared extent to outgrow.
     const uint32_t mips = hiz_mip_count(screen_size);
     hiz_.assign(frames_in_flight_, HizPyramid{ mips, glm::uvec2(base.width, base.height) });
     STRING_LOG_INFO("[hiz] pyramid {}x{}, {} mips", base.width, base.height, mips);
 
     // The resolved-depth contents every slot held are gone with the resize, so GTAO's reprojection
-    // input is invalid until each slot is rendered again.
-    for (DepthHistorySlot& h : depth_history_) h.valid = 0;
+    // input is invalid until each slot is rendered again. SIZING is load-bearing: the brief-20
+    // rewrite deleted the hiz ring allocation that used to size this vector, leaving it EMPTY —
+    // GTAO's `prev < depth_history_.size()` readiness check then never passed, GTAO silently never
+    // ran, and its consumers sampled the 0.5 neutral fallback whose decoded bent normal is the
+    // zero vector — the giant pose-dependent black regions that presented as broken shadows.
+    depth_history_.assign(frames_in_flight_, DepthHistorySlot{});
 }
 
 void geometry_pass::compute_cascades()
@@ -179,6 +186,12 @@ void geometry_pass::compute_cascades()
         // (never under-covers) -> off-cascade casters are safely kept.
         cascade_center_[c] = center;
         cascade_cull_radius_[c] = radius + far_d;
+        // STRING_CSM_LOG=1: per-cascade fit numbers, for A/B against the pre-rewrite renderer.
+        if (std::getenv("STRING_CSM_LOG") != nullptr)
+            STRING_LOG_INFO("[csm] c{} split {:.2f} radius {:.2f} texel {:.4f} center ({:.1f},{:.1f},{:.1f}) "
+                            "L ({:.2f},{:.2f},{:.2f}) near {:.3f} far {:.1f} eye_back {:.1f} far_d {:.1f}",
+                            c, split, radius, texel, center.x, center.y, center.z, L.x, L.y, L.z,
+                            near_clip, far_clip, eye_back, far_d);
         last_split = split;
     }
 }

@@ -5,7 +5,7 @@
 
 #include <volk.h>
 
-namespace String
+namespace string
 {
 
 // Per-frame-slot CPU-side state. Command recorders moved to the per-lane submission_set (brief

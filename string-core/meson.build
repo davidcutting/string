@@ -212,7 +212,6 @@ core_src = [
     'src/vulkan/scene_registry.cpp',
     'src/vulkan/content_root.cpp',
     'src/core/user_dirs.cpp',
-    'src/vulkan/frame_scratch.cpp',
     'src/vulkan/vulkan_utils.cpp',
     'src/gpu/pipeline_builder.cpp',
     'src/gpu/shader_compiler.cpp',

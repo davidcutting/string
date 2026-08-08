@@ -5,7 +5,7 @@
 
 #include <string/scene/camera.hpp>
 
-namespace String
+namespace string
 {
 
 void Camera::bind_default_controls(InputMap& map)
@@ -93,4 +93,4 @@ void Camera::update(const InputMap& input, float delta_time, float aspect)
     view_proj_ = proj * view;
 }
 
-}  // namespace String
+}  // namespace string

@@ -37,10 +37,9 @@ namespace string::render
 class shadow_maps
 {
 public:
-    // Builds the depth-only meshlet program and reserves the per-cascade work lists from the frame
-    // scratch arena. The reservation must happen at construction, before the renderer materializes
-    // the arena (FrameScratch::reserve's contract).
-    shadow_maps(String::engine_context& ctx, GeometryScene* scene);
+    // Builds the depth-only meshlet program. The per-cascade work lists are graph transients the app
+    // declares and hands to declare() — this owns the shadow RENDER, not any allocation.
+    shadow_maps(string::engine_context& ctx, GeometryScene* scene);
     ~shadow_maps();
 
     shadow_maps(const shadow_maps&) = delete;
@@ -48,20 +47,12 @@ public:
 
     // Author onto the graph: ONE pass per cascade, each a depth-only render into its own cascade
     // image plus the indirect work list the meshlet culler filled earlier this frame. `cascades` is
-    // the application's declared cascade images, in cascade order; `worklists` is the frame scratch
-    // buffer the culler writes and these draws consume.
+    // the application's declared cascade images, in cascade order; `worklists` carries the per-cascade
+    // list buffers the culler writes and these draws consume.
     void declare(::string::frame_graph& fg, std::span<const ::string::gpu::image> cascades,
-                 ::string::gpu::buffer worklists);
-
-    // Ordinary per-frame CPU work the app calls before the graph executes: binds this run's work
-    // lists to the scratch slot buffers once the renderer has materialized the arena. Idempotent.
-    void tick();
+                 const WorklistSet& worklists);
 
     uint32_t cascade_count() const { return scene_ != nullptr ? scene_->settings_.cascade_count : 0u; }
-
-    // The list the culler fills for `cascade` this frame. The culler writes lists it does not own,
-    // so the offsets stay published here.
-    const Worklist& worklist(uint16_t frame, uint32_t cascade) const { return lists_[frame][cascade]; }
 
 private:
     // Is there anything to draw? Folded into the graph conditional, so a scene with no resident
@@ -69,8 +60,7 @@ private:
     // (unshadowed) fallback instead.
     bool ready() const;
 
-    void record_cascade(::string::pass_context& ctx, uint32_t cascade,
-                        ::string::gpu::buffer worklists);
+    void record_cascade(::string::pass_context& ctx, uint32_t cascade, ::string::gpu::buffer list);
 
     ::string::gpu::device* device_ = nullptr;
     ::string::gpu::resource_allocator* allocator_ = nullptr;
@@ -79,8 +69,6 @@ private:
     ::string::gpu::shader_program* program_ = nullptr;
     uint32_t frames_in_flight_ = 0;
 
-    std::vector<std::array<Worklist, kMaxCascades>> lists_;
-    bool lists_bound_ = false;
 };
 
 }  // namespace string::render

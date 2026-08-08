@@ -47,7 +47,7 @@ class grid_2d_pass
 public:
     // `samples` is the MSAA sample count of the colour/depth attachments this draws into: the
     // pipeline's rasterizationSamples must match the render-pass instance the graph opens.
-    grid_2d_pass(String::engine_context& ctx, VkSampleCountFlagBits samples);
+    grid_2d_pass(string::engine_context& ctx, VkSampleCountFlagBits samples);
     ~grid_2d_pass();
 
     grid_2d_pass(const grid_2d_pass&) = delete;

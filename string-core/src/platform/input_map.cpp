@@ -2,7 +2,7 @@
 
 #include <string/platform/input_map.hpp>
 
-namespace String
+namespace string
 {
 
 // --- Context stack ---------------------------------------------------------------------------
@@ -236,4 +236,4 @@ float InputMap::axis(ActionId action, ActionId reader) const
     return std::clamp(value, -1.0f, 1.0f);
 }
 
-}  // namespace String
+}  // namespace string

@@ -6,7 +6,7 @@
 
 #include <volk.h>
 
-namespace String
+namespace string
 {
 
 struct Vertex {
@@ -82,15 +82,15 @@ static_assert(offsetof(Vertex, texCoord) == 24);
 static_assert(offsetof(Vertex, normal) == 32);
 static_assert(offsetof(Vertex, tangent) == 44);
 
-}  // namespace String
+}  // namespace string
 
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/hash.hpp>
 
 namespace std {
 template <>
-struct hash<String::Vertex> {
-    size_t operator()(String::Vertex const& vertex) const {
+struct hash<::string::Vertex> {
+    size_t operator()(::string::Vertex const& vertex) const {
         return ((((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^
                  (hash<glm::vec2>()(vertex.texCoord) << 1)) ^
                 (hash<glm::vec3>()(vertex.normal) << 1)) ^

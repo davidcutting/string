@@ -7,12 +7,12 @@ agents implement them, they do not re-decide them. Parent spec:
 
 ## Order
 
-**IMMEDIATE — `20-graph-declaration-unification.md`** (2026-08-06). Runs NEXT, before everything
-below. A provenance audit found the shipped render-graph authoring surface diverges from the design
-locked in 04e/11/16: two disconnected declaration channels, agent-invented concepts presented as
-user decisions, and ~44 hand-rolled barriers surviving behind exemptions that existed for agent
-convenience. Nothing else is built until the graph matches the vision — briefs 12-15 in particular
-rest on brief 11 deliverables that are unaudited.
+**IMMEDIATE — `21-vision-alignment.md`** (2026-08-07). Runs NEXT, before everything below. Brief 20
+(the render-graph declaration unification) LANDED and is committed as `12c1ebc`; the post-landing
+audit found the drift did not disappear so much as move around the graph, and that several of the
+brief's own completion claims were false. Brief 21 is the alignment pass that closes that out —
+doc-record repair first, then seven code steps. Nothing else is built until it lands: briefs 12-15
+rest on brief 11 deliverables that this arc is still reshaping.
 
 Reordered with the user 2026-07-22 (after brief 03 closed): solidify the
 pipeline and land UI + tooling + PBR *before* VFX/post — the last three briefs
@@ -35,21 +35,23 @@ pipeline modular, the debug experience real, and the UI more mature than brief 0
 9. `04f-cooked-format-v3-quantization.md` — Quantized vertex stream (~half the geometry footprint)
 10. `05-ui-maturation.md` — UI abstraction hardening + feel + gamepad — **DONE** (ran parallel to 04c, 2026-07-22; solidification still ends at 04f)
 11. `06-debug-tooling.md` — CVars/console, per-pass GPU profiling, inspector, capture — **DONE** (three slices, 2026-07-22)
-7. `07-pbr-ibl.md` — Dynamic sky IBL, physical light units, EV exposure — **DONE** (user-verified 2026-07-23)
-8. `09-post-processing.md` — Bloom, auto-exposure, GTAO, ACES 2.0 LUT — **DONE** (pulled ahead of 08; defect marathon user-verified 2026-07-24; SMAA deferred)
-9. `09b-probe-gi.md` — Relightable irradiance probe volume — **FUNCTIONALLY CLOSED** (2026-07-25; GI + CSM done, runtime cost deferred to the perf+quant brief; HW-RT backend = Phase 2)
-10. `11-pipeline-modularity.md` — Decompose the GeometryPass monolith into registered passes; graph abstraction update (pass registration/metadata, dynamic enable/disable in the toposort, target tagging); introspectable+mutable light/material state; pass enable/disable proven live via CVar toggles *(not yet written — next up)*
-11. `12-ui-panels.md` — Full ImGui-like dockable/splittable/tabbed panel system + layout persistence *(not yet written)*
-12. `13-ui-widgets.md` — Widget set (sliders, drag-values, collapsibles, tabs, tables/trees, color) inside the panels; immediate-mode CPU cost *(not yet written)*
-13. `14-debug-ui-inspect.md` — Debug tools in the UI: render-target visualizer, material/G-buffer channel isolation + material-preview sphere, per-pass toggles + inline timings, live CVar sliders *(not yet written)*
-14. `15-debug-ui-manipulate.md` — Interactive debug: transform gizmos (point lights first, generic ray-pick + handle system) + live material-property editing for scene testing *(not yet written)*
-14a. `12b-ui-frame-architecture.md` — UI frame architecture: shaping cache, frame arena, surfaces in layers, placement, clean-surface skip. **COMPLETE 2026-08-03** — M0, M0b, M1, M2, M3 all landed and gated.
-14c. `12c-retained-regions.md` — Retained regions: skip AUTHORING for subtrees whose tracked handle reads are unchanged, then the whole UI pass when nothing is dirty. This is brief 12's deferred M4, scoped once 12b's measurements showed authoring is ~96% of the UI frame at stress scale (and is paid every frame — it was never amortized). Dirt model chosen with the user: auto-tracked handle reads compared by value, with `STRING_UI_VERIFY_RETAINED=1` as the net. *(DRAFT — M0 is a measurement milestone that may reorder the rest.)*
-14b. `17-input-routing.md` — Unified input: one binding table + a context stack arbitrating between UI and gameplay, interned action ids. **M1+M2 done 2026-08-03** (contexts + interned ids; UI routed actions + focus scopes). **M3 done** (context priority tiers, system actions, F8 binding inspector/rebinder). Slots beside the UI arc because the UI's hardcoded key signals are what M2 migrates.
-14d. `18-asset-scene-import.md` — Asset import + data-driven scenes: `.scene` descriptors discovered from disk, cook-on-import (geometry + BC7 textures), rescan/import in the Scene menu, plus **M4 Shadertoy scenes** (a descriptor naming a shader instead of models — fullscreen pass + standard inputs, riding the brief-01 hot-reload keep-last-good loop; no in-engine code editing). Closes the gap left by runtime scene switching — scenes are still C++ lambdas with hardcoded asset paths, so an artist's glTF needs a rebuild. Scope is *view this asset / prototype this shader*, NOT scene composition. *(DRAFT 2026-08-04, not started.)*
-15. `08-vfx-telegraphs.md` — GPU particles, telegraphs, decals
-16. **End-of-Phase-A perf + quantization brief** (not yet written) — absorbs `04f` vertex quantization + probe-GI cost reduction + general perf-regression hunt. Runs after 08, before Phase B (hard deadline: quantized/skinned vertex format must be locked before Phase B skinning).
-17. `10-style-checkpoint.md` — Asset style validation (process, not feature)
+12. `07-pbr-ibl.md` — Dynamic sky IBL, physical light units, EV exposure — **DONE** (user-verified 2026-07-23)
+13. `09-post-processing.md` — Bloom, auto-exposure, GTAO, ACES 2.0 LUT — **DONE** (pulled ahead of 08; defect marathon user-verified 2026-07-24; SMAA deferred)
+14. `09b-probe-gi.md` — Relightable irradiance probe volume — **FUNCTIONALLY CLOSED** (2026-07-25; GI + CSM done, runtime cost deferred to the perf+quant brief; HW-RT backend = Phase 2)
+15. `20-graph-declaration-unification.md` — One declaration channel over logical handles; app owns the graph; pass base class deleted — **LANDED + COMMITTED `12c1ebc` 2026-08-07** (read its STATE BANNER first; sections are non-chronological)
+16. `21-vision-alignment.md` — Post-audit alignment: four user adjudications (framework-opens ratified, soft authored-once, time-outside-the-graph, FrameScratch deleted), doc repairs, then code steps 1-7 — **IN PROGRESS 2026-08-07**
+17. `11-pipeline-modularity.md` — Decompose the GeometryPass monolith into registered passes; graph abstraction update; introspectable+mutable light/material state — **WRITTEN + LARGELY SUPERSEDED**: the graph/pass half landed via briefs 20/21 (see their supersession notes inside 11); the introspection + light/material store half (M4) is still open and is the seam briefs 14/15 need
+18. `12-ui-panels.md` — Full ImGui-like dockable/splittable/tabbed panel system + layout persistence *(written; not started)*
+19. `12b-ui-frame-architecture.md` — UI frame architecture: shaping cache, frame arena, surfaces in layers, placement, clean-surface skip. **COMPLETE 2026-08-03** — M0, M0b, M1, M2, M3 all landed and gated.
+20. `12c-retained-regions.md` — Retained regions: skip AUTHORING for subtrees whose tracked handle reads are unchanged, then the whole UI pass when nothing is dirty. This is brief 12's deferred M4, scoped once 12b's measurements showed authoring is ~96% of the UI frame at stress scale (and is paid every frame — it was never amortized). Dirt model chosen with the user: auto-tracked handle reads compared by value, with `STRING_UI_VERIFY_RETAINED=1` as the net. **CLOSED as premature** (the measurement that motivated it was an `-O0` artefact).
+21. `13-ui-widgets.md` — Widget set (sliders, drag-values, collapsibles, tabs, tables/trees, color) inside the panels; immediate-mode CPU cost *(written; not started)*
+22. `14-debug-ui-inspect.md` — Debug tools in the UI: render-target visualizer, material/G-buffer channel isolation + material-preview sphere, per-pass toggles + inline timings, live CVar sliders *(written; not started)*
+23. `15-debug-ui-manipulate.md` — Interactive debug: transform gizmos + live material-property editing *(NOT yet written — the only one of 11-15 that isn't)*
+24. `17-input-routing.md` — Unified input: one binding table + a context stack arbitrating between UI and gameplay, interned action ids. **M1+M2 done 2026-08-03** (contexts + interned ids; UI routed actions + focus scopes). **M3 done** (context priority tiers, system actions, F8 binding inspector/rebinder). Slots beside the UI arc because the UI's hardcoded key signals are what M2 migrates.
+25. `18-asset-scene-import.md` — Asset import + data-driven scenes: `.scene` descriptors discovered from disk, cook-on-import (geometry + BC7 textures), rescan/import in the Scene menu, plus **M4 Shadertoy scenes** (a descriptor naming a shader instead of models — fullscreen pass + standard inputs, riding the brief-01 hot-reload keep-last-good loop; no in-engine code editing). Closes the gap left by runtime scene switching — scenes are still C++ lambdas with hardcoded asset paths, so an artist's glTF needs a rebuild. Scope is *view this asset / prototype this shader*, NOT scene composition. *(DRAFT 2026-08-04, not started.)*
+26. `08-vfx-telegraphs.md` — GPU particles, telegraphs, decals
+27. **End-of-Phase-A perf + quantization brief** (not yet written) — absorbs `04f` vertex quantization + probe-GI cost reduction + general perf-regression hunt. Runs after 08, before Phase B (hard deadline: quantized/skinned vertex format must be locked before Phase B skinning).
+28. `10-style-checkpoint.md` — Asset style validation (process, not feature)
 
 **Tooling/UI arc dependency order** (briefs 11–15, inserted 2026-07-25): dependency-wise `11` is
 independent of the UI track (`12` → `13`), and `14` needs `11`+`13`, `15` needs `11`+`13` plus

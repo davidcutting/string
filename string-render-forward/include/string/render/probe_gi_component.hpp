@@ -113,7 +113,7 @@ public:
     // cube, no view, no sampler and no bindless slot. `scene_samples` is the MSAA sample count of the
     // scene attachments the debug spheres draw into (engine_context no longer supplies one: the app
     // declares the scene attachments, so the app is what chooses the sample count).
-    probe_gi_component(String::engine_context& ctx, GeometryScene* scene,
+    probe_gi_component(string::engine_context& ctx, GeometryScene* scene,
                        VkSampleCountFlagBits scene_samples);
     ~probe_gi_component();
 

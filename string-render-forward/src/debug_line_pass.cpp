@@ -6,7 +6,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 debug_line_pass::debug_line_pass(engine_context& ctx, std::shared_ptr<const MeshOverlayStats> stats,
                                  VkSampleCountFlagBits samples)

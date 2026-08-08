@@ -7,7 +7,6 @@
 
 #include <string/gpu/resource.hpp>
 #include <string/scene/camera.hpp>
-#include <string/vulkan/frame_scratch.hpp>
 
 #include <string/render/gltf_types.hpp>
 #include <string/render/lighting_data.hpp>
@@ -45,14 +44,25 @@ struct DepthHistorySlot
     glm::mat4 view_proj{ 1.0f };
 };
 
-// One GPU work list: a suballocation of a frame slot's scratch buffer holding the draw-cull counts,
-// the scan scratch, the compacted indirect commands + records, and the surviving-draw count. The
-// camera lists live on GeometryPass; the per-cascade shadow lists are owned by ShadowMaps. The struct
-// is shared because the culler fills lists it does not own.
-struct Worklist
+// The GPU work lists: one graph-owned TRANSIENT BUFFER each (brief 21 D4), holding that list's
+// draw-cull counts, scan scratch, compacted indirect commands + records, and surviving-draw count at
+// the WorklistLayout offsets below.
+//
+// They used to be byte regions of one per-frame-slot arena (FrameScratch), which cost two things the
+// graph is supposed to provide: every list aliased into one allocation, so the graph could only see
+// "the arena" and had to serialise the camera and cascade expand chains against each other; and the
+// arena's lifetime was hand-managed outside the graph, with a materialize-then-rebind dance that the
+// first frames raced. As separate declarations the chains de-serialise and the aliasing decision goes
+// back to where it belongs — materialize()'s interval packing.
+//
+// The set is passed around whole because the culler fills lists it does not own: one dispatch writes
+// the camera lists, one per cascade writes that cascade's.
+struct WorklistSet
 {
-    ::string::gpu::resource_id buffer = 0;
-    VkDeviceSize offset = 0;
+    ::string::gpu::buffer opaque;
+    ::string::gpu::buffer twosided;
+    std::array<::string::gpu::buffer, kMaxCascades> cascade{};
+    ::string::gpu::buffer draw_lod;   // the shared per-draw selected LOD, one word per draw
 };
 
 // Byte layout WITHIN one worklist region. Computed once during the meshlet build and shared, because
@@ -125,7 +135,7 @@ struct GeometryScene
     // drives it through the InputMap's default fly controls + mouse-look.
     // Current viewport. Was on the deleted Pass base; it is scene state, not a graph concept.
     VkExtent2D screen_size{ 0, 0 };
-    String::Camera camera_;
+    string::Camera camera_;
 
     // --- Cascaded shadow maps + environment lighting ---------------------------------------------
     LightingSettings settings_;
@@ -187,11 +197,9 @@ struct GeometryScene
     ::string::gpu::buffer stats_buffer_;
     std::vector<GpuMeshStats> stats_readback_;         // last read stats per frame slot
     GpuMeshStats stats_latest_{};                       // most recent, for the UI accessor
-    // Brief 04e M3: per-frame transient buffers reserve into the renderer's scratch arena.
-    ::string::gpu::FrameScratch* scratch_ = nullptr;
-    bool scratch_bound_ = false;
     // Shared worklist format + cull capacity: the cull/expand computes (GeometryPass) write lists that
-    // ShadowMaps owns, so both sides need the layout and the max-draw bound.
+    // ShadowMaps consumes, so both sides need the layout and the max-draw bound — and the APP needs
+    // them to size the declarations (worklist_bytes / draw_lod_bytes).
     WorklistLayout wl_layout_;
     uint32_t cull_max_draws_ = 0;
     // The vertex heap. In the scene tables (not GeometryPass) because the cascade draws push its

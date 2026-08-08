@@ -10,21 +10,6 @@
 namespace string::gpu
 {
 
-enum class resource_type : std::uint8_t
-{
-    SHADER,
-    PIPELINE,
-    BUFFER,
-    IMAGE
-};
-
-enum class memory_type : std::uint8_t
-{
-    CPU_LOCAL,
-    SHARED,
-    GPU_LOCAL
-};
-
 enum class stream_status : std::uint8_t
 {
     WANTED,
@@ -41,14 +26,11 @@ enum class resource_priority : std::uint8_t
 
 using resource_id = std::uint64_t;
 
-// Sentinel targets for the renderer-owned render targets. Passes declare their ColorWrite /
-// DepthWrite against these stable logical IDs; the frame graph resolves them to the current
-// backing image at record time (so recreating an attachment on resize doesn't invalidate any
-// pass's declared usages). They sit at the top of the ID space, never colliding with
-// allocator-assigned IDs (which count up from 0).
-constexpr resource_id SWAPCHAIN_TARGET = ~resource_id{0};       // the acquired swapchain image
-constexpr resource_id COLOR_TARGET     = ~resource_id{0} - 1;   // the offscreen HDR color target
-constexpr resource_id DEPTH_TARGET     = ~resource_id{0} - 2;   // the offscreen depth target
+// The acquired swapchain image's id. The one sentinel that survives: its backing genuinely is not
+// known until the frame acquires it, which is what `persistent_image_info::swapchain` declares.
+// (COLOR_TARGET / DEPTH_TARGET are gone — passes name the app's declared handles now, so there is
+// nothing left for a renderer-owned sentinel to stand in for.)
+constexpr resource_id SWAPCHAIN_TARGET = ~resource_id{0};
 
 struct image_view;
 
@@ -137,6 +119,15 @@ struct sampler_info
     VkCompareOp compare_op = VK_COMPARE_OP_ALWAYS;
     bool compare_enable = false;
     VkBorderColor border_color = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    // Coarsest mip the sampler is allowed to reach — i.e. the finest level whose memory somebody has
+    // actually written. It exists for PARTIALLY RESIDENT images: a streamed texture is created at its
+    // full mip count but only its coarse tail is uploaded, and sampling a level that was never
+    // uploaded reads whatever the allocation happened to contain (zeros on this driver: black albedo,
+    // zero roughness — a sky mirror where a brick wall should be). The streamer raises detail by
+    // LOWERING this as finer levels land, through resource_allocator::set_sampler.
+    float min_lod = 0.0f;
+
+    bool operator==(const sampler_info&) const = default;
 };
 
 struct image_info

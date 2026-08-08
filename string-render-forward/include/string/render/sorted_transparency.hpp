@@ -41,7 +41,7 @@ public:
     };
     static list_layout layout_for(uint32_t max_draws);
 
-    sorted_transparency(String::engine_context& ctx, GeometryScene* scene, VkSampleCountFlagBits samples);
+    sorted_transparency(string::engine_context& ctx, GeometryScene* scene, VkSampleCountFlagBits samples);
     ~sorted_transparency();
 
     sorted_transparency(const sorted_transparency&) = delete;

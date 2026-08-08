@@ -10,7 +10,7 @@
 
 namespace string::gpu { class device; }
 
-namespace String
+namespace string
 {
 
 // Per-pass GPU timing via vkCmdWriteTimestamp2 pairs (brief 06). The renderer wraps each pass's
@@ -102,4 +102,4 @@ private:
     std::vector<PassStat> stats_;
 };
 
-}  // namespace String
+}  // namespace string

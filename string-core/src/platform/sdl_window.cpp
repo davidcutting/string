@@ -11,7 +11,7 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL_vulkan.h>
 
-namespace String
+namespace string
 {
 
 namespace
@@ -194,17 +194,17 @@ Window::Window(const Properties& properties)
     
     switch (properties.mode)
     {
-        case String::View::Mode::WINDOWED:
+        case string::View::Mode::WINDOWED:
             // No additional flags needed
             break;
-        case String::View::Mode::FULLSCREEN_BORDERLESS:
+        case string::View::Mode::FULLSCREEN_BORDERLESS:
             flags |= SDL_WINDOW_BORDERLESS;
             break;
-        case String::View::Mode::FULLSCREEN:
+        case string::View::Mode::FULLSCREEN:
             flags |= SDL_WINDOW_FULLSCREEN;
             break;
         // TODO(DCut): Handle headless?
-        case String::View::Mode::HEADLESS:
+        case string::View::Mode::HEADLESS:
             flags |= SDL_WINDOW_HIDDEN;
             break;
     }

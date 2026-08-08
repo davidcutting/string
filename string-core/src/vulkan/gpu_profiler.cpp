@@ -4,7 +4,7 @@
 
 #include <string/gpu/device.hpp>
 
-namespace String
+namespace string
 {
 
 GpuProfiler::~GpuProfiler()
@@ -149,4 +149,4 @@ namespace { const GpuProfiler* g_global = nullptr; }
 void GpuProfiler::set_global(const GpuProfiler* p) { g_global = p; }
 const GpuProfiler* GpuProfiler::global() { return g_global; }
 
-}  // namespace String
+}  // namespace string

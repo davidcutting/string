@@ -45,7 +45,7 @@ uint32_t pack_tangent(const glm::vec3& t, float sign)
 // range, then writes packed tangents back to the (indexed) shared vertex array. glTF winds CCW.
 struct MikktMesh
 {
-    String::Vertex* verts;          // base of this primitive's vertex range in model.vertices
+    string::Vertex* verts;          // base of this primitive's vertex range in model.vertices
     const uint32_t* indices;        // global index values for this primitive (already vertex-rebased)
     uint32_t base_vertex;           // subtract to map a global index back to a local vertex slot
     uint32_t face_count;
@@ -57,7 +57,7 @@ int mikkt_num_faces(const SMikkTSpaceContext* c)
 }
 int mikkt_num_verts_of_face(const SMikkTSpaceContext*, int) { return 3; }
 
-const String::Vertex& mikkt_vertex(const SMikkTSpaceContext* c, int face, int vert)
+const string::Vertex& mikkt_vertex(const SMikkTSpaceContext* c, int face, int vert)
 {
     const MikktMesh* m = static_cast<const MikktMesh*>(c->m_pUserData);
     const uint32_t idx = m->indices[face * 3 + vert] - m->base_vertex;
@@ -329,7 +329,7 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
                 glm::vec3 local_max(std::numeric_limits<float>::lowest());
                 fastgltf::iterateAccessorWithIndex<glm::vec3>(
                     casset, position_accessor, [&](glm::vec3 value, std::size_t i) {
-                        String::Vertex& v = model.vertices[plan.base_vertex + i];
+                        string::Vertex& v = model.vertices[plan.base_vertex + i];
                         v.pos = value;
                         v.color = glm::vec3(1.0f);
                         local_min = glm::min(local_min, value);

@@ -19,7 +19,7 @@ namespace
 // No glTF / textures — bake_scene is the geometry-only core (the procgen-shaped entry point).
 struct SynthScene
 {
-    std::vector<String::Vertex> vertices;
+    std::vector<string::Vertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<GltfDraw> draws;
 };
@@ -32,7 +32,7 @@ void add_grid(SynthScene& s, int n, glm::vec3 origin, int material)
     for (int y = 0; y <= n; ++y)
         for (int x = 0; x <= n; ++x)
         {
-            String::Vertex v{};
+            string::Vertex v{};
             v.pos = origin + glm::vec3(float(x), float((x * 7 + y * 13) % 5) * 0.1f, float(y));
             v.color = glm::vec3(1.0f);
             v.texCoord = glm::vec2(float(x) / n, float(y) / n);
@@ -126,7 +126,7 @@ TEST(BakeScene, RoundTrip)
 
     ASSERT_EQ(back.vertices.size(), scene.vertices.size());
     EXPECT_EQ(0, std::memcmp(back.vertices.data(), scene.vertices.data(),
-                             scene.vertices.size() * sizeof(String::Vertex)));
+                             scene.vertices.size() * sizeof(string::Vertex)));
     ASSERT_EQ(back.meshlets.size(), scene.meshlets.size());
     EXPECT_EQ(0, std::memcmp(back.meshlets.data(), scene.meshlets.data(),
                              scene.meshlets.size() * sizeof(GpuMeshlet)));

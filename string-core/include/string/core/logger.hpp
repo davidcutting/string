@@ -12,7 +12,7 @@
 #include <vector>
 #include <string/core/platform_detection.hpp>
 
-namespace String
+namespace string
 {
 
 enum class LogLevel : int
@@ -219,10 +219,10 @@ private:
 };
 
 #ifndef STRING_RELEASE
-#define STRING_LOG_TRACE(fmt, ...) ::String::Logger::get_logger().trace(fmt __VA_OPT__(,) __VA_ARGS__)
-#define STRING_LOG_DEBUG(fmt, ...) ::String::Logger::get_logger().debug(fmt __VA_OPT__(,) __VA_ARGS__)
-#define STRING_LOG_INFO(fmt, ...)  ::String::Logger::get_logger().info(fmt __VA_OPT__(,) __VA_ARGS__)
-#define STRING_LOG_WARN(fmt, ...)  ::String::Logger::get_logger().warn(fmt __VA_OPT__(,) __VA_ARGS__)
+#define STRING_LOG_TRACE(fmt, ...) ::string::Logger::get_logger().trace(fmt __VA_OPT__(,) __VA_ARGS__)
+#define STRING_LOG_DEBUG(fmt, ...) ::string::Logger::get_logger().debug(fmt __VA_OPT__(,) __VA_ARGS__)
+#define STRING_LOG_INFO(fmt, ...)  ::string::Logger::get_logger().info(fmt __VA_OPT__(,) __VA_ARGS__)
+#define STRING_LOG_WARN(fmt, ...)  ::string::Logger::get_logger().warn(fmt __VA_OPT__(,) __VA_ARGS__)
 #else
 #define STRING_LOG_TRACE(fmt, ...) ((void)0)
 #define STRING_LOG_DEBUG(fmt, ...) ((void)0)
@@ -230,7 +230,7 @@ private:
 #define STRING_LOG_WARN(fmt, ...)  ((void)0)
 #endif  // STRING_RELEASE
 
-#define STRING_LOG_ERROR(fmt, ...)    ::String::Logger::get_logger().error(fmt __VA_OPT__(,) __VA_ARGS__)
-#define STRING_LOG_CRITICAL(fmt, ...) ::String::Logger::get_logger().critical(fmt __VA_OPT__(,) __VA_ARGS__)
+#define STRING_LOG_ERROR(fmt, ...)    ::string::Logger::get_logger().error(fmt __VA_OPT__(,) __VA_ARGS__)
+#define STRING_LOG_CRITICAL(fmt, ...) ::string::Logger::get_logger().critical(fmt __VA_OPT__(,) __VA_ARGS__)
 
 }

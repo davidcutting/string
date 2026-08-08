@@ -13,7 +13,7 @@ struct vec2
 
 }
 
-namespace String
+namespace string
 {
 
 struct Extent2D

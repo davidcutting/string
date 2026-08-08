@@ -16,8 +16,27 @@
 
 #include <string/core/cache_dir.hpp>
 #include <string/gpu/vk_check.hpp>
+// Vendored RenderDoc in-application API (MIT), for headless .rdc capture — see rdoc_api() below.
+#if __has_include("renderdoc_app.h") && defined(__linux__)
+#include "renderdoc_app.h"
+#include <dlfcn.h>
+#define STRING_HAS_RENDERDOC_APP 1
+#else
+#define STRING_HAS_RENDERDOC_APP 0
+// Stub so the hook below compiles (to a guaranteed-nullptr no-op) when the vendored header is
+// absent (non-Linux, or a source snapshot without untracked files).
+struct RENDERDOC_API_1_1_2
+{
+    void StartFrameCapture(void*, void*) {}
+    void EndFrameCapture(void*, void*) {}
+    void SetCaptureFilePathTemplate(const char*) {}
+};
+#endif
 #include <string/core/cvar.hpp>
 #include <string/core/png_writer.hpp>
+// The capture writer applies the composite's output transform on the CPU (encode_display).
+#include <string/vulkan/passes/composite_pass.hpp>
+#include <glm/glm.hpp>
 #include <string/debug_draw.hpp>
 #include <string/gpu/driver.hpp>
 #include <string/vulkan/renderer.hpp>
@@ -93,7 +112,7 @@ core::CVar<bool>& async_enabled_cvar()
 
 }  // namespace
 
-renderer::renderer(const String::ApplicationInfo& application_info, std::shared_ptr<String::Window> window)
+renderer::renderer(const string::ApplicationInfo& application_info, std::shared_ptr<string::Window> window)
 : application_info_(application_info)
 , window_(std::move(window))
 , driver_(application_info, window_)
@@ -101,7 +120,7 @@ renderer::renderer(const String::ApplicationInfo& application_info, std::shared_
 , graphics_queue_(device_.get_queue(gpu::queue_type::GRAPHICS))
 , presenter_(device_, window_, frames_in_flight_)
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
-, transfer_batch_(device_, allocator_, graphics_queue_)
+, transfer_batch_(device_, allocator_)
 , global_descriptor_table_(device_.get_device(), allocator_)
 , shader_jobs_(1)
 , file_watcher_(shader_jobs_)
@@ -124,7 +143,6 @@ renderer::renderer(const String::ApplicationInfo& application_info, std::shared_
     std::filesystem::path(application_info.resources_directory),
     static_cast<uint16_t>(frames_in_flight_),
     &gpu_profiler_ctx_,
-    scratch_,
 }
 {
     STRING_LOG_DEBUG("Initializing renderer...");
@@ -148,8 +166,8 @@ renderer::renderer(const String::ApplicationInfo& application_info, std::shared_
 
     init_gpu_profiler();
     gpu_timing_.init(device_, frames_in_flight_);
-    String::GpuProfiler::set_global(&gpu_timing_);
-    String::GraphIntrospect::set_global(&introspect_);
+    string::GpuProfiler::set_global(&gpu_timing_);
+    string::GraphIntrospect::set_global(&introspect_);
 
     // NOTE: no render targets are created here. The scene's colour and depth attachments are
     // viewport-scaled TRANSIENTS the graph owns and re-sizes; the swapchain is the one image the
@@ -159,19 +177,30 @@ renderer::renderer(const String::ApplicationInfo& application_info, std::shared_
 renderer::~renderer()
 {
     vkDeviceWaitIdle(device_.get_device());
-    String::GpuProfiler::set_global(nullptr);
-    String::GraphIntrospect::set_global(nullptr);
+    string::GpuProfiler::set_global(nullptr);
+    string::GraphIntrospect::set_global(nullptr);
 #if defined(STRING_PROFILE) && !defined(STRING_RELEASE)
     for (auto ctx : lane_profiler_ctxs_)
         if (ctx) TracyVkDestroy(ctx);
 #endif
     gpu_timing_.destroy(device_.get_device());
-    scratch_.destroy(allocator_);
 }
 
 void renderer::wait_idle()
 {
     gpu::vk_report(vkDeviceWaitIdle(device_.get_device()), "vkDeviceWaitIdle(shutdown)");
+}
+
+void renderer::flush_construction_uploads()
+{
+    if (!transfer_batch_.pending()) return;
+    gpu::command_recorder rec;
+    rec.init(device_.get_device(), graphics_queue_);
+    transfer_batch_.record(rec.begin());
+    rec.end().immediate_submit();   // submits AND waits — that is what makes this the drain
+    // Construction staged into bucket 0; it is on the GPU now, so free it and move new staging into
+    // frame 1's bucket. Nothing later can free a bucket for a frame that has not retired.
+    transfer_batch_.begin_frame(1, 0);
 }
 
 void renderer::publish_introspection(const compiled_frame& frame)
@@ -212,6 +241,12 @@ void renderer::begin_frame()
 
     frame.garbage_collector.flush();
 
+    // Uploads staged from here on belong to THIS frame, and everything up to the value the main
+    // timeline just reached has retired — which is what frees the staging those frames used. The
+    // per-frame `transfer_batch_.flush()` that used to sit at the bottom of this function is gone:
+    // the copies are recorded by a declared pass inside the frame now (brief 21 step 5).
+    transfer_batch_.begin_frame(frame_count_, frame.frame_id);
+
     // One acquire, one fresh semaphore, always waited, always presented. Acquiring here rather than
     // mid-frame makes it unrepresentable for a frame to present an image it never drew — the class
     // of bug where a binary semaphore belonging to a consumed frame is waited on forever.
@@ -237,18 +272,57 @@ void renderer::begin_frame()
         });
     });
 
-    // Push streamed uploads onto the graphics queue. This is the one upload path still outside the
-    // graph, and only until per-frame uploads become declared transfer passes.
-    {
-        STRING_PROFILE_SCOPE("transfer_batch flush")
-        transfer_batch_.flush();
-    }
 }
+
+// Headless RenderDoc capture (STRING_RDOC_FRAME=N): when the RenderDoc Vulkan layer is active
+// (ENABLE_VULKAN_RENDERDOC_CAPTURE=1, no GUI needed), bracket frame N with the in-application API
+// so a .rdc lands at STRING_RDOC_PATH without anyone pressing F12. Loads nothing itself —
+// RTLD_NOLOAD only finds librenderdoc if the layer already injected it, so this is a no-op in
+// every normal run.
+namespace
+{
+RENDERDOC_API_1_1_2* rdoc_api()
+{
+#if STRING_HAS_RENDERDOC_APP
+    static RENDERDOC_API_1_1_2* api = []() -> RENDERDOC_API_1_1_2* {
+        void* mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+        if (mod == nullptr) return nullptr;
+        auto get = reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(mod, "RENDERDOC_GetAPI"));
+        RENDERDOC_API_1_1_2* a = nullptr;
+        if (get != nullptr && get(eRENDERDOC_API_Version_1_1_2, reinterpret_cast<void**>(&a)) == 1)
+        {
+            if (const char* path = std::getenv("STRING_RDOC_PATH"))
+                a->SetCaptureFilePathTemplate(path);
+            return a;
+        }
+        return nullptr;
+    }();
+    return api;
+#else
+    return nullptr;
+#endif
+}
+
+int rdoc_capture_frame()
+{
+    static const int frame = [] {
+        const char* e = std::getenv("STRING_RDOC_FRAME");
+        return e != nullptr ? std::atoi(e) : -1;
+    }();
+    return frame;
+}
+}  // namespace
 
 void renderer::render_frame(compiled_frame& frame, float dt)
 {
     STRING_PROFILE_SCOPE("render_frame")
     (void)dt;
+
+    static int rdoc_frame_counter = 0;
+    const bool rdoc_this_frame = rdoc_capture_frame() >= 0
+                              && rdoc_frame_counter++ == rdoc_capture_frame()
+                              && rdoc_api() != nullptr;
+    if (rdoc_this_frame) rdoc_api()->StartFrameCapture(nullptr, nullptr);
 
     // The frame the capture path reads. Latched here rather than handed over separately, so the two
     // can never disagree about which graph is executing.
@@ -281,9 +355,9 @@ void renderer::render_frame(compiled_frame& frame, float dt)
         .async_rec = async,
         .frame_slot = slot,
         .extent = presenter_.get_extent(),
-        .swapchain = swapchain_target,
-        .swapchain_image = acquired_image_,
-        .swapchain_view = acquired_image_view_,
+
+        .swapchain = { acquired_image_, acquired_image_view_ },
+
     };
     frame.execute(info);
 
@@ -311,6 +385,13 @@ void renderer::render_frame(compiled_frame& frame, float dt)
 
     main.end();
     end_frame();
+
+    if (rdoc_this_frame)
+    {
+        rdoc_api()->EndFrameCapture(nullptr, nullptr);
+        STRING_LOG_INFO("[rdoc] captured frame {} (template: {})", rdoc_capture_frame(),
+                        std::getenv("STRING_RDOC_PATH") ? std::getenv("STRING_RDOC_PATH") : "default");
+    }
 }
 
 // Submit one lane's recorder, signalling its timeline at `value`.
@@ -423,16 +504,20 @@ void renderer::end_frame()
     current_frame_ = frame_count_ % frames_in_flight_;
 }
 
-void renderer::resize(compiled_frame& frame, const String::View::Extent& extent)
+void renderer::resize(compiled_frame& frame, const string::View::Extent& extent)
 {
     if (extent.width == 0 || extent.height == 0) return;
 
     gpu::vk_report(vkDeviceWaitIdle(device_.get_device()), "vkDeviceWaitIdle(resize)");
     presenter_.resize({ extent.width, extent.height });
 
-    // Hand the new viewport to the graph. It re-sizes its viewport-scaled transients and forgets
-    // tracked state (the backing it described no longer exists). The DECLARATIONS are untouched:
-    // no re-authoring, no recompile, no plan rebuild.
+    // Owner half first: the app re-backs its viewport-sized persistents and re-points their handles,
+    // so the graph half's re-bind below picks up the NEW backing.
+    if (resize_cb_) resize_cb_(presenter_.get_extent());
+
+    // Graph half: re-materialize viewport-scaled transients, re-bind every declared descriptor,
+    // re-seed persistent layouts, forget tracked state. The DECLARATIONS are untouched: no
+    // re-authoring, no recompile, no plan rebuild.
     frame.resize(context_, presenter_.get_extent());
 }
 
@@ -461,24 +546,48 @@ void renderer::init_gpu_profiler()
 #endif
 }
 
-// Tonemap RGBA16F to 8-bit and write a bottom-up 24-bit BMP, or a PNG when the path says so. Same
-// output the gates have always compared, so existing baselines stay valid.
+// Tonemap RGBA16F to 8-bit and write a bottom-up 24-bit BMP, or a PNG when the path says so.
+//
+// The source is the SCENE HDR target, which is display-referred only after the composite's output
+// transform runs on the GPU. So this must apply the same transform on the CPU — exposure plus the
+// grading/ACES LUT (composite_pass::encode_display), then gamma — or the capture is raw linear HDR
+// and every bright pixel clips to white.
+//
+// This was dropped in the brief-20 rewrite and the loss was invisible for a while: the images still
+// looked like a scene, just blown out, so they read as an exposure bug rather than a capture bug.
+// Gamma here is pow(1/2.2), NOT the sRGB piecewise curve — it must match what the existing
+// baselines were written with, or every stored baseline silently stops comparing.
 namespace
 {
+// Depth-target capture (debug): raw D32 floats to a sqrt-encoded grayscale PNG. Reverse-Z, so
+// white = near occluder, black = empty/far. The sqrt lifts small values so a distant caster set
+// is visible instead of near-black. Written for the shadow-cascade investigation; generally useful
+// for any depth target (the brief-14 target visualizer will subsume it).
+void write_capture_depth(const std::string& path, const void* d32, uint32_t w, uint32_t h)
+{
+    const auto* src = static_cast<const float*>(d32);
+    std::vector<uint8_t> rgb(static_cast<std::size_t>(w) * h * 3);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i)
+    {
+        const float v = std::sqrt(std::clamp(src[i], 0.0f, 1.0f));
+        const auto g = static_cast<uint8_t>(v * 255.0f + 0.5f);
+        rgb[i * 3 + 0] = g; rgb[i * 3 + 1] = g; rgb[i * 3 + 2] = g;
+    }
+    const std::vector<uint8_t> png = core::png::encode(rgb.data(), w, h, 3);
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+}
+
 void write_capture(const std::string& path, const void* rgba16f, uint32_t w, uint32_t h)
 {
     const auto* src = static_cast<const uint16_t*>(rgba16f);
     const auto half_to_float = [](uint16_t v) -> float {
-        const uint32_t sign = (v >> 15) & 0x1u;
-        const uint32_t exp = (v >> 10) & 0x1Fu;
-        const uint32_t man = v & 0x3FFu;
-        uint32_t bits;
-        if (exp == 0)      bits = sign << 31;
-        else if (exp == 31) bits = (sign << 31) | 0x7F800000u | (man << 13);
-        else               bits = (sign << 31) | ((exp + 112u) << 23) | (man << 13);
+        const uint32_t sign = (v >> 15) & 1, exp = (v >> 10) & 0x1F, man = v & 0x3FF;
         float f;
-        std::memcpy(&f, &bits, sizeof(f));
-        return f;
+        if (exp == 0)       f = man / 1024.0f / 16384.0f;
+        else if (exp == 31) f = 65504.0f;
+        else                f = (1.0f + man / 1024.0f) * std::pow(2.0f, int(exp) - 15);
+        return sign ? -f : f;
     };
 
     std::vector<uint8_t> rgb(static_cast<std::size_t>(w) * h * 3);
@@ -488,13 +597,13 @@ void write_capture(const std::string& path, const void* rgba16f, uint32_t w, uin
         {
             const std::size_t si = (static_cast<std::size_t>(y) * w + x) * 4;
             const std::size_t di = (static_cast<std::size_t>(y) * w + x) * 3;
+            // Per-PIXEL, not per-channel — the aces2 CAM DRT mixes channels.
+            const glm::vec3 hdr(half_to_float(src[si + 0]), half_to_float(src[si + 1]),
+                                half_to_float(src[si + 2]));
+            const glm::vec3 enc =
+                glm::pow(string::composite_pass::encode_display(hdr), glm::vec3(1.0f / 2.2f));
             for (int c = 0; c < 3; ++c)
-            {
-                const float lin = half_to_float(src[si + c]);
-                const float enc = lin <= 0.0031308f ? lin * 12.92f
-                                                    : 1.055f * std::pow(std::max(lin, 0.0f), 1.0f / 2.4f) - 0.055f;
-                rgb[di + c] = static_cast<uint8_t>(std::clamp(enc, 0.0f, 1.0f) * 255.0f + 0.5f);
-            }
+                rgb[di + c] = static_cast<uint8_t>(std::clamp(enc[c], 0.0f, 1.0f) * 255.0f + 0.5f);
         }
     }
 
@@ -549,69 +658,82 @@ void renderer::capture(const std::string& path)
         return;
     }
 
+    // The device is already idle: the copy was recorded by the DECLARED capture pass inside the frame
+    // that just submitted, and the caller waited for it. All that is left here is reading the staging
+    // buffer the pass filled and writing the file — no image transitions, no second submit, and
+    // nothing for the graph's tracker to be told about afterwards.
     gpu::vk_report(vkDeviceWaitIdle(device_.get_device()), "vkDeviceWaitIdle(capture)");
 
     const gpu::resource_id id = capture_frame_->physical_of(capture_source_,
                                                             static_cast<std::uint32_t>(current_frame_));
-    if (id == 0) return;
+    if (id == 0 || capture_staging_ == 0) return;
     const gpu::allocated_image& img = allocator_.get_image(id);
 
+    // A D32 source (a shadow cascade, the resolved depth) captures as raw depth -> grayscale;
+    // everything else is treated as the RGBA16F scene target.
+    const bool depth_source = img.format == VK_FORMAT_D32_SFLOAT;
+    const VkImageAspectFlags aspect = depth_source ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                   : VK_IMAGE_ASPECT_COLOR_BIT;
     const VkExtent2D size{ img.extent.width, img.extent.height };
-    const VkDeviceSize bytes = VkDeviceSize{ size.width } * size.height * 8;   // RGBA16F
-    const gpu::resource_id staging = allocator_.create_resource(gpu::buffer_info{
-        .size = bytes,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
-        .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT,
-    });
+    void* mapped = allocator_.get_buffer(capture_staging_).allocation_info.pMappedData;
+    if (mapped == nullptr) return;
+    if (depth_source) write_capture_depth(path, mapped, size.width, size.height);
+    else              write_capture(path, mapped, size.width, size.height);
+}
 
+// The capture's GPU half, as a DECLARED pass the app authors. Declaring `.reads(source,
+// transfer_read)` is what makes the graph transition the source into TRANSFER_SRC from whatever
+// layout it is actually in, and back for the next frame's reader — the two hand-written transitions
+// this replaced had to GUESS that layout (they hardcoded SHADER_READ_ONLY, which is not what a
+// shadow cascade or a colour target ends the frame in), and then tell the tracker about it through
+// note_external_layout. Both are gone: no guess, no back channel, no second submit.
+void renderer::record_capture(pass_context& ctx)
+{
+    const gpu::resource_id id = ctx.id(capture_source_);
+    if (id == 0) return;
+    const gpu::allocated_image& img = allocator_.get_image(id);
+    const bool depth_source = img.format == VK_FORMAT_D32_SFLOAT;
+    const VkImageAspectFlags aspect = depth_source ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                   : VK_IMAGE_ASPECT_COLOR_BIT;
+    const VkDeviceSize bytes =
+        VkDeviceSize{ img.extent.width } * img.extent.height * (depth_source ? 4 : 8);
+    if (capture_staging_ == 0 || capture_staging_bytes_ < bytes)
     {
-        // Outside the graph on purpose: the capture drains the device first, so this is a one-shot
-        // submit on its own recorder, exactly like the construction-time uploads the brief keeps out.
-        // The device was drained above, so this slot's pool is idle and safe to recycle. Without the
-        // reset, begin() lands on a buffer that is still in the executable state.
-        gpu::command_recorder& rec = main_recorder(current_frame_);
-        rec.reset();
-        VkCommandBuffer cmd = rec.begin();
-        String::vku::transition_image(cmd, {
-            .image = img.image,
-            .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .new_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .src_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .src_access = VK_ACCESS_2_MEMORY_WRITE_BIT,
-            .dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT,
-            .dst_access = VK_ACCESS_2_TRANSFER_READ_BIT,
-            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        if (capture_staging_ != 0) allocator_.destroy_resource(capture_staging_);
+        capture_staging_ = allocator_.create_resource(gpu::buffer_info{
+            .size = bytes,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
+            .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT,
         });
-        const VkBufferImageCopy region{
-            .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
-            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .imageOffset = { 0, 0, 0 },
-            .imageExtent = { size.width, size.height, 1 },
-        };
-        vkCmdCopyImageToBuffer(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               allocator_.get_buffer(staging).buffer, 1, &region);
-        String::vku::transition_image(cmd, {
-            .image = img.image,
-            .old_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .src_stage = VK_PIPELINE_STAGE_2_COPY_BIT,
-            .src_access = VK_ACCESS_2_TRANSFER_READ_BIT,
-            .dst_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .dst_access = VK_ACCESS_2_MEMORY_READ_BIT,
-            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-        });
-        rec.end().immediate_submit();
+        capture_staging_bytes_ = bytes;
     }
+    const VkBufferImageCopy region{
+        .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
+        .imageSubresource = { aspect, 0, 0, 1 },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { img.extent.width, img.extent.height, 1 },
+    };
+    vkCmdCopyImageToBuffer(ctx.rec.get_command_buffer(), img.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           allocator_.get_buffer(capture_staging_).buffer, 1, &region);
+}
 
-    write_capture(path, allocator_.get_buffer(staging).allocation_info.pMappedData,
-                  size.width, size.height);
-    allocator_.destroy_resource(staging);
+bool renderer::capture_armed() const
+{
+    const int32_t at = capture_frame_cvar().get();
+    if (at > 0 && frame_count_ >= static_cast<uint64_t>(at)) return true;
+    const int32_t every = capture_every_n_cvar().get();
+    return every > 0 && (frame_count_ % static_cast<uint64_t>(every)) == 0;
+}
 
-    // The capture path transitions the source behind the graph's back, so the tracker's belief
-    // about it is now stale. Telling it, rather than leaving it to guess, is the difference between
-    // a debug feature and a debug feature that corrupts the next frame.
-    capture_frame_->note_external_layout(capture_source_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+void renderer::declare_capture(frame_graph& fg, gpu::image source)
+{
+    capture_source_ = source;
+    fg.pass("debug.capture")
+      .reads(source, access::transfer_read)
+      .toggle([this] { return capture_armed(); })
+      .transfer([this](pass_context& ctx) { record_capture(ctx); });
 }
 
 }  // namespace string

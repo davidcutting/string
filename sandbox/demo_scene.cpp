@@ -81,13 +81,17 @@ VkExtent2D scene_viewport()
 // Defined below; the content-scan registry lambdas above call them.
 struct scene_resources;
 std::function<void(float)> make_geometry_scene(
-    string::frame_graph& fg, String::engine_context& ctx, VkExtent2D viewport,
+    string::frame_graph& fg, string::engine_context& ctx, VkExtent2D viewport,
     VkSampleCountFlagBits samples, VkFormat swapchain_format,
     std::vector<std::filesystem::path> models,
-    std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t np_stress, string::renderer& rr);
+    std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t np_stress, string::renderer& rr,
+    bool lookdev = false);
 struct scene_resources;
 std::function<void(float)> make_shader_scene(
-    string::frame_graph& fg, String::engine_context& ctx, const std::filesystem::path& shader,
+    string::frame_graph& fg, string::engine_context& ctx, const std::filesystem::path& shader,
+    std::shared_ptr<string::dynamic_font_atlas> atlas, string::renderer& rr);
+std::function<void(float)> make_ui_scene(
+    string::frame_graph& fg, string::engine_context& ctx,
     std::shared_ptr<string::dynamic_font_atlas> atlas, string::renderer& rr);
 
 // Throws naming the path rather than returning an empty vector. A silent empty read used to travel
@@ -282,7 +286,7 @@ ui_pass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::uint32_t
 //
 // Everything the scene renders into or through is stated HERE, once, as logical handles: the
 // renderer creates no render targets, and no pass owns a viewport-sized image any more. Sizes that
-// follow the window are declared as RELATIONSHIPS (viewport_scaled / bytes_for) rather than computed,
+// follow the window are declared as RELATIONSHIPS (viewport_fit / tile_pixels) rather than computed,
 // which is what lets a resize be a backing swap instead of a re-author.
 struct scene_resources
 {
@@ -295,17 +299,183 @@ struct scene_resources
     string::gpu::image hiz_depth_prev;
     string::gpu::image gi_irradiance, gi_cap_gbuf, gi_cap_albedo, gi_visibility;
     string::gpu::image gi_cube_albedo, gi_cube_nd, gi_cube_depth;
-    string::gpu::buffer froxels, ibl_sh, worklists, transparency_list, histogram_bins;
+    string::gpu::buffer froxels, ibl_sh, transparency_list, histogram_bins;
+    ::string::render::WorklistSet worklists;
     string::gpu::buffer scene_data, lights, stats;
     string::gpu::buffer gi_active, gi_offset, gi_meshlet_table;
-    uint32_t hiz_mips = 0, bloom_mips = 0;
+    uint32_t bloom_mips = 0;
+};
+
+// Brief 21 D3 — time lives OUTSIDE the graph. Every resource whose CONTENTS outlive the frame
+// (cross-frame history, host-write pacing rings, in-place accumulators) has a lifetime beyond the
+// graph's scope, so the APP creates and destroys its backing and hands it in as a persistent; the
+// graph tracks usage only. This struct is that owner for the geometry scene. The category test:
+// contents outlive the frame -> persistent (here); frame-scoped -> transient (fg.image/fg.buffer).
+struct scene_backing
+{
+    string::engine_context* ctx = nullptr;
+    // The depth-history ring: GTAO reprojection reads LAST frame's resolved depth, so the app backs
+    // one image per frame in flight and declares TWO handles over them — identity order for this
+    // frame's write, rotated one slot back for last frame's read. The rotation is static: resolved
+    // by frame slot, no per-frame swap call, no reach into graph records.
+    std::vector<string::gpu::resource_id> hiz_depth;
+    // Host-write pacing rings: the CPU fills frame N+1's slot while the GPU still reads frame N's.
+    std::vector<string::gpu::resource_id> scene_data, lights, stats, transparency_list;
+    // Probe-GI accumulators: captured/relit tiles persist across the amortized rounds, and readers
+    // must see REAL accumulated data on frames when no producer pass runs — as transients they were
+    // degrade-substituted with the 1x1 neutral on exactly those frames.
+    string::gpu::resource_id gi_irradiance = 0, gi_cap_gbuf = 0, gi_cap_albedo = 0, gi_visibility = 0;
+    string::gpu::resource_id gi_active = 0, gi_offset = 0, gi_meshlet_table = 0;
+    // IBL products: the bake is AMORTIZED — it re-runs only when the sun moves, so on nearly every
+    // frame nothing writes them and everything reads them. Same category as the GI atlases, and the
+    // same failure when they were transients: a resize destroyed their backing, no bake re-ran, and
+    // the whole scene shaded against 1x1 neutral env/DFG until the sun happened to move.
+    string::gpu::resource_id env_capture = 0, env_prefiltered = 0, dfg_lut = 0, ibl_sh = 0;
+
+    void create(string::engine_context& c, VkExtent2D viewport, uint32_t max_draws,
+                const ::string::render::ProbeVolume& gi_volume, std::size_t gi_table_entries)
+    {
+        ctx = &c;
+        const uint32_t slots = c.frames_in_flight;
+
+        create_hiz_depth(viewport);
+
+        const VkBufferUsageFlags host_ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                           | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        const VmaAllocationCreateFlags mapped = VMA_ALLOCATION_CREATE_MAPPED_BIT
+                                              | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+        const auto ring = [&](std::vector<string::gpu::resource_id>& out, string::gpu::buffer_info info) {
+            for (uint32_t s = 0; s < slots; ++s) out.push_back(c.allocator.create_resource(info));
+        };
+        ring(scene_data, { .size = sizeof(::string::render::SceneData), .usage = host_ssbo,
+                           .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU, .allocation_flags = mapped });
+        ring(lights, { .size = sizeof(::string::render::GpuLight) * 1024u, .usage = host_ssbo,
+                       .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU, .allocation_flags = mapped });
+        ring(stats, { .size = sizeof(::string::render::GpuMeshStats),
+                      .usage = host_ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
+                      .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT });
+        ring(transparency_list, { .size = ::string::render::sorted_transparency::layout_for(max_draws).bytes,
+                                  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                         | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                                         | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                  .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                  .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
+                                                    | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT });
+
+        const glm::uvec2 gi_tiles = gi_volume.tile_grid();
+        const string::gpu::sampler_info gi_sampler{ .mag_filter = VK_FILTER_LINEAR,
+                                                    .min_filter = VK_FILTER_LINEAR,
+                                                    .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                                                    .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                                    .anisotropy = false };
+        const auto gi_atlas = [&](uint32_t stride) {
+            string::gpu::image_info info{};
+            info.extent = { std::max(1u, gi_tiles.x * stride), std::max(1u, gi_tiles.y * stride), 1 };
+            info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            info.aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT;
+            info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
+            info.sampler = gi_sampler;
+            return c.allocator.create_resource(info);
+        };
+        gi_irradiance = gi_atlas(::string::render::kProbeIrradStride);
+        gi_cap_gbuf   = gi_atlas(::string::render::kProbeVisStride);
+        gi_cap_albedo = gi_atlas(::string::render::kProbeVisStride);
+        gi_visibility = gi_atlas(::string::render::kProbeVisStride);
+
+        const VkBufferUsageFlags gi_buf = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                        | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                                        | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        gi_active = c.allocator.create_resource(string::gpu::buffer_info{
+            .size = std::max<VkDeviceSize>(4 * gi_volume.total(), 4), .usage = gi_buf,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY, .allocation_flags = 0 });
+        gi_offset = c.allocator.create_resource(string::gpu::buffer_info{
+            .size = std::max<VkDeviceSize>(16 * gi_volume.total(), 16), .usage = gi_buf,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY, .allocation_flags = 0 });
+        gi_meshlet_table = c.allocator.create_resource(string::gpu::buffer_info{
+            .size = 8 * std::max<VkDeviceSize>(gi_table_entries, 1), .usage = gi_buf,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY, .allocation_flags = 0 });
+
+        // IBL: two 128^3 cubes with a 6-mip roughness ladder, the split-sum BRDF LUT, and the SH
+        // buffer. Viewport-INDEPENDENT, so a resize leaves them alone — which is the point: the bake
+        // that fills them is amortized and will not re-run just because the window changed.
+        const string::gpu::sampler_info env_sampler{
+            .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
+            .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+            .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .anisotropy = false,
+            .border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE };
+        const auto env_cube = [&] {
+            string::gpu::image_info info{};
+            info.extent = { 128, 128, 1 };
+            info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            info.aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT;
+            info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
+            info.sampler = env_sampler;
+            info.mip_levels = 6;
+            info.cube = true;   // 6 array layers + CUBE_COMPATIBLE, per image_info::cube
+            return c.allocator.create_resource(info);
+        };
+        env_capture = env_cube();
+        env_prefiltered = env_cube();
+        {
+            string::gpu::image_info info{};
+            info.extent = { 128, 128, 1 };
+            info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            info.aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT;
+            info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
+            info.sampler = env_sampler;
+            dfg_lut = c.allocator.create_resource(info);
+        }
+        ibl_sh = c.allocator.create_resource(string::gpu::buffer_info{
+            .size = sizeof(float) * 4 * 9,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                   | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY, .allocation_flags = 0 });
+    }
+
+    // The depth-history ring is viewport-sized, so ITS OWNER re-creates it on resize (the graph
+    // only re-backs what it owns — the viewport-scaled transients). Called at creation and from the
+    // renderer's resize callback, under device idle.
+    void create_hiz_depth(VkExtent2D viewport)
+    {
+        for (string::gpu::resource_id id : hiz_depth) ctx->allocator.destroy_resource(id);
+        hiz_depth.clear();
+        string::gpu::image_info depth_info{};
+        depth_info.extent = { viewport.width, viewport.height, 1 };
+        depth_info.format = VK_FORMAT_D32_SFLOAT;
+        depth_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        depth_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        depth_info.aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT;
+        depth_info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
+        for (uint32_t s = 0; s < ctx->frames_in_flight; ++s)
+            hiz_depth.push_back(ctx->allocator.create_resource(depth_info));
+    }
+
+    ~scene_backing()
+    {
+        if (ctx == nullptr) return;
+        for (string::gpu::resource_id id : hiz_depth) ctx->allocator.destroy_resource(id);
+        for (auto* v : { &scene_data, &lights, &stats, &transparency_list })
+            for (string::gpu::resource_id id : *v) ctx->allocator.destroy_resource(id);
+        for (string::gpu::resource_id id : { gi_irradiance, gi_cap_gbuf, gi_cap_albedo, gi_visibility,
+                                             gi_active, gi_offset, gi_meshlet_table,
+                                             env_capture, env_prefiltered, dfg_lut, ibl_sh })
+            if (id != 0) ctx->allocator.destroy_resource(id);
+    }
 };
 
 scene_resources declare_resources(string::frame_graph& fg, VkExtent2D viewport,
                                   VkSampleCountFlagBits samples, uint32_t shadow_res,
-                                  uint32_t cascades, uint32_t max_draws,
-                                  const ::string::render::ProbeVolume& gi_volume,
-                                  std::size_t gi_table_entries)
+                                  uint32_t cascades, VkDeviceSize worklist_bytes,
+                                  VkDeviceSize draw_lod_bytes, const scene_backing* backing)
 {
     using namespace string;
     scene_resources r;
@@ -318,29 +488,45 @@ scene_resources declare_resources(string::frame_graph& fg, VkExtent2D viewport,
     // colour writes on one pass is what tells the graph there is a resolve; there is no marker and no
     // hook.
     r.color = fg.image({ .name = "scene.color", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                         .viewport_scaled = true, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                         .fit = string::viewport_fit::scaled, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                          .samples = samples });
     r.depth = fg.image({ .name = "scene.depth", .format = VK_FORMAT_D32_SFLOAT,
-                         .viewport_scaled = true,
+                         .fit = string::viewport_fit::scaled,
                          .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                          .aspect = VK_IMAGE_ASPECT_DEPTH_BIT, .samples = samples });
     r.hdr = fg.image({ .name = "scene.hdr", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                       .viewport_scaled = true,
+                       .fit = string::viewport_fit::scaled,
                        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                               | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                               | VK_IMAGE_USAGE_STORAGE_BIT });
 
-    // HiZ. The depth ring is the one genuinely temporal image in the renderer — GTAO reprojection
-    // reads the PREVIOUS frame slot's resolved depth — so it is per_frame, and gtao declares a second
-    // handle over the same backing rotated one slot back.
-    const VkExtent2D hz = ::string::render::geometry_pass::hiz_extent(viewport);
-    r.hiz_mips = ::string::render::geometry_pass::hiz_mip_count(viewport);
-    r.hiz_depth = fg.image({ .name = "hiz.depth", .format = VK_FORMAT_D32_SFLOAT,
-                             .viewport_scaled = true,
-                             .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                             .aspect = VK_IMAGE_ASPECT_DEPTH_BIT, .per_frame = true });
+    // HiZ. The depth history is the one genuinely temporal image in the renderer — GTAO reprojection
+    // reads the PREVIOUS frame slot's resolved depth. Its contents outlive the frame, so per brief
+    // 21 D3 the APP backs it (scene_backing, one image per frame in flight) and declares TWO
+    // persistent handles over the same physicals: identity order for this frame's write, rotated
+    // one slot back for last frame's read. The rotation is STATIC — declared once, resolved by
+    // frame slot, no per-frame wiring and no reach into graph records.
+    {
+        std::vector<gpu::resource_id> ring, rotated;
+        if (backing != nullptr)
+        {
+            ring = backing->hiz_depth;
+            rotated.resize(ring.size());
+            for (std::size_t i = 0; i < ring.size(); ++i)
+                rotated[i] = ring[(i + ring.size() - 1) % ring.size()];
+        }
+        r.hiz_depth = fg.use_persistent(string::persistent_image_info{
+            .name = "hiz.depth", .physical = ring });
+        r.hiz_depth_prev = fg.use_persistent(string::persistent_image_info{
+            .name = "hiz.depth_prev", .physical = rotated });
+    }
+    // The occlusion pyramid FOLLOWS THE WINDOW: half the next power of two, full chain. Both halves
+    // of that are declared relationships, not numbers, so a resize re-backs it without re-authoring —
+    // and the reduction chain that builds it is authored once at the maximum depth with the levels
+    // this extent does not reach conditioned off (geometry_pass::declare_hiz).
     r.hiz_pyramid = fg.image({ .name = "hiz.pyramid", .format = VK_FORMAT_R32_SFLOAT,
-                               .extent = { hz.width, hz.height, 1 }, .mip_levels = r.hiz_mips,
+                               .fit = string::viewport_fit::half_pow2,
+                               .mip_levels = string::transient_image_info::all_mips,
                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                                .sampler = { .mag_filter = VK_FILTER_NEAREST,
                                             .min_filter = VK_FILTER_NEAREST,
@@ -355,11 +541,11 @@ scene_resources declare_resources(string::frame_graph& fg, VkExtent2D viewport,
                                           .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                           .anisotropy = false };
     r.gtao_raw = fg.image({ .name = "gtao.raw", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                            .viewport_scaled = true, .viewport_scale = 0.5f,
+                            .fit = string::viewport_fit::scaled, .viewport_scale = 0.5f,
                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                             .sampler = clamp_linear });
     r.gtao_ao = fg.image({ .name = "gtao.ao", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                           .viewport_scaled = true, .viewport_scale = 0.5f,
+                           .fit = string::viewport_fit::scaled, .viewport_scale = 0.5f,
                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                            .sampler = clamp_linear,
                            .neutral = {{ 0.5f, 0.5f, 0.5f, 1.0f }} });
@@ -371,80 +557,75 @@ scene_resources declare_resources(string::frame_graph& fg, VkExtent2D viewport,
         r.shadow[c] = fg.image({
             .name = "shadow.cascade" + std::to_string(c), .format = VK_FORMAT_D32_SFLOAT,
             .extent = { shadow_res, shadow_res, 1 },
-            .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            // TRANSFER_SRC so STRING_CAPTURE_SOURCE=shadowN can actually read one. Without it the
+            // copy is invalid usage, which is why that lever never produced a real depth dump.
+            .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                   | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
             .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
             .sampler = { .mag_filter = VK_FILTER_NEAREST, .min_filter = VK_FILTER_NEAREST,
                          .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
                          .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                          .anisotropy = false,
                          .border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE },
-            .neutral = {{ 1.0f, 0.0f, 0.0f, 0.0f }} });
-
-    // IBL: two 128^3 cubes with a 6-mip roughness ladder, the split-sum BRDF LUT, and the SH buffer.
-    const gpu::sampler_info env_sampler{ .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
-                                         .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-                                         .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                         .anisotropy = false,
-                                         .border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE };
-    r.env_capture = fg.image({ .name = "ibl.env_capture", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                               .extent = { 128, 128, 1 }, .mip_levels = 6, .array_layers = 6, .cube = true,
-                               .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                               .sampler = env_sampler });
-    r.env_prefiltered = fg.image({ .name = "ibl.env_prefiltered", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                                   .extent = { 128, 128, 1 }, .mip_levels = 6, .array_layers = 6, .cube = true,
-                                   .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                                   .sampler = env_sampler });
-    r.dfg_lut = fg.image({ .name = "ibl.dfg", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                           .extent = { 128, 128, 1 },
-                           .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-                                  | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                           .sampler = env_sampler });
+            // REVERSE-Z: 0.0 is the far plane, so 0.0 means "no occluder anywhere" and reads as LIT.
+            // It was declared 1.0 — the near plane — which is an occluder in front of everything, so
+            // degrading to it shadowed the entire scene. The old `cascade_count = 0` ternary hid that
+            // by making the shader skip the lookup entirely; deleting the ternary (step 4) is what
+            // exposed it, which is exactly what the per-toggle gate is for.
+            .neutral = {{ 0.0f, 0.0f, 0.0f, 0.0f }} });
 
     // Bloom's mip count is fixed at author time, from the initial viewport — authored-once means the
     // number of declared passes cannot change on resize.
     r.bloom_mips = ::string::render::post_pass::bloom_mip_count(viewport);
     r.bloom = fg.image({ .name = "post.bloom", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                         .viewport_scaled = true, .viewport_scale = 0.5f, .mip_levels = r.bloom_mips,
+                         .fit = string::viewport_fit::scaled, .viewport_scale = 0.5f, .mip_levels = r.bloom_mips,
                          .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                          .sampler = clamp_linear });
 
     // --- buffers ---------------------------------------------------------------------------------
     r.froxels = fg.buffer({ .name = "froxels",
-                            .bytes_for = [](VkExtent2D e) { return ::string::render::froxel_component::bytes_for(e); },
+                            // One [count, light indices...] record per froxel, and a froxel column
+                            // per screen tile — the relationship, stated rather than computed.
+                            .tile_pixels = ::string::render::kFroxelTileSize,
+                            .bytes_per_tile = ::string::render::froxel_component::bytes_per_tile(),
                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT });
-    r.ibl_sh = fg.buffer({ .name = "ibl.sh", .bytes = sizeof(float) * 4 * 9,
-                           .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                                  | VK_BUFFER_USAGE_TRANSFER_SRC_BIT });
-    r.transparency_list = fg.buffer({
-        .name = "transparency.list",
-        .bytes = ::string::render::sorted_transparency::layout_for(max_draws).bytes,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-               | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-        .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
-        .per_frame = true });
-    // Probe GI. The atlases are tiled by the probe grid — the app sizes them from the SAME fit the
-    // component uses (probe_gi_component::fit_volume), so neither side can drift from the other.
-    const glm::uvec2 gi_tiles = gi_volume.tile_grid();
+    // Host-write pacing rings (brief 21 D3): the CPU fills frame N+1's slot while the GPU reads
+    // frame N's, so their contents outlive the frame and the APP backs them, one slot per frame in
+    // flight. The graph resolves by slot exactly as it did when these were per_frame transients.
+    const auto persist_buf = [&](const char* name, const std::vector<gpu::resource_id>* phys) {
+        return fg.use_persistent(string::persistent_buffer_info{
+            .name = name, .physical = phys != nullptr ? *phys : std::vector<gpu::resource_id>{} });
+    };
+    r.transparency_list = persist_buf("transparency.list",
+                                      backing != nullptr ? &backing->transparency_list : nullptr);
+    // Probe GI accumulators (brief 21 D3): captured and relit tiles PERSIST across the amortized
+    // rounds — most frames run neither capture nor relight, and readers must see the real
+    // accumulated data on exactly those frames. As transients they were degrade-substituted with
+    // the 1x1 neutral whenever no producer pass survived, which blanked a bake that was perfectly
+    // good. Contents outlive the frame -> the app backs them (scene_backing), sized from the SAME
+    // fit the component uses (probe_gi_component::fit_volume), so neither side can drift.
+    const auto persist_img = [&](const char* name, gpu::resource_id id) {
+        return fg.use_persistent(string::persistent_image_info{
+            .name = name,
+            .physical = id != 0 ? std::vector<gpu::resource_id>{ id } : std::vector<gpu::resource_id>{} });
+    };
+    // IBL products, same category and the same reason (see scene_backing): amortized producers whose
+    // contents must survive both an idle frame and a resize.
+    r.env_capture     = persist_img("ibl.env_capture",     backing != nullptr ? backing->env_capture : 0);
+    r.env_prefiltered = persist_img("ibl.env_prefiltered", backing != nullptr ? backing->env_prefiltered : 0);
+    r.dfg_lut         = persist_img("ibl.dfg",             backing != nullptr ? backing->dfg_lut : 0);
+
+    r.gi_irradiance = persist_img("gi.irradiance",     backing != nullptr ? backing->gi_irradiance : 0);
+    r.gi_cap_gbuf   = persist_img("gi.capture_gbuf",   backing != nullptr ? backing->gi_cap_gbuf : 0);
+    r.gi_cap_albedo = persist_img("gi.capture_albedo", backing != nullptr ? backing->gi_cap_albedo : 0);
+    r.gi_visibility = persist_img("gi.visibility",     backing != nullptr ? backing->gi_visibility : 0);
+
+    // The per-probe cube G-buffer, destructively reused between probes — pure write-after-read, no
+    // history, so one set serves every probe. Genuinely frame-scoped -> stays a graph transient.
     const gpu::sampler_info gi_sampler{ .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
                                         .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
                                         .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                         .anisotropy = false };
-    const VkImageUsageFlags gi_atlas_usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-                                           | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    const auto gi_atlas = [&](const char* name, uint32_t stride) {
-        return fg.image({ .name = name, .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                          .extent = { std::max(1u, gi_tiles.x * stride),
-                                      std::max(1u, gi_tiles.y * stride), 1 },
-                          .usage = gi_atlas_usage, .sampler = gi_sampler });
-    };
-    r.gi_irradiance  = gi_atlas("gi.irradiance",     ::string::render::kProbeIrradStride);
-    r.gi_cap_gbuf    = gi_atlas("gi.capture_gbuf",   ::string::render::kProbeVisStride);
-    r.gi_cap_albedo  = gi_atlas("gi.capture_albedo", ::string::render::kProbeVisStride);
-    r.gi_visibility  = gi_atlas("gi.visibility",     ::string::render::kProbeVisStride);
-
-    // The per-probe cube G-buffer, destructively reused between probes — pure write-after-read, no
-    // history, so one set serves every probe.
     const auto gi_cube = [&](const char* name, VkFormat fmt, VkImageUsageFlags use, VkImageAspectFlags asp) {
         return fg.image({ .name = name, .format = fmt, .extent = { 32, 32, 1 },
                           .array_layers = 6, .cube = true, .usage = use, .aspect = asp,
@@ -460,55 +641,46 @@ scene_resources declare_resources(string::frame_graph& fg, VkExtent2D viewport,
                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                                VK_IMAGE_ASPECT_DEPTH_BIT);
 
-    const VkBufferUsageFlags gi_buf = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                    | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                                    | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    r.gi_active = fg.buffer({ .name = "gi.active",
-                              .bytes = std::max<VkDeviceSize>(4 * gi_volume.total(), 4),
-                              .usage = gi_buf });
-    r.gi_offset = fg.buffer({ .name = "gi.offset",
-                              .bytes = std::max<VkDeviceSize>(16 * gi_volume.total(), 16),
-                              .usage = gi_buf });
-    r.gi_meshlet_table = fg.buffer({ .name = "gi.meshlet_table",
-                                     .bytes = 8 * std::max<VkDeviceSize>(gi_table_entries, 1),
-                                     .usage = gi_buf });
+    // GI table/state buffers: uploaded at bake start, read for the volume's whole lifetime —
+    // contents outlive the frame, app-backed like the atlases.
+    const auto persist_one_buf = [&](const char* name, gpu::resource_id id) {
+        return fg.use_persistent(string::persistent_buffer_info{
+            .name = name,
+            .physical = id != 0 ? std::vector<gpu::resource_id>{ id } : std::vector<gpu::resource_id>{} });
+    };
+    r.gi_active        = persist_one_buf("gi.active",        backing != nullptr ? backing->gi_active : 0);
+    r.gi_offset        = persist_one_buf("gi.offset",        backing != nullptr ? backing->gi_offset : 0);
+    r.gi_meshlet_table = persist_one_buf("gi.meshlet_table", backing != nullptr ? backing->gi_meshlet_table : 0);
+    r.ibl_sh           = persist_one_buf("ibl.sh",           backing != nullptr ? backing->ibl_sh : 0);
 
+    // Histogram bins are written and consumed within one frame — a true transient; the cross-frame
+    // write-after-read against last frame's resolve derives from tracked state.
     r.histogram_bins = fg.buffer({ .name = "post.histogram.bins", .bytes = 256 * sizeof(uint32_t),
-                                   .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                   .per_frame = true });
+                                   .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT });
 
-    // SceneData, the animated light ring and the GPU stats block. All three are host-written each
-    // frame and read by that same frame's draws, so they ring for CPU-vs-GPU pacing.
-    const VkBufferUsageFlags host_ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                       | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    const VmaAllocationCreateFlags mapped = VMA_ALLOCATION_CREATE_MAPPED_BIT
-                                          | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-    r.scene_data = fg.buffer({ .name = "scene.data", .bytes = sizeof(::string::render::SceneData),
-                               .usage = host_ssbo, .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-                               .allocation_flags = mapped, .per_frame = true });
-    r.lights = fg.buffer({ .name = "scene.lights",
-                           .bytes = sizeof(::string::render::GpuLight) * 1024u,
-                           .usage = host_ssbo, .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-                           .allocation_flags = mapped, .per_frame = true });
-    r.stats = fg.buffer({ .name = "scene.stats", .bytes = sizeof(::string::render::GpuMeshStats),
-                          .usage = host_ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                          .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
-                          .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT, .per_frame = true });
+    // SceneData, the animated light ring and the GPU stats block — host-write pacing rings,
+    // app-backed (see scene_backing).
+    r.scene_data = persist_buf("scene.data",   backing != nullptr ? &backing->scene_data : nullptr);
+    r.lights     = persist_buf("scene.lights", backing != nullptr ? &backing->lights : nullptr);
+    r.stats      = persist_buf("scene.stats",  backing != nullptr ? &backing->stats : nullptr);
 
-    // The worklist arena: draw-cull counts, scan offsets, and the compacted indirect command lists
-    // for the camera, the two-sided set and every cascade. One buffer, many regions.
-    // The meshlet worklist arena is the per-frame SCRATCH buffer — the passes reserve byte regions
-    // from it at construction and address them as offsets, so the graph handle must name that same
-    // allocation, not a separate one. Its backing is filled in after the arena materializes
-    // (wire_scratch_arena), because reservations are only known once every pass has been built.
-    r.worklists = fg.use_persistent(string::persistent_buffer_info{ .name = "meshlet.worklists" });
-
-    // GTAO reads the PREVIOUS frame slot's resolved depth. Rather than inventing a "read at slot-1"
-    // verb, that is a SECOND logical handle over the same physical ring, rotated one slot back. Both
-    // handles resolve to the same VkImages, so the tracker sees one resource and derives the
-    // cross-frame edge correctly — and it is persistent, because degrade must never substitute a
-    // fallback for real history.
-    r.hiz_depth_prev = fg.use_persistent(string::persistent_image_info{ .name = "hiz.depth_prev" });
+    // The GPU work lists (brief 21 D4): ONE TRANSIENT PER LIST — the camera's opaque and two-sided
+    // lists, one per possible cascade, and the shared per-draw LOD. They were regions of a per-frame
+    // scratch arena the app had to wire in after the fact; as declarations the graph owns their
+    // lifetime, their aliasing and the edges between them, and the cascade chains stop serialising
+    // behind the camera's just because they shared an allocation.
+    const VkBufferUsageFlags wl_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                      | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                                      | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
+                                      | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const auto list = [&](const std::string& name, VkDeviceSize bytes) {
+        return fg.buffer({ .name = name, .bytes = bytes, .usage = wl_usage });
+    };
+    r.worklists.opaque   = list("meshlet.worklist.opaque", worklist_bytes);
+    r.worklists.twosided = list("meshlet.worklist.twosided", worklist_bytes);
+    for (uint32_t c = 0; c < ::string::render::kMaxCascades; ++c)
+        r.worklists.cascade[c] = list("meshlet.worklist.cascade" + std::to_string(c), worklist_bytes);
+    r.worklists.draw_lod = list("meshlet.draw_lod", draw_lod_bytes);
 
     return r;
 }
@@ -600,11 +772,11 @@ std::optional<SceneDescriptor> read_descriptor(const std::filesystem::path& file
 // folder the user chose — so pass the absolute path through and let the loader's `resources_path /
 // rel` composition leave it alone (operator/ with an absolute right-hand side yields the absolute).
 // That is why nothing here tries to relativise: an absolute content root simply works.
-void register_content_scenes(String::SceneRegistry& registry,
+void register_content_scenes(string::SceneRegistry& registry,
                              const std::shared_ptr<string::dynamic_font_atlas>& atlas,
                              int np_stress)
 {
-    const std::filesystem::path& root = String::ContentRoot::get();
+    const std::filesystem::path& root = string::ContentRoot::get();
     std::error_code ec;
     if (!std::filesystem::is_directory(root, ec))
     {
@@ -679,7 +851,7 @@ void register_content_scenes(String::SceneRegistry& registry,
             registry.add(d->name,
                          d->description.empty() ? "Shader: " + file.filename().string()
                                                 : d->description,
-                         [atlas, shader](string::frame_graph& fg, String::engine_context& ctx,
+                         [atlas, shader](string::frame_graph& fg, string::engine_context& ctx,
                                          string::renderer& r) -> std::function<void(float)> {
                 // Same shape as the `ui` scene: a fullscreen pass then the UI overlay, and NO post
                 // chain — that absence IS the post bypass. The error overlay rides on the UI pass, so
@@ -695,7 +867,7 @@ void register_content_scenes(String::SceneRegistry& registry,
         registry.add(d->name, d->description.empty() ? "Content: " + file.filename().string()
                                                      : d->description,
                      [atlas, np_stress, models = d->models](string::frame_graph& fg,
-                                                            String::engine_context& ctx,
+                                                            string::engine_context& ctx,
                                                             string::renderer& r)
                        -> std::function<void(float)> {
             return make_geometry_scene(fg, ctx, scene_viewport(), kSceneSamples, r.swapchain_format(),
@@ -717,7 +889,7 @@ void register_content_scenes(String::SceneRegistry& registry,
                                  ? name
                                  : asset.parent_path().filename().string() + "/" + name;
         registry.add(unique, "Content: " + asset.filename().string(),
-                     [atlas, np_stress, asset](string::frame_graph& fg, String::engine_context& ctx, string::renderer& r)
+                     [atlas, np_stress, asset](string::frame_graph& fg, string::engine_context& ctx, string::renderer& r)
                        -> std::function<void(float)> {
             // NOTE: marked from_content below so a rescan can drop and re-add it.
             return make_geometry_scene(fg, ctx, scene_viewport(), kSceneSamples, r.swapchain_format(),
@@ -725,7 +897,11 @@ void register_content_scenes(String::SceneRegistry& registry,
                                        static_cast<std::size_t>(np_stress), r);
         }, std::vector<std::filesystem::path>{ asset }, /*from_content=*/true);
     }
-    STRING_LOG_INFO("[content] {} scene(s) discovered under {}", assets.size(), root.string());
+    // Report BOTH counts. This used to print only `assets`, which is the leftovers after erase_if
+    // dropped everything a descriptor claimed — so a content root holding nothing but sponza's three
+    // glTFs and its descriptor logged "0 scene(s) discovered" while having registered sponza fine.
+    STRING_LOG_INFO("[content] {} descriptor scene(s) + {} bare asset(s) under {}",
+                    descriptors.size(), assets.size(), root.string());
 }
 
 
@@ -743,6 +919,9 @@ void register_content_scenes(String::SceneRegistry& registry,
 
 struct geometry_scene_state
 {
+    // Declared FIRST so it is destroyed LAST: passes may record against these backings up to the
+    // wait_idle that precedes scene teardown, and the ids must outlive every pass that named them.
+    scene_backing backing;
     std::shared_ptr<MeshOverlayStats> mesh_stats = std::make_shared<MeshOverlayStats>();
     std::unique_ptr<geometry_pass> geo;
     std::unique_ptr<froxel_component> froxel;
@@ -755,36 +934,11 @@ struct geometry_scene_state
     std::unique_ptr<debug_line_pass> debug_lines;
     std::unique_ptr<ui_pass> ui;
     std::unique_ptr<post_pass> post;
-    std::unique_ptr<String::composite_pass> composite;
+    std::unique_ptr<string::composite_pass> composite;
     scene_resources res;
     string::frame_graph* graph = nullptr;
-    bool history_wired = false;
+
 };
-
-// GTAO reads the PREVIOUS frame slot's resolved depth. That is expressed as a SECOND logical handle
-// over the SAME physical ring, rotated one slot back — no "read at slot-1" verb, no ping-pong, and
-// no second allocation. It has to happen after compile(), because the ring's physicals are what the
-// graph allocated; set_images() is exactly the backing-swap verb for it.
-// Point the worklist handle at the materialized scratch arena, one physical per frame slot.
-void wire_scratch_arena(geometry_scene_state& s, String::engine_context& ctx)
-{
-    if (!ctx.scratch.materialized()) return;
-    std::vector<string::gpu::resource_id> slots;
-    for (std::uint32_t i = 0; i < ctx.frames_in_flight; ++i) slots.push_back(ctx.scratch.buffer(i));
-    s.graph->set_buffers(s.res.worklists, slots);
-}
-
-void wire_depth_history(geometry_scene_state& s)
-{
-    if (s.history_wired || s.graph == nullptr) return;
-    const std::vector<string::gpu::resource_id>& ring = s.graph->record_of(s.res.hiz_depth).physical;
-    if (ring.empty()) return;
-    std::vector<string::gpu::resource_id> rotated(ring.size());
-    for (std::size_t i = 0; i < ring.size(); ++i)
-        rotated[i] = ring[(i + ring.size() - 1) % ring.size()];
-    s.graph->set_images(s.res.hiz_depth_prev, rotated);
-    s.history_wired = true;
-}
 
 // The shadertoy scene: one fullscreen pass, the UI overlay, and the composite. Deliberately NO post
 // chain — that absence IS the post bypass.
@@ -792,17 +946,16 @@ struct shader_scene_state
 {
     std::unique_ptr<shadertoy_pass> toy;
     std::unique_ptr<ui_pass> ui;
-    std::unique_ptr<String::composite_pass> composite;
+    std::unique_ptr<string::composite_pass> composite;
     scene_resources res;
 };
 
 std::function<void(float)> make_shader_scene(
-    string::frame_graph& fg, String::engine_context& ctx, const std::filesystem::path& shader,
+    string::frame_graph& fg, string::engine_context& ctx, const std::filesystem::path& shader,
     std::shared_ptr<string::dynamic_font_atlas> atlas, string::renderer& rr)
 {
     auto s = std::make_shared<shader_scene_state>();
-    s->res = declare_resources(fg, scene_viewport(), kSceneSamples, 2048, 0, 0,
-                               ::string::render::ProbeVolume{}, 0);
+    s->res = declare_resources(fg, scene_viewport(), kSceneSamples, 2048, 0, 256, 256, nullptr);
     s->toy = std::make_unique<shadertoy_pass>(ctx, shader, kSceneSamples);
     auto toy_ui_slot = std::make_shared<std::optional<ui::Ui>>();
     auto toy_panels = std::make_shared<debug::DebugPanels>();
@@ -810,37 +963,101 @@ std::function<void(float)> make_shader_scene(
         ctx, kSceneSamples, atlas,
         make_ui_author(std::make_shared<MeshOverlayStats>(), toy_panels, 0, toy_ui_slot),
         make_ui_observer(toy_ui_slot), make_deferred_author(toy_ui_slot));
-    s->composite = std::make_unique<String::composite_pass>(ctx, rr.swapchain_format());
+    s->composite = std::make_unique<string::composite_pass>(ctx, rr.swapchain_format());
 
     s->toy->declare(fg, s->res.color, s->res.depth);
     s->ui->declare(fg, s->res.color);
     s->composite->declare(fg, s->res.hdr, s->res.swapchain);
-    rr.capture_source(s->res.hdr);
+    rr.declare_capture(fg, s->res.hdr);
 
-    return [s](float dt) {
+    string::renderer* rp = &rr;
+    return [s, rp](float dt) {
         s->toy->tick(dt);
-        s->ui->tick(dt, scene_viewport(), 0);
+        // The live extent and the slot the NEXT frame records into. Packing slot 0 while recording
+        // slot N means most frames draw from a ring nothing filled — flicker, not an error.
+        s->ui->tick(dt, rp->extent(), rp->frame_slot());
+        s->composite->tick();
+    };
+}
+
+// The UI-dev sandbox: a gradient background (+ orbit camera + synthetic anchors, both driven by the
+// author) and the UI overlay. NO geometry_pass, which is the point — startup is instant because
+// nothing loads glTF, builds meshlets or streams textures. Same shape as the shadertoy scene, and
+// for the same reason: no post chain, so the composite reads the resolved HDR directly.
+struct ui_scene_state
+{
+    std::unique_ptr<ui_background_pass> bg;
+    std::unique_ptr<ui_pass> ui;
+    std::unique_ptr<string::composite_pass> composite;
+    scene_resources res;
+};
+
+std::function<void(float)> make_ui_scene(
+    string::frame_graph& fg, string::engine_context& ctx,
+    std::shared_ptr<string::dynamic_font_atlas> atlas, string::renderer& rr)
+{
+    const int np = cv_ui_nameplates().get();
+    // A visible handful of anchors by default, so nameplates show without opting into the stress.
+    const std::uint32_t anchor_count = np > 0 ? static_cast<std::uint32_t>(np) : 24u;
+    const std::size_t np_budget = np > 0 ? static_cast<std::size_t>(np) : 0;   // 0 = draw all
+    const std::string screen = cv_ui_screen().get();
+
+    auto s = std::make_shared<ui_scene_state>();
+    s->res = declare_resources(fg, scene_viewport(), kSceneSamples, 2048, 0, 256, 256, nullptr);
+    s->bg = std::make_unique<ui_background_pass>(ctx, kSceneSamples);
+
+    // Shared between the author and the post-layout hook: the workspace is authored before layout
+    // and observed after it, and both need the same instance.
+    auto ws = std::make_shared<string::ui::Workspace>();
+    if (screen == "workspace")
+        client::seed_workspace(*ws);
+    auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
+    auto dbg_panels = std::make_shared<debug::DebugPanels>();
+    s->ui = std::make_unique<ui_pass>(
+        ctx, kSceneSamples, atlas,
+        make_ui_dev_author(std::make_shared<UiScene>(), anchor_count, dbg_panels, np_budget, screen,
+                           ws, ui_slot),
+        make_ui_observer(ui_slot, ws), make_deferred_author(ui_slot));
+    s->composite = std::make_unique<string::composite_pass>(ctx, rr.swapchain_format());
+
+    s->bg->declare(fg, s->res.color, s->res.depth);
+    s->ui->declare(fg, s->res.color);
+    s->composite->declare(fg, s->res.hdr, s->res.swapchain);
+    rr.declare_capture(fg, s->res.hdr);
+
+    string::renderer* rp = &rr;
+    return [s, rp](float dt) {
+        s->bg->tick(dt);
+        s->ui->tick(dt, rp->extent(), rp->frame_slot());
         s->composite->tick();
     };
 }
 
 std::function<void(float)> make_geometry_scene(
-    string::frame_graph& fg, String::engine_context& ctx, VkExtent2D viewport,
+    string::frame_graph& fg, string::engine_context& ctx, VkExtent2D viewport,
     VkSampleCountFlagBits samples, VkFormat swapchain_format,
     std::vector<std::filesystem::path> models,
-    std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t np_stress, string::renderer& rr)
+    std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t np_stress, string::renderer& rr,
+    bool lookdev)
 {
     auto s = std::make_shared<geometry_scene_state>();
     s->graph = &fg;
 
-    s->geo = std::make_unique<geometry_pass>(ctx, samples, std::move(models), s->mesh_stats);
+    s->geo = std::make_unique<geometry_pass>(ctx, samples, std::move(models), s->mesh_stats, lookdev);
     ::string::render::GeometryScene* scene = s->geo->scene();
 
     const ::string::render::ProbeVolume gi_volume =
         probe_gi_component::fit_volume(scene->scene_aabb_min_, scene->scene_aabb_max_);
+    // The app allocates the temporal backings BEFORE declaring, so every persistent handle is
+    // backed at compile and its descriptor slots bind once, up front (brief 21 D3).
+    s->backing.create(ctx, viewport, scene->cull_max_draws_, gi_volume, s->geo->gi_capture_entries());
+    // The work-list sizes come from the meshlet build (which has already run, in the geometry_pass
+    // constructor above): both sides read the SAME numbers, so a declaration cannot drift from the
+    // layout the shaders index with.
     s->res = declare_resources(fg, viewport, samples, scene->settings_.shadow_resolution,
-                               scene->settings_.cascade_count, scene->cull_max_draws_,
-                               gi_volume, s->geo->gi_capture_entries());
+                               scene->settings_.cascade_count, scene->wl_layout_.size,
+                               VkDeviceSize{ sizeof(uint32_t) } * scene->cull_max_draws_,
+                               &s->backing);
     const scene_resources& r = s->res;
 
     s->froxel       = std::make_unique<froxel_component>(ctx);
@@ -858,7 +1075,7 @@ std::function<void(float)> make_geometry_scene(
         make_ui_author(s->mesh_stats, dbg_panels, np_stress, ui_slot),
         make_ui_observer(ui_slot), make_deferred_author(ui_slot));
     s->post         = std::make_unique<post_pass>(ctx);
-    s->composite    = std::make_unique<String::composite_pass>(ctx, swapchain_format);
+    s->composite    = std::make_unique<string::composite_pass>(ctx, swapchain_format);
 
     const std::span<const string::gpu::image> cascades{ r.shadow, scene->settings_.cascade_count };
     const probe_gi_component::resources gi_res{
@@ -866,13 +1083,25 @@ std::function<void(float)> make_geometry_scene(
         r.gi_cube_albedo, r.gi_cube_nd, r.gi_cube_depth,
         r.gi_active, r.gi_offset, r.gi_meshlet_table };
 
+    // Per-frame streaming uploads, INSIDE the frame (brief 21 step 5). Authored first so the copies
+    // land before anything samples this frame; they touch resources the graph does not own —
+    // streamed textures reached through bindless slots, the geometry heaps — so there is nothing for
+    // it to declare, and the pass states that undeclarable edge itself with one conservative barrier
+    // (see TransferBatch::record). It replaced a second submission path that ran beside the frame.
+    {
+        string::TransferBatch* transfer = &ctx.transfer;
+        fg.pass("uploads.stream")
+          .toggle([transfer] { return transfer->pending(); })
+          .transfer([transfer](string::pass_context& pc) { transfer->record(pc.rec.get_command_buffer()); });
+    }
+
     s->froxel->declare(fg, r.froxels, r.lights);
     s->ibl->declare(fg, r.env_capture, r.env_prefiltered, r.dfg_lut, r.ibl_sh);
     s->gtao->declare(fg, r.hiz_depth_prev, r.gtao_raw, r.gtao_ao);
     s->gi->declare(fg, gi_res, r.ibl_sh, r.scene_data, cascades, r.color, r.depth);
     s->shadow->declare(fg, cascades, r.worklists);
     s->sky->declare(fg, r.color, r.depth, [] { return ::string::render::cv_pass_sky().get(); });
-    s->geo->declare(fg, r.color, r.hdr, r.depth, r.hiz_depth, r.hiz_pyramid, r.hiz_mips,
+    s->geo->declare(fg, r.color, r.hdr, r.depth, r.hiz_depth, r.hiz_pyramid,
                     r.worklists, r.scene_data, r.lights, r.stats,
                     cascades, r.gtao_ao, r.env_prefiltered, r.dfg_lut, r.ibl_sh, r.froxels);
     s->transparency->declare(fg, r.color, r.depth, r.transparency_list, r.scene_data, r.stats);
@@ -883,26 +1112,47 @@ std::function<void(float)> make_geometry_scene(
 
     // The headless gates capture the resolved HDR target — an app-declared transient, so the app is
     // what names it. This is the seam the renderer cannot fill on its own.
-    rr.capture_source(r.hdr);
+    // STRING_CAPTURE_SOURCE=shadow<N> redirects the capture at cascade N's raw depth map
+    // (grayscale; white = near occluder) — the headless eyes on shadow-map content.
+    string::gpu::image capture_target = r.hdr;
+    if (const char* csrc = std::getenv("STRING_CAPTURE_SOURCE");
+        csrc != nullptr && std::strncmp(csrc, "shadow", 6) == 0)
+    {
+        const int c = std::atoi(csrc + 6);
+        if (c >= 0 && c < static_cast<int>(scene->settings_.cascade_count))
+            capture_target = r.shadow[c];
+    }
+    rr.declare_capture(fg, capture_target);
+
+    // The OWNER half of a resize: re-back the viewport-sized depth-history ring and re-point both
+    // handles (identity + rotated-one-back), before the renderer's graph half re-binds. Raw pointer
+    // capture: the callback only fires inside the frame loop, while the scene state is alive.
+    geometry_scene_state* sp = s.get();
+    rr.on_resize([sp](VkExtent2D e) {
+        sp->backing.create_hiz_depth(e);
+        const std::vector<string::gpu::resource_id>& ring = sp->backing.hiz_depth;
+        std::vector<string::gpu::resource_id> rotated(ring.size());
+        for (std::size_t i = 0; i < ring.size(); ++i)
+            rotated[i] = ring[(i + ring.size() - 1) % ring.size()];
+        sp->graph->set_images(sp->res.hiz_depth, ring);
+        sp->graph->set_images(sp->res.hiz_depth_prev, rotated);
+    });
 
     // The per-frame tick. Ordinary app code: nothing here resolves a device address or a bindless
     // slot — every one of those is looked up through pass_context while its owning pass records.
     ::string::render::GeometryScene* scene_ptr = scene;
-    String::engine_context* ctx_ptr = &ctx;
+    string::engine_context* ctx_ptr = &ctx;
     string::renderer* rp = &rr;
     return [s, scene_ptr, ctx_ptr, rp](float dt) {
         // The live viewport. This used to arrive via Pass::resize(); with that gone, the scene state
         // carries it and the app is what knows it. Zero here means every viewport-derived layout —
         // the UI most visibly — computes against a 0x0 screen and draws nothing.
         scene_ptr->screen_size = rp->extent();
-        wire_depth_history(*s);
-        wire_scratch_arena(*s, *ctx_ptr);
         const std::uint32_t slot = rp->frame_slot();
         s->geo->tick(dt, slot);
         s->gtao->tick(rp->extent(), static_cast<uint16_t>(slot));
         s->ibl->tick(scene_ptr->ibl_lighting(), false);
         s->gi->tick();
-        s->shadow->tick();
         s->froxel->tick(scene_ptr->froxel_params());
         s->sky->tick(scene_ptr->sky_params());
         s->ui->tick(dt, rp->extent(), slot);
@@ -912,7 +1162,7 @@ std::function<void(float)> make_geometry_scene(
 }
 }  // namespace
 
-String::Application::scene_fn build_demo_scene(const std::filesystem::path& resources_dir)
+string::Application::scene_fn build_demo_scene(const std::filesystem::path& resources_dir)
 {
     // The UI's SDF atlas is baked once, up front and shared: the UI pass's per-frame layout measures
     // against it and draws text from it.
@@ -921,34 +1171,91 @@ String::Application::scene_fn build_demo_scene(const std::filesystem::path& reso
 
     // Content defaults to the resources dir's assets/. Must precede any ContentRoot::get(), which
     // memoises on first call.
-    String::ContentRoot::set_default(resources_dir / "assets");
-
-    std::vector<std::filesystem::path> models;
-    if (const char* scene = std::getenv("STRING_SCENE"))
-    {
-        const std::filesystem::path p = String::ContentRoot::get() / scene;
-        if (std::filesystem::exists(p)) models.push_back(p);
-    }
+    string::ContentRoot::set_default(resources_dir / "assets");
 
     const std::size_t np_stress = static_cast<std::size_t>(std::max(0, cv_ui_nameplates().get()));
 
-    // Populate the scene registry so the Scene panel can LIST what is on disk. Registration was
-    // dropped when build_demo_plan became build_demo_scene, which is why the dropdown was empty.
-    // NOTE: listing is all this restores — SELECTING a scene still does nothing, because switching
-    // needs the app to tear down its pass objects and author a fresh graph (see the TODO in
-    // application.cpp). A menu that lists scenes and silently ignores clicks is its own trap, so
-    // that gap is called out here rather than left to be discovered.
-    register_content_scenes(String::SceneRegistry::instance(), atlas, static_cast<int>(np_stress));
+    string::SceneRegistry& registry = string::SceneRegistry::instance();
+
+    // Registration order is the order the Scene panel lists them in.
+    registry.add("ui", "UI sandbox — no geometry, instant start",
+                 [atlas](string::frame_graph& fg, string::engine_context& ctx, string::renderer& r)
+                   -> std::function<void(float)> {
+        return make_ui_scene(fg, ctx, atlas, r);
+    });
+
+    // Brief 07: the standing material-probe scene — a roughness x metallic sphere grid plus a
+    // white/mirror pair, generated in-process (no glTF load; near-instant startup). Same
+    // geometry_pass, so sun/TOD scrub keys, the furnace CVar, IBL, shadows and every capture lever
+    // work identically.
+    //
+    // Brief 09: lookdev PINS MANUAL exposure by default — it is the EV100/material calibration
+    // reference, and auto-metering a sphere grid over grey would defeat that. set_env_default, so
+    // an explicit STRING_EXPOSURE_AUTO from the user still wins.
+    ::string::core::set_env_default("STRING_EXPOSURE_AUTO", "0");
+    registry.add("lookdev", "Material probe grid — roughness x metallic",
+                 [atlas](string::frame_graph& fg, string::engine_context& ctx, string::renderer& r)
+                   -> std::function<void(float)> {
+        return make_geometry_scene(fg, ctx, scene_viewport(), kSceneSamples, r.swapchain_format(),
+                                   {}, atlas, /*np_stress=*/0, r, /*lookdev=*/true);
+    });
+
+    // Sponza is not registered in code: it is `assets/sponza.scene.json`, discovered by the same
+    // scan as anything the user drops in. Deliberate — it is the proof the data path is real rather
+    // than a second-class route beside a hardcoded one. The descriptor ships; the assets it names
+    // stay gitignored, and a descriptor whose files are absent is simply skipped.
+    register_content_scenes(registry, atlas, static_cast<int>(np_stress));
+
+    // The same scan as the rescan hook, so "Rescan content" in the Scene menu picks up an asset
+    // dropped in while the engine is running. instance() rather than the reference above: that
+    // reference dies with this function even though it binds a singleton.
+    registry.set_rescan([atlas, np_stress] {
+        register_content_scenes(string::SceneRegistry::instance(), atlas,
+                                static_cast<int>(np_stress));
+    });
+
+    // Texture cook. Lives here rather than in the engine because it needs the asset-tools library,
+    // and string-core deliberately does not link it. Blocking — see cook_scene_textures_for.
+    registry.set_cook([resources_dir](const string::SceneRegistry::Scene& scene) {
+        const uint32_t chunk_budget =
+            static_cast<uint32_t>(std::max(0, ::string::render::cv_chunk_budget().get()));
+        STRING_LOG_INFO("[cook] '{}': {} asset(s) — the engine will be unresponsive until this "
+                        "finishes", scene.name, scene.assets.size());
+        ::string::render::cook_scene_textures_for(resources_dir, scene.assets, chunk_budget);
+    });
+
+    // `dbg.scene` (STRING_SCENE) is a LOOKUP, not a branch. An unknown name falls back rather than
+    // failing: a typo should cost you the scene you asked for, not the session.
+    //
+    // The fallback chain ends at "ui" because it is the only scene guaranteed to exist — it needs no
+    // assets at all. Falling back to sponza was what made an assetless clone unable to start.
+    const std::string requested = cv_scene().get();
+    const string::SceneRegistry::Scene* selected = registry.find(requested);
+    if (selected == nullptr)
+    {
+        // "demo" is the historical default value of the cvar and means "sponza if you have it".
+        if (requested == "demo")
+        {
+            selected = registry.find("sponza");
+        }
+        else if (!requested.empty())
+        {
+            STRING_LOG_WARN("Unknown scene '{}' — is it under the content root ({})?",
+                            requested, string::ContentRoot::get().string());
+        }
+        if (selected == nullptr)
+        {
+            selected = registry.find("ui");
+        }
+    }
+    registry.set_active(selected->name);
+    STRING_LOG_INFO("[scene] '{}' selected", selected->name);
 
     // Brief 20: the app hands back ONE callback. It constructs the scene against the ready graph and
     // engine context, declares every pass, and returns the per-frame tick. There is no pass list
     // alongside it — that second list, and the unenforced agreement between the two, is what this
     // brief deleted.
-    return [atlas, models, np_stress](string::frame_graph& fg, String::engine_context& ctx, string::renderer& r)
-             -> std::function<void(float)> {
-        return make_geometry_scene(fg, ctx, scene_viewport(), kSceneSamples, r.swapchain_format(),
-                                   models, atlas, np_stress, r);
-    };
+    return selected->configure;
 }
 
 }  // namespace sandbox

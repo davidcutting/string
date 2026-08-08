@@ -29,7 +29,7 @@ namespace string::asset
 inline constexpr char kCookedMagic[8] = { 'S', 'T', 'R', 'C', 'O', 'O', 'K', '1' };
 
 // Bump on ANY change to the on-disk layout, a serialized struct's stride (GpuMeshlet / GpuDrawInfo /
-// CookedMaterial / CookedTexture / CookedDraw / String::Vertex), or the meshlet build parameters
+// CookedMaterial / CookedTexture / CookedDraw / string::Vertex), or the meshlet build parameters
 // (kMeshletMaxVertices/Triangles/ConeWeight/kMaxLods, LOD math). A drift here means a stale cooked
 // file is silently loaded with the wrong stride -> GPU garbage; the loader re-cooks on mismatch.
 // v2: vertex stream repacked grouped-per-draw (each draw's window is its own contiguous range; a v1
@@ -110,7 +110,7 @@ static_assert(sizeof(CookedTexture) == 256);
 // Section indices in the header's section table.
 enum CookedSection : uint32_t
 {
-    kSecVertices = 0,   // String::Vertex[]   shared vertex heap (48B each)
+    kSecVertices = 0,   // string::Vertex[]   shared vertex heap (48B each)
     kSecMeshlets,       // GpuMeshlet[]        global meshlet table (48B)
     kSecMeshletVerts,   // uint32_t[]          global meshlet-vertex remap
     kSecMeshletTris,    // uint32_t[]          packed local triangle words

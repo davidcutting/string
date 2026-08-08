@@ -52,7 +52,7 @@ struct FroxelParams
 
 // Forward+ froxel light-binning: a dependency-free compute pass that bins the scene's local lights
 // into the per-froxel index lists the lit fragment reads. Owns its compute pipeline and nothing else
-// — the index buffer is a viewport-derived graph resource the app declares (see bytes_for()).
+// — the index buffer is a viewport-derived graph resource the app declares (see bytes_per_tile()).
 //
 // Brief 20: a plain app-owned object, no base class. It runs on the async lane (.async()); on 1-lane
 // hardware the graph records it inline. No usages vector, no barriers, no ensure_capacity/resize —
@@ -60,14 +60,14 @@ struct FroxelParams
 class froxel_component
 {
 public:
-    explicit froxel_component(String::engine_context& ctx);
+    explicit froxel_component(string::engine_context& ctx);
     ~froxel_component();
 
     froxel_component(const froxel_component&) = delete;
     froxel_component& operator=(const froxel_component&) = delete;
 
     // Author onto the graph: reads the local-light buffer, writes the froxel index buffer, on the
-    // async lane. `froxels` is the viewport-scaled transient described by bytes_for().
+    // async lane. `froxels` is the tile-derived transient described by bytes_per_tile().
     void declare(::string::frame_graph& fg, ::string::gpu::buffer froxels,
                  ::string::gpu::buffer lights);
 
@@ -81,11 +81,11 @@ public:
 
     // --- the froxel grid, as a pure function of the viewport ---------------------------------------
     // These are what the app's transient_buffer_info declares its size relationship with:
-    //   .bytes_for = [](VkExtent2D e) { return froxel_component::bytes_for(e); }
+    //   .tile_pixels = kFroxelTileSize, .bytes_per_tile = froxel_component::bytes_per_tile()
     static uint32_t tiles_x(VkExtent2D screen);
     static uint32_t tiles_y(VkExtent2D screen);
     static uint32_t froxel_count(VkExtent2D screen);
-    static VkDeviceSize bytes_for(VkExtent2D screen);
+    static VkDeviceSize bytes_per_tile();
 
 private:
     void record(::string::pass_context& ctx, ::string::gpu::buffer froxels,

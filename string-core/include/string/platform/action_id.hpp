@@ -13,7 +13,7 @@
 //
 // The name does not disappear. `InputMap` keeps it alongside the binding for the rebinding UI and for
 // debug output, which is the only place a human needs to see it.
-namespace String
+namespace string
 {
 
 // FNV-1a, 64-bit. Same construction as the UI kit's `string::fnv1a` — duplicated rather than shared
@@ -61,4 +61,4 @@ namespace literals
 }
 }  // namespace literals
 
-}  // namespace String
+}  // namespace string

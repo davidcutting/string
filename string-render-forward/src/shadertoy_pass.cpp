@@ -7,7 +7,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 shadertoy_pass::shadertoy_pass(engine_context& ctx, std::filesystem::path shader,
                                VkSampleCountFlagBits samples)

@@ -28,8 +28,24 @@ class descriptor_allocator
     std::unordered_map<resource_id, slot> slot_map_;
 
 public:
+    // A resource's slot is STABLE for as long as it stays bound: re-allocating an already-bound
+    // resource returns the slot it already has, so bind() rewrites that slot's descriptor in place.
+    //
+    // Minting a fresh slot instead is silent corruption, because a slot index is DATA the GPU already
+    // holds — material tables, SceneData, every shader-side handle stores the number returned the
+    // first time. A second bind() would move the resource to a slot nothing references and strand the
+    // referenced one holding whatever the FIRST bind wrote (for a streamed texture: the image before
+    // a single mip had been uploaded). Every streamed texture in the scene sampled that stale
+    // descriptor for the rest of the run, which is what flattened Sponza's materials to single
+    // colours. It also leaked a slot per rebind. bind() is the design's rebinding verb (brief 20);
+    // this is what makes it one.
     auto allocate(resource_id resource) -> slot
     {
+        const auto it = slot_map_.find(resource);
+        if (it != slot_map_.end())
+        {
+            return it->second;
+        }
         const slot slot = registry_.get_id();
         slot_map_[resource] = slot;
         return slot;

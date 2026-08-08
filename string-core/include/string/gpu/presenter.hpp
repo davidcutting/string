@@ -49,7 +49,7 @@ class presenter
     uint32_t swapchain_image_count_ = 2;
 
 public:
-    explicit presenter(device& device, const std::shared_ptr<String::Window>& window, uint32_t frames_in_flight = 3);
+    explicit presenter(device& device, const std::shared_ptr<string::Window>& window, uint32_t frames_in_flight = 3);
     ~presenter();
 
     [[nodiscard]]

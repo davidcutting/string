@@ -7,7 +7,7 @@
 #include <string/core/logger.hpp>
 #include <string/core/user_dirs.hpp>
 
-namespace String
+namespace string
 {
 
 string::core::CVar<std::string>& cv_content_root()
@@ -118,4 +118,4 @@ bool ContentRoot::set(const std::filesystem::path& dir, std::string& error_out)
     return true;
 }
 
-}  // namespace String
+}  // namespace string

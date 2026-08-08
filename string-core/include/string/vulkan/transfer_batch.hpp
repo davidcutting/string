@@ -1,125 +1,134 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
-#include <string/gpu/command_recorder.hpp>
 #include <string/gpu/device.hpp>
-#include <string/gpu/queue.hpp>
 #include <string/gpu/resource_allocator.hpp>
 
 #include <volk.h>
 
-namespace String
+namespace string
 {
 
-// Streams one-time GPU uploads (buffer + image) to the device without stalling the CPU.
+// Stages one-time GPU uploads (buffer + image) and records them into a command buffer the CALLER
+// owns.
 //
-// Uploads are recorded into a small ring of command buffers and submitted asynchronously,
-// each signalling a monotonically increasing value on an owned timeline semaphore. Staging
-// buffers are held until their submit's timeline value is reached, then freed. When the
-// recorded staging exceeds a byte budget the current batch is submitted and the next ring
-// slot is taken — reusing a slot waits for its previous submit, which bounds how much staging
-// is resident at once (the guard the old per-texture flush provided) while still overlapping
-// the GPU copies with CPU decode/record (which the old per-texture vkQueueWaitIdle did not).
+// Brief 21 step 5: this used to own a ring of command buffers and a timeline semaphore, and submit
+// itself asynchronously — a second, invisible submission path beside the frame. The renderer called
+// flush() once per frame to push it. That is gone. An upload now STAGES its bytes immediately (so the
+// caller may free its blob on return) and QUEUES the copy; a declared transfer pass records the queue
+// into the frame's command buffer, which is what puts uploads inside the graph rather than beside it.
 //
-// Uploads run on the graphics queue: the image TRANSFER_DST -> SHADER_READ barrier uses a
-// FRAGMENT_SHADER destination stage (graphics-only), and sharing the queue family with the
-// later sampling avoids a queue-ownership transfer. Passes record their uploads during
-// construction (via engine_context); the renderer drains once with wait_idle() before the first
-// frame.
+// What that buys, beyond one less submission path:
+//   * the copies land at a defined point in the frame, ordered with everything else by the graph;
+//   * completion is the FRAME's completion — one fence instead of a private timeline;
+//   * the pre-copy barrier can be correct. The old one sourced from UNDEFINED at TOP_OF_PIPE, which
+//     names no prior work at all: it neither waited for in-flight sampling of the texture being
+//     overwritten (a write-after-read hazard, per-texture and timing-dependent — the streamed-texture
+//     corruption class) nor preserved the mips it was not touching. Reads of a bindless texture are
+//     undeclarable by construction — any pass may sample any slot — so the honest expression is one
+//     conservative barrier per record: all shader reads before any transfer write.
 class TransferBatch
 {
-    // A ring slot: its own command recorder plus the staging it must keep alive until the GPU
-    // reaches `signal` on the timeline. `signal == 0` means the slot has never been submitted.
-    struct Batch
-    {
-        string::gpu::command_recorder recorder;
-        std::vector<string::gpu::resource_id> staging;
-        uint64_t signal = 0;
-        bool recording = false;
-    };
-
-    // Two slots overlap CPU record of one batch with GPU execution of the other; the byte
-    // budget caps resident staging at roughly STAGING_BUDGET * RING.
-    static constexpr std::size_t RING = 2;
-    static constexpr VkDeviceSize STAGING_BUDGET = 256ull * 1024 * 1024;
-
-    string::gpu::device& device_;
-    string::gpu::resource_allocator& allocator_;
-    string::gpu::queue queue_;
-    VkSemaphore timeline_ = VK_NULL_HANDLE;
-    uint64_t next_signal_ = 1;
-
-    std::array<Batch, RING> ring_;
-    std::size_t current_ = 0;
-    VkDeviceSize pending_bytes_ = 0;
-
-    // Ensures the current slot is recording, reclaiming it first (wait its prior submit, free
-    // its staging, reset the pool) if it isn't. Returns the command buffer to record into.
-    VkCommandBuffer begin_if_needed();
-    // Ends + async-submits the current slot (with a trailing global barrier), then advances the
-    // ring. No-op if the current slot isn't recording.
-    void submit_current();
-    void wait_for(uint64_t value) const;
-    void free_staging(Batch& batch);
-
 public:
-    // The timeline value an upload will signal once the GPU has the data. Compare against
-    // completed_value() / is_complete() to know when a streamed resource is safe to sample.
-    // 0 is never a valid ticket (the timeline starts at 0), so it means "nothing to wait on".
-    using upload_ticket = uint64_t;
+    // The frame index whose recording will carry an upload. `is_complete` answers once that frame has
+    // retired on the GPU. 0 means "nothing to wait on".
+    using upload_ticket = std::uint64_t;
 
-    TransferBatch(string::gpu::device& device, string::gpu::resource_allocator& allocator,
-                  string::gpu::queue queue);
+    TransferBatch(string::gpu::device& device, string::gpu::resource_allocator& allocator);
     ~TransferBatch();
 
     TransferBatch(const TransferBatch&) = delete;
     TransferBatch& operator=(const TransferBatch&) = delete;
 
-    // Records a staging copy of `data` into a device-local buffer at `dst_offset`. Nothing is
-    // waited on; the batch may be submitted asynchronously once the staging budget is hit. The
-    // returned ticket is the timeline value this upload's batch will signal once complete. The
-    // offset lets a streamer upload a sub-range into a larger buffer (e.g. one draw's vertices).
+    // Stage `data` and queue a copy into `dst_buffer` at `dst_offset`. The offset lets a streamer
+    // upload a sub-range of a larger buffer (one draw's vertices).
     upload_ticket upload_buffer(const void* data, VkDeviceSize size, string::gpu::resource_id dst_buffer,
                                 VkDeviceSize dst_offset = 0);
-    // Records UNDEFINED -> TRANSFER_DST, a staging copy, then TRANSFER_DST -> SHADER_READ for
-    // the destination image (extent taken from the allocated image). Generates the mip chain by
-    // blitting when the image has more than one level — for CPU-decoded RGBA8 textures.
+    // Whole-image upload from CPU-decoded pixels, generating the mip chain by blitting when the image
+    // has more than one level. Construction-time path (stb textures, the 1x1 fallbacks, the UI atlas).
     upload_ticket upload_image(const void* pixels, VkDeviceSize size, string::gpu::resource_id dst_image);
 
-    // One precomputed mip level inside the blob handed to upload_image_levels: its byte offset
-    // into that blob and the level's texel extent.
+    // One precomputed mip level inside the blob handed to upload_image_levels: its byte offset into
+    // that blob and the level's texel extent.
     struct level_copy
     {
         VkDeviceSize offset;
         VkExtent3D extent;
     };
-    // Uploads image mip levels already laid out in `data` (e.g. a transcoded KTX2 texture):
-    // stages the whole blob once, copies each level verbatim into a mip, then moves the touched
-    // levels to SHADER_READ. No blit — levels are taken as-is, so block-compressed formats (BC7)
-    // work. Level i of `levels` targets image mip `base_mip + i`, so this both does the whole-
-    // image upload (base_mip = 0, levels.size() == mip_levels) and streams a subrange of finer
-    // mips into an already-live, sampled image (base_mip > 0). Only the touched subrange is
-    // transitioned, so other mips stay readable.
+    // Levels already laid out in `data` (a cooked KTX2 blob): staged once, then copied verbatim into
+    // mips `base_mip + i`. No blit, so block-compressed formats work. This is the streaming path —
+    // it targets a subrange of an image that is already live and being sampled.
     upload_ticket upload_image_levels(const void* data, VkDeviceSize total_size,
                                       std::span<const level_copy> levels,
-                                      string::gpu::resource_id dst_image, uint32_t base_mip = 0);
+                                      string::gpu::resource_id dst_image, std::uint32_t base_mip = 0);
 
-    // The highest timeline value the GPU has finished (polls the timeline semaphore).
-    uint64_t completed_value() const;
-    // Whether the upload with this ticket has completed on the GPU. Note a ticket whose batch is
-    // still only recorded (never flushed) will never complete until flush()/wait_idle() submits it.
-    bool is_complete(upload_ticket ticket) const;
+    bool is_complete(upload_ticket ticket) const { return ticket == 0 || retired_frame_ >= ticket; }
+    bool pending() const { return !copies_.empty(); }
 
-    // Submits any pending batch without waiting (so its GPU work can overlap what follows).
-    // Called once per frame by the renderer to push streamed uploads on the graphics queue.
-    void flush();
-    // Submits any pending batch and blocks until every in-flight batch completes, freeing all
-    // staging. The one acceptable wait: called once by the renderer before the first frame.
-    void wait_idle();
+    // Record every queued copy into `cmd`, with the barriers around them. Called by the declared
+    // uploads pass each frame, and once by the renderer for the construction-time backlog.
+    void record(VkCommandBuffer cmd);
+
+    // The frame index uploads staged from now on belong to, and the highest frame the GPU has
+    // finished. Retiring a frame frees the staging its copies used.
+    void begin_frame(std::uint64_t frame, std::uint64_t retired_frame);
+
+private:
+    struct BufferCopy
+    {
+        string::gpu::resource_id staging;
+        string::gpu::resource_id dst;
+        VkDeviceSize size;
+        VkDeviceSize dst_offset;
+    };
+    struct ImageCopy
+    {
+        string::gpu::resource_id staging;
+        string::gpu::resource_id dst;
+        std::vector<VkBufferImageCopy> regions;
+        std::uint32_t base_mip;
+        std::uint32_t level_count;
+        bool generate_mips;          // blit the chain down from level 0 after the copy
+    };
+    // Staging held until the frame that recorded it retires.
+    struct FrameStaging
+    {
+        std::uint64_t frame;
+        std::vector<string::gpu::resource_id> buffers;
+    };
+
+    string::gpu::resource_id stage(const void* data, VkDeviceSize size);
+    upload_ticket ticket_for_pending() const;
+    // Have these mips ever been written? Decides UNDEFINED (discard, nothing to preserve) vs
+    // SHADER_READ_ONLY (an already-live texture whose other content must survive).
+    bool initialized(VkImage image, std::uint32_t base_mip, std::uint32_t count) const;
+    void mark_initialized(VkImage image, std::uint32_t base_mip, std::uint32_t count);
+
+    string::gpu::device& device_;
+    string::gpu::resource_allocator& allocator_;
+
+    std::vector<BufferCopy> buffer_copies_;
+    std::vector<ImageCopy> copies_;
+    // Staging for copies not yet recorded. It is stamped with a frame at RECORD time, never at stage
+    // time: uploads are staged during the app's tick, which runs BEFORE the frame begins, so stamping
+    // then buckets them one frame early — and that bucket is freed while the command buffer that
+    // reads it is still in flight.
+    std::vector<string::gpu::resource_id> pending_staging_;
+    std::vector<FrameStaging> staging_;
+    // Per-image bitmask of mips already uploaded (images have far fewer than 64 levels).
+    std::unordered_map<VkImage, std::uint64_t> initialized_mips_;
+
+    std::uint64_t frame_ = 0;
+    std::uint64_t retired_frame_ = 0;
+    // Before the first frame, uploads are drained synchronously (flush_construction_uploads), so a
+    // construction upload's ticket is 0 — "nothing to wait on" — rather than a frame that has to
+    // retire first.
+    bool frames_started_ = false;
 };
 
-}  // namespace String
+}  // namespace string

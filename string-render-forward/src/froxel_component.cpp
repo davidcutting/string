@@ -9,7 +9,7 @@
 
 namespace string::render
 {
-using namespace String;
+using namespace string;
 
 froxel_component::froxel_component(engine_context& ctx)
 : device_(ctx.device)
@@ -59,11 +59,13 @@ uint32_t froxel_component::froxel_count(VkExtent2D screen)
     return tiles_x(screen) * tiles_y(screen) * kFroxelDepthSlices;
 }
 
-// Stride = [count, idx...] = 1 + max lights per froxel, one entry per froxel.
-VkDeviceSize froxel_component::bytes_for(VkExtent2D screen)
+// One [count, light indices...] record per froxel, and one froxel COLUMN (kFroxelDepthSlices deep)
+// per screen tile. The app declares the buffer as `tile_pixels` + this, which is the same fact
+// without a callback in the middle.
+VkDeviceSize froxel_component::bytes_per_tile()
 {
     const VkDeviceSize stride = (1 + kMaxLightsPerFroxel) * sizeof(uint32_t);
-    return stride * froxel_count(screen);
+    return stride * kFroxelDepthSlices;
 }
 
 void froxel_component::tick(const FroxelParams& params)

@@ -3,7 +3,7 @@
 #include <string>
 #include <filesystem>
 
-namespace String
+namespace string
 {
 struct ApplicationInfo
 {

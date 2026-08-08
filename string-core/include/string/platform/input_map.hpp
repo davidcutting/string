@@ -12,7 +12,7 @@
 #include <string/platform/action_id.hpp>
 #include <string/platform/input.hpp>
 
-namespace String
+namespace string
 {
 
 // A remappable action layer over the polled Input, with a CONTEXT STACK deciding who receives what.
@@ -195,4 +195,4 @@ private:
     std::vector<Context> stack_;
 };
 
-}  // namespace String
+}  // namespace string

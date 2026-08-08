@@ -8,7 +8,7 @@
 
 #include <string/application.hpp>
 
-namespace String
+namespace string
 {
 
 // The set of scenes an application can render, by name.
@@ -110,4 +110,4 @@ private:
     CookFn cook_;
 };
 
-}  // namespace String
+}  // namespace string
