@@ -57,6 +57,12 @@ private:
     entt::dispatcher event_handler_;
 
     void on_window_event(const WindowEvent& event);
+    /// Tear down the running scene and author the next one into a cleared graph. Called from run()
+    /// between frames — never mid-record, because it destroys the passes being recorded.
+    // Takes the callback and the name rather than a SceneRegistry::Scene: scene_registry.hpp
+    // includes THIS header (it stores an Application::scene_fn), so naming its types here would be
+    // circular — and the loader needs nothing else from a registry entry.
+    void load_scene(const scene_fn& configure, std::string_view name);
 };
 
 }  // namespace string

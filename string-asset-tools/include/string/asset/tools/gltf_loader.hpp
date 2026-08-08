@@ -17,10 +17,16 @@ namespace string::asset::tools
 // textures are multiple GB decoded). Exactly one of `file` / `encoded` is set: external images
 // decode from disk, embedded / buffer-view images from these in-memory bytes. `srgb` drives the
 // upload VkFormat — base-color maps are sRGB, data maps (normal / metallic-roughness) linear.
+// The container an embedded image's bytes are in. Needed because embedded images are EXTRACTED to
+// files at bake (see bake_gltf), and a file needs the right extension for the cook's decoder to
+// recognise it — the bytes alone do not say what they are.
+enum class GltfImageFormat : uint8_t { Unknown = 0, Png, Jpeg, Ktx2, Dds };
+
 struct GltfTexture
 {
     std::filesystem::path file;      // non-empty => external image, decode from this path
     std::vector<uint8_t> encoded;    // else => embedded, decode from these encoded bytes
+    GltfImageFormat format = GltfImageFormat::Unknown;   // container of `encoded`
     bool srgb = false;
 };
 

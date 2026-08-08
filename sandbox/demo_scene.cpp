@@ -902,6 +902,17 @@ void register_content_scenes(string::SceneRegistry& registry,
     // glTFs and its descriptor logged "0 scene(s) discovered" while having registered sponza fine.
     STRING_LOG_INFO("[content] {} descriptor scene(s) + {} bare asset(s) under {}",
                     descriptors.size(), assets.size(), root.string());
+    // The NAMES, not just the counts. A switch is addressed by name (the F1 menu, STRING_SCENE,
+    // STRING_SCENE_SWITCH), and SceneRegistry::request() silently no-ops on a name it does not
+    // know — so "nothing happened when I clicked" and "that asset is not registered" look identical
+    // from outside. Printing the registry once removes the guesswork.
+    std::string names;
+    for (const string::SceneRegistry::Scene& s : registry.scenes())
+    {
+        if (!names.empty()) names += ", ";
+        names += s.name;
+    }
+    STRING_LOG_INFO("[content] switchable scenes: {}", names);
 }
 
 

@@ -225,6 +225,11 @@ TextureCookStats cook_scene_textures(const CookedScene& scene, const std::filesy
     {
         if (t.path[0] == '\0') continue;   // embedded image: no file to cook, runtime falls back
 
+        // An EMPTY path is "this texture has no source", not "the asset directory". `base_dir / ""`
+        // is base_dir, which exists(), so without this the cook tried to read a directory as an
+        // image and wrote a stray `<dir>.ktx2` beside it.
+        if (t.path[0] == '\0') continue;
+
         const std::filesystem::path src = base_dir / std::filesystem::path(t.path);
         std::error_code ec;
         if (!std::filesystem::exists(src, ec) || ec)

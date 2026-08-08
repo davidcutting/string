@@ -245,14 +245,25 @@ void resource_allocator::destroy_resource(resource_id id)
     }
 }
 
+// Both of these used bare `at()`, whose "unordered_map::at" locates nothing — and the id IS the
+// question on every path that reaches here wrongly: a handle resolved after its backing was freed,
+// or an id recycled by a scene switch. Name it.
 auto resource_allocator::get_buffer(resource_id id) const -> const allocated_buffer&
 {
-    return buffers_.at(id);
+    const auto it = buffers_.find(id);
+    if (it == buffers_.end())
+        throw std::out_of_range("resource_allocator::get_buffer: no live buffer with id "
+                                + std::to_string(id));
+    return it->second;
 }
 
 auto resource_allocator::get_image(resource_id id) const -> const allocated_image&
 {
-    return images_.at(id);
+    const auto it = images_.find(id);
+    if (it == images_.end())
+        throw std::out_of_range("resource_allocator::get_image: no live image with id "
+                                + std::to_string(id));
+    return it->second;
 }
 
 void resource_allocator::copy_data_to_buffer(const void* data, resource_id resource) const

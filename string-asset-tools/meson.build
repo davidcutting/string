@@ -115,6 +115,23 @@ if get_option('tests')
             install : false,
         )
     )
+    test('winding_tests',
+        executable(
+            'winding_tests',
+            [ 'test/winding_test.cpp' ],
+            dependencies : [ project_deps, gtest_dep ],
+            install : false,
+        )
+    )
+    # Covers bake_gltf() over a real .glb — the glTF front end has no other test.
+    test('glb_embedded_tests',
+        executable(
+            'glb_embedded_tests',
+            [ 'test/glb_embedded_test.cpp' ],
+            dependencies : [ project_deps, gtest_dep ],
+            install : false,
+        )
+    )
     test('texture_cook_tests',
         executable(
             'texture_cook_tests',

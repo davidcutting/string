@@ -129,10 +129,32 @@ std::uint32_t desired_detail(const glm::mat4& view_proj, const glm::vec3& mn, co
     return std::max(levels - base_mip, coarse_detail);
 }
 
-// Decode one texture source (file or embedded bytes) to RGBA8. Pure CPU work — safe to run on a
-// job thread. Throws on failure (captured by the job's future, rethrown at .get()).
+// A 1x1 opaque white stand-in. Multiplying by white is the identity for every slot that takes a
+// colour map, so a texture we could not decode costs that surface its detail and nothing else.
+DecodedTexture white_fallback(bool srgb)
+{
+    auto* pixels = static_cast<stbi_uc*>(STBI_MALLOC(4));
+    pixels[0] = pixels[1] = pixels[2] = pixels[3] = 0xFF;
+    DecodedTexture decoded;
+    decoded.pixels.reset(pixels);
+    decoded.width = 1;
+    decoded.height = 1;
+    decoded.format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    return decoded;
+}
+
+// Decode one texture source (file or embedded bytes) to RGBA8. Pure CPU work — safe to run on a job
+// thread. NEVER throws: a texture is content, and bad content must not be able to kill the engine.
+// This used to throw, and because a source with neither a file nor bytes decodes to nothing, a .glb
+// whose embedded images had been dropped at bake reached here and took the process down.
 DecodedTexture decode_texture(const GltfTexture& source)
 {
+    if (source.file.empty() && source.encoded.empty())
+    {
+        STRING_LOG_WARN("[load] texture has no source (embedded image lost at bake?); using white");
+        return white_fallback(source.srgb);
+    }
+
     int width = 0;
     int height = 0;
     int channels = 0;
@@ -140,10 +162,13 @@ DecodedTexture decode_texture(const GltfTexture& source)
         ? stbi_load_from_memory(source.encoded.data(), static_cast<int>(source.encoded.size()),
                                 &width, &height, &channels, STBI_rgb_alpha)
         : stbi_load(source.file.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
-    if (!pixels)
+    if (!pixels || width <= 0 || height <= 0)
     {
-        throw std::runtime_error("gltf: failed to decode texture " +
-            (source.file.empty() ? std::string("<embedded>") : source.file.string()));
+        if (pixels) stbi_image_free(pixels);
+        STRING_LOG_WARN("[load] failed to decode texture {}: {}; using white",
+                        source.file.empty() ? std::string("<embedded>") : source.file.string(),
+                        stbi_failure_reason() ? stbi_failure_reason() : "unknown");
+        return white_fallback(source.srgb);
     }
 
     DecodedTexture decoded;
@@ -566,14 +591,30 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
 
     // Model AABB, computed now (before the geometry arrays are moved into the streamer below) for
     // framing the camera.
+    // WORLD space, from the per-draw bounds — not the raw vertex positions, which are MODEL space.
+    // A glTF places its meshes with node transforms, so an asset authored around the origin and then
+    // positioned somewhere else has vertices that say one thing and a location that says another.
+    // Framing the model-space box aims the camera at empty space, which reads as "I loaded my asset
+    // and there is nothing there". The cook already computed each draw's world AABB (it transforms
+    // the 8 corners); union those.
     glm::vec3 aabb_min(std::numeric_limits<float>::max());
     glm::vec3 aabb_max(std::numeric_limits<float>::lowest());
-    for (const auto& vertex : geometry.vertices)
+    for (const auto& d : geometry.draws)
     {
-        aabb_min = glm::min(aabb_min, vertex.pos);
-        aabb_max = glm::max(aabb_max, vertex.pos);
+        aabb_min = glm::min(aabb_min, d.aabb_min);
+        aabb_max = glm::max(aabb_max, d.aabb_max);
     }
-    if (geometry.vertices.empty())
+    // Fall back to model space only if no draw carried bounds, and to a unit box if there is no
+    // geometry at all — a degenerate box would make the framing maths produce NaNs.
+    if (geometry.draws.empty())
+    {
+        for (const auto& vertex : geometry.vertices)
+        {
+            aabb_min = glm::min(aabb_min, vertex.pos);
+            aabb_max = glm::max(aabb_max, vertex.pos);
+        }
+    }
+    if (!(aabb_min.x <= aabb_max.x && aabb_min.y <= aabb_max.y && aabb_min.z <= aabb_max.z))
     {
         aabb_min = glm::vec3(-1.0f);
         aabb_max = glm::vec3(1.0f);
@@ -747,6 +788,12 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
             }
         }
     }
+
+    // The bounds the camera is about to be framed on. Printed because "I loaded my asset and see
+    // nothing" and "my asset is somewhere unexpected" are the same symptom, and this is the number
+    // that separates them — it is also what you need to aim STRING_CAM at a specific part of a model.
+    STRING_LOG_INFO("[scene] world bounds ({:.2f},{:.2f},{:.2f}) .. ({:.2f},{:.2f},{:.2f})",
+                    aabb_min.x, aabb_min.y, aabb_min.z, aabb_max.x, aabb_max.y, aabb_max.z);
 
     // Frame the whole model with the engine camera using the AABB computed above, then let it
     // position itself to fit. Bind the conventional fly controls (WASD + Space/Ctrl + Shift) onto

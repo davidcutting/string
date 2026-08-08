@@ -2,8 +2,6 @@
 /result
 /result-*
 /docs/diagrams
-
-# Meson's wrap-DB cache (populated by `meson wrap update-db` / `meson wrap install`).
-# It's a local, regenerable cache — not a pinned dependency, so we don't track it.
 string-engine/subprojects/wrapdb.json
+*/subprojects/.wraplock
 build-uml/

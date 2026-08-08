@@ -34,7 +34,10 @@ inline constexpr char kCookedMagic[8] = { 'S', 'T', 'R', 'C', 'O', 'O', 'K', '1'
 // file is silently loaded with the wrong stride -> GPU garbage; the loader re-cooks on mismatch.
 // v2: vertex stream repacked grouped-per-draw (each draw's window is its own contiguous range; a v1
 // split chunk windowed its parent's whole span, exploding the streamer heap to parent x chunk-count).
-inline constexpr uint32_t kCookedFormatVersion = 2;
+// v3: triangle winding is reversed at bake for negative-determinant (mirrored) node transforms, so
+// every draw is counter-clockwise once its model matrix is applied. A v2 file's mirrored draws are
+// still inside-out and cannot be corrected at load, so they must be re-cooked.
+inline constexpr uint32_t kCookedFormatVersion = 3;
 
 // A cooked draw: the geometry-only record the engine needs to reconstruct a GpuDrawInfo and to
 // register the draw's vertex window with the streamer. Material/transform come from CookedMaterial +

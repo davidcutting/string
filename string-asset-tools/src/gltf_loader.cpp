@@ -86,12 +86,43 @@ void mikkt_set_tspace_basic(const SMikkTSpaceContext* c, const float t[], float 
     m->verts[idx].tangent = pack_tangent(glm::vec3(t[0], t[1], t[2]), sign);
 }
 
+GltfImageFormat format_of(fastgltf::MimeType mime)
+{
+    switch (mime)
+    {
+    case fastgltf::MimeType::PNG:  return GltfImageFormat::Png;
+    case fastgltf::MimeType::JPEG: return GltfImageFormat::Jpeg;
+    case fastgltf::MimeType::KTX2: return GltfImageFormat::Ktx2;
+    case fastgltf::MimeType::DDS:  return GltfImageFormat::Dds;
+    default:                       return GltfImageFormat::Unknown;
+    }
+}
+
+// Sniff the container from the leading magic bytes. The mime type is OPTIONAL on a buffer-view
+// image and Blender's GLB exporter routinely omits it, so trusting it alone would leave real
+// embedded textures unnamed and therefore unextractable.
+GltfImageFormat sniff_format(const std::vector<uint8_t>& bytes)
+{
+    static constexpr uint8_t kPng[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    if (bytes.size() >= 8 && std::equal(std::begin(kPng), std::end(kPng), bytes.begin()))
+        return GltfImageFormat::Png;
+    if (bytes.size() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
+        return GltfImageFormat::Jpeg;
+    if (bytes.size() >= 12 && bytes[0] == 0xAB && bytes[1] == 'K' && bytes[2] == 'T' && bytes[3] == 'X')
+        return GltfImageFormat::Ktx2;
+    if (bytes.size() >= 4 && bytes[0] == 'D' && bytes[1] == 'D' && bytes[2] == 'S' && bytes[3] == ' ')
+        return GltfImageFormat::Dds;
+    return GltfImageFormat::Unknown;
+}
+
 // Copy a slice of encoded image bytes into a texture source (no decode — the pass decodes it).
-GltfTexture encoded_source(const std::byte* bytes, std::size_t size)
+GltfTexture encoded_source(const std::byte* bytes, std::size_t size, fastgltf::MimeType mime)
 {
     GltfTexture texture;
     const auto* begin = reinterpret_cast<const uint8_t*>(bytes);
     texture.encoded.assign(begin, begin + size);
+    texture.format = format_of(mime);
+    if (texture.format == GltfImageFormat::Unknown) texture.format = sniff_format(texture.encoded);
     return texture;
 }
 
@@ -112,24 +143,26 @@ GltfTexture resolve_image(const fastgltf::Asset& asset, const fastgltf::Image& i
             result.file = base_dir / source.uri.fspath();
         },
         [&](const fastgltf::sources::Array& source) {
-            result = encoded_source(source.bytes.data(), source.bytes.size());
+            result = encoded_source(source.bytes.data(), source.bytes.size(), source.mimeType);
         },
         [&](const fastgltf::sources::Vector& source) {
-            result = encoded_source(source.bytes.data(), source.bytes.size());
+            result = encoded_source(source.bytes.data(), source.bytes.size(), source.mimeType);
         },
         [&](const fastgltf::sources::BufferView& source) {
             const auto& view = asset.bufferViews[source.bufferViewIndex];
             const auto& buffer = asset.buffers[view.bufferIndex];
+            // The IMAGE's mime type, not the buffer's: the buffer is an octet-stream either way.
+            const fastgltf::MimeType mime = source.mimeType;
             std::visit(fastgltf::visitor{
                 [](const auto&) { throw std::runtime_error("gltf: unsupported buffer source for image"); },
                 [&](const fastgltf::sources::Array& bytes) {
-                    result = encoded_source(bytes.bytes.data() + view.byteOffset, view.byteLength);
+                    result = encoded_source(bytes.bytes.data() + view.byteOffset, view.byteLength, mime);
                 },
                 [&](const fastgltf::sources::Vector& bytes) {
-                    result = encoded_source(bytes.bytes.data() + view.byteOffset, view.byteLength);
+                    result = encoded_source(bytes.bytes.data() + view.byteOffset, view.byteLength, mime);
                 },
                 [&](const fastgltf::sources::ByteView& bytes) {
-                    result = encoded_source(bytes.bytes.data() + view.byteOffset, view.byteLength);
+                    result = encoded_source(bytes.bytes.data() + view.byteOffset, view.byteLength, mime);
                 },
             }, buffer.data);
         },

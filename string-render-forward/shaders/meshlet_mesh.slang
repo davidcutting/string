@@ -133,7 +133,8 @@ void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint draw : 
         bool cone_ok = true;
         if (in_frustum && di.skinned == 0 && (di.flags & kDrawFlagDoubleSided) == 0u && ml.cone_cutoff < 1.0)
         {
-            float3 axis_ws = normalize(mul((float3x3)di.model, ml.cone_axis));
+            // The cone axis is a direction, so it follows the normal transform (see meshlet.slang).
+            float3 axis_ws = normalize(transform_normal(di.model, ml.cone_axis));
             if (cone_backfacing(axis_ws, ml.cone_cutoff, center_ws, radius_ws, pc.camera_pos))
                 cone_ok = false;
         }
@@ -254,7 +255,10 @@ void mesh_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID,
 
     SetMeshOutputCounts(ml.vertex_count, ml.triangle_count);
 
-    float3x3 nmat = (float3x3)di.model;
+    // The tangent lies ALONG the surface so it follows the model matrix; the normal is
+    // perpendicular to it and follows the inverse transpose (transform_normal). Sharing one
+    // matrix made whichever it was wrong under non-uniform scale.
+    float3x3 tmat = (float3x3)di.model;
 
     // Emit vertices (one lane per vertex; up to 64).
     if (tid < ml.vertex_count)
@@ -271,8 +275,8 @@ void mesh_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID,
         o.position = mul(pc.view_proj, world);
         o.uv = v.texCoord;
         o.world_pos = world.xyz;
-        o.world_normal = mul(nmat, v.normal);
-        o.world_tangent = mul(nmat, t);
+        o.world_normal = transform_normal(di.model, v.normal);
+        o.world_tangent = mul(tmat, t);
         o.tangent_sign = sign;
         o.base_color = di.base_color;
         o.slots = uint4(di.base_slot, di.normal_slot, di.mr_slot, di.occlusion_slot);

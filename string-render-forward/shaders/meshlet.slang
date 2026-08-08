@@ -21,6 +21,41 @@ struct Vertex
 };
 struct VertexBuffer { Vertex verts[]; };
 
+// NORMALS DO NOT TRANSFORM LIKE POSITIONS. A direction lying ALONG the surface (a tangent) follows
+// the model matrix; a direction PERPENDICULAR to it (a normal, or a meshlet's backface cone axis)
+// follows the inverse transpose. They agree for rotation, uniform scale and mirroring, which is why
+// using the model matrix for both went unnoticed — every scale in the test scene is uniform. Under a
+// NON-uniform scale they diverge badly and in the wrong direction: stretching a surface makes it
+// flatter, so its normal should tilt AWAY from the stretched axis, while the model matrix tilts it
+// TOWARD. A 45-degree slope under a 4x stretch lands 62 degrees out.
+//
+// This applies the COFACTOR matrix, which equals det * inverse-transpose, then divides the sign of
+// the determinant back out. The MAGNITUDE is irrelevant because every consumer normalizes, but the
+// SIGN is not: for a mirrored transform det is negative, and the raw cofactor would point the normal
+// opposite to the geometry it belongs to. The cook reverses triangle winding for mirrored draws, so
+// a normal that did not also flip would disagree with the front face it is shading.
+// Cofactor-with-sign costs three cross products, a dot and a select — no division and no
+// singularity, both of which an explicit inverse would need.
+//
+// Deliberately a VECTOR function rather than one returning a float3x3. Building the matrix means
+// naming its rows, and whether a float3x3 constructor fills rows or columns is exactly the kind of
+// convention that is easy to get backwards and produces a plausible-looking wrong image — a
+// transposed cofactor is a valid rotation, just the wrong one. Expressed as a weighted sum of the
+// cofactor's COLUMNS there is nothing left to get backwards: C*n == c0'*n.x + c1'*n.y + c2'*n.z.
+float3 transform_normal(float4x4 model, float3 n)
+{
+    // Basis vectors: the model matrix's columns (same indexing the bounds code above uses).
+    const float3 c0 = float3(model[0][0], model[1][0], model[2][0]);
+    const float3 c1 = float3(model[0][1], model[1][1], model[2][1]);
+    const float3 c2 = float3(model[0][2], model[1][2], model[2][2]);
+    // Columns of the cofactor matrix are the cross products of the other two basis vectors.
+    const float3 n0 = cross(c1, c2);
+    const float3 n1 = cross(c2, c0);
+    const float3 n2 = cross(c0, c1);
+    const float det = dot(c0, n0);
+    return (n0 * n.x + n1 * n.y + n2 * n.z) * (det < 0.0 ? -1.0 : 1.0);
+}
+
 // One meshlet: a range into the meshlet-vertex remap + the packed local triangle indices, plus
 // the meshopt-computed bounding sphere and quantized cone (for frustum + backface-cone culling).
 struct Meshlet

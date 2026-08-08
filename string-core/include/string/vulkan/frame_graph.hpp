@@ -240,6 +240,19 @@ public:
     frame_graph(const frame_graph&) = delete;
     frame_graph& operator=(const frame_graph&) = delete;
 
+    // Drop every declaration, so a new scene can author into this graph from scratch. IN PLACE
+    // rather than by replacing the object, because a compiled_frame holds a pointer BACK to its
+    // graph — move-assigning one out from under a live compiled_frame would dangle it. The caller
+    // must have released its compiled_frame first (see compiled_frame::release); this only forgets
+    // declarations, it frees no GPU memory, and it is not the thing that makes a switch safe.
+    void clear()
+    {
+        passes_.clear();
+        images_.clear();
+        buffers_.clear();
+        executing_ = false;
+    }
+
     // Externally-owned resources: the graph manages usage, never lifetime.
     gpu::image  use_persistent(const persistent_image_info& info);
     gpu::buffer use_persistent(const persistent_buffer_info& info);
@@ -394,6 +407,12 @@ public:
     // reach a real image; pass code resolves through pass_context instead.
     gpu::resource_id physical_of(gpu::image h, std::uint32_t slot) const { return physical(h, slot); }
     gpu::resource_id physical_of(gpu::buffer h, std::uint32_t slot) const { return physical(h, slot); }
+
+    // Hand back everything this frame OWNS (bindless slots, cached views, transient backing) while
+    // leaving the declarations alone. A resize calls it and re-materializes; a SCENE SWITCH calls it
+    // and then discards the graph. There is no destructor doing this, so a compiled_frame that is
+    // simply dropped leaks its transients — call this first. Requires device idle.
+    void release(string::engine_context& ctx);
 
 
 private:

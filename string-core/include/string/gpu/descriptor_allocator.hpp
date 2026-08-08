@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdexcept>
+#include <string>
 #include <cstdint>
 #include <unordered_map>
 
@@ -69,7 +71,17 @@ public:
 
     auto get_slot(resource_id resource) const -> slot
     {
-        return slot_map_.at(resource);
+        const auto it = slot_map_.find(resource);
+        // `slot_map_.at()` threw "unordered_map::at", which locates nothing — and this fires on the
+        // paths where the resource id is the whole question (a scene switch recycling ids, a
+        // resource used before it was bound). Name the id and how many are bound.
+        if (it == slot_map_.end())
+        {
+            throw std::out_of_range("descriptor_allocator::get_slot: resource id "
+                                    + std::to_string(resource) + " is not bound ("
+                                    + std::to_string(slot_map_.size()) + " bound)");
+        }
+        return it->second;
     }
 
     // get_slot() throws on an unbound handle; unbind() is called speculatively in destructors, so

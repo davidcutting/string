@@ -205,7 +205,6 @@ void mesh_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint view : 
     SetMeshOutputCounts(ml.vertex_count, ml.triangle_count);
 
     float4x4 vp = face_view_proj(view);
-    float3x3 nmat = (float3x3)di.model;
     if (tid < ml.vertex_count)
     {
         uint gv = uint(int(pc.mverts.indices[ml.vertex_offset + tid]) + int(di.vertex_offset));
@@ -214,7 +213,7 @@ void mesh_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint view : 
         MeshOut o;
         o.position = mul(vp, world);
         o.world_pos = world.xyz;
-        o.world_normal = mul(nmat, v.normal);
+        o.world_normal = transform_normal(di.model, v.normal);   // inverse transpose — see meshlet.slang
         o.uv = v.texCoord;
         o.base_color = di.base_color;
         o.base_slot = di.base_slot;

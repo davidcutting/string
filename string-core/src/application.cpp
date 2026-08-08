@@ -46,6 +46,51 @@ void Application::initialize(const ApplicationInfo& info, scene_fn scene)
     window_->register_resize_event_callback([this](const View::Extent& e) { pending_resize_ = e; });
 }
 
+// Tear the current scene down and stand the next one up. Brief 20 made the APP own the graph, so a
+// switch is not "hand the renderer a new plan" any more — it is the whole of initialize()'s author →
+// compile → publish sequence run again against a fresh frame_graph.
+//
+// The ORDER is the entire difficulty, because ownership is split three ways:
+//   1. device idle — everything below frees GPU objects that submitted work may still be reading;
+//   2. frame_.release() — the compiled frame gives back its bindless slots, cached views and
+//      transient backing. It must go BEFORE the scene dies, because those slots name resources the
+//      scene owns, and unbinding after they are freed is a use-after-free in the descriptor table;
+//   3. drop the renderer's callbacks into the OLD scene — on_resize captures scene state by raw
+//      pointer (it must; the callback only fires inside the frame loop while that state is alive),
+//      so leaving it installed across a switch leaves a dangling call waiting for the next resize;
+//   4. tick_ = nullptr — releases the scene's pass objects and every persistent they own;
+//   5. a FRESH graph. Reusing it would keep the old scene's declarations, and a switch that
+//      silently kept stale declarations is the exact class of bug brief 20 exists to remove.
+// Only then can the new scene author into a clean graph.
+void Application::load_scene(const scene_fn& configure, std::string_view name)
+{
+    STRING_LOG_INFO("[scene] switching to '{}'", name);
+
+    // COMMIT THE OUTGOING SCENE'S STAGED UPLOADS FIRST, while the images they name are still alive.
+    // The transfer batch is an engine service that outlives any scene: it accumulates copies until
+    // something records them. A scene torn down with uploads still pending (a texture whose stream
+    // landed after the last flush) leaves entries pointing at images the teardown then destroys, and
+    // the NEXT scene's flush walks that same list and resolves a freed id — which is what
+    // `no live image with id 57` was. Flushing here empties the list against live resources, so
+    // teardown cannot strand anything in it.
+    renderer_->flush_construction_uploads();
+
+    renderer_->wait_idle();
+
+    frame_.release(renderer_->context());
+    renderer_->on_resize(nullptr);
+    tick_ = nullptr;
+    graph_.clear();
+
+    tick_ = configure(graph_, renderer_->context(), *renderer_);
+    renderer_->flush_construction_uploads();
+    frame_ = graph_.compile(renderer_->context(), renderer_->extent());
+    renderer_->publish_introspection(frame_);
+
+    SceneRegistry::instance().set_active(name);
+    STRING_LOG_INFO("[scene] '{}' active", name);
+}
+
 Application::~Application()
 {
     // ORDER IS LOAD-BEARING. The application owns its pass objects (captured by the tick callback and
@@ -225,12 +270,11 @@ void Application::run() {
         // Scene switching happens HERE — between frames, never inside one. A UI click or console
         // command only records a request (SceneRegistry::request); this is the point where no
         // command buffer is being recorded and the passes about to be destroyed are not in use by
-        // anything except already-submitted work, which load_scene() waits out.
-        // TODO(brief 20, step 14b): scene switching needs re-expressing against an app-owned graph.
-        // It used to rebuild a RenderPlan and hand it to the renderer; now the APP owns the graph, so
-        // a switch means tearing down the pass objects and authoring a fresh frame_graph. Deliberately
-        // left unwired rather than half-wired: a scene switch that silently kept stale declarations
-        // would be the exact class of bug this brief exists to remove.
+        // anything except already-submitted work, which the device-idle wait below flushes.
+        if (const SceneRegistry::Scene* next = SceneRegistry::instance().take_pending())
+        {
+            load_scene(next->configure, next->name);
+        }
 
         if (const std::optional<View::Extent> forced = scripted_resize()) pending_resize_ = *forced;
         if (scripted_maximize()) window_->maximize();

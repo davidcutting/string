@@ -7,7 +7,8 @@ test_files = [
     'shader_compiler_test.cpp',
     'cvar_test.cpp',
     'debug_draw_test.cpp',
-    'input_map_test.cpp'
+    'input_map_test.cpp',
+    'normal_matrix_test.cpp'
 ]
 
 test_dep = [

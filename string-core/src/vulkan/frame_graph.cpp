@@ -820,25 +820,19 @@ void compiled_frame::derive_groups()
     }
 }
 
-void compiled_frame::resize(string::engine_context& ctx, VkExtent2D viewport)
+// Give back everything this compiled frame OWNS, leaving the declarations untouched. Two callers
+// need exactly this and they need it identically: a resize (which then re-materializes at the new
+// viewport) and a SCENE SWITCH (which then throws the declarations away too). Splitting it out is
+// what makes the second possible — compiled_frame has no destructor, so simply letting one go out of
+// scope leaks every transient and leaves the bindless table pointing at freed ids.
+//
+// Order matters and is the reason this is not just a loop: descriptors UNBIND first, because the ids
+// they name are about to be freed; then the cached sub-resource views, which borrow those images;
+// then the transient backing itself; then the tracked state, which described backing that no longer
+// exists. Persistents are NOT touched — their owner allocated them and their owner frees them.
+// The caller holds device idle across this.
+void compiled_frame::release(string::engine_context& ctx)
 {
-    // A resize is a BACKING swap: the declarations, the order, the groups and the derived barriers
-    // are all untouched. What must be rebuilt, in dependency order:
-    //   1. every declared descriptor UNBINDS (the ids are about to be freed; without this the freed
-    //      ids leak slots and the new backing never gets any — get_binding_slot throws);
-    //   2. every cached sub-resource VIEW dies (views of destroyed — or owner-swapped persistent —
-    //      images dangle);
-    //   3. every transient's physical dies. ALL of them, not just the viewport-scaled ones:
-    //      materialize() re-creates every transient unconditionally, so a partial destroy leaked
-    //      the survivors' old backing on every resize;
-    //   4. tracked state resets (it described backing that no longer exists);
-    //   5. materialize + bind_declared_slots + seed_persistent_layouts re-run, exactly as at
-    //      compile — the persistents were already re-pointed by their owners (renderer::resize
-    //      runs the owner callback first), so binding picks up their new backing too;
-    //   6. the neutral fallbacks queue for their one-shot clear again.
-    // The caller holds device idle across this.
-    viewport_ = viewport;
-
     for (const auto& [id, type] : bound_) ctx.descriptor_table.unbind(id, type);
     bound_.clear();
 
@@ -859,6 +853,28 @@ void compiled_frame::resize(string::engine_context& ctx, VkExtent2D viewport)
     }
 
     states_.clear();
+}
+
+void compiled_frame::resize(string::engine_context& ctx, VkExtent2D viewport)
+{
+    // A resize is a BACKING swap: the declarations, the order, the groups and the derived barriers
+    // are all untouched. What must be rebuilt, in dependency order:
+    //   1. every declared descriptor UNBINDS (the ids are about to be freed; without this the freed
+    //      ids leak slots and the new backing never gets any — get_binding_slot throws);
+    //   2. every cached sub-resource VIEW dies (views of destroyed — or owner-swapped persistent —
+    //      images dangle);
+    //   3. every transient's physical dies. ALL of them, not just the viewport-scaled ones:
+    //      materialize() re-creates every transient unconditionally, so a partial destroy leaked
+    //      the survivors' old backing on every resize;
+    //   4. tracked state resets (it described backing that no longer exists);
+    //   5. materialize + bind_declared_slots + seed_persistent_layouts re-run, exactly as at
+    //      compile — the persistents were already re-pointed by their owners (renderer::resize
+    //      runs the owner callback first), so binding picks up their new backing too;
+    //   6. the neutral fallbacks queue for their one-shot clear again.
+    // The caller holds device idle across this.
+    viewport_ = viewport;
+
+    release(ctx);
     materialize(ctx, viewport);
     bind_declared_slots();
     seed_persistent_layouts();

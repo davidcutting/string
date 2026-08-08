@@ -2,10 +2,25 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cmath>
+#include <functional>
 #include <limits>
 #include <unordered_map>
 
 #include <meshoptimizer.h>
+
+// The meshletizer and the LOD chain ARE meshoptimizer, so the version that built the cooked assets
+// is part of their content. Two builds resolve it differently — nix from nixpkgs, off-nix from
+// subprojects/meshoptimizer.wrap — and those two drifted to 0.21 vs 1.1 without anyone noticing,
+// which meant the artist's simplifier was four minor versions behind the one under test. This turns
+// the next divergence into a compile error that names the number, instead of a difference that only
+// shows up as geometry looking subtly wrong on someone else's machine.
+static_assert(MESHOPTIMIZER_VERSION >= 1010,
+              "meshoptimizer is older than the 1.1 this engine is developed against — bump "
+              "string-asset-tools/subprojects/meshoptimizer.wrap (off-nix) or the nixpkgs pin.");
+
+#include <glm/mat3x3.hpp>
+#include <glm/matrix.hpp>
 
 #include <string/core/logger.hpp>
 
@@ -373,6 +388,35 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
             chunks.push_back(std::move(chunk));
         }
     }
+
+    // MIRRORED INSTANCES: a node transform with a negative determinant (a -1 scale, an applied
+    // Mirror modifier) reverses triangle orientation, so geometry authored counter-clockwise
+    // rasterises clockwise once the model matrix is applied. Every pipeline here is
+    // VK_FRONT_FACE_COUNTER_CLOCKWISE, so those triangles get back-face culled — the "a few faces
+    // are inside-out, but they look right in Blender" report.
+    //
+    // Fixed HERE rather than in the shaders because it is a property of the geometry, not of one
+    // pass: baking it in means the lit, shadow, transparency and probe-capture pipelines are all
+    // correct without any of them knowing, and meshopt_computeMeshletBounds then derives each
+    // meshlet's backface cone from correctly-oriented triangles too, which a shader-side flip
+    // could not fix. Safe per chunk: every chunk owns its own index copy, so a mesh instanced both
+    // mirrored and unmirrored gets one of each winding rather than a shared, wrong one.
+    uint32_t mirrored_chunks = 0;
+    for (BakeChunk& chunk : chunks)
+    {
+        if (glm::determinant(glm::mat3(chunk.transform)) >= 0.0f) continue;
+        for (std::size_t t = 0; t + 2 < chunk.indices.size(); t += 3)
+        {
+            std::swap(chunk.indices[t + 1], chunk.indices[t + 2]);
+        }
+        ++mirrored_chunks;
+    }
+    if (mirrored_chunks > 0)
+    {
+        STRING_LOG_INFO("[cook] winding reversed for {} mirrored chunk(s) (negative-determinant transform)",
+                        mirrored_chunks);
+    }
+
 
     // Phase 2 — repack the vertex stream grouped per chunk (the format contract: every draw's
     // vertices are one contiguous range, so the streamer suballocates windows whose sum equals the
