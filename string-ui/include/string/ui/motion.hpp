@@ -35,16 +35,11 @@ struct Transition
     // "the clock starts when the target is written" has to mean for a state that changes its mind.
     //
     // STAGGER NEEDS NO API: it is author-side index math, `{.delay = i * 0.03f}` in the loop that
-    // authors the rows. That is why this is a field rather than a choreography system — the
-    // pull-based model already gives every element its own clock, so a sequencer would be a second
-    // way to say something the author can say directly.
+    // authors the rows. A field rather than a choreography system, because the pull-based model
+    // already gives every element its own clock.
     //
-    // Deliberately NOT applied on first sight: a newly-seen entry still snaps to its target, so a
-    // delayed ENTRANCE is expressed by authoring the initial state and then the final one, exactly
-    // as it was before this field existed.
-    //
-    // At the default 0 this costs nothing and changes nothing: the hold branch is only ever entered
-    // by an author who asked for it.
+    // NOT applied on first sight: a newly-seen entry snaps to its target, so a delayed ENTRANCE is
+    // expressed by authoring the initial state and then the final one.
     float delay = 0.0f;
 };
 

@@ -12,19 +12,17 @@ namespace string::asset::tools
 // Texture cook: source image -> KTX2/BC7 with a full mip chain
 // ============================================================================
 //
-// This was `tools/cook_textures.sh` (shelling out to the `ktx` CLI). It is a library stage now for
-// two reasons. The mechanical one: the geometry cook was C++ with a manifest and the texture cook
-// was a shell script with none, so "cook this asset" had two entry points and two staleness stories.
-// The substantive one is a correctness fix the script itself called out — it had to guess each
-// image's transfer function from its FILENAME (`_normal`, `_orm`, ...) because a shell script can't
-// read glTF. The cook can: `CookedTexture::srgb` is set from the image's actual material role
-// (base-color is sRGB, every data map is linear). Guessing wrong means a normal map decoded through
-// an sRGB curve, which is a subtle, permanent shading error.
+// A library stage, sharing the geometry cook's manifest and staleness story — one entry point for
+// "cook this asset".
 //
-// Output shape is unchanged, and deliberately so: BC7 baked straight to disk, zstd-supercompressed,
-// so the runtime streamer uploads blocks with no transcode (see the renderer's texture_streamer —
-// that is what removes the ~15s stb_image decode floor on Sponza). BC7 cannot be encoded directly,
-// so this cooks in the same two stages the script did: encode UASTC, then transcode to BC7.
+// TRANSFER FUNCTION COMES FROM THE MATERIAL ROLE, never from the filename: `CookedTexture::srgb` is
+// set from how the glTF actually uses the image (base-color is sRGB, every data map is linear).
+// Guessing from a `_normal`/`_orm` suffix decodes a normal map through an sRGB curve — a subtle,
+// permanent shading error.
+//
+// BC7 is baked straight to disk, zstd-supercompressed, so the runtime streamer uploads blocks with
+// no transcode (see texture_streamer — that is what removes the ~15s stb_image decode floor on
+// Sponza). BC7 cannot be encoded directly, so this cooks in two stages: UASTC, then transcode.
 
 struct TextureCookParams
 {

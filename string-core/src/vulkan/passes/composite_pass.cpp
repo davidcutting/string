@@ -9,7 +9,7 @@
 #include <fstream>
 #include <stdexcept>
 
-#include <string/core/cache_dir.hpp>
+#include <string/platform/user_dirs.hpp>
 #include <string/core/cvar.hpp>
 #include <string/core/logger.hpp>
 

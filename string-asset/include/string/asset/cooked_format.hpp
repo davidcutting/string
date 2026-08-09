@@ -11,9 +11,8 @@ namespace string::asset
 // Cooked scene format (brief 04b)
 // ============================================================================
 //
-// One cooked file per source glTF; the engine's existing multi-file merge consumes N cooked
-// scenes (the same rebase concept as the old flatten+merge, now over cooked tables). The format
-// is little-endian raw structs with a mmap-friendly, 16-byte-aligned section table.
+// One cooked file per source glTF; the engine's multi-file merge rebases N cooked scenes into one.
+// The format is little-endian raw structs with a mmap-friendly, 16-byte-aligned section table.
 //
 // Determinism: same source bytes -> byte-identical cooked file. Every serialized struct is
 // value-initialized ({}) so padding bytes are zero; the writer never emits uninitialized memory.

@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include <string/core/cache_dir.hpp>
+#include <string/platform/user_dirs.hpp>
 #include <string/gpu/vk_check.hpp>
 // Vendored RenderDoc in-application API (MIT), for headless .rdc capture — see rdoc_api() below.
 #if __has_include("renderdoc_app.h") && defined(__linux__)
@@ -683,10 +683,9 @@ void renderer::capture(const std::string& path)
 
 // The capture's GPU half, as a DECLARED pass the app authors. Declaring `.reads(source,
 // transfer_read)` is what makes the graph transition the source into TRANSFER_SRC from whatever
-// layout it is actually in, and back for the next frame's reader — the two hand-written transitions
-// this replaced had to GUESS that layout (they hardcoded SHADER_READ_ONLY, which is not what a
-// shadow cascade or a colour target ends the frame in), and then tell the tracker about it through
-// note_external_layout. Both are gone: no guess, no back channel, no second submit.
+// layout it is actually in, and back for the next frame's reader. Hand-written transitions cannot
+// do this: they would have to GUESS the layout, and SHADER_READ_ONLY is not what a shadow cascade
+// or a colour target ends the frame in.
 void renderer::record_capture(pass_context& ctx)
 {
     const gpu::resource_id id = ctx.id(capture_source_);

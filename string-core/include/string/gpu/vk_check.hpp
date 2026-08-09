@@ -11,10 +11,9 @@ const char* vk_result_name(VkResult result);
 
 // Report a Vulkan call's result, naming the CALL SITE.
 //
-// Exists because a GPU fault or hang surfaces as VK_ERROR_DEVICE_LOST from whichever call happens to
-// notice — submit, present, acquire, or a device-idle wait — and until now every one of those was
-// either unchecked or collapsed into a bare "!= VK_SUCCESS". A device loss then looked like a
-// generic failure (or nothing at all), which is useless when the symptom is a black screen on a
+// A GPU fault or hang surfaces as VK_ERROR_DEVICE_LOST from whichever call happens to notice —
+// submit, present, acquire, or a device-idle wait — so a bare "!= VK_SUCCESS" makes a device loss
+// indistinguishable from a generic failure, which is useless when the symptom is a black screen on a
 // machine you cannot attach a debugger to.
 //
 // Device loss is logged at CRITICAL, which survives a release build (INFO/WARN do not), so a shipped

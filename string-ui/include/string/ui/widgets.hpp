@@ -20,7 +20,7 @@
 // defaults with per-element override. Each emits in its DESTRUCTOR, like `Element`, so a widget is
 // an ordinary statement:
 //
-//     u.checkbox("wireframe", bind(cv_wireframe)).label("Wireframe");
+//     u.checkbox("wireframe", bind(show_wireframe)).label("Wireframe");
 //
 // WIDGET STATE lives in `Ui::widget_state(id)`: widgets are rebuilt every frame, so anything that
 // must survive the rebuild (a combo's open flag, a drag's value-at-press) is keyed by the widget's

@@ -528,37 +528,4 @@ std::vector<const char*> Window::get_platform_extensions(bool enable_validation_
     return extensions;
 }
 
-// auto Window::is_minimized() const -> bool
-// {
-//     assert(window_handle_ && "Window is null");
-//     Uint32 flags = SDL_GetWindowFlags(window_handle_);
-//     return (flags & SDL_WINDOW_MINIMIZED) != 0;
-// }
-
-// auto Window::is_maximized() const -> bool
-// {
-//     assert(window_handle_ && "Window is null");
-//     Uint32 flags = SDL_GetWindowFlags(window_handle_);
-//     return (flags & SDL_WINDOW_MAXIMIZED) != 0;
-// }
-
-// auto Window::has_focus() const -> bool
-// {
-//     assert(window_handle_ && "Window is null");
-//     Uint32 flags = SDL_GetWindowFlags(window_handle_);
-//     return (flags & SDL_WINDOW_INPUT_FOCUS) != 0;
-// }
-
-// auto Window::show() -> void
-// {
-//     assert(window_handle_ && "Window is null");
-//     SDL_ShowWindow(window_handle_);
-// }
-
-// auto Window::hide() -> void
-// {
-//     assert(window_handle_ && "Window is null");
-//     SDL_HideWindow(window_handle_);
-// }
-
 }

@@ -5,13 +5,11 @@
 namespace string::render
 {
 
-// The glTF front-end's types moved to string-asset-tools with the rest of the importer. The pass
-// code consumes them (the loader hands back GltfMaterial/GltfTexture tables that the renderer binds
-// into its own draw records), so re-export them unqualified rather than churning every use site.
+// Unqualified re-exports of the importer's types, which live in string-asset-tools. Pass code still
+// reads front-end tables (GltfMaterial/GltfTexture) when binding its draw records.
 //
-// Anything the RENDERER needs long-term should migrate off these: they are the importer's shapes,
-// and a second front-end (OBJ/FBX) has no reason to speak glTF's vocabulary. The cooked format is
-// already the neutral hand-off; these survive only where the pass still reads front-end tables.
+// The renderer should migrate off these: they are the importer's shapes, and a second front-end
+// (OBJ/FBX) has no reason to speak glTF's vocabulary. The cooked format is the neutral hand-off.
 using ::string::asset::tools::GltfAlphaMode;
 using ::string::asset::tools::GltfDraw;
 using ::string::asset::tools::GltfGeometry;

@@ -1591,11 +1591,8 @@ void compiled_frame::execute(const execute_info& info)
             // Barriers recorded on the async lane land on a compute-only queue, which cannot name
             // graphics stages; the tracker widens them (see set_queue_scope) — the cross-queue
             // ordering itself is the lane timeline's job.
-            // Per-pass GPU timing (brief 06), restored 2026-08-09. Brief 20 deleted the eight
-            // write_begin/write_end sites along with the per-pass recording paths they lived in and
-            // never re-added them, so `stats()` was empty and the HUD printed "GPU total 0.000 ms"
-            // without ever reporting a failure. ONE site now, because this is the one place that
-            // runs per pass — the centralisation brief 20 was for.
+            // Per-pass GPU timing (brief 06). ONE site, because this is the one place that runs per
+            // pass.
             //
             // MAIN LANE ONLY. The pool is reset on the main recorder in begin_frame(); an async pass
             // records onto a compute queue whose ordering against that reset is the lane timeline's

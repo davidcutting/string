@@ -156,20 +156,14 @@ enum class ui_action : uint8_t
 
 // Ordered stacking layer for an element's subtree.
 //
-// Generalises what `element.overlay` was — a ONE-BIT layer, documented as "topmost render LAYER" —
-// into a named ordered list. The reason is that one bit was never enough and the gap got filled with
-// hand-picked z values: a menu popup at 255, a dock drop preview at 253 ("above every panel, below
-// the debug surfaces" — a comment describing a layer that no longer existed), lens chrome at 200,
-// and panels ranking 1..254 from their own stack. Four claimants on one byte, each correct only by
+// A named ordered list rather than hand-picked z values. When stacking was one bit plus a z byte,
+// the gap got filled by convention — a menu popup at 255, a dock drop preview at 253, lens chrome at
+// 200, panels ranking 1..254 from their own stack — four claimants on one byte, each correct only by
 // coincidence of the numbers chosen.
 //
-// The batching key stays one integer — `(layer << 8) | z` where it was `(overlay << 8) | z` — so the
-// renderer's draw batching and `hit_test_layered` compare exactly what they compared before. `z`
-// keeps its meaning WITHIN a layer, which is what orders panels among themselves.
-//
-// (This is brief 12's deferred "canvas" and brief 12b's M1 layers: the two arrived at the same
-// concept from different directions. Surfaces — per-surface placement and signatures — are the rest
-// of M1 and are NOT this.)
+// The batching key is one integer, `(layer << 8) | z`, so draw batching and `hit_test_layered`
+// compare a single value. `z` keeps its meaning WITHIN a layer, which is what orders panels among
+// themselves.
 enum class ui_layer : uint8_t
 {
     content = 0,   // ordinary screen and HUD content
@@ -302,91 +296,69 @@ struct element
     // for the same reasons: `element` stays small and trivially copyable, and images fall out as
     // their own buffer for a third draw stream.
     uint32_t image = 0;
-    // Absolute-positioned ("floating") overlay escape. A floating node (and its subtree) is placed
-    // at (float_x, float_y) in the ROOT's coordinate space, ignoring its parent's flow — and it does
-    // not contribute to its parent's fit size or push siblings. This is the overlay/anchor primitive
-    // world-anchored UI (nameplates, ping markers, tooltips, radial menus) needs; without it every
-    // node is packed into the flow. Default off: existing layouts are unchanged.
+    // Absolute-positioned escape. A floating node (and its subtree) is placed at (float_x, float_y)
+    // in the ROOT's coordinate space, ignoring its parent's flow — it neither contributes to the
+    // parent's fit size nor pushes siblings. The anchor primitive world-anchored UI needs
+    // (nameplates, ping markers, tooltips, radial menus).
     bool floating = false;
     // Signed, for the same reason the box is: an anchor left of or above the origin is a real
     // position for scrolled and panned content, not an error to clamp away.
     int16_t float_x = 0;
     int16_t float_y = 0;
     // Interpret (float_x, float_y) relative to the PARENT's content origin instead of the root.
-    //
-    // Root space is right for world-anchored UI (a nameplate knows a screen position), but useless
-    // for a container that computes its children's positions in its OWN coordinates — a graph canvas
-    // laying out nodes, for instance. Without this, such a widget would have to learn where it
-    // landed on screen, which means reading geometry back after layout for something the layout
-    // engine can simply do.
+    // Root space suits world-anchored UI (a nameplate knows a screen position); a container that
+    // positions children in its OWN coordinates — a graph canvas — would otherwise have to read its
+    // own geometry back after layout to do what the layout engine can just do.
     bool float_local = false;
     // Stacking layer for this element's subtree (see ui_layer). Inherited by descendants: the
     // renderer draws each layer's shapes AND text before moving to the next, so a modal surface
     // covers a lower layer's TEXT as well as its shapes — which two globally ordered draw streams
     // could never do. Layout ignores it entirely.
     ui_layer layer = ui_layer::content;
-    // Front-to-back order WITHIN a layer (inherited by the subtree, like `overlay`; higher = in
-    // front). Layout ignores it — it is a DRAW-BATCHING key, and it exists for the same reason
-    // `overlay` does: shapes and glyphs are separate draw streams, so a renderer that emits all
-    // shapes then all text cannot put a raised panel's background over a lower panel's TEXT. Each
-    // distinct z becomes its own shapes-then-text batch, so anything sharing a z still batches
-    // together and z only costs draw calls when it is actually used.
+    // Front-to-back order WITHIN a layer (inherited by the subtree; higher = in front). Layout
+    // ignores it: it is a DRAW-BATCHING key. Shapes and glyphs are separate draw streams, so a
+    // renderer emitting all shapes then all text cannot put a raised panel's background over a lower
+    // panel's TEXT. Each distinct z becomes its own shapes-then-text batch, so equal-z elements still
+    // batch together and z costs draw calls only where it is used.
     //
-    // Convention (sandbox): floating panels take 1..N from their front-to-back order; modal debug
-    // surfaces (console, HUD) sit at a reserved high value so they stay above panels.
+    // Convention (sandbox): floating panels take 1..N front-to-back; modal debug surfaces (console,
+    // HUD) sit at a reserved high value so they stay above panels.
     uint8_t z = 0;
-    // Clip this node's SUBTREE to this node's box.
-    //
-    // Shapes are otherwise unclipped — only glyphs clip, and only to their own text node — so a
-    // scrolled or panned container has no way to show part of its content: it can cull whole
-    // children at the edge (which pops) but never cut one off mid-way. The renderer turns this into
-    // a scissor rect, so it costs a draw-call split at each distinct clip region rather than any
-    // per-element work.
+    // Clip this node's SUBTREE to this node's box. Shapes are otherwise unclipped — only glyphs
+    // clip, and only to their own text node — so without this a scrolled container can cull whole
+    // children at the edge (which pops) but never cut one off mid-way. Becomes a scissor rect: it
+    // costs a draw-call split per distinct clip region, no per-element work.
     //
     // Nested clips INTERSECT: a clipped child of a clipped parent shows only where both allow.
     bool clip = false;
-    // This node consumes the mouse wheel.
-    //
-    // Layout ignores it; it exists so the HIT TEST can answer "which container should the wheel go
-    // to", which is a question only the tree can answer. Text follows FOCUS, but scrolling follows
-    // the POINTER, and the pointer usually lands on a leaf (a table row, a graph node) rather than on
-    // the container that actually scrolls. Marking the container lets the hit test walk up from the
-    // leaf to the nearest marked ancestor, so the INNERMOST scrollable under the cursor wins and a
-    // list inside a list behaves the way every other UI does.
+    // This node consumes the mouse wheel. Layout ignores it; it answers "which container gets the
+    // wheel" for the hit test. Scrolling follows the POINTER (unlike text, which follows focus), and
+    // the pointer lands on a leaf — a table row, a graph node — not the container that scrolls. The
+    // hit test walks up from the leaf to the nearest marked ancestor, so the innermost scrollable
+    // under the cursor wins and a list inside a list behaves as expected.
     bool wheel = false;
-    // This element is a KEYBOARD/GAMEPAD FOCUS TARGET.
-    //
-    // Distinct from having an id, and the distinction is the whole point. An id is required for
-    // ANYTHING that hovers, drags or animates — so panel title bars, resize grips, scroll tracks,
-    // splitters and lens chrome all carry one. Treating "has an id" as "is focusable" (which is what
-    // directional nav used to do) made every one of those a nav target: pushing the stick in a
-    // panel-heavy screen landed focus on a resize grip.
-    //
-    // So there are THREE states, not two, and the tree has to be able to say all three:
-    //   * no id           — decoration. Not interactive at all; the hit test resolves through it.
+    // This element is a KEYBOARD/GAMEPAD FOCUS TARGET. Deliberately distinct from having an id: an
+    // id is required for anything that hovers, drags or animates, so title bars, resize grips,
+    // scroll tracks and splitters all carry one, and treating "has an id" as "is focusable" makes
+    // every one of them a nav target. Three states, not two:
+    //   * no id           — decoration. Not interactive; the hit test resolves through it.
     //   * id, !focusable  — POINTER-DRIVEN chrome. Hover, drag and capture work; nav skips it,
     //                       because "drag me" is not a thing a stick can express.
     //   * id + focusable  — a control. Reachable by nav, activatable by the gamepad's south button.
     //
-    // OPT-IN, like `wrap` and `clip`: the widget factories set it, so ordinary authoring gets it for
-    // free, and the failure mode for hand-rolled elements (a missing nav target) is a great deal
-    // easier to notice and fix than a junk one.
+    // OPT-IN: the widget factories set it, so ordinary authoring gets it for free.
     bool focusable = false;
-    // Bitmask of `ui_action`s this element HANDLES (see action_bit). An action offered to the UI
-    // walks from the focused element up its ancestors, and the first node whose mask contains it
-    // receives it — so a button handles `activate`, and the dialog containing it handles `cancel`,
-    // without either knowing about the other.
-    //
-    // Mask rather than a per-action flag for the same reason `z` is a byte: it rides in every
-    // element, and the action set is small and closed.
+    // Bitmask of `ui_action`s this element HANDLES (see action_bit). An action walks from the
+    // focused element up its ancestors; the first node whose mask contains it receives it — so a
+    // button handles `activate` and the dialog containing it handles `cancel`, without either
+    // knowing about the other. A mask, not per-action flags: it rides in every element and the
+    // action set is small and closed.
     uint32_t actions = 0;
-    // A FOCUS SCOPE: directional nav is confined to this subtree.
-    //
-    // This is what stops the stick walking out of an open dialog into the buttons behind it. It is
-    // NOT the same thing as the engine's InputMap context stack — that is coarse arbitration between
-    // whole surfaces (does gameplay or chat get WASD) and must be immediate app state, because
-    // anything read off this tree is a frame stale. This is the fine routing WITHIN the UI, where a
-    // frame of staleness is the same one hover and press already live with.
+    // A FOCUS SCOPE: directional nav is confined to this subtree — what stops the stick walking out
+    // of an open dialog into the buttons behind it. NOT the engine's InputMap context stack: that is
+    // coarse arbitration between whole surfaces (does gameplay or chat get WASD) and must be
+    // immediate app state, because anything read off this tree is a frame stale. This is fine
+    // routing WITHIN the UI, where that staleness is the same one hover and press already live with.
     bool scope = false;
     // A MODAL scope: additionally, an unhandled action stops here instead of bubbling to outer
     // scopes. A dialog that ignores an action still swallows it, which is what "modal" means —
@@ -395,12 +367,10 @@ struct element
     // Implies `scope`; setting this alone is enough.
     bool modal = false;
     // Word-wrap this element's text to the width LAYOUT gives it, and take the height its lines
-    // need. OPT-IN, deliberately: wrapping changes an element's height, so making it the default
-    // would silently re-flow every existing screen.
-    //
-    // Note what this is not: a fixed-width text element already wraps (its width is known before
-    // layout, so the measurer can predict it). This is for the case that needs the layout's answer —
-    // text in a GROW or PERCENT box, where the width is not decided until the width pass has run.
+    // need. OPT-IN: wrapping changes an element's height, so defaulting it on would re-flow every
+    // existing screen. Note a fixed-width text element already wraps (its width is known before
+    // layout, so the measurer predicts it) — this is for text in a GROW or PERCENT box, whose width
+    // is not decided until the width pass has run.
     bool wrap = false;
     // Radial cooldown-sweep fraction (0 = none/ready, 255 = fully on cooldown). A renderer that
     // supports it (the UI overlay's shape shader) dims the not-yet-elapsed clockwise wedge — the
@@ -550,24 +520,19 @@ struct surface_placement
 // A SURFACE: an element subtree laid out as ONE unit, in its OWN coordinates, positioned by a
 // placement rather than by the flow.
 //
-// The distinction this draws is between the two things a position can mean. A flowed child's
-// position is a LAYOUT PRODUCT — it falls out of its siblings' sizes and its parent's justify, and
-// nothing else can be said about it without re-running the passes. A surface's position is an
-// INPUT written by whoever owns the surface: `PanelStore` for a floating panel, the world
-// projection for a nameplate, anchor logic for a popup. Those owners move their surfaces
-// constantly and never change a thing inside them.
+// The distinction is between the two things a position can mean. A flowed child's position is a
+// LAYOUT PRODUCT — it falls out of its siblings' sizes and its parent's justify, and nothing can be
+// said about it without re-running the passes. A surface's position is an INPUT written by whoever
+// owns it: `PanelStore` for a floating panel, the world projection for a nameplate, anchor logic for
+// a popup. Those owners move their surfaces constantly and never change anything inside them.
 //
-// Conflating the two is what made movement expensive: `float_x/float_y` were read by the position
-// pass, so a nameplate that moved one pixel re-positioned (and, before the shaping cache,
-// re-measured) its entire subtree. Dragging an OS window does not re-lay-out the app inside it,
-// and dragging a panel should not either. So boxes inside a surface resolve LOCAL to it, the
-// placement is applied at consumption (`screen_box`), and moving a surface writes exactly one
-// number.
+// So boxes inside a surface resolve LOCAL to it, the placement is applied at consumption
+// (`screen_box`), and moving a surface writes exactly one number — dragging a panel does not
+// re-lay-out its contents, just as dragging an OS window does not re-lay-out the app inside it.
 //
-// This is deliberately the degenerate — translate-only — case of a per-surface transform. When the
-// graph canvas needs pan/zoom it extends THIS (placement becomes a 2D affine, and the hit test
-// inverts it at the cursor-conversion seam it already has) rather than introducing a second
-// concept. Nothing here precludes that; nothing here builds it.
+// Deliberately the degenerate, translate-only case of a per-surface transform: placement can become
+// a 2D affine (the hit test already has the cursor-conversion seam to invert it at) without
+// introducing a second concept.
 struct layout_surface
 {
     // Node index of the surface root. Its subtree is contiguous in the pool — pre-order append
@@ -581,17 +546,16 @@ struct layout_surface
     //
     // That exclusion list is the whole point. A Motion hover fade or a cooldown sweep ticks a paint
     // field every frame; if paint entered the signature, every animated panel would be dirty every
-    // frame and the skip would degenerate to today's full rebuild. Equally, position is excluded
-    // because M2 made it not a layout input — which is what lets a surface that MOVES stay clean.
+    // frame and the skip would degenerate to a full rebuild. Position is excluded because it is not
+    // a layout input — which is what lets a surface that MOVES stay clean.
     uint64_t signature = 0;
     // Nodes belonging to THIS surface (its subtree minus any nested surfaces' subtrees).
     uint32_t own_nodes = 0;
 };
 
-// The A/B lever for every future "is the skip lying to me?" bug: STRING_UI_NO_SKIP=1 forces every
-// surface to lay out, so a suspect frame can be compared against the same build with skipping on.
-// Kept rather than removed after M3 lands — a cache with no way to turn it off is a cache nobody
-// can debug.
+// The A/B lever for every "is the skip lying to me?" bug: STRING_UI_NO_SKIP=1 forces every surface
+// to lay out, so a suspect frame can be compared against the same build with skipping on. A cache
+// with no way to turn it off is a cache nobody can debug.
 [[nodiscard]] inline bool layout_skip_disabled_by_env() noexcept
 {
     static const bool disabled = [] {
@@ -1244,7 +1208,7 @@ constexpr void layout_builder::fit_sizing(uint32_t index, Measure& measure)
     for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
     {
         if (nodes_[c].element.floating)
-            continue;  // overlay child: out of flow, no contribution to the parent's fit size
+            continue;  // floating child: out of flow, no contribution to the parent's fit size
         const dimension d = nodes_[c].box.dimension;
         main_content += horizontal ? d.width : d.height;
         cross_content = std::max(cross_content, static_cast<int>(horizontal ? d.height : d.width));
@@ -1353,7 +1317,7 @@ constexpr void layout_builder::flex_sizing(uint32_t index, bool x_axis) noexcept
         for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)
         {
             if (nodes_[c].element.floating)
-                continue;  // overlay child: out of flow
+                continue;  // floating child: out of flow
             used += main_of(c);
             ++child_count;
         }
@@ -1477,7 +1441,7 @@ constexpr void layout_builder::position(uint32_t index, int origin_x, int origin
         (horizontal ? node.box.dimension.height : node.box.dimension.width) - detail::cross_axis_padding(node.format));
 
     // Main-axis leftover drives justify (leading offset + extra spacing between children). Floating
-    // (overlay) children are out of flow — they don't count here and are placed absolutely below.
+    // Floating children are out of flow — they don't count here and are placed absolutely below.
     int used = 0;
     int child_count = 0;
     for (uint32_t c = node.first_child; c != layout_node::none; c = nodes_[c].next_sibling)

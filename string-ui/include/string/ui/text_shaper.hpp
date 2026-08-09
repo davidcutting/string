@@ -12,27 +12,20 @@
 
 // THE text shaper. One walk over a run that both MEASURES it and PLACES its glyphs.
 //
-// It exists because those two jobs used to be two implementations of the same algorithm, in two
-// different libraries: `dynamic_text_measurer::shape` in the UI kit decided how wide and how tall a
-// text element is, and `append_glyphs` in the renderer's UI pass decided where each glyph goes. Both
-// walked UTF-8, applied kerning, rounded advances to whole pixels and made the same two word-wrap
-// break decisions — and each carried a comment warning that it had to match the other exactly or
-// text would draw a different number of lines than its box reserved and overdraw whatever sat below.
-//
-// That is a correctness hazard maintained by discipline across a library boundary, which is the kind
-// that survives review and fails in the field. So: one function, one set of break rules, and the two
-// callers differ only in what they do with the result.
+// Measuring and placing MUST agree on kerning, advance rounding and word-wrap breaks, or text draws
+// a different number of lines than its box reserved and overdraws whatever sits below. One function
+// with one set of break rules makes that structural rather than a discipline the two callers have to
+// keep across a library boundary; they differ only in what they do with the result.
 //
 // LOCAL COORDINATES, deliberately. Glyphs come back positioned relative to the run's own top-left,
 // so the shaper never learns where on screen a node landed — the caller adds its box origin.
 //
 // WHICH IS WHY GLYPH POSITIONS COME BACK UNROUNDED, and the caller snaps them after translating.
-// Rounding here instead looks equivalent and is not: `std::round` rounds halves AWAY FROM ZERO, so it
-// does not commute with adding an integer across the sign boundary — round(5 + -0.5) == 5 while
-// 5 + round(-0.5) == 4. A glyph's left side bearing is frequently negative, and the FIRST glyph of a
-// run is the one whose local pen is 0, so that is exactly where it bites. Snapping locally moved the
-// leading character of a great many runs by one pixel, which a pixel gate caught and nothing else
-// would have.
+// Rounding here looks equivalent and is not: `std::round` rounds halves AWAY FROM ZERO, so it does
+// not commute with adding an integer across the sign boundary — round(5 + -0.5) == 5 while
+// 5 + round(-0.5) == 4. A glyph's left side bearing is frequently negative and the FIRST glyph of a
+// run has local pen 0, so that is exactly where it bites: snapping locally moves the leading
+// character of many runs by one pixel. Only a pixel gate catches it.
 //
 // ADVANCES are still rounded here, and must be: whole-pixel advances are what keep letter spacing
 // even at minified SDF sizes, they are a property of the run rather than of where it is drawn, and

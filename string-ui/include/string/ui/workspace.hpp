@@ -195,15 +195,13 @@ public:
 
     // POST-LAYOUT. Caches each emitted node's resolved size along its parent split's axis.
     //
-    // This is the one place the workspace reads layout back, and it is deliberately narrow: a
-    // splitter drag has to turn a pixel delta into a sizing change, and no combination of author-time
-    // information can do that — the container's size does not exist until layout has run. It is a
-    // CONVERSION FACTOR, read once per frame and used only while a splitter is held; it is not fed
-    // back into the serialised arrangement. (Contrast the content-aware panel floor, rejected in M1
-    // for being a structural constraint read every frame into state meaning "user intent".)
+    // The one place the workspace reads layout back, and deliberately narrow: a splitter drag turns
+    // a pixel delta into a sizing change, and no author-time information can do that — the
+    // container's size does not exist until layout has run. A CONVERSION FACTOR, read once per frame
+    // and used only while a splitter is held; never fed back into the serialised arrangement.
     //
-    // Reading a rect here does NOT violate "the workspace computes no geometry": it consumes a size
-    // the layout engine produced rather than deriving one.
+    // This does NOT violate "the workspace computes no geometry": it consumes a size the layout
+    // engine produced rather than deriving one.
     void observe(const layout_builder& b) noexcept;
 
     // Applies a splitter drag: `delta` is the cursor movement along the split's axis, in pixels,

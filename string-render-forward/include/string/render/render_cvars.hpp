@@ -4,11 +4,10 @@
 
 #include <string/core/cvar.hpp>
 
-// Renderer CVars. Every improvised STRING_* lever that used to be read via std::getenv in the
-// passes is a first-class, self-registering CVar under a canonical dotted name (`r.*` for tuning,
-// `dbg.*` for diagnostics). The LEGACY env name keeps working verbatim via an alias, so existing
-// recipes and muscle-memory launch lines are unchanged: STRING_HIZ=0 still resolves (alias "hiz"
-// -> r.hiz.enabled) exactly as before.
+// Renderer CVars. Each is a self-registering CVar under a canonical dotted name (`r.*` for tuning,
+// `dbg.*` for diagnostics), never a std::getenv in a pass. Every one also answers to its STRING_*
+// env name via an alias, so existing recipes and launch lines keep working: STRING_HIZ=0 resolves
+// through alias "hiz" -> r.hiz.enabled.
 //
 // These live with the renderer, not the app, because they ARE the renderer's tuning surface — a
 // different renderer would expose a different set. The app keeps its own handful (debug-surface

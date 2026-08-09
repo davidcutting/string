@@ -123,7 +123,7 @@ struct transient_image_info
     // A transient is single-backed BY DEFINITION: its contents are frame-scoped. Anything whose
     // contents must outlive the frame — history, host-write pacing rings — has a lifetime beyond
     // the graph's scope and is therefore a PERSISTENT its owner backs (multi-slot when ringed),
-    // per brief 21 D3. The per_frame flag that used to live here was that misfiling.
+    // per brief 21 D3.
 };
 
 struct transient_buffer_info

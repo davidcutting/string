@@ -25,13 +25,10 @@
 // hardware bilinear filtering across the tile wraps correctly. So an 8x8 irradiance probe occupies
 // a 10x10 footprint; a 16x16 visibility/capture probe occupies 18x18.
 //
-// Atlas layout: probes are tiled 2D. The X axis packs (probes_x * probes_y) tiles across; the Y axis
-// packs probes_z tiles down. i.e. atlas_tile(px,py,pz) = column (pz? no) — see probe_common.slang
-// probe_tile_origin for the exact addressing. Addressing is centralized in probe_common.slang so a
-// future clipmap-scrolled cascade layout (Phase B) is a data-layout change there, not a rewrite.
-//
-// Phase 2 (NOT built): the capture G-buffer is replaced by VK_KHR_ray_query per-frame probe rays;
-// the atlases, relight, sampling and debug all stay. Keep capture texel production isolated.
+// Atlas layout: probes are tiled 2D — the X axis packs (probes_x * probes_y) tiles across, the Y
+// axis packs probes_z tiles down. `probe_tile_origin` in probe_common.slang is the exact addressing,
+// and it is centralized there so a clipmap-scrolled cascade layout is a data-layout change rather
+// than a rewrite.
 namespace string::render
 {
 

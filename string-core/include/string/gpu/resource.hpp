@@ -98,12 +98,10 @@ inline image_view image::mips(std::uint32_t base, std::uint32_t count) const { r
 inline image_view image::layer(std::uint32_t idx) const { return { *this, 0, image_view::all, idx, 1 }; }
 inline image_view image::whole() const { return { *this }; }
 
-// How an image's sampler is configured. Brief 20: the allocator creates a sampler for EVERY image
-// (it always did), but hardcoded exactly one configuration — LINEAR/REPEAT/aniso — so any pass
-// wanting NEAREST or CLAMP_TO_EDGE had to create its own VkSampler and then force it into the
-// descriptor set through update_texture(). Making the configuration a property of the image is what
-// lets bind() be sufficient on its own again, and puts the sampler's lifetime with the image that
-// owns it. Defaults reproduce the previous hardcoded configuration exactly.
+// How an image's sampler is configured. The allocator creates one for EVERY image, and the
+// configuration is a property of the image rather than something a pass forces into the descriptor
+// set afterwards — which is what makes bind() sufficient on its own and puts the sampler's lifetime
+// with the image that owns it. Defaults are LINEAR/REPEAT/aniso.
 struct sampler_info
 {
     VkFilter mag_filter = VK_FILTER_LINEAR;

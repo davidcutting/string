@@ -80,9 +80,8 @@ void ibl_component::tick(const IblLighting& light, bool force_every_frame)
         || align < kSunDeltaCos)
         ibl_update_pending_ = true;
 
-    // One decision per frame, read by every pass's conditional. The bookkeeping that used to sit at
-    // the end of record_update() belongs here with it: the chain is a CPU decision about whether to
-    // record, and a pass body that mutated the decision would gate the rest of itself off.
+    // One decision per frame, read by every pass's conditional. It lives here rather than in a pass
+    // body because a body that mutated the decision would gate the rest of itself off.
     chain_this_frame_ = (ibl_update_pending_ || !dfg_baked_)
                      && env_capture_program_ != nullptr && env_capture_.valid();
     if (chain_this_frame_)

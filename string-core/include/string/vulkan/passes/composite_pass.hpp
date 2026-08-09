@@ -32,7 +32,7 @@ namespace string
 //   * declare() authors it onto the app's frame_graph, capturing `this`. The declaration lives next
 //     to the state that knows what it touches, and the app decides whether and when to call it.
 //   * The recording callback resolves everything it needs through pass_context. NOTHING is pushed
-//     in from outside — no set_source(), no bind_color_source(), no slot handed over at init.
+//     in from outside: no sources, no slots handed over at init.
 //   * tick() is ordinary per-frame CPU work the app calls. It is not a graph concept.
 class composite_pass
 {

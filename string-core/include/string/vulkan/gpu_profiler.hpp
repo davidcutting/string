@@ -14,8 +14,8 @@ namespace string::gpu { class device; }
 namespace string
 {
 
-// Per-pass GPU timing via vkCmdWriteTimestamp2 pairs (brief 06). The renderer wraps each pass's
-// record()/record_compute() in a begin/end timestamp at the SAME seam the Tracy GPU zones use;
+// Per-pass GPU timing via vkCmdWriteTimestamp2 pairs (brief 06). The executor wraps each declared
+// pass's body in a begin/end timestamp at the SAME seam the Tracy GPU zones use;
 // this gives an IN-GAME per-pass millisecond readout (a HUD panel) plus periodic log lines — Tracy
 // stays the deep-capture tool, this is the always-on glance.
 //

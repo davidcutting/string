@@ -10,6 +10,8 @@
 #include <string>
 #include <cstdlib>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace string {
 
@@ -176,6 +178,77 @@ bool scripted_maximize()
     STRING_LOG_INFO("[resize] STRING_MAXIMIZE_AT: maximizing at frame {}", frame);
     return true;
 }
+
+// STRING_SCENE_SWITCH="name@frame[,name@frame...]" drives scene switches headlessly, since a menu
+// click is not reachable without a window. Kept permanently (same species as STRING_UI_NO_SKIP): it
+// is the only way to gate the load_scene teardown path, and that path is where resource-ownership
+// bugs surface — see the resource_id-0 aliasing bug it caught.
+void scripted_scene_switch()
+{
+    // Parsed ONCE: the spec is an env string that cannot change, so re-splitting it per frame only
+    // bought a std::string and a substr per entry every frame.
+    static const std::vector<std::pair<std::string, std::uint64_t>> schedule = [] {
+        std::vector<std::pair<std::string, std::uint64_t>> out;
+        const char* spec = std::getenv("STRING_SCENE_SWITCH");
+        if (spec == nullptr) return out;
+        const std::string s(spec);
+        for (std::size_t pos = 0; pos < s.size();)
+        {
+            const std::size_t comma = std::min(s.find(',', pos), s.size());
+            const std::string entry = s.substr(pos, comma - pos);
+            if (const std::size_t at = entry.find('@'); at != std::string::npos)
+            {
+                out.emplace_back(entry.substr(0, at),
+                                 std::strtoull(entry.c_str() + at + 1, nullptr, 10));
+            }
+            pos = comma + 1;
+        }
+        return out;
+    }();
+    static std::uint64_t frame = 0;
+    const std::uint64_t now = frame++;
+    for (const auto& [name, at] : schedule)
+    {
+        if (at == now) SceneRegistry::instance().request(name);
+    }
+}
+
+// `content.root <dir>` from the console: validate + persist the user's content folder. Polled rather
+// than hooked because CVar has no change callback; a string compare per frame is free next to the
+// work in the loop. Applying it live would mean re-registering every scene while one is loaded, so
+// set() deliberately only persists and asks for a restart.
+void poll_content_root()
+{
+    static std::string last_seen = cv_content_root().get();
+    const std::string now = cv_content_root().get();
+    if (now == last_seen) return;
+    last_seen = now;
+    if (now.empty()) return;
+    if (std::string err; !ContentRoot::set(now, err)) STRING_LOG_WARN("[content] {}", err);
+}
+
+// `content.cook <scene>` — the same texture cook the Scene menu offers, reachable from the console
+// and headlessly (a menu click is not, which is how this gets gated). Blocking, by design; cleared
+// after firing so it runs once per request rather than every frame.
+void poll_content_cook()
+{
+    static string::core::CVar<std::string> cook_scene{
+        "content.cook", "",
+        "cook a scene's textures to KTX2/BC7 (blocking, minutes). Name, or empty for none."};
+    // Seeded from the env ONCE, read directly rather than via the cvar's env alias: this cvar is
+    // constructed on the first poll, which is after the registry's env sweep, so the alias would
+    // never see it (same trap as ContentRoot).
+    static const bool seeded = [] {
+        if (const char* e = std::getenv("STRING_CONTENT_COOK"); e != nullptr && *e != '\0') cook_scene.set(e);
+        return true;
+    }();
+    (void)seeded;
+    const std::string want = cook_scene.get();
+    if (want.empty()) return;
+    cook_scene.set("");
+    SceneRegistry::instance().cook(want == "*" ? SceneRegistry::instance().active()
+                                               : std::string_view{ want });
+}
 }  // namespace
 
 void Application::run() {
@@ -195,77 +268,9 @@ void Application::run() {
 
         event_handler_.update();
 
-        // STRING_SCENE_SWITCH="name@frame[,name@frame...]" drives scene switches headlessly, since a
-        // menu click is not reachable without a window. Kept permanently (same species as
-        // STRING_UI_NO_SKIP): it is the only way to gate the load_scene teardown path, and that path
-        // is where resource-ownership bugs surface — see the resource_id-0 aliasing bug it caught.
-        {
-            static const char* spec = std::getenv("STRING_SCENE_SWITCH");
-            static std::uint64_t frame = 0;
-            if (spec != nullptr)
-            {
-                std::string s(spec);
-                std::size_t pos = 0;
-                while (pos < s.size())
-                {
-                    const std::size_t comma = std::min(s.find(',', pos), s.size());
-                    const std::string entry = s.substr(pos, comma - pos);
-                    const std::size_t at = entry.find('@');
-                    if (at != std::string::npos &&
-                        std::strtoull(entry.c_str() + at + 1, nullptr, 10) == frame)
-                    {
-                        SceneRegistry::instance().request(entry.substr(0, at));
-                    }
-                    pos = comma + 1;
-                }
-            }
-            ++frame;
-        }
-
-        // `content.root <dir>` from the console: validate + persist the user's content folder.
-        // Polled rather than hooked because CVar has no change callback; a string compare per frame
-        // is free next to the work below. Applying it live would mean re-registering every scene
-        // while one is loaded, so set() deliberately only persists and asks for a restart.
-        {
-            static std::string last_seen = cv_content_root().get();
-            if (const std::string now = cv_content_root().get(); now != last_seen)
-            {
-                last_seen = now;
-                if (!now.empty())
-                {
-                    if (std::string err; !ContentRoot::set(now, err))
-                    {
-                        STRING_LOG_WARN("[content] {}", err);
-                    }
-                }
-            }
-        }
-
-        // `content.cook <scene>` — the same texture cook the Scene menu offers, reachable from the
-        // console and headlessly (a menu click is not, which is how this gets gated). Blocking, by
-        // design; cleared after firing so it runs once per request rather than every frame.
-        {
-            static string::core::CVar<std::string> cook_scene{
-                "content.cook", "",
-                "cook a scene's textures to KTX2/BC7 (blocking, minutes). Name, or empty for none."};
-            // Seeded from the env ONCE, read directly rather than via the cvar's env alias: this
-            // cvar is constructed on the first poll, which is after the registry's env sweep, so
-            // the alias would never see it (same trap as ContentRoot).
-            static const bool seeded = [] {
-                if (const char* e = std::getenv("STRING_CONTENT_COOK"); e != nullptr && *e != '\0')
-                {
-                    cook_scene.set(e);
-                }
-                return true;
-            }();
-            (void)seeded;
-            if (const std::string want = cook_scene.get(); !want.empty())
-            {
-                cook_scene.set("");
-                SceneRegistry::instance().cook(want == "*" ? SceneRegistry::instance().active()
-                                                          : std::string_view{ want });
-            }
-        }
+        scripted_scene_switch();
+        poll_content_root();
+        poll_content_cook();
 
         // Scene switching happens HERE — between frames, never inside one. A UI click or console
         // command only records a request (SceneRegistry::request); this is the point where no

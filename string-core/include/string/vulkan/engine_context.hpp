@@ -19,11 +19,9 @@ namespace string
 // Daxa's app owns its device directly). Distinct from `string::pass_context`, which is the
 // EXECUTE-time surface and is where handles resolve.
 //
-// Brief 20: this no longer carries `color_target` / `depth_target`. Those were raw resource_id
-// sentinels a pass declared its attachment writes against; the scene's colour and depth are now
-// viewport-scaled transients the application declares to its frame_graph and passes to whichever
-// pass objects need them, as logical handles. It also no longer carries a ResourceRegistry — the
-// graph is the resolution authority.
+// It carries no attachment targets and no resource registry: the scene's colour and depth are
+// viewport-scaled transients the application declares to its frame_graph and hands to whichever
+// passes need them as logical handles, and the graph is the resolution authority.
 struct engine_context
 {
     string::gpu::device& device;

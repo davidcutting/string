@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-#include <string/core/cache_dir.hpp>
+#include <string/platform/user_dirs.hpp>
 #include <string/core/job_system.hpp>
 #include <string/core/logger.hpp>
 #include <string/gpu/command_recorder.hpp>
@@ -416,19 +416,13 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
 , gpu_profiler_ctx_(context.gpu_profiler_ctx)
 {
     scene_samples_ = samples;
-    // frames_in_flight_ + overlay_stats_ moved to the GeometryScene base (brief 11 P2); a base
-    // class's members can't sit in the derived init list, so seed them first thing in the body
-    // (nothing above uses them).
+    // These live on the GeometryScene base, and a base's members cannot sit in the derived init
+    // list, so seed them first thing in the body (nothing above uses them).
     frames_in_flight_ = context.frames_in_flight;
     overlay_stats_ = std::move(overlay_stats);
-    // Brief 20: no cached sentinels. The scene attachments are app-declared handles that arrive at
-    // declare() — the pass never names a resource_id.
-    // Brief 11 Phase 2 (M3): the whole geometry pass is CVar-toggleable (r.pass.geometry) through
-    // the renderer's per-pass enable/disable. Off -> composite reads the cleared color target.
-    // Touch the CVar NOW (init-capture invokes cv_pass_geometry()) so it self-registers at
-    // construction — before the STRING_PASS_GEOMETRY env override is applied — not lazily at frame 1.
-    // Touch the CVar now so it self-registers before the env override is applied. The toggle itself
-    // is declared fluently in declare(); there is no enable_predicate member any more.
+    // The whole geometry pass is CVar-toggleable (r.pass.geometry); off -> composite reads the
+    // cleared color target. Touch it NOW so it self-registers at construction, before the env
+    // override is applied, rather than lazily at frame 1. The toggle is declared in declare().
     (void)cv_pass_geometry();
     // Brief 21 D4: the work lists are graph transients the app declares; nothing is reserved here.
     // Brief 16 M1: the resource-virtualization hub, for the registry-owned SceneData ring (below)
@@ -901,7 +895,7 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
 // denoised within one record hook) + one final target per frame slot (this frame's fragments
 // sample it while the next frame's chain rewrites its own slot).
 
-// Record the GTAO chain (top of record_compute): horizon-search AO + bent normal from the
+// Record the GTAO chain: horizon-search AO + bent normal from the
 // PREVIOUS slot's resolved depth, then the spatial denoise into this slot's final target.
 // Barriers are the documented cross-frame local class (07 precedent: same-queue, cross-CB;
 // hz.depth is untracked pass-managed state, its resolve re-discards from UNDEFINED).
@@ -936,8 +930,8 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
 // Brief 04e M4: froxel light binning — one thread per froxel bins the local lights into
 // per-froxel index lists the lit fragment shader reads. DEPENDENCY-FREE within the frame (reads
 // only the host-written light SSBO ring), so the renderer places it on an async compute lane
-// when the hardware exposes one (timeline edge + queue-family ownership transfer derived from
-// async_usages), or records it inline on the main queue otherwise. No Tracy zone here: the
+// when the hardware exposes one (timeline edge + queue-family ownership transfer derived from the
+// declarations), or records it inline on the main queue otherwise. No Tracy zone here: the
 // renderer wraps the whole async chain in the LANE's own GPU context (a pass-side zone would
 // use the main-queue context and produce bogus timestamps on the async queue).
 
@@ -982,7 +976,6 @@ SunState sun_for_time(float t)
 
 
 
-// ensure_froxel_capacity moved to FroxelComponent::ensure_capacity (brief 11).
 
 geometry_pass::~geometry_pass()
 {
@@ -1422,10 +1415,9 @@ void geometry_pass::record_reset_visbits(string::pass_context& ctx)
 }
 
 
-// Brief 11 M2: probe-GI static capture (once) + dynamic relight (amortized). Extracted from
-// record_compute's head into its own public method, scheduled by the standalone GiPass in the compute
-// prepass — ordered after IblPass (relight's sky-SH source is this frame's) and before ShadowPass (the
-// relight->shadow WAR edge). Byte-identical to its old record_compute home; all barriers are internal.
+// Brief 11 M2: probe-GI static capture (once) + dynamic relight (amortized). Scheduled by the
+// standalone GiPass in the compute prepass — ordered after IblPass (relight's sky-SH source is this
+// frame's) and before ShadowPass (the relight->shadow WAR edge). All barriers are internal.
 // Returns true if it recorded work.
 
 void geometry_pass::record_phase1(string::pass_context& ctx)
@@ -1457,15 +1449,15 @@ void geometry_pass::record_phase1(string::pass_context& ctx)
         {
             // Brief 04d PHASE 1: render meshlets marked visible LAST frame (bit set) directly into the
             // MSAA color+depth. No HiZ test (the pyramid isn't built yet). The renderer then MIN-resolves
-            // this depth -> hz.depth, record_between() builds the pyramid, record_after_between() draws
+            // this depth -> hz.depth, the hiz.build pass builds the pyramid, and geometry.phase2 draws
             // phase 2 (the disocclusion complement) + transparency.
             STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "main-draw")
             record_opaque_phase(ctx, /*phase*/ 1u, pyramid_, scene_data_, stats_);
         }
         else
         {
-            // Single-pass (HiZ off / warmup): frustum+cone+HiZ in one group, then transparency — the
-            // legacy phase-0 flow. breaks_scene_group() is false so this all lands in one render group.
+            // Single-pass (HiZ off / warmup): frustum+cone+HiZ, then transparency, all in one render
+            // group.
             {
                 STRING_PROFILE_GPU_ZONE(gpu_ctx(), command_buffer, "main-draw")
                 record_opaque_phase(ctx, /*phase*/ 0u, pyramid_, scene_data_, stats_);
@@ -1480,8 +1472,8 @@ void geometry_pass::record_phase1(string::pass_context& ctx)
 }
 
 // Brief 04d: draw the opaque one-sided + two-sided camera lists at `phase` (0 legacy / 1 bit-set /
-// 2 bit-clear+HiZ+update). Assumes an MSAA scene render pass is already open (record() for phase 1/0,
-// record_after_between() for phase 2). Shared by both phases — the task shader does the partitioning.
+// 2 bit-clear+HiZ+update). Assumes an MSAA scene render pass is already open (record_phase1 for
+// phase 1/0, record_phase2 for phase 2). Shared by both phases — the task shader does the partitioning.
 
 // Brief 04d: the depth-resolve target the renderer MIN-resolves the phase-1 MSAA depth into (the
 // pyramid's single-sample mip-0 source). Valid only when the two-phase path is active this frame.
@@ -1848,36 +1840,24 @@ void geometry_pass::record_scene_upload(string::pass_context& ctx)
         // here is exactly what the declaration licenses — the address is this frame's backing, at
         // record time, ordered against the froxel pass by the graph.
         //
-        // It used to say "deliberately NOT set here — patched in record() instead", from an era when
-        // update() ran before the producers had. Nothing ever did the patching: the field stayed 0
-        // for the whole life of the renderer, and `lighting.slang` dereferences it the moment a scene
-        // has local lights (`froxel_planes.w > 0`). A null device address is a GPU fault, not a wrong
-        // colour. It survived only because the demo scenes light with the sun alone.
+        // This MUST be set: `lighting.slang` dereferences it the moment a scene has local lights
+        // (`froxel_planes.w > 0`), and a null device address is a GPU fault, not a wrong colour.
         scene.froxels = ctx.address(froxels_);
         scene.max_lights_per_froxel = kMaxLightsPerFroxel;
         scene.debug_flags = (froxel_heatmap_ ? 1u : 0u) | (furnace_ ? 2u : 0u)
                           | (cv_gtao_spec_occ().get() ? 0u : 4u)    // bit2: disable bent-normal spec-occ
                           | ((static_cast<uint32_t>(std::max(cv_light_debug().get(), 0)) & 0xFu) << 4);  // bits4-7: lighting isolate
         // Brief 07: the sky-IBL products (single-buffered; the update chain is ordered against
-        // in-flight readers inside record_ibl_update / by the declared SH usages).
+        // in-flight readers by the declared SH usages).
         scene.sh = ctx.address(ibl_sh_);
         scene.env_slot = ctx.slot(env_prefiltered_);
         scene.env_mips = ibl->env_mips();
         scene.dfg_slot = ctx.slot(dfg_lut_);
 
-        // Brief 09 GTAO: decide HERE (pre-record) whether the chain runs this frame — the shader
-        // reads gtao_slot from this SceneData, so the decision and the recording must agree.
-        // Needs the PREVIOUS slot's resolved depth (two-phase HiZ path); descriptor updates for
-        // (re)created targets land in ensure_gtao(), safely before any set bind this frame.
-        // The furnace test must be a flat white background at every roughness/metallic — GTAO on
-        // the furnace must read as vis == 1 (the brief-09 gate). Rather than trust the AO pass to
-        // produce exactly 1.0 over a depthful furnace scene, disable the whole chain under furnace
-        // so ambient occlusion cannot perturb the uniform-white acceptance state.
-        // GTAO targets are ensured by GtaoPass::update (it owns them and runs before this pass).
-        // Brief 11 step 3: ensure the HiZ pyramid HERE (in update()) too — its (re)build binds new
+        // Ensure the HiZ pyramid HERE, in update() — its (re)build binds new
         // per-mip storage views into the bindless set, and now that IblPass records its compute BEFORE
         // this pass, that descriptor update must land in the update phase (before any set bind this
-        // frame), not in record_compute. ensure_hiz is idempotent, so the record_compute calls no-op.
+        // frame), not at record time. ensure_hiz is idempotent, so the later calls no-op.
         if (meshlet_program_ && draw_info_mapped_)
             ensure_hiz(current_frame);
         // GtaoPass decided the go/no-go in its own update (it runs before this pass); read it here.

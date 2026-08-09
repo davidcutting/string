@@ -222,7 +222,6 @@ class geometry_pass final : private GeometryScene
 
     // Brief 20: the colour/depth sentinels are gone. The scene attachments are viewport-scaled
     // transients the application declares and hands to declare() as logical handles.
-    // draw_count_ / frames_in_flight_ moved to GeometryScene (brief 11 P2).
 
     // Geometry residency streaming: per-draw vertex/index ranges suballocate into heaps SMALLER than
     // the whole model as draws enter the view frustum, and are freed (reclaimed) on eviction. A
@@ -252,34 +251,24 @@ class geometry_pass final : private GeometryScene
     ::string::gpu::resource_id flat_normal_image_;
     uint32_t flat_normal_slot_ = 0;
 
-    // Cascaded shadow maps. A depth-only prepass (in record_compute) renders the scene from the sun's
+    // Cascaded shadow maps. A depth-only prepass (ShadowPass) renders the scene from the sun's
     // orthographic view into cascade_count per-frame-in-flight D32 images (one per cascade), sampled
     // by the lit fragment shader with 5x5 PCF. Cascades are stabilized (texel-snapped) and refit each
     // frame because the sun and camera both move (dynamic time-of-day).
-    // settings_/sun_dir_/cascade_*/time_of_day_/sun_animate_/sky_*/sun_*/furnace_/lookdev_ moved to
-    // GeometryScene (brief 11 P2).
-    // Fullscreen procedural sky moved OUT to its own registered SkyPass (brief 11 step 3) — it owns the
-    // SkyComponent + reads GeometryScene, drawn as the first pass of the scene MSAA group.
-
-    // Brief 07/11-step-3 dynamic sky IBL is its own IblPass (prepass compute) now; the component it owns
-    // is published into GeometryScene (scene().ibl) — GeometryPass reads sh_address/env/dfg slots for
-    // SceneData, and probe GI reads the SH. The shared sun/sky colours + furnace flag are in GeometryScene.
-
-    // Probe GI (brief 09b relightable irradiance volume): owned by GiPass (ProbeGi component),
-    // reached via GeometryScene::gi.
-    // Shadow maps: owned by ShadowPass (ShadowMaps component), reached via GeometryScene::shadow.
+    //
+    // Where the state lives: sun/sky/cascade settings and the camera are in GeometryScene. Sky is
+    // SkyPass (SkyComponent), drawn first in the scene MSAA group. Sky IBL is IblPass, published as
+    // scene().ibl — GeometryPass reads sh_address/env/dfg slots for SceneData and probe GI reads the
+    // SH. Probe GI is GiPass (scene().gi); shadow maps are ShadowPass (scene().shadow).
     // Recompute the per-cascade stabilized ortho fits from the live camera + sun (called per frame).
     void compute_cascades();
 
     // --- Forward+ lighting: scene data + local lights + froxels --------------------------------
-    // scene_buffers_/scene_mapped_ + lights_/light_buffers_/light_mapped_ moved to GeometryScene
-    // (brief 11 P2).
     // Forward+ froxel light-binning is its own FroxelPass now (brief 11 step 3); the component it owns
     // is published into GeometryScene (scene().froxel) so SceneData can read its grid dims + address.
     void animate_lights(float delta_time);
     struct LightAnim { glm::vec3 center; float radius; float speed; float phase; float height; };
     std::vector<LightAnim> light_anim_;
-    // scene_aabb_min_/scene_aabb_max_ + lights_enabled_ moved to GeometryScene (brief 11 P2/step 3).
     bool froxel_heatmap_ = false;  // H toggles the froxel light-count heatmap
 
     // Texture residency streaming: the streamer (a residency_provider) owns each texture's mip
@@ -312,10 +301,6 @@ class geometry_pass final : private GeometryScene
     uint64_t stream_frame_ = 0;
     bool logged_full_resident_ = false;
 
-    // materials_/draws_ + camera_ moved to GeometryScene (brief 11 P2).
-
-    // cull_enabled_ moved to GeometryScene (shared by every meshlet draw path).
-
     // --- Brief 03: task/mesh meshlet pipeline --------------------------------------------------
     // Built at load from the flattened geometry: the GPU-side meshlet/vertex/triangle heaps + the
     // per-draw DrawInfo table. Metadata buffers are small and always resident; only the vertex/index
@@ -328,8 +313,6 @@ class geometry_pass final : private GeometryScene
     // A/B; kept here so the loader + cooked-file naming agree.
     static constexpr uint32_t kChunkMaxMeshlets = 1024;
     // meshlet_model_/meshlet_buffer_/meshlet_vertices_/meshlet_triangles_/draw_info_buffer_/
-    // draw_info_mapped_ + stats_buffers_/stats_readback_/stats_latest_ moved to GeometryScene
-    // (brief 11 P2).
     // Mesh pipelines (hot-reloadable via the registry).
     ::string::gpu::shader_program* meshlet_program_ = nullptr;
     ::string::gpu::shader_program* meshlet_twosided_program_ = nullptr;  // brief 04: CULL_NONE variant
@@ -388,7 +371,7 @@ class geometry_pass final : private GeometryScene
     void ensure_hiz(uint16_t current_frame);
 
     // --- Brief 09: half-res GTAO with bent normals ----------------------------------------------
-    // Computed at the top of record_compute from the PREVIOUS frame slot's min-resolved depth
+    // Computed by GtaoPass from the PREVIOUS frame slot's min-resolved depth
     // (hz.depth) under that frame's matrices; consumed by this frame's lit fragments through
     // SceneData.prev_view_proj reprojection (exact for the static scene; 1-frame-late AO, zero
     // temporal accumulation so nothing can ghost). raw -> denoise -> per-slot final (RGBA8:
@@ -396,7 +379,7 @@ class geometry_pass final : private GeometryScene
     // GTAO targets/slots/sampler/programs owned by GtaoPass (GtaoChain component).
 
     // Brief 06: address of the renderer's Tracy GPU context (from engine_context), for finer per-stage
-    // GPU zones inside record_compute/record. Null when the renderer exposes none; the zone macros
+    // GPU zones inside the pass bodies. Null when the renderer exposes none; the zone macros
     // are no-ops without -Dtracy regardless. Read live at record time (the ctx is created after the
     // pass is built). Helper below turns the double-indirection into the value the macros want.
     STRING_PROFILE_GPU_CONTEXT_TYPE* gpu_profiler_ctx_ = nullptr;
@@ -423,7 +406,6 @@ class geometry_pass final : private GeometryScene
     // between the base set and base+crowd. Grid side N gives (N*N - 1) extra copies of the model.
     static constexpr uint32_t kCrowdGrid = 6;   // 6x6 = 35 extra copies (+ base) of the model
     bool crowd_enabled_ = false;
-    // base_draw_count_/active_draw_count_ moved to GeometryScene (brief 11 P2).
     void build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_max);
     void build_meshlet_gpu(string::engine_context& context);
     // Brief 04d: `phase` (0 legacy/transparency, 1 = bit-set only, 2 = bit-clear+HiZ+update) is pushed
@@ -438,14 +420,13 @@ class geometry_pass final : private GeometryScene
     // device-local, zero-initialized on creation. NOT ring-buffered — the temporal visibility state
     // must accumulate across frames. Phase 1 reads it; phase 2 sets/clears it (atomics). A cleared bit
     // => the meshlet takes phase 2 for one frame (warmup = fallback = streaming/LOD-change path).
-    // visbits_buffer_ moved to GeometryScene (named by every meshlet push constant).
     uint32_t visbits_words_ = 0;
     // Per-draw LOD selected LAST frame (device-local, one word per draw). The draw-cull compute
     // compares it to this frame's selected LOD; a switch clears that draw's bitfield range (its
     // meshlets become "new" -> phase 2), because bits are keyed to the CURRENT LOD's meshlet ids.
     ::string::gpu::resource_id prev_draw_lod_buffer_ = 0;
-    // True when the two-phase path is active this frame (HiZ enabled + warmup done). Gates
-    // breaks_scene_group(): when false the pass renders single-pass (phase 0) in one group.
+    // True when the two-phase path is active this frame (HiZ enabled + warmup done). When false the
+    // pass renders single-pass (phase 0) into one render group.
     bool two_phase_active_ = false;
     // Records phase-1 or phase-2 opaque+two-sided draws into the (already-open) MSAA render pass.
     void record_opaque_phase(::string::pass_context& ctx, uint32_t phase,
@@ -454,7 +435,6 @@ class geometry_pass final : private GeometryScene
     // Zeroes visbits_buffer_ + prev_draw_lod_buffer_ (teleport/first-frame/streaming full clear).
     bool visbits_clear_pending_ = true;
 
-    // overlay_stats_ moved to GeometryScene (brief 11 P2).
 
 public:
     // Latest GPU culling stats (read back one frame late) for the UI overlay.
@@ -513,12 +493,11 @@ private:
     // the one above it. The graph derives the chain from the slice declarations.
     // Graph handles this subsystem was declared against, latched in declare() so the record bodies
     // can name them. They are LOGICAL — every resolution still happens through pass_context.
+    // One-shot zero of every declared work list (see record_reset_lists). Transients are
+    // single-backed, so this is one flag, not one per frame slot.
+    bool lists_zeroed_ = false;
     // MSAA sample count of the scene attachments. The APP declares those, so the app states this;
     // the renderer no longer has an opinion to supply.
-    // Per-slot: has this frame slot's worklist arena been zeroed yet? See record_cull.
-    // One-shot zero of every declared work list (see record_cull). Transients are single-backed, so
-    // this is one flag, not one per frame slot.
-    bool lists_zeroed_ = false;
     VkSampleCountFlagBits scene_samples_ = VK_SAMPLE_COUNT_1_BIT;
     string::gpu::buffer scene_data_{}, lights_buffer_{}, stats_{}, froxels_{}, ibl_sh_{};
     // The persistent visibility bitfield, as a GRAPH handle over the buffer this pass owns. It is
@@ -570,19 +549,5 @@ public:
     // Brief 20: the IBL SH buffer is an app-declared graph buffer; gi.relight declares .reads(sh)
     // and the graph derives the edge. No id accessor needed.
 };
-
-// Brief 20: the nine wrapper `Pass` subclasses that used to live here — SkyPass, FroxelPass, IblPass,
-// GtaoPass, GiPass, ShadowPass, HizBuildPass, GeometryPhase2Pass, TransparencyPass — are DELETED.
-//
-// Every one of them existed only to give a component a place to hang two things the graph now owns:
-// a hand-written `usages` vector refreshed each frame, and an `enable_predicate`. Several were pure
-// scheduling seams with no state at all (HizBuildPass held a single `GeometryPass*` and forwarded
-// one call). The components they wrapped — sky_component, froxel_component, ibl_component,
-// gtao_chain, probe_gi_component, shadow_maps, sorted_transparency — are plain objects that declare
-// themselves onto the graph through their own declare(), and the application owns them.
-//
-// The `usages`-refreshed-in-update() pattern they all shared is precisely the second declaration
-// channel this brief deletes: a pass had to re-state, in a different format, what it had already
-// said fluently, and only the re-statement governed correctness.
 
 }  // namespace string::render

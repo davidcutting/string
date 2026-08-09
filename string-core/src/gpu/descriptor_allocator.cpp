@@ -36,20 +36,6 @@ descriptor_table::descriptor_table(VkDevice device, resource_allocator& allocato
             .stageFlags = VK_SHADER_STAGE_ALL,
             .pImmutableSamplers = nullptr
         },
-        // {
-        //     .binding = 3,
-        //     .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
-        //     .descriptorCount = MAX_BINDLESS_ACCEL_STRUCT,
-        //     .stageFlags = VK_SHADER_STAGE_ALL,
-        //     .pImmutableSamplers = nullptr
-        // },
-        // {
-        //     .binding = 4,
-        //     .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
-        //     .descriptorCount = MAX_BINDLESS_ACCEL_STRUCT,
-        //     .stageFlags = VK_SHADER_STAGE_ALL,
-        //     .pImmutableSamplers = nullptr
-        // },
     };
 
     // VARIABLE_DESCRIPTOR_COUNT_BIT must be on the highest-numbered binding, so it lives on
@@ -58,8 +44,6 @@ descriptor_table::descriptor_table(VkDevice device, resource_allocator& allocato
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // binding 0: fixed size ssbos
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // binding 1: combined image samplers
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT, // binding 2: storage images (last)
-        // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size tlas
-        // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, // fixed size blas
     };
 
     VkDescriptorSetLayoutBindingFlagsCreateInfoEXT binding_flags_info = {
@@ -87,8 +71,6 @@ descriptor_table::descriptor_table(VkDevice device, resource_allocator& allocato
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_BINDLESS_BUFFERS },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_BINDLESS_IMAGES },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_BINDLESS_IMAGES },
-        // { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, MAX_BINDLESS_ACCEL_STRUCT },
-        // { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, MAX_BINDLESS_ACCEL_STRUCT },
     };
 
     VkDescriptorPoolCreateInfo pool_info = {

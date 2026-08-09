@@ -18,7 +18,7 @@ string::core::CVar<std::string>& cv_content_root();
 //
 // Resolution order, first wins:
 //   1. STRING_CONTENT_DIR         (env; also how headless gating points at a fixture)
-//   2. the persisted setting      (user_config_dir()/content_root.txt, written by set_content_root)
+//   2. the persisted setting      (user_config_dir()/content_root.txt, written by ContentRoot::set)
 //   3. `<cwd>/assets`             (the historical layout, so an existing checkout keeps working)
 //
 // An empty or missing folder is NORMAL, not an error: a clone with no content must still start.

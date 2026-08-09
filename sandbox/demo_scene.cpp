@@ -74,9 +74,6 @@ VkExtent2D scene_viewport()
     return e;
 }
 
-// Brief 20: author_pass is DELETED. It existed to bridge a Pass object onto the graph by handing
-// over its hand-written `usages` vector plus two record hooks — the second declaration channel and
-// the two-entry-point pass, in one helper. A pass now declares itself; there is nothing to bridge.
 
 // Defined below; the content-scan registry lambdas above call them.
 struct scene_resources;
@@ -136,8 +133,7 @@ std::vector<std::uint8_t> read_file(const std::filesystem::path& path)
 // reach the same instance: `Ui::observe()` caches the boxes widgets asked to measure, and sizes only
 // exist after layout. Same seam, and same reason, as `Workspace::observe`.
 using SharedUi = std::shared_ptr<std::optional<ui::Ui>>;
-// The debug shell is shared for the SAME reason: it owns a second `Ui`, and that one needs
-// The debug shell no longer owns a Ui, so it is not passed here — see DebugPanels::update_and_author.
+// The debug shell does not own a Ui, so it is not passed here — see DebugPanels::update_and_author.
 using SharedPanels = std::shared_ptr<debug::DebugPanels>;
 
 // Post-layout hook for an author built around `fluent`. Null-safe on the first frame, when the Ui has
@@ -604,7 +600,7 @@ scene_resources declare_resources(string::frame_graph& fg, VkExtent2D viewport,
                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT });
     // Host-write pacing rings (brief 21 D3): the CPU fills frame N+1's slot while the GPU reads
     // frame N's, so their contents outlive the frame and the APP backs them, one slot per frame in
-    // flight. The graph resolves by slot exactly as it did when these were per_frame transients.
+    // flight. The graph resolves them by slot.
     const auto persist_buf = [&](const char* name, const std::vector<gpu::resource_id>* phys) {
         return fg.use_persistent(string::persistent_buffer_info{
             .name = name, .physical = phys != nullptr ? *phys : std::vector<gpu::resource_id>{} });

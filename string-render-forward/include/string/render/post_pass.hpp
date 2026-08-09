@@ -50,7 +50,7 @@ static_assert(sizeof(PostPush) == 64);
 // Brief 20 shape (see composite_pass, the reference): NO base class. This is a plain object the
 // application owns; the graph never sees the type. declare() authors it onto the app's frame_graph
 // and every recording callback resolves what it needs through pass_context — nothing is pushed in
-// from outside, so bind_color_source() and its three hand-held slots are gone.
+// from outside — no sources or slots pushed in.
 //
 // The chain that used to be ONE record hook with six unscoped global VkMemoryBarrier2s is now
 // (3 + mips + (mips-1) + 1) declared compute passes. Every one of those barriers is a declared

@@ -7,11 +7,10 @@
 
 // UI theme (brief 12 M0c, L3). The engine owns the TYPE; the app owns the VALUES.
 //
-// Brief 05 shipped the theme as 24 `constexpr color` constants in the sandbox, which cannot be
-// inherited by an element tree or overridden per element — both of which the brief-12 conventions
-// require ("central theme all elements inherit from, with per-element override"). So the theme
-// becomes a value: one instance lives beside the Ui facade, every element reads its defaults from
-// it, and `.color(...)` on an element overrides just that element.
+// A VALUE, not a set of constants, because the brief-12 conventions require a central theme every
+// element inherits with per-element override — which constants cannot express. One instance lives
+// beside the Ui facade, every element reads its defaults from it, and `.color(...)` on an element
+// overrides just that element.
 //
 // Game-specific vocabulary (item rarity, health/cast fills, hostile/friendly) deliberately does NOT
 // live here — that is meaning, not interaction, and stays in the app's palette. The line is the

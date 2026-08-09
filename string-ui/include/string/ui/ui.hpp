@@ -33,10 +33,9 @@
 //   * FULL CLAY SIZING with inherited defaults, and a THEME every element inherits with
 //     per-element override.
 //
-// It also owns the STRING SCRATCH ARENA. `layout_builder::add_text` takes a non-owning view, so
-// every author previously had to keep its own frame-persistent storage and know that it must be a
-// deque (a vector regrowth relocates SSO buffers and dangles every view taken so far). That rule is
-// now enforced in one place instead of re-derived per author — `Ui::own()` is the only entry point.
+// It also owns the STRING SCRATCH ARENA. `layout_builder::add_text` takes a non-owning view, so the
+// backing storage must be frame-persistent AND stable — a vector regrowth relocates SSO buffers and
+// dangles every view taken so far. `Ui::own()` is the single entry point that guarantees both.
 namespace string::ui
 {
 
@@ -416,21 +415,15 @@ public:
     [[nodiscard]] PanelStore& panels() { return panels_; }
 
     // Per-widget persistent scratch, keyed by the widget's stable id: a combo's open/closed flag, a
-    // drag-value's value-at-press. Widgets are rebuilt every frame, so anything that must outlive
-    // the rebuild needs a home, and `Ui` is the one object that already persists across frames.
-    //
-    // Deliberately one weak type rather than a typed store per widget: this holds a handful of
-    // scalars, and a `variant`/type-erased store would be more machinery than the problem.
+    // drag-value's value-at-press. Widgets are rebuilt every frame, so anything outliving the
+    // rebuild needs a home, and `Ui` is the one object that already persists across frames. One weak
+    // type rather than a typed store: this holds a handful of scalars.
     [[nodiscard]] double& widget_state(std::uint64_t id, double initial = 0.0);
 
     // --- Deferred surfaces (brief 12b M1) --------------------------------------------------------
-    //
-    // Declares a surface to be authored AFTER the main tree has been laid out, on `layer`.
-    //
-    // This is what lets a popup anchor to THIS frame's geometry. A dropdown is declared while the
-    // thing it hangs off is still being authored — its anchor has no box yet — so previously it read
-    // `observed_box`, LAST frame's box, and lagged a frame whenever its anchor moved. Deferring the
-    // emission until layout has run turns that into a same-frame read.
+    // Declares a surface to be authored AFTER the main tree has been laid out, on `layer`. This is
+    // what lets a popup anchor to THIS frame's geometry: a dropdown is declared while the thing it
+    // hangs off is still being authored, so its anchor has no box yet.
     //
     // The body runs later in the SAME frame, so arena views stay valid — but it outlives the WIDGET
     // that declared it, so capture data by value (a `string_view` into the arena is fine; a reference
@@ -446,26 +439,23 @@ public:
     bool emit_next_deferred();
 
     // THIS frame's box for an element that has already been laid out. Legal only from a deferred
-    // body, which by construction runs after the main tree resolved.
-    //
-    // Distinct from `observed_box`, which is one frame stale and works for ANY element: that is the
-    // right tool for an EXTENT (a scroll area's content height), and this is the right tool for an
-    // ANCHOR. Asking the stale one for an anchor is what made popups lag.
+    // body, which by construction runs after the main tree resolved. Distinct from `observed_box`,
+    // which is one frame stale and works for ANY element: that one is right for an EXTENT (a scroll
+    // area's content height), this one for an ANCHOR.
     [[nodiscard]] bounding_box resolved_box(std::uint64_t id) const;
 
     // --- Post-layout box observation ---------------------------------------------------------
     // Registers `id` for observation and returns the box layout gave it LAST frame — empty until it
     // has been laid out once.
     //
-    // This is the sanctioned form of the thing `interaction::hovered_box` deliberately is not: an
-    // OPT-IN, per-id cache rather than a map of every element. A widget needs this when it must know
-    // its own extent CONTINUOUSLY rather than while the pointer is on it — a scroll area clamping to
-    // its content height is the case that forced it, since content height is exactly what the layout
-    // computes and the author does not know.
+    // An OPT-IN, per-id cache rather than a map of every element (which is what
+    // `interaction::hovered_box` deliberately is not). A widget needs this when it must know its own
+    // extent CONTINUOUSLY rather than while the pointer is on it — a scroll area clamping to its
+    // content height, which only the layout knows.
     //
     // ONE FRAME STALE, unavoidably: sizes exist only after layout, and the widget that needs them is
-    // rebuilt before it. That is fine for an EXTENT (it changes when content changes, not per frame)
-    // and would not be for a position the pointer chases — which is what hovered_box is for.
+    // rebuilt before it. Fine for an EXTENT (it changes with content, not per frame); not fine for a
+    // position the pointer chases, which is what hovered_box is for.
     [[nodiscard]] bounding_box observed_box(std::uint64_t id);
     // Host seam, called AFTER layout resolves: caches the boxes of the registered ids. Same seam as
     // `Workspace::observe`, and for the same reason.

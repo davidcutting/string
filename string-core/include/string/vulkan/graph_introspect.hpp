@@ -24,7 +24,7 @@ public:
     // One resource the compiled plan touches, with its lifetime as TOPO POSITIONS into `passes`.
     struct Resource
     {
-        // Derived, not stored anywhere in the engine — see the note in refresh_introspection().
+        // Derived for display only; the engine stores no such label.
         std::string label;
         bool is_image = false;
         std::uint32_t first = 0;         // first pass position that touches it

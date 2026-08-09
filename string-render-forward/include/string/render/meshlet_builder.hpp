@@ -36,10 +36,8 @@ struct MeshletModel
     bool from_cache = false;
 };
 
-// NOTE (brief 04c M3): the runtime meshletizer (build_meshlets) and its disk cache moved to the cook
-// path (string-asset-tools, src/bake.cpp — bake_scene) when the asset pipeline landed;
-// meshlet_builder.cpp was dead
-// (uncompiled, uncalled) and is deleted. This header now only defines MeshletModel, the in-memory form
-// the scene loader fills and GeometryPass uploads.
+// Meshletization happens at COOK time (string-asset-tools, bake.cpp — bake_scene), not at runtime.
+// This header defines only MeshletModel: the in-memory form the scene loader fills and GeometryPass
+// uploads.
 
 }  // namespace string::render

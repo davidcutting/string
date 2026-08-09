@@ -23,9 +23,8 @@ namespace string::render
 using ::string::asset::CookedDraw;
 using ::string::asset::CookedScene;
 
-// The merged, engine-ready result of loading N cooked scenes (brief 04b). This is exactly the data
-// the old GeometryPass constructor produced after parse+flatten+build_meshlets+merge, so the rest of
-// the pass (build_meshlet_gpu, streamer, per-frame LOD/streaming) is unchanged:
+// The merged, engine-ready result of loading N cooked scenes (brief 04b) — what build_meshlet_gpu,
+// the streamer and per-frame LOD/streaming consume:
 //   - `vertices`         : merged shared vertex heap (streamer takes ownership)
 //   - `meshlets/verts/tris`: merged global meshlet heaps (uploaded to GPU)
 //   - `draws`            : geometry-only GpuDrawInfo records (LOD ranges + bounds; the pass fills

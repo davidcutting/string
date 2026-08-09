@@ -5,15 +5,15 @@
 
 #include <string/ui/layout.hpp>
 
-// UI interaction state (brief 12 M0b). Promoted out of the sandbox UI pass so the panel layer above
-// it (dock drags, splitters, tab bars — all engine) has something to compile against.
+// UI interaction state (brief 12 M0b), for the engine panel layer above it (dock drags, splitters,
+// tab bars).
 //
 // ARCHITECTURAL CONSTRAINT, LOAD-BEARING — do not relax without re-opening the brief-12 decision:
 // `interaction` is a PLAIN VALUE TYPE. No back-pointer to the pass, no callbacks into the host, no
-// ownership, no platform types. Brief 12 deliberately deferred "engine owns a ui::host" (option 3)
-// in favour of "engine owns the STATE, the app owns the PRODUCER" (option 2); the deferral is only
-// cheap while this stays a value. The moment it grows a `UIPass&` the deferred step becomes a
-// rewrite instead of a move. Keeping it a value is also what makes L1 unit-testable with no device.
+// ownership, no platform types. Brief 12 deferred "engine owns a ui::host" in favour of "engine owns
+// the STATE, the app owns the PRODUCER", and that deferral is only cheap while this stays a value —
+// the moment it grows a `UIPass&` the deferred step becomes a rewrite rather than a move. Being a
+// value is also what makes this unit-testable with no device.
 //
 // The host fills `interaction_input` in ONE crossing function and calls the two resolvers below;
 // everything else in the engine reads `interaction` and never talks to the host at all.
@@ -121,13 +121,12 @@ struct interaction
     // walking up from the focused element to the first ancestor-or-self that declares it handles
     // that action, stopping at a modal scope.
     //
-    // ARBITRATION LIVES HERE, not in the widgets, for exactly the reason it does for the wheel: with
-    // a text field inside a dialog inside a panel, precisely one of them must act on Enter, and
-    // "whoever checks first" is not a rule — it is a bug that depends on authoring order. Resolving
-    // to a single target makes consumption structural: there is no second claimant to lose a race to.
+    // ARBITRATION LIVES HERE, not in the widgets: with a text field inside a dialog inside a panel,
+    // precisely one must act on Enter, and "whoever checks first" is a bug that depends on authoring
+    // order. Resolving to a single target leaves no second claimant to lose a race to.
     //
-    // A fixed array rather than a map because the vocabulary is closed and tiny, and because
-    // `interaction` must stay a plain, trivially copyable value (see the note at the top).
+    // A fixed array rather than a map: the vocabulary is closed and tiny, and `interaction` must stay
+    // a plain, trivially copyable value (see the note at the top).
     std::uint64_t action_target[static_cast<std::size_t>(ui_action::count)]{};
 
     // Text entry for this frame, forwarded verbatim. Only the FOCUSED widget should consume it.

@@ -295,9 +295,8 @@ ui_pass::ui_pass(engine_context& context, VkSampleCountFlagBits samples,
     // --- Dynamic SDF atlas: an R8 sampled image, seeded here and re-uploaded (whole atlas) by the
     // declared ui.atlas_upload transfer pass on any frame the atlas grew. ---
     //
-    // The sampler is part of the image now (brief 20): LINEAR/LINEAR with NEAREST mip mode and
-    // CLAMP_TO_EDGE, no anisotropy, transparent-black border — exactly the configuration this pass
-    // used to create by hand and force in through the deleted update_texture().
+    // The sampler is part of the image: LINEAR/LINEAR with NEAREST mip mode and CLAMP_TO_EDGE, no
+    // anisotropy, transparent-black border.
     atlas_upload_bytes_ = static_cast<std::uint32_t>(atlas_->pixels_size());
     atlas_image_ = allocator_.create_resource(::string::gpu::image_info{
         .extent = { atlas_->atlas_w(), atlas_->atlas_h(), 1 },
@@ -816,9 +815,8 @@ void ui_pass::tick(float delta_time, VkExtent2D screen, std::uint32_t frame_slot
 
 // Author onto the graph. The glyph atlas is the pass's own image, so it enters the graph as a
 // PERSISTENT resource — the graph manages its usage, never its lifetime — and the two declarations
-// below are what the write->read edge is derived from. The upload used to sit in record_compute()
-// wrapped in a hand-rolled SHADER_READ->TRANSFER_DST / TRANSFER_DST->SHADER_READ barrier pair; both
-// are deleted. The first is derived from ui.atlas_upload's transfer_write against the tracked state
+// below are what the write->read edge is derived from. The first is derived from ui.atlas_upload's
+// transfer_write against the tracked state
 // (which now carries across the frame boundary, so it also covers the cross-frame WAR against LAST
 // frame's text draw); the second from this pass's sampled read of the same handle.
 void ui_pass::declare(::string::frame_graph& fg, ::string::gpu::image target)
