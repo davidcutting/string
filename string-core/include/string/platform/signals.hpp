@@ -1,6 +1,6 @@
 #pragma once
 
-#include <string/core/platform_detection.hpp>
+#include <string/platform/platform_detection.hpp>
 #include <string/core/logger.hpp>
 #include <atomic>
 

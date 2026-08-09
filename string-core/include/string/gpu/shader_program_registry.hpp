@@ -48,8 +48,6 @@ public:
     // ones via `retire`. Call once per frame before recording. Cheap when nothing reloaded.
     void apply_pending_swaps(const retire_fn& retire);
 
-    // True if any program currently holds a compile error (drives the overlay's visibility).
-    bool has_errors() const;
     // Snapshot of all current compile errors, for the overlay.
     std::vector<compile_error> current_errors() const;
 

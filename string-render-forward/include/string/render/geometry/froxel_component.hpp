@@ -84,7 +84,6 @@ public:
     //   .tile_pixels = kFroxelTileSize, .bytes_per_tile = froxel_component::bytes_per_tile()
     static uint32_t tiles_x(VkExtent2D screen);
     static uint32_t tiles_y(VkExtent2D screen);
-    static uint32_t froxel_count(VkExtent2D screen);
     static VkDeviceSize bytes_per_tile();
 
 private:

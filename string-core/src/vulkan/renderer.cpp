@@ -45,7 +45,7 @@ struct RENDERDOC_API_1_1_2
 #include <string/gpu/resource.hpp>
 #include <string/gpu/resource_allocator.hpp>
 #include <string/gpu/presenter.hpp>
-#include <string/core/platform_detection.hpp>
+#include <string/platform/platform_detection.hpp>
 #include <string/core/logger.hpp>
 #include <string/gpu/command_recorder.hpp>
 #include <string/gpu/queue.hpp>

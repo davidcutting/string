@@ -34,7 +34,6 @@ public:
     pipeline_builder& operator=(const pipeline_builder&) = delete;
 
     // shader stages (SPIR-V from disk — the legacy glslang path)
-    pipeline_builder& add_compute_shader(const std::filesystem::path& resource_path);
     pipeline_builder& add_vertex_shader(const std::filesystem::path& resource_path);
     pipeline_builder& add_fragment_shader(const std::filesystem::path& resource_path);
 

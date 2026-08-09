@@ -1,6 +1,6 @@
-#include <string/core/user_dirs.hpp>
+#include <string/platform/user_dirs.hpp>
 
-#include <string/core/platform_detection.hpp>
+#include <string/platform/platform_detection.hpp>
 
 #ifdef STRING_PLATFORM_WINDOWS
     #include <windows.h>

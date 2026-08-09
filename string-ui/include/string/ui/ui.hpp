@@ -211,7 +211,6 @@ public:
 
 private:
     void emit_leaf();
-    void fire_events();
 
     Ui& ui_;
     struct element element_{};

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <string/core/logger.hpp>
-#include <string/core/platform_detection.hpp>
+#include <string/platform/platform_detection.hpp>
 #include <string/core/app_info.hpp>
 #include <string/platform/window.hpp>
 

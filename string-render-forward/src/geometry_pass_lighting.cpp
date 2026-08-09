@@ -190,52 +190,6 @@ void geometry_pass::compute_cascades()
     }
 }
 
-void geometry_pass::build_light_stress_scene(const glm::vec3& aabb_min, const glm::vec3& aabb_max)
-{
-    // Hundreds of colored point + spot lights orbiting over the model — the brief's light stress test
-    // bed. Deterministic pseudo-random placement so runs are comparable. Radii/intensities sized to
-    // the scene so froxel binning is meaningfully exercised without washing everything out.
-    constexpr uint32_t kStressLights = 384;
-    const glm::vec3 extent = aabb_max - aabb_min;
-    const glm::vec3 center = (aabb_min + aabb_max) * 0.5f;
-    const float scene_scale = glm::length(extent);
-    const float light_range = scene_scale * 0.06f;
-
-    uint32_t seed = 0x1234567u;
-    auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / static_cast<float>(0xFFFFFF); };
-
-    lights_.clear();
-    light_anim_.clear();
-    lights_.reserve(kStressLights);
-    light_anim_.reserve(kStressLights);
-    for (uint32_t i = 0; i < kStressLights; ++i)
-    {
-        const bool spot = (i % 4) == 0;
-        // A warm/saturated palette so overlapping lights read distinctly.
-        const glm::vec3 color = glm::vec3(0.4f + 0.6f * rnd(), 0.4f + 0.6f * rnd(), 0.4f + 0.6f * rnd());
-        LightAnim a;
-        a.center = center + glm::vec3((rnd() - 0.5f) * extent.x, aabb_min.y + extent.y * (0.15f + 0.5f * rnd()),
-                                      (rnd() - 0.5f) * extent.z);
-        a.radius = extent.x * (0.05f + 0.25f * rnd());
-        a.speed = (0.3f + 1.2f * rnd()) * (rnd() > 0.5f ? 1.0f : -1.0f);
-        a.phase = rnd() * 6.2831853f;
-        a.height = extent.y * 0.15f * rnd();
-        light_anim_.push_back(a);
-
-        GpuLight L{};
-        L.position_radius = glm::vec4(a.center, light_range);
-        // Brief 07 M4 units: luminous intensity in kilocandela (illuminance = I/d^2 in klx).
-        // Stress lights are deliberately floodlight-class so they still read against daylight.
-        L.color_intensity = glm::vec4(color, spot ? 300.0f : 150.0f);
-        const glm::vec3 dir = glm::normalize(glm::vec3(rnd() - 0.5f, -1.0f, rnd() - 0.5f));
-        L.direction_type = glm::vec4(dir, spot ? 1.0f : 0.0f);
-        L.cone = glm::vec4(std::cos(glm::radians(18.0f)), std::cos(glm::radians(30.0f)), 0.0f, 0.0f);
-        lights_.push_back(L);
-    }
-    STRING_LOG_INFO("[light] stress scene: {} lights ({} spot), range {:.2f}",
-                    lights_.size(), kStressLights / 4, light_range);
-}
-
 void geometry_pass::animate_lights(float delta_time)
 {
     static float t = 0.0f;

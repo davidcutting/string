@@ -62,7 +62,6 @@ public:
     // max_detail is the finest available; min_detail is the pinned floor that is never evicted.
     void register_resource(resource_id id, residency_provider& provider, std::uint32_t min_detail,
                            std::uint32_t max_detail, std::uint32_t initial_detail);
-    void unregister_resource(resource_id id);
 
     // Called each frame for every visible resource: request `detail` (clamped to [min,max]) and
     // stamp it visible at `frame` (drives LRU). Resources not want()'d this frame keep their prior
@@ -97,9 +96,6 @@ private:
         std::uint64_t last_visible_frame = 0;
     };
 
-    // Bytes an entry currently commits to VRAM: while streaming it already reserves the target
-    // detail's cost (so promotions don't over-commit the budget before completion).
-    VkDeviceSize committed_cost(entry& e) const;
     // Evict the single least-recently-visible evictable entry's finer detail down to its floor.
     // Returns false when nothing more can be evicted (all pinned / streaming / visible this frame).
     bool evict_one(std::uint64_t frame);

@@ -54,11 +54,6 @@ uint32_t froxel_component::tiles_y(VkExtent2D screen)
     return (screen.height + kFroxelTileSize - 1) / kFroxelTileSize;
 }
 
-uint32_t froxel_component::froxel_count(VkExtent2D screen)
-{
-    return tiles_x(screen) * tiles_y(screen) * kFroxelDepthSlices;
-}
-
 // One [count, light indices...] record per froxel, and one froxel COLUMN (kFroxelDepthSlices deep)
 // per screen tile. The app declares the buffer as `tile_pixels` + this, which is the same fact
 // without a callback in the middle.

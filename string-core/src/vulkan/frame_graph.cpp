@@ -191,7 +191,6 @@ gpu::image frame_graph::use_persistent(const persistent_image_info& info)
     r.transient = false;
     r.swapchain = info.swapchain;
     r.initial_layout = info.initial_layout;
-    r.per_frame = info.physical.size() > 1;
     r.physical = info.physical;
     r.neutral = info.neutral;
     images_.push_back(std::move(r));
@@ -203,15 +202,14 @@ gpu::buffer frame_graph::use_persistent(const persistent_buffer_info& info)
     buffer_record r;
     r.name = info.name;
     r.transient = false;
-    r.per_frame = info.physical.size() > 1;
     r.physical = info.physical;
     buffers_.push_back(std::move(r));
     return gpu::buffer{ static_cast<std::uint32_t>(buffers_.size() - 1) };
 }
 
 // Re-backing that changes the id SET is only ever part of a resize, and compiled_frame::resize
-// unbinds and re-binds every declared slot wholesale — so there is nothing for these to do beyond
-// swapping the ids and refusing to do it mid-frame.
+// unbinds and re-binds every declared slot wholesale — so there is nothing to do beyond swapping
+// the ids and refusing to do it mid-frame.
 void frame_graph::set_images(gpu::image h, std::span<const gpu::resource_id> physical)
 {
     if (executing_)
@@ -223,19 +221,6 @@ void frame_graph::set_images(gpu::image h, std::span<const gpu::resource_id> phy
     }
     image_record& r = images_[h.index];
     r.physical.assign(physical.begin(), physical.end());
-    r.per_frame = physical.size() > 1;
-}
-
-void frame_graph::set_buffers(gpu::buffer h, std::span<const gpu::resource_id> physical)
-{
-    if (executing_)
-    {
-        STRING_LOG_ERROR("[graph] set_buffers on '{}' during execute", buffers_[h.index].name);
-        return;
-    }
-    buffer_record& r = buffers_[h.index];
-    r.physical.assign(physical.begin(), physical.end());
-    r.per_frame = physical.size() > 1;
 }
 
 gpu::image frame_graph::image(const transient_image_info& info)
@@ -941,11 +926,6 @@ void compiled_frame::compute_survivors()
     }
 }
 
-bool compiled_frame::ran(std::uint32_t order_index) const
-{
-    return order_index < order_.size() && alive_[order_[order_index]];
-}
-
 gpu::resource_id compiled_frame::physical(gpu::image h, std::uint32_t slot) const
 {
     if (!h.valid() || h.index >= graph_->images_.size()) return 0;
@@ -954,7 +934,8 @@ gpu::resource_id compiled_frame::physical(gpu::image h, std::uint32_t slot) cons
     // frame. Nothing resolves it as a resource; the executor binds swapchain_image_/_view_ directly.
     if (r.swapchain) return 0;
     if (r.physical.empty()) return 0;
-    return r.physical[r.per_frame ? slot % r.physical.size() : 0];
+    // Single-backed resolves to [0] on its own: slot % 1 == 0. A ring resolves by slot.
+    return r.physical[slot % r.physical.size()];
 }
 
 gpu::resource_id compiled_frame::physical(gpu::buffer h, std::uint32_t slot) const
@@ -962,7 +943,7 @@ gpu::resource_id compiled_frame::physical(gpu::buffer h, std::uint32_t slot) con
     if (!h.valid() || h.index >= graph_->buffers_.size()) return 0;
     const frame_graph::buffer_record& r = graph_->buffers_[h.index];
     if (r.physical.empty()) return 0;
-    return r.physical[r.per_frame ? slot % r.physical.size() : 0];
+    return r.physical[slot % r.physical.size()];
 }
 
 gpu::resource_allocator& compiled_frame::allocator() const { return ctx_->allocator; }

@@ -106,25 +106,6 @@ pipeline_builder::~pipeline_builder()
         vkDestroyShaderModule(device_.get_device(), mesh_shader_module_, nullptr);
 }
 
-pipeline_builder& pipeline_builder::add_compute_shader(const std::filesystem::path& resource_path)
-{
-    compute_shader_module_ = string::vku::load_shader_from_disk(device_.get_device(), resource_path);
-
-    // clang-format off
-    VkPipelineShaderStageCreateInfo compute_shader_stage_info = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = compute_shader_module_,
-        .pName = "main",
-        .pSpecializationInfo = nullptr
-    };
-    compute_shader_stage_info_ = compute_shader_stage_info;
-    // clang-format on
-    return *this;
-}
-
 pipeline_builder& pipeline_builder::add_vertex_shader(const std::filesystem::path& resource_path)
 {
     vertex_shader_module_ = string::vku::load_shader_from_disk(device_.get_device(), resource_path);

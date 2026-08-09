@@ -3,7 +3,7 @@
 #include <string/vulkan/content_root.hpp>
 #include <string/core/cvar.hpp>
 #include <string/core/logger.hpp>
-#include <string/core/signals.hpp>
+#include <string/platform/signals.hpp>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>

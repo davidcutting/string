@@ -585,36 +585,9 @@ VkFormat device::get_format_support(const std::vector<VkFormat>& candidates, con
     throw std::runtime_error("Failed to find supported format!");
 }
 
-uint32_t device::get_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties)
-{
-    VkPhysicalDeviceMemoryProperties memory_properties;
-    vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties);
-
-    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
-        if ((type_filter & (1 << i)) && (memory_properties.memoryTypes[i].propertyFlags & properties) == properties) {
-            return i;
-        }
-    }
-
-    throw std::runtime_error("failed to find suitable memory type!");
-}
-
 VkPhysicalDeviceLimits device::get_physical_device_limits()
 {
     return properties_.limits;
-}
-
-VkFormat device::get_depth_format() {
-    // clang-format off
-    return get_format_support(
-        {
-            VK_FORMAT_D32_SFLOAT,
-            VK_FORMAT_D32_SFLOAT_S8_UINT,
-            VK_FORMAT_D24_UNORM_S8_UINT
-        },
-        VK_IMAGE_TILING_OPTIMAL,
-        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
-    // clang-format on
 }
 
 VkSurfaceKHR device::get_surface() const

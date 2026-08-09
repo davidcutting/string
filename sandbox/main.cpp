@@ -6,7 +6,7 @@
 #include <string/core/logger.hpp>
 
 #include <string/core/cvar.hpp>
-#include <string/core/user_dirs.hpp>
+#include <string/platform/user_dirs.hpp>
 #include <string/client/theme.hpp>
 #include <string/debug/debug_cvars.hpp>
 #include <string/render/render_cvars.hpp>

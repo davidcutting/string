@@ -74,7 +74,6 @@ public:
     // here each frame; exposure_scale() uses it while r.exposure.auto (STRING_EXPOSURE_AUTO) is
     // on. Before the first publish (warmup) the manual CVar value is used.
     static void set_auto_ev100(float ev100);
-    static bool auto_exposure_enabled();
 
     // Calibration override: while active, exposure_scale() uses THIS EV100 and ignores both the
     // manual CVar and auto-exposure. The white-furnace test pins EV100 = log2(1000/1.2) (~9.70,

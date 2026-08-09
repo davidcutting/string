@@ -276,8 +276,6 @@ class geometry_pass final : private GeometryScene
     // (brief 11 P2).
     // Forward+ froxel light-binning is its own FroxelPass now (brief 11 step 3); the component it owns
     // is published into GeometryScene (scene().froxel) so SceneData can read its grid dims + address.
-    // Light stress scene: hundreds of moving colored lights orbiting over the model (test bed).
-    void build_light_stress_scene(const glm::vec3& aabb_min, const glm::vec3& aabb_max);
     void animate_lights(float delta_time);
     struct LightAnim { glm::vec3 center; float radius; float speed; float phase; float height; };
     std::vector<LightAnim> light_anim_;
@@ -555,13 +553,6 @@ public:
     void record_reset_stats(string::pass_context& ctx);
     void record_reset_visbits(string::pass_context& ctx);
     void record_phase2(string::pass_context& ctx);
-    // Brief 11 M2: the cascaded shadow-map depth render. Extracted from record_compute into its own
-    // public method so the standalone ShadowPass (a scheduling seam, like GtaoPass) can schedule it —
-    // Brief 11 M2: probe-GI capture (run-once, load-time) + relight (amortized). Extracted from the
-    // head of record_compute into its own public method so the standalone GiPass (a scheduling seam)
-    // can schedule it in the compute prepass — ordered after IblPass (this frame's SH) and before
-    // ShadowPass (the relight->shadow-write WAR edge). All barriers are internal; byte-identical.
-    bool record_gi_if_enabled(::string::gpu::command_recorder& recorder, uint16_t current_frame);
     bool two_phase_active() const { return two_phase_active_; }
     // Brief 11 step 3: hand out the shared scene state (the privately-inherited GeometryScene) so the
     // decomposed sub-passes (sky, ... ) reference it directly instead of reaching back into GeometryPass.

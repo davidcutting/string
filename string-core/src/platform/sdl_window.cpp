@@ -1,6 +1,6 @@
 #include <string/platform/window.hpp>
 #include <string/core/logger.hpp>
-#include <string/core/platform_detection.hpp>
+#include <string/platform/platform_detection.hpp>
 #include <cassert>
 #include <stdexcept>
 #include <entt/entt.hpp>
@@ -501,12 +501,6 @@ void Window::set_size(const View::Extent& extent)
 {
     SDL_SetWindowSize((SDL_Window*)window_handle_, static_cast<int>(extent.width),
                       static_cast<int>(extent.height));
-}
-
-void* Window::get_native_handle() const
-{
-    assert(window_handle_ && "Window is null");
-    return window_handle_;
 }
 
 VkSurfaceKHR Window::create_surface(const VkInstance& instance)

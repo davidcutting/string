@@ -5,7 +5,7 @@
 
 #include <string/core/cvar.hpp>
 #include <string/core/logger.hpp>
-#include <string/core/user_dirs.hpp>
+#include <string/platform/user_dirs.hpp>
 
 namespace string
 {

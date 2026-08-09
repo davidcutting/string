@@ -2,7 +2,6 @@
 
 #include <string_view>
 #include <string/core/logger.hpp>
-#include <string/vulkan/render_data.hpp>
 #include <string/gpu/resource.hpp>
 #include <vector>
 #include <fstream>
@@ -91,8 +90,6 @@ inline VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugU
         return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
 }
-
-void load_model(const std::filesystem::path& model_path, std::vector<Vertex>& vertex_buffer, std::vector<uint32_t>& index_buffer);
 
 inline void DestroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerEXT debugMessenger,
                                           const VkAllocationCallbacks* pAllocator) {

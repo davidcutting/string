@@ -258,8 +258,7 @@ public:
     gpu::buffer use_persistent(const persistent_buffer_info& info);
     // Re-point a persistent handle at fresh backing (the reference doc's TaskImage::set_images).
     // This is how a resize reaches the graph: the declarations never change, only the backing.
-    void set_images (gpu::image h,  std::span<const gpu::resource_id> physical);
-    void set_buffers(gpu::buffer h, std::span<const gpu::resource_id> physical);
+    void set_images(gpu::image h, std::span<const gpu::resource_id> physical);
 
     // Graph-owned, frame-scoped, aliasable.
     gpu::image  image (const transient_image_info& info);
@@ -289,7 +288,6 @@ private:
         std::string name;
         bool transient = false;
         bool swapchain = false;
-        bool per_frame = false;
         VkImageLayout initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         std::vector<gpu::resource_id> physical;   // 1, or one per frame slot
         transient_image_info info{};              // transient only (re-created on resize)
@@ -307,7 +305,6 @@ private:
     {
         std::string name;
         bool transient = false;
-        bool per_frame = false;
         std::vector<gpu::resource_id> physical;
         transient_buffer_info info{};
     };
@@ -397,20 +394,13 @@ public:
     // the declarations are unchanged, only the backing. Caller waits for device idle first.
     void resize(string::engine_context& ctx, VkExtent2D viewport);
 
-    // Did the executor skip `pass_index` (order index) this frame? For introspection/timing.
-    bool ran(std::uint32_t order_index) const;
-
     const std::vector<std::uint32_t>& order() const { return order_; }
     const std::vector<render_group>& groups() const { return groups_; }
     frame_graph* graph() const { return graph_; }
 
-    // Total bytes the graph allocated for transients (reported after compile; the aliasing win).
-    VkDeviceSize transient_bytes() const { return transient_bytes_; }
-
     // Resolve a handle's backing for a frame slot. Public for the debug capture path, which has to
     // reach a real image; pass code resolves through pass_context instead.
     gpu::resource_id physical_of(gpu::image h, std::uint32_t slot) const { return physical(h, slot); }
-    gpu::resource_id physical_of(gpu::buffer h, std::uint32_t slot) const { return physical(h, slot); }
 
     // Hand back everything this frame OWNS (bindless slots, cached views, transient backing) while
     // leaving the declarations alone. A resize calls it and re-materializes; a SCENE SWITCH calls it

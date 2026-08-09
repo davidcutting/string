@@ -79,7 +79,6 @@ public:
     // action performed once. The read side IS on Input, cached — see Input::clipboard_text.
     void set_clipboard_text(std::string_view text);
 
-    void* get_native_handle() const;
     VkSurfaceKHR create_surface(const VkInstance& instance);
     std::vector<const char*> get_platform_extensions(bool enable_validation_layers);
 

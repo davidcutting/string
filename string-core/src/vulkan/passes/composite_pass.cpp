@@ -371,11 +371,6 @@ void composite_pass::set_auto_ev100(float ev100)
     s_auto_valid = true;
 }
 
-bool composite_pass::auto_exposure_enabled()
-{
-    return exposure_auto_cvar().get();
-}
-
 glm::vec3 composite_pass::encode_display(glm::vec3 hdr)
 {
     const glm::vec3 exposed = glm::max(hdr, glm::vec3(0.0f)) * exposure_scale();

@@ -37,11 +37,6 @@ void residency_manager::register_resource(resource_id id, residency_provider& pr
     entries_[id] = e;
 }
 
-void residency_manager::unregister_resource(resource_id id)
-{
-    entries_.erase(id);
-}
-
 void residency_manager::want(resource_id id, std::uint32_t detail, resource_priority priority,
     std::uint64_t frame)
 {
@@ -64,14 +59,6 @@ void residency_manager::release(resource_id id)
         return;
     }
     it->second.desired = it->second.min_detail;
-}
-
-VkDeviceSize residency_manager::committed_cost(entry& e) const
-{
-    // While streaming, the target detail is already reserved so the budget accounts for in-flight
-    // uploads before they land; otherwise the resident detail is what occupies VRAM.
-    const std::uint32_t detail = (e.status == stream_status::STREAMING) ? e.streaming_to : e.resident;
-    return e.provider->cost(e.id, detail);
 }
 
 VkDeviceSize residency_manager::resident_bytes() const

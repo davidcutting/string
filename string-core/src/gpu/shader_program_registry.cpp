@@ -111,18 +111,6 @@ void shader_program_registry::apply_pending_swaps(const retire_fn& retire)
     }
 }
 
-bool shader_program_registry::has_errors() const
-{
-    for (const auto& p : programs_)
-    {
-        if (p->error_)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
 std::vector<compile_error> shader_program_registry::current_errors() const
 {
     std::vector<compile_error> errors;

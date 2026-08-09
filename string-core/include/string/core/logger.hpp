@@ -10,7 +10,7 @@
 #include <string_view>
 #include <mutex>
 #include <vector>
-#include <string/core/platform_detection.hpp>
+#include <string/platform/platform_detection.hpp>
 
 namespace string
 {

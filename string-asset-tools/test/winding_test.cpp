@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>   // glm::scale — was arriving transitively via render_data.hpp
 
 #include <string/asset/tools/bake.hpp>
 #include <string/asset/cooked_format.hpp>

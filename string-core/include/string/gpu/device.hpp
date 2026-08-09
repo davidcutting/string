@@ -6,7 +6,7 @@
 #include <vector>
 #include <string/platform/window.hpp>
 #include <string/gpu/driver.hpp>
-#include <string/core/platform_detection.hpp>
+#include <string/platform/platform_detection.hpp>
 #include <string/gpu/command_recorder.hpp>
 #include <string/gpu/queue.hpp>
 
@@ -28,8 +28,6 @@ public:
 
     swap_chain_support_details get_swap_chain_support();
     VkFormat get_format_support(const std::vector<VkFormat>& candidates, const VkImageTiling& tiling, const VkFormatFeatureFlags& features);
-    VkFormat get_depth_format();
-    uint32_t get_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties);
     VkPhysicalDeviceLimits get_physical_device_limits();
     queue_family_indices get_queue_families();
 
