@@ -46,9 +46,9 @@ using namespace string;
 namespace
 {
 
-// The renderer's debug keys, interned once. Bind and query both go through these constants, so a
-// typo is a compile error rather than an action that silently never fires — which is exactly the
-// failure mode a stringly-typed query has, and it is silent in both directions.
+// The renderer's debug keys, interned once. Queries use these constants so a typo is a compile
+// error; binding goes through the string overload deliberately (brief 17: that is what registers the
+// name the rebinding UI reads back).
 namespace debug_actions
 {
 inline constexpr ::string::ActionId freeze_culling   = ::string::action_id("freeze_culling");
@@ -799,14 +799,8 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     // position itself to fit. Bind the conventional fly controls (WASD + Space/Ctrl + Shift) onto
     // the shared InputMap so update() can read them by action name.
     string::Camera::bind_default_controls(input_map_);
-    // BIND BY NAME, QUERY BY ID. The string overload is what registers the human-readable name for
-    // the rebinding UI and debug output; it interns to exactly the constants in `debug_actions`
-    // above, which is what the per-frame queries use.
-    // Debug: F freezes/unfreezes the culling frustum, C toggles culling off entirely (see update()).
     input_map_.bind_button("freeze_culling", string::KeyCode::F);
     input_map_.bind_button("toggle_culling", string::KeyCode::C);
-    // Brief 03 debug keys: O toggles HiZ occlusion, V cycles debug views
-    // (none/meshlet/LOD/occlusion-reject), K spawns the crowd stress scene, G toggles LOD select.
     input_map_.bind_button("toggle_hiz", string::KeyCode::O);
     input_map_.bind_button("cycle_debug_view", string::KeyCode::V);
     input_map_.bind_button("toggle_crowd", string::KeyCode::K);
@@ -1105,57 +1099,6 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
         camera_.update(input_map_, 0.0f, aspect);
     }
 
-    // Debug GPU readback (STRING_MESHLET_READBACK=1): memcmp GPU meshlet buffers vs CPU arrays
-    // well after the load-time uploads drained. Reports the first divergent offset per buffer.
-    if (meshlet_readback_pending_ && stream_frame_ == 50)
-    {
-        meshlet_readback_pending_ = false;
-        vkDeviceWaitIdle(device_.get_device());
-        auto check = [&](const char* name, ::string::gpu::resource_id id, const void* cpu, VkDeviceSize size) {
-            const ::string::gpu::resource_id staging = allocator_.create_resource(::string::gpu::buffer_info{
-                .size = size,
-                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
-                .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
-                                  | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
-            });
-            ::string::gpu::command_recorder rec;
-            rec.init(device_.get_device(), device_.get_queue(::string::gpu::queue_type::GRAPHICS));
-            VkCommandBuffer cb = rec.begin();
-            const VkBufferCopy region = { 0, 0, size };
-            vkCmdCopyBuffer(cb, allocator_.get_buffer(id).buffer,
-                            allocator_.get_buffer(staging).buffer, 1, &region);
-            rec.end().immediate_submit();
-            rec.destroy();
-            const uint8_t* gpu = static_cast<const uint8_t*>(
-                allocator_.get_buffer(staging).allocation_info.pMappedData);
-            const uint8_t* ref = static_cast<const uint8_t*>(cpu);
-            VkDeviceSize first_bad = size, bad_bytes = 0;
-            for (VkDeviceSize i = 0; i < size; ++i)
-                if (gpu[i] != ref[i]) { if (first_bad == size) first_bad = i; ++bad_bytes; }
-            if (bad_bytes)
-                STRING_LOG_WARN("[readback] {} CORRUPT: {} of {} bytes differ, first at {}",
-                                name, bad_bytes, size, first_bad);
-            else
-                STRING_LOG_INFO("[readback] {} clean ({} bytes)", name, size);
-            allocator_.destroy_resource(staging);
-        };
-        check("meshlets", meshlet_buffer_, meshlet_model_.meshlets.data(),
-              sizeof(GpuMeshlet) * meshlet_model_.meshlets.size());
-        check("meshlet_vertices", meshlet_vertices_, meshlet_model_.meshlet_vertices.data(),
-              sizeof(uint32_t) * meshlet_model_.meshlet_vertices.size());
-        check("meshlet_triangles", meshlet_triangles_, meshlet_model_.meshlet_triangles.data(),
-              sizeof(uint32_t) * meshlet_model_.meshlet_triangles.size());
-        // What the GPU actually reads per draw: the MAPPED DrawInfo (post-fill, live).
-        for (uint32_t d = 79; d < 87 && draw_info_mapped_; ++d)
-        {
-            const GpuDrawInfo& mi = draw_info_mapped_[d];
-            STRING_LOG_INFO("[mapped] draw {} model[3] ({:.2f},{:.2f},{:.2f}) resident {} lod0 off {} cnt {} lod_count {}",
-                d, mi.model[3].x, mi.model[3].y, mi.model[3].z, mi.resident,
-                mi.lods[0].meshlet_offset, mi.lods[0].meshlet_count, mi.lod_count);
-        }
-    }
-
     // Toggle the debug frozen culling frustum. On freeze, snapshot the current view-projection;
     // the camera keeps moving but the cull test stays against the snapshot, so culled geometry
     // becomes visible as it leaves the frozen view.
@@ -1225,14 +1168,10 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
     // Brief 07 furnace test lever (r.furnace): shader-side it forces a uniform white environment
     // + white albedo and skips sun/local lights; here it also drives the IBL capture + sky pass.
     furnace_ = cv_furnace().get();
-    // Brief 09 fix: the furnace PINS the exposure (beats auto AND manual) so the radiance-1
-    // furnace environment renders flat WHITE — under scene exposure it reads as uniform grey,
-    // defeating the visual gate. The pin targets exposed = 4.0 (EV ~7.70), NOT 1.0: filmic-style
-    // output transforms map scene 1.0 to only ~80-85% display (the shoulder reserves headroom
-    // above scene-white; the aces2 CAM DRT sits lower still), so an exposed-1.0 furnace showed as
-    // light grey. Two stops above reference white lands the flat field at display white
-    // (>= ~0.96 sRGB) through BOTH tonemap curves while staying on the shoulder rather than hard
-    // clip, so non-uniformities (the gate's actual signal) remain visible.
+    // The furnace PINS exposure (over auto AND manual) so a radiance-1 environment reads as flat
+    // white, not grey. Target is exposed = 4.0, NOT 1.0: filmic transforms map scene 1.0 to only
+    // ~80-85% display, so two stops up lands the flat field at display white through both tonemap
+    // curves while staying on the shoulder — non-uniformities, the gate's actual signal, stay visible.
     string::composite_pass::set_exposure_override(std::log2(1000.0f / (1.2f * 4.0f)), furnace_);
     // Drive the sun direction + sky palette from the time of day, then refit the cascades to the live
     // camera + sun. Both move, so the cascades are recomputed every frame (stabilization keeps them
@@ -1249,25 +1188,10 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
         animate_lights(delta_time);
     }
 
-    // Brief 07: amortized IBL update trigger. The chain re-runs only when the sun has moved more
-    // than ~0.1 deg since the last capture (TOD scrub/animation -> every frame; static sun ->
-    // never), when the furnace lever flips, or on the first frame. dbg.ibl_every_frame forces the
-    // worst case for cost measurement.
-    // IBL update trigger + numeric verification moved to IblPass::update (brief 11 step 3).
-
-    // Brief 09b: the probe relight trigger + debug-sphere snapshot live in ProbeGi::update_debug_mode,
-    // driven from GiPass::update.
-
-    // Residency feedback — textures and geometry driven by the SAME per-draw frustum visibility.
-    //  - Textures: every streamed texture is pinned to its coarse-tail floor (so the whole scene is
-    //    blurry-but-real), and each *visible* draw raises its base-color texture toward the mip its
-    //    on-screen coverage needs (screen-coverage LOD). The finest request across all draws sharing
-    //    a texture wins; it's aggregated in frame_desired_detail_ and issued once per texture below.
-    //    Textures are never released — re-reading from disk on return is cheap but their VRAM fits —
-    //    so once resolved they stay.
-    //  - Geometry (only when streaming, i.e. the model doesn't fit): want visible draws, release the
-    //    rest, so off-screen geometry is evicted and its heap space reused. begin_frame() first
-    //    reclaims ranges whose deferred-free window has elapsed.
+    // Residency feedback — textures and geometry both driven by the SAME per-draw frustum visibility.
+    // Textures: pinned to a coarse-tail floor, raised toward each visible draw's screen-coverage mip
+    // (finest request wins, aggregated in frame_desired_detail_), and never released. Geometry: only
+    // when streaming, want visible draws and release the rest so their heap space is reused.
     for (std::size_t i = 0; i < texture_lod_.size(); ++i)
     {
         frame_desired_detail_[i] = texture_lod_[i].coarse_detail;  // 0 for non-streamed (stb) textures
@@ -1347,12 +1271,6 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
             logged_full_resident_ = true;
         }
     }
-
-    // Brief 20: SceneData and the light ring are filled at RECORD time now (record_scene_upload),
-    // not here. That is the structural fix for the address-latching crash class: every device
-    // address and bindless slot in SceneData is resolved through pass_context against THIS frame's
-    // backing, while the pass records, instead of being latched during an update() whose ordering
-    // against other passes' update() nothing enforced.
 
     // Crowd built lazily the first time it's enabled once geometry residency is known (so crowd
     // copies inherit the base draws' resident flags). Cheap no-op once active_draw_count_ reflects it.
@@ -1450,12 +1368,6 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
     }
 
     ++stream_frame_;
-
-    // --- Brief 04e M2: declare this frame's inter-phase buffer usages -------------------------
-    // Brief 20: this is where the SECOND declaration channel lived — a `usages` vector rebuilt every
-    // frame, in a different format from the fluent authoring, and the only one that governed
-    // correctness. All of it is deleted. The same facts are declared once in declare(), and the
-    // executor reads the live declarations each frame, so per-frame-slot resources need no restating.
 }
 
 // The three resets are three DECLARED PASSES, because they are three producer-consumer stages with

@@ -67,7 +67,6 @@ private:
     ::string::gpu::descriptor_table* descriptors_ = nullptr;
     GeometryScene* scene_ = nullptr;
     ::string::gpu::shader_program* program_ = nullptr;
-    uint32_t frames_in_flight_ = 0;
 
 };
 

@@ -409,7 +409,6 @@ class geometry_pass final : private GeometryScene
     }
 
     // Runtime state.
-    bool meshlet_readback_pending_ = false;  // STRING_MESHLET_READBACK: GPU-vs-CPU memcmp at frame 50
     bool hiz_enabled_ = true;        // O toggles two-pass HiZ occlusion on the meshlet path
     bool lod_enabled_ = true;        // (LOD select on by default)
     // dbg.orbit motion lever: continuously sways the camera around a captured base pose so headless

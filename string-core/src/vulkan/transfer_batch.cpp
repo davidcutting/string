@@ -8,9 +8,8 @@
 namespace string
 {
 
-TransferBatch::TransferBatch(string::gpu::device& device, string::gpu::resource_allocator& allocator)
-: device_(device)
-, allocator_(allocator)
+TransferBatch::TransferBatch(string::gpu::resource_allocator& allocator)
+: allocator_(allocator)
 {
 }
 

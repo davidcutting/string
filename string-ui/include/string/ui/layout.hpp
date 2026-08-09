@@ -665,6 +665,9 @@ constexpr int resolve_axis(const axis_sizing& s, int content) noexcept
         case size_mode::FIXED: base = s.value; break;
         case size_mode::FIT:   base = std::max<int>(content, s.value); break;
         case size_mode::GROW:  base = content; break;
+        // Resolved in flex_sizing()'s distribute pass, which set_main()s over this — a per-mille
+        // share of the space left by definite siblings. 0 here IS the answer: percent ignores content.
+        case size_mode::PERCENT: break;
     }
     return std::clamp(base, static_cast<int>(s.min), static_cast<int>(s.max));
 }

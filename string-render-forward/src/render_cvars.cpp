@@ -46,14 +46,6 @@ CVar<float>& cv_lod_error_px()
 }
 
 
-CVar<bool>& cv_meshlet_readback()
-{
-    static CVar<bool> v{"dbg.meshlet_readback", false, "read meshlet buffers back and memcmp after upload"};
-    static const bool a = [] { v.add_alias("meshlet_readback"); return true; }();
-    (void)a;
-    return v;
-}
-
 
 CVar<int32_t>& cv_meshlet_dump()
 {
@@ -521,7 +513,6 @@ void register_render_cvars()
     cv_lod_enabled();
     cv_cull_enabled();
     cv_lod_error_px();
-    cv_meshlet_readback();
     cv_meshlet_dump();
     cv_lights_enabled();
     cv_crowd_enabled();

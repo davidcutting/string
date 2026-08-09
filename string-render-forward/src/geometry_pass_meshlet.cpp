@@ -59,12 +59,6 @@ void geometry_pass::build_meshlet_gpu(engine_context& context)
     meshlet_triangles_ = make_device_buffer(meshlet_model_.meshlet_triangles.data(),
         sizeof(uint32_t) * meshlet_model_.meshlet_triangles.size(), 0);
 
-    // Debug (STRING_MESHLET_READBACK=1): after the transfer batch drains, read each buffer back and
-    // memcmp against the CPU arrays — catches upload corruption that CPU-side validation can't see.
-    if (cv_meshlet_readback().get())
-    {
-        meshlet_readback_pending_ = true;
-    }
     if (const int32_t dump_start = cv_meshlet_dump().get(); dump_start >= 0)
     {
         const uint32_t d0 = uint32_t(dump_start);

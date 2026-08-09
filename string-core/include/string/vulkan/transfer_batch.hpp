@@ -40,7 +40,7 @@ public:
     // retired on the GPU. 0 means "nothing to wait on".
     using upload_ticket = std::uint64_t;
 
-    TransferBatch(string::gpu::device& device, string::gpu::resource_allocator& allocator);
+    explicit TransferBatch(string::gpu::resource_allocator& allocator);
     ~TransferBatch();
 
     TransferBatch(const TransferBatch&) = delete;
@@ -110,7 +110,6 @@ private:
     bool initialized(VkImage image, std::uint32_t base_mip, std::uint32_t count) const;
     void mark_initialized(VkImage image, std::uint32_t base_mip, std::uint32_t count);
 
-    string::gpu::device& device_;
     string::gpu::resource_allocator& allocator_;
 
     std::vector<BufferCopy> buffer_copies_;

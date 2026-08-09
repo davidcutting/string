@@ -120,7 +120,7 @@ renderer::renderer(const string::ApplicationInfo& application_info, std::shared_
 , graphics_queue_(device_.get_queue(gpu::queue_type::GRAPHICS))
 , presenter_(device_, window_, frames_in_flight_)
 , allocator_({ driver_.get_instance(), device_.get_physical_device(), device_.get_device() })
-, transfer_batch_(device_, allocator_)
+, transfer_batch_(allocator_)
 , global_descriptor_table_(device_.get_device(), allocator_)
 , shader_jobs_(1)
 , file_watcher_(shader_jobs_)

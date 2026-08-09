@@ -1177,9 +1177,8 @@ std::function<void(float)> make_geometry_scene(
     // The per-frame tick. Ordinary app code: nothing here resolves a device address or a bindless
     // slot — every one of those is looked up through pass_context while its owning pass records.
     ::string::render::GeometryScene* scene_ptr = scene;
-    string::engine_context* ctx_ptr = &ctx;
     string::renderer* rp = &rr;
-    return [s, scene_ptr, ctx_ptr, rp](float dt) {
+    return [s, scene_ptr, rp](float dt) {
         // The live viewport. This used to arrive via Pass::resize(); with that gone, the scene state
         // carries it and the app is what knows it. Zero here means every viewport-derived layout —
         // the UI most visibly — computes against a 0x0 screen and draws nothing.

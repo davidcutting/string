@@ -29,7 +29,6 @@ void register_render_cvars();
 ::string::core::CVar<bool>&    cv_lod_enabled();      // r.lod.enabled       <- STRING_LOD
 ::string::core::CVar<bool>&    cv_cull_enabled();     // r.cull.enabled      <- STRING_CULL
 ::string::core::CVar<float>&   cv_lod_error_px();     // r.lod.error_px      <- STRING_LOD_PX
-::string::core::CVar<bool>&    cv_meshlet_readback(); // dbg.meshlet_readback<- STRING_MESHLET_READBACK
 ::string::core::CVar<int32_t>& cv_meshlet_dump();     // dbg.meshlet_dump    <- STRING_MESHLET_DUMP (-1 off)
 
 // --- Lighting / scene composition ------------------------------------------------------------

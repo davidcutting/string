@@ -186,12 +186,6 @@ void geometry_pass::compute_cascades()
         // (never under-covers) -> off-cascade casters are safely kept.
         cascade_center_[c] = center;
         cascade_cull_radius_[c] = radius + far_d;
-        // STRING_CSM_LOG=1: per-cascade fit numbers, for A/B against the pre-rewrite renderer.
-        if (std::getenv("STRING_CSM_LOG") != nullptr)
-            STRING_LOG_INFO("[csm] c{} split {:.2f} radius {:.2f} texel {:.4f} center ({:.1f},{:.1f},{:.1f}) "
-                            "L ({:.2f},{:.2f},{:.2f}) near {:.3f} far {:.1f} eye_back {:.1f} far_d {:.1f}",
-                            c, split, radius, texel, center.x, center.y, center.z, L.x, L.y, L.z,
-                            near_clip, far_clip, eye_back, far_d);
         last_split = split;
     }
 }

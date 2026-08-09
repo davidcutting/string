@@ -22,7 +22,6 @@ shadow_maps::shadow_maps(string::engine_context& ctx, GeometryScene* scene)
 , allocator_(&ctx.allocator)
 , descriptors_(&ctx.descriptor_table)
 , scene_(scene)
-, frames_in_flight_(scene->frames_in_flight_)
 {
     // Published so the meshlet culler can reach the per-cascade work lists it FILLS but does not own,
     // and so SceneData can read the cascade count. The cascade IMAGES are no longer published here —

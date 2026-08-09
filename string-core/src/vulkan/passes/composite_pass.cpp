@@ -169,8 +169,8 @@ bool s_override_active = false;
 composite_pass::composite_pass(string::engine_context& ctx, VkFormat color_format)
 : device_(ctx.device)
 , allocator_(ctx.allocator)
-, descriptor_table_(ctx.descriptor_table)
 , transfer_(ctx.transfer)
+, descriptor_table_(ctx.descriptor_table)
 {
     const std::filesystem::path resources_path = ctx.resources_path;
     string::gpu::shader_program_registry& registry = ctx.shader_registry;
@@ -239,7 +239,6 @@ composite_pass::~composite_pass()
         allocator_.destroy_resource(lut_image_);
     }
     const string::gpu::pipeline& p = program_->current();
-    const VkDescriptorSet set = descriptor_table_.get_set();
     vkDestroyPipeline(device_.get_device(), p.pipeline, nullptr);
     vkDestroyPipelineLayout(device_.get_device(), p.pipeline_layout, nullptr);
 }

@@ -102,8 +102,9 @@ void gtao_chain::tick(VkExtent2D extent, uint16_t current_frame)
         && prev < scene_->depth_history_.size() && scene_->depth_history_[prev].valid != 0;
     if (runs_this_frame_) has_output_ = true;
     // STRING_STATS_LOG: name the conjunct keeping GTAO off (one line per second at 60fps).
+    static const bool stats_log = std::getenv("STRING_STATS_LOG") != nullptr;
     static uint32_t gtao_log_frame = 0;
-    if (std::getenv("STRING_STATS_LOG") != nullptr && !runs_this_frame_ && (++gtao_log_frame % 60u) == 0u)
+    if (stats_log && !runs_this_frame_ && (++gtao_log_frame % 60u) == 0u)
         STRING_LOG_INFO("[gtao] OFF: allowed {} program {} denoise {} size {}x{} prev {} hist_size {} valid {}",
                         allowed, program_ != nullptr, denoise_program_ != nullptr, size_.x, size_.y,
                         prev, scene_->depth_history_.size(),
