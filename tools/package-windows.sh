@@ -64,11 +64,25 @@ find "$build" -name '*.spv' -exec cp -f {} "$out/shaders/" \;
 # --- assets the engine loads unconditionally ---
 cp -r "$repo/sandbox/assets/fonts" "$out/assets/"
 
-# --- prebuilt shader cache (optional 3rd arg; REQUIRED for a -Dslang=disabled build) ---
+# --- prebuilt shader cache (optional 3rd arg; ONLY for a -Dslang=disabled build) ---
+# Deliberately NOT baked into a slang-ENABLED package. The cache key (shader_compiler.cpp) hashes
+# the shader source + import closure + schema version, but NOT the Slang compiler version, and it is
+# location-independent on purpose so a shipped cache hits. Bake with one slang-compiler.dll and ship
+# another and the key still matches while the SPIR-V behind it does not: the stale entry is HIT
+# rather than skipped, and the GPU hangs on the first frame of the new scene's graph
+# (VK_ERROR_DEVICE_LOST, "No fault detected"). That is the scene-switch freeze. A slang-enabled build
+# can always compile its own shaders, so the cache buys a faster first visit at the cost of a hang on
+# any machine with a cold user cache — not a trade worth making. A -Dslang=disabled build has no
+# compiler and cannot render at all without one, so it still gets the cache.
 cache_src="${3:-}"
 if [ -n "$cache_src" ] && [ -d "$cache_src" ]; then
-    mkdir -p "$out/shadercache"
-    cp -f "$cache_src"/*.program "$out/shadercache/" 2>/dev/null || true
+    if [ -f "$out/slang.dll" ]; then
+        echo "NOTE: ignoring prebuilt cache '$cache_src' — this build compiles its own shaders, and a"
+        echo "      cache baked by a different slang-compiler.dll hangs the GPU on scene switch."
+    else
+        mkdir -p "$out/shadercache"
+        cp -f "$cache_src"/*.program "$out/shadercache/" 2>/dev/null || true
+    fi
 fi
 
 cp -f "$repo/tools/package-readme.txt" "$out/README.txt" 2>/dev/null || true
@@ -91,12 +105,14 @@ done < <(grep -rhoE '[a-z0-9_]+\.(vert|frag|comp)\.spv' \
 [ "${#missing[@]}" -eq 0 ] || { echo "MISSING DLLs: ${missing[*]}"; fail=1; }
 [ "$(ls "$out"/shaders/*.slang 2>/dev/null | wc -l)" -gt 0 ] || { echo "MISSING: shaders/*.slang"; fail=1; }
 
-# A slang-ENABLED package with no cache still WORKS, but the first visit to each scene compiles its
-# shaders on the main thread — seconds of frozen window, which on Windows looks like a hang (the
-# compositor blanks a window that stops pumping messages). Ship a warm cache.
+# A slang-ENABLED package ships WITHOUT a cache by design (see above). The first visit to each scene
+# compiles its shaders on the main thread — seconds of frozen window, which on Windows looks like a
+# hang (the compositor blanks a window that stops pumping messages). That freeze is recoverable and
+# one-time per machine; the baked-cache alternative was an unrecoverable GPU hang, so this is the
+# better failure. Fix it properly by keying the cache on the compiler version, not by baking.
 if [ -f "$out/slang.dll" ] && [ ! -d "$out/shadercache" ]; then
-    echo "NOTE: no prebuilt shadercache/ — the first switch to each scene will freeze while its"
-    echo "      shaders compile. Pass a warmed cache dir as arg 3."
+    echo "NOTE: no prebuilt shadercache/ (by design for a slang-enabled build) — the first switch to"
+    echo "      each scene will freeze briefly while its shaders compile, then be instant after."
 fi
 
 # A build with no slang.dll import is -Dslang=disabled: it CANNOT compile, so a package without a

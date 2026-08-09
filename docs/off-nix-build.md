@@ -333,6 +333,18 @@ prove a cache entry matches. They are 264KB.
 To bake the cache: run a slang-ENABLED build, then copy `%LOCALAPPDATA%\string\cache\shaders\*.program`
 (Linux: `~/.cache/string/shaders`) into the package's `shadercache/`.
 
+> **Only bake for a `-Dslang=disabled` package, and only from the SAME commit and the same
+> `slang-compiler.dll` you ship.** `package-windows.sh` now refuses to bake into a slang-enabled
+> package for this reason. The cache key hashes shader source + import closure + schema version —
+> **not the Slang compiler version** — and is location-independent by design so a shipped cache hits.
+> Bake with one compiler and ship another and the key still matches while the SPIR-V behind it does
+> not: the stale entry is *hit*, not skipped, and the GPU hangs on the first frame after a scene
+> switch (`FRAME WAIT STALLED`, then `VK_ERROR_DEVICE_LOST` with "No fault detected"). It reproduces
+> only on a cold `%LOCALAPPDATA%\string\cache\shaders` — any prior good run masks it, which is why it
+> hits fresh machines and not the one that built the package. Folding the compiler version into the
+> key seed (`shader_compiler.cpp`, `seed`) would make a mismatched cache miss cleanly and make baking
+> safe again.
+
 **A bug this exposed, now fixed:** the cache key folded in each module's *absolute native* path, so a
 cache baked at package time missed 100% once the user unzipped it elsewhere — the first ship run
 failed with `no cached program ... key e263fb23272342be`. `hash_import_closure` now hashes each

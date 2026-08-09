@@ -42,6 +42,10 @@ endif
 if system == 'windows'
     message('Building for Windows')
     public_args += '-DSTRING_PLATFORM_WINDOWS'
+    # windows.h defines min/max as object-like macros, so any `std::min(a, b)` downstream of it
+    # expands to `std::(a, b)` — "expected unqualified-id". It bit application.cpp's scene-switch
+    # parser. Public, not build-only: consumers include our headers and hit the same collision.
+    public_args += '-DNOMINMAX'
 elif system == 'linux'
     message('Building for Linux')
     public_args += '-DSTRING_PLATFORM_LINUX'
