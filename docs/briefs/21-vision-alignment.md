@@ -78,9 +78,15 @@ a mid-frame swap is refused with an error rather than corrupting. A pure PERMUTA
   list: it is cleared, accumulated and reduced inside one frame. Its contents do not outlive the
   frame, so by D3's own category test it is not a persistent.
 
-**Step 2 — DONE.** Resize is wired end to end and, for the first time, **testable**: the new
-`STRING_RESIZE_AT=frame:WxH` lever drives one from the frame counter, because an offscreen SDL
-window never emits a resize event and nothing headless could otherwise reach the path at all.
+**Step 2 — DONE (code), NOT UNDER TEST.** Resize is wired end to end, and the new
+`STRING_RESIZE_AT=frame:WxH` lever makes it **reachable** from a headless run, because an offscreen
+SDL window never emits a resize event and nothing headless could otherwise reach the path at all.
+
+> **CORRECTED 2026-08-08.** This step originally claimed resize was "for the first time,
+> **testable**", which read as *tested* and was cited that way. It is not. `string-core/test/`
+> contains **zero occurrences of "resize"** — no automated test exercises the path. What exists is a
+> lever that lets a human drive one manually, plus the one-off runs transcribed in step 7. A
+> regression in resize would be caught by nobody today.
 `hiz.pyramid` is viewport-derived: `viewport_fit::half_pow2` + `mip_levels = all_mips` declare the
 RELATIONSHIP (replacing the `viewport_scaled` bool with a `viewport_fit` enum), and the reduction
 chain is authored once at `kMaxHizMips` with each level conditioned on `m < hiz_mip_count(viewport)`.
@@ -174,7 +180,27 @@ derived from `colors` rather than stored beside it.
   graph is built ON — depend on the graph's declaration type. That is a layering inversion bought for
   nothing; the duplication is two small structs, and it is the honest kind.
 
-**Step 7 — the headless battery is GREEN.** Every run below is sync-validation-on, one at a time:
+**Step 7 — a one-time TRANSCRIPT, not a battery, and its green is known to be unreliable.**
+
+> **CORRECTED 2026-08-08. Read this before citing the table below.**
+>
+> 1. **It is not a gate and cannot be re-run.** "Battery" implied a durable artifact; there is none.
+>    These were manual invocations, transcribed here in prose. `tools/gate.sh` is a capture/AE-compare
+>    script and runs **no** resize, **no** non-square, and **no** sync validation. Nothing in
+>    `nix flake check` covers this table. Re-running it means hand-reconstructing the commands.
+> 2. **It reported green over a total synchronisation failure.** Every "0 hazards" row below was
+>    recorded while `resource_state_tracker::transition_scope` was recording a write's own access mask
+>    as *visible*, so the read path's "already visible, skip the barrier" shortcut fired on **every
+>    same-layout storage read-after-write in the engine** — `storage_image_write`'s mask is a superset
+>    of `storage_image_read`'s. Found 2026-08-08 via the IBL capture mip chain needing two bakes to
+>    converge; fixed in `string-core/src/vulkan/resource_state.cpp`. **Sync validation did not flag
+>    it.** So "0 hazards" here establishes only that the validation layer saw nothing, which is a much
+>    weaker statement than this step made.
+>
+> What the table below IS: an honest record of what those specific runs printed on 2026-08-07. It is
+> evidence, not proof, and it is not a regression net.
+
+Every run below is sync-validation-on, one at a time:
 
 | gate | result |
 |---|---|
@@ -231,8 +257,10 @@ layout management for resources the graph does not own — streamed textures are
 which is the honest limit here, not an omission) and 2 in `ibl_component`'s numeric-verification
 readback. Zero in any per-frame render pass.
 
-**Step 7 — the headless half runs green** (motion + resize + non-square + sync validation, 0 errors;
-77/77 gtests). The live flythrough is the user's.
+**Step 7 — the headless runs printed green** (motion + resize + non-square + sync validation, 0
+errors; 77/77 gtests). The live flythrough is the user's. **See the correction at step 7 above: these
+were one-off manual runs, not a re-runnable gate, and their "0 hazards" was recorded over an
+engine-wide read-after-write barrier failure that sync validation did not detect.**
 
 ## Part 1 — Doc record repair (first, so no agent re-inherits the drift)
 

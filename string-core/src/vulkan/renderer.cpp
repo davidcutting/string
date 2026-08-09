@@ -196,7 +196,8 @@ void renderer::flush_construction_uploads()
     if (!transfer_batch_.pending()) return;
     gpu::command_recorder rec;
     rec.init(device_.get_device(), graphics_queue_);
-    transfer_batch_.record(rec.begin());
+    rec.begin();
+    transfer_batch_.record(rec);
     rec.end().immediate_submit();   // submits AND waits — that is what makes this the drain
     // Construction staged into bucket 0; it is on the GPU now, so free it and move new staging into
     // frame 1's bucket. Nothing later can free a bucket for a frame that has not retired.
@@ -348,7 +349,7 @@ void renderer::render_frame(compiled_frame& frame, float dt)
         async->begin();
     }
 
-    gpu_timing_.begin_frame(main.vk(), slot);
+    gpu_timing_.begin_frame(main, slot);
 
     execute_info info{
         .rec = main,
@@ -357,6 +358,7 @@ void renderer::render_frame(compiled_frame& frame, float dt)
         .extent = presenter_.get_extent(),
 
         .swapchain = { acquired_image_, acquired_image_view_ },
+        .profiler = &gpu_timing_,
 
     };
     frame.execute(info);
@@ -712,9 +714,8 @@ void renderer::record_capture(pass_context& ctx)
         .imageOffset = { 0, 0, 0 },
         .imageExtent = { img.extent.width, img.extent.height, 1 },
     };
-    vkCmdCopyImageToBuffer(ctx.rec.get_command_buffer(), img.image,
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           allocator_.get_buffer(capture_staging_).buffer, 1, &region);
+    ctx.rec.copy_image_to_buffer(img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                 allocator_.get_buffer(capture_staging_).buffer, 1, &region);
 }
 
 bool renderer::capture_armed() const

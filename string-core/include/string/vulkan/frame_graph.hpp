@@ -32,7 +32,7 @@
 
 #include <volk.h>
 
-namespace string { struct engine_context; }
+namespace string { struct engine_context; class GpuProfiler; }
 
 namespace string
 {
@@ -377,6 +377,10 @@ struct execute_info
         VkImageView view = VK_NULL_HANDLE;
     };
     acquired_image swapchain{};
+    // Per-pass GPU timing (brief 06). Optional: null disables timing entirely. Passed in rather than
+    // read from GpuProfiler::global() because the global handle is const — it exists for the HUD to
+    // READ, and the executor is the one component that writes.
+    GpuProfiler* profiler = nullptr;
 };
 
 class compiled_frame
@@ -432,17 +436,17 @@ private:
     void seed_persistent_layouts();
 
     // Derive and emit every barrier a pass's declarations imply, against tracked state.
-    void barrier_for(VkCommandBuffer cmd, const pass_decl& p, std::uint32_t slot,
+    void barrier_for(gpu::command_recorder& rec, const pass_decl& p, std::uint32_t slot,
                      bool skip_attachments);
     // Open a render-pass instance with load/store/resolve derived from the group's lifetime facts.
     // clear_color/clear_depth are THIS FRAME's clear ownership, derived in execute() over the
     // groups that actually survived the conditionals — not the compile-time facts, which assume
     // every group opens (a skipped first-writer would silently turn every clear into a load).
-    void open_group(VkCommandBuffer cmd, const render_group& g, std::uint32_t slot, VkExtent2D extent,
+    void open_group(gpu::command_recorder& rec, const render_group& g, std::uint32_t slot, VkExtent2D extent,
                     bool clear_color, bool clear_depth);
     static VkImageAspectFlags aspect_of(VkFormat format);
     // One-shot clear of each neutral fallback to its declared value, on the first executed frame.
-    void init_fallbacks(VkCommandBuffer cmd);
+    void init_fallbacks(gpu::command_recorder& rec);
     // Transients queued for a one-shot clear to their declared neutral, because freshly allocated
     // backing is undefined and a resize hands back RECYCLED memory. See init_fallbacks().
     std::vector<gpu::image> pending_inits_;

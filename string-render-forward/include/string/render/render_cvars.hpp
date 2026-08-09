@@ -29,7 +29,6 @@ void register_render_cvars();
 ::string::core::CVar<bool>&    cv_lod_enabled();      // r.lod.enabled       <- STRING_LOD
 ::string::core::CVar<bool>&    cv_cull_enabled();     // r.cull.enabled      <- STRING_CULL
 ::string::core::CVar<float>&   cv_lod_error_px();     // r.lod.error_px      <- STRING_LOD_PX
-::string::core::CVar<bool>&    cv_meshlet_validate(); // dbg.meshlet_validate<- STRING_MESHLET_VALIDATE
 ::string::core::CVar<bool>&    cv_meshlet_readback(); // dbg.meshlet_readback<- STRING_MESHLET_READBACK
 ::string::core::CVar<int32_t>& cv_meshlet_dump();     // dbg.meshlet_dump    <- STRING_MESHLET_DUMP (-1 off)
 
@@ -60,9 +59,6 @@ void register_render_cvars();
 // AO off. An energy-conserving BRDF makes the scene disappear into the background — the
 // acceptance gate for the brief-07 BRDF work.
 ::string::core::CVar<bool>&    cv_furnace();          // r.furnace           <- STRING_FURNACE
-// Numeric IBL verification: at a settled frame, read the DFG LUT + SH coefficients back and check
-// them against CPU references (uniform-env SH DC, DFG corner/interior values). Logs PASS/FAIL.
-::string::core::CVar<bool>&    cv_ibl_verify();       // dbg.ibl_verify      <- STRING_IBL_VERIFY
 // Force the IBL update chain (capture/prefilter/SH) to re-run EVERY frame regardless of the
 // sun-delta trigger — for measuring the worst-case per-frame cost (Tracy "ibl-update" zone).
 ::string::core::CVar<bool>&    cv_ibl_every_frame();  // dbg.ibl_every_frame <- STRING_IBL_EVERY_FRAME

@@ -47,14 +47,14 @@ void GpuProfiler::destroy(VkDevice device)
     period_ns_ = 0.0;
 }
 
-void GpuProfiler::begin_frame(VkCommandBuffer cmd, uint32_t frame_index)
+void GpuProfiler::begin_frame(gpu::command_recorder& rec, uint32_t frame_index)
 {
     if (!enabled() || frame_index >= pools_.size()) return;
     FramePool& fp = pools_[frame_index];
     // The renderer already waited on this frame index's timeline value, so last cycle's queries for
     // this pool are complete — read them before resetting.
     if (fp.pending) readback(frame_index);
-    vkCmdResetQueryPool(cmd, fp.pool, 0, max_pairs_ * 2);
+    rec.reset_query_pool(fp.pool, 0, max_pairs_ * 2);
     fp.used = 0;
     fp.open_slot = UINT32_MAX;
     fp.pending = false;
@@ -72,7 +72,7 @@ void GpuProfiler::reset_stats()
     }
 }
 
-void GpuProfiler::write_begin(VkCommandBuffer cmd, uint32_t frame_index, const std::string& name)
+void GpuProfiler::write_begin(gpu::command_recorder& rec, uint32_t frame_index, const std::string& name)
 {
     if (!enabled() || frame_index >= pools_.size()) return;
     FramePool& fp = pools_[frame_index];
@@ -80,16 +80,16 @@ void GpuProfiler::write_begin(VkCommandBuffer cmd, uint32_t frame_index, const s
     const uint32_t slot = fp.used;
     fp.slot_names[slot].name = name;
     fp.open_slot = slot;
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, fp.pool, slot * 2);
+    rec.write_timestamp(VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, fp.pool, slot * 2);
 }
 
-void GpuProfiler::write_end(VkCommandBuffer cmd, uint32_t frame_index)
+void GpuProfiler::write_end(gpu::command_recorder& rec, uint32_t frame_index)
 {
     if (!enabled() || frame_index >= pools_.size()) return;
     FramePool& fp = pools_[frame_index];
     if (fp.open_slot == UINT32_MAX) return;
     const uint32_t slot = fp.open_slot;
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, fp.pool, slot * 2 + 1);
+    rec.write_timestamp(VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, fp.pool, slot * 2 + 1);
     fp.open_slot = UINT32_MAX;
     fp.used = slot + 1;
     fp.pending = true;

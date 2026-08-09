@@ -1,6 +1,7 @@
 # Brief 18 — Asset import + data-driven scenes
 
 **Status:** DRAFT — not started. Written 2026-08-04, after runtime scene switching landed.
+**Extended 2026-08-08** with M5 (a second source format) and the front-end-seam decision behind it.
 
 ## Why
 
@@ -224,6 +225,68 @@ The one thing worth taking *from* the glTF that we currently drop is authored **
 `KHR_lights_punctual` lights): `CookedScene` carries geometry, materials and textures only, so the
 cook needs to carry them through.
 
+### More source formats: the seam already exists, and the engine already cannot see it
+
+Raised 2026-08-08 ("can the backend importer be invisible from the engine's perspective?"). It
+already is, and this section exists so that is not rediscovered as an open problem.
+
+**The engine never links an importer.** `string-asset-tools` is tools-only and does not ship; the
+runtime reads `.cooked` blobs through `string-asset`. fastgltf is not in the client binary. Importer
+invisibility is a property of the locked library split, not something to design.
+
+**The extension point is already named**, in `string-asset-tools/include/string/asset/tools/bake.hpp`:
+
+> its core entry is `bake_scene(vertices, indices, draws, params) -> CookedScene` with the glTF
+> importer (gltf_loader) as ONE front-end. Procgen calls `bake_scene()` with generated arrays; an
+> OBJ/FBX front-end is another function that calls the same core. **Deliberately NOT a plugin
+> registry** — `bake_scene()` is already the extension point, and a registry only earns its keep if
+> importers ever need to be discovered at runtime.
+
+That decision stands. A second front-end is a new `.cpp` producing `(vertices, indices, draws)` plus
+materials and textures, and calling `bake_scene`. No interface, no registry, no dynamic dispatch.
+
+**What is genuinely mis-placed today — one thing.** Of the import invariants fixed 2026-08-08, three
+are already in shared code and a second front-end inherits them free:
+
+| invariant | lives in | shared? |
+|---|---|---|
+| mirrored winding (negative-determinant transform) | `bake.cpp:392`, determinant-based | yes |
+| non-uniform-scale normals | runtime + `meshlet_mesh.slang`, pinned by `string-core/test/normal_matrix_test.cpp` | yes |
+| meshopt skew | bake core | yes |
+| **MikkTSpace tangent generation** | **`gltf_loader.cpp`** | **no** |
+
+Tangent generation is trapped in the glTF front-end. A second importer would duplicate it or silently
+skip it and ship wrong normal mapping — the same defect class, re-entered through the new door. Move
+it to the shared path *before* a second front-end exists, not after (M5a).
+
+Naming is the other leak, and it is cosmetic: `GltfDraw` appears in `bake_scene`'s signature, and
+`GltfMaterial` / `GltfTexture` are format-neutral structs wearing glTF's name.
+
+**What is actually hard, and it is not the plumbing:**
+
+- **Materials degrade outside glTF.** `GltfMaterial` is metallic-roughness plus the glTF alpha modes.
+  Assimp's `aiMaterial` for FBX/OBJ/Collada is a Phong/spec-gloss key bag; the conversion is lossy and
+  heuristic. Decide deliberately whether non-glTF import means *geometry with placeholder materials*
+  — honest and useful — or a per-format material heuristic maintained forever. **Recommend the
+  former**, and say so in the log at import time so the artist is not guessing.
+- **Determinism is a locked requirement.** `bake_scene` documents *"identical inputs → identical
+  output arrays"* because procgen and the server both depend on it. Assimp's `aiProcess_*`
+  postprocessing is version-sensitive. This has already bitten once from a different direction:
+  meshoptimizer 1.2 (nixpkgs) vs 0.21 (wrap) produced **43305 vs 41939 meshlets** from byte-identical
+  input. Pin the importer hard and treat a version bump as a cooked-asset baseline change.
+- **Do not take the importer's tangents or handedness conversion.** `aiProcess_CalcTangentSpace` is
+  not MikkTSpace, and our normal maps assume MikkTSpace convention. Same for axes: glTF is Y-up RH,
+  FBX/Blender content is often Z-up, DirectX-lineage formats are LH — which is precisely the
+  mirroring/winding class already closed once.
+- **Build cost lands on the Windows package.** Assimp is CMake-based and large: under the wraps
+  posture (see brief 22) that is a second CMake wrap beside libktx, the known off-nix Windows blocker.
+
+**Library recommendation.** If the real need is **FBX for the artist**, prefer **`ufbx`** over assimp:
+single-file, no CMake, and it matches the dependency posture the feature spec invokes explicitly
+(item 12 picks miniaudio for being "single-header, matches dependency posture"). Assimp is the
+opposite of that posture, and taking it means ~40 format parsers to get one. Choose assimp only if
+*breadth* is the goal rather than a specific format. Open question 5.
+
 ### The registry gains discovery; it does not gain a format
 
 `SceneRegistry` stays what it is (name + description + `ConfigureFn`). A descriptor is turned into a
@@ -360,6 +423,47 @@ Two consequences to implement deliberately rather than discover:
   prototyping actual engine effects in scene-referred HDR) was on the table and is NOT being built
   now — it is a plausible follow-up once the plain path works, not a v1 requirement.
 
+## M5 — A second source format
+
+Independent of M1–M4 and of the Shadertoy work; sequenced last because nothing else needs it. Split
+because M5a is worth doing on its own merits and has a much stronger gate than M5b can have.
+
+### M5a — Neutralize the front-end seam (pure refactor, no new format)
+
+1. **Move MikkTSpace tangent generation out of `gltf_loader.cpp`** into the shared path, so it applies
+   to any front-end's output rather than only glTF's.
+2. **Rename the crossing types** to format-neutral names: `GltfDraw` → `ImportedDraw`,
+   `GltfMaterial` → `ImportedMaterial`, `GltfTexture` → `ImportedTexture`, `GltfGeometry` →
+   `ImportedGeometry`. `GltfParsed`, `GltfImageFormat` and `parse_gltf` stay glTF-named — they *are*
+   glTF-specific and should look it.
+
+**Gate — the strong one: the cook must be BYTE-IDENTICAL before and after.** This is a rename plus a
+code move with no intended behaviour change, so any diff in the `.cooked` blob is a bug, and the
+content hash makes that trivial to check. Do not accept "renders the same"; compare the bytes. Plus
+`nix build .#checks.{default,ui,cook}` green and the existing `winding_test` / `glb_embedded_test` /
+`bake_test` unchanged and passing.
+
+### M5b — The front-end itself
+
+A new `.cpp` in `string-asset-tools` that converts to the neutral structs and calls `bake_scene`.
+**The importer's types must not cross that boundary** — no `aiScene`/`ufbx_scene` in any header, the
+same containment `GltfParsed::Impl` already uses to keep `fastgltf::Asset` out of `gltf_loader.hpp`.
+
+Wire it in exactly where glTF is wired: `cook_main` dispatches on extension, and brief 18's discovery
+(M1) treats the new extension as a bare scene the same way it treats `*.gltf`/`*.glb`.
+
+**Gates:**
+- **A conformance test set for the new front-end**, pinning the same invariants glTF's does — the
+  existing `winding_test.cpp` and `glb_embedded_test.cpp` cover the *glTF path only*, and a second
+  importer re-opens every question they answer. At minimum: mirrored/negative-determinant instance,
+  a non-uniform-scaled node, tangent generation against a known-good reference, and embedded vs
+  external textures.
+- **Determinism:** cooking the same source twice produces byte-identical output, and the pinned
+  importer version is recorded next to the meshoptimizer note in `docs/off-nix-build.md`.
+- **Off-nix build green**, since this is the milestone most likely to break the mingw cross build.
+- NEEDS VISUAL VERIFY: an imported non-glTF asset renders with correct winding (no inside-out
+  surfaces) and correct normal mapping (no inverted-looking detail under a moving sun).
+
 ## Dependency: the build must not require nix
 
 This brief's whole point is handing the engine to someone else, so "it builds on my machine via the
@@ -386,3 +490,9 @@ conflating the two would hide it.
    longer a special case bolted onto a path-list format. Revisit when M4 lands, not before.
 4. ~~**M4: does Shadertoy output bypass post?**~~ **ANSWERED 2026-08-04: yes, bypass.** See the M4
    section; the route-through-post flag is not in v1.
+5. **M5: which importer, and is breadth or FBX the actual goal?** `ufbx` (single-file, matches the
+   dependency posture, FBX only) vs assimp (~40 formats, CMake, large, version-sensitive
+   postprocessing). The recommendation above is ufbx unless breadth itself is the requirement. Also
+   worth settling with it: is non-glTF import accepted as *geometry with placeholder materials*?
+   Answering that first makes the library choice much easier, because assimp's breadth mostly buys
+   material formats we would not faithfully convert anyway.

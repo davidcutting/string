@@ -1021,7 +1021,7 @@ void declare_stream_uploads(string::frame_graph& fg, string::engine_context& ctx
     string::TransferBatch* transfer = &ctx.transfer;
     fg.pass("uploads.stream")
       .toggle([transfer] { return transfer->pending(); })
-      .transfer([transfer](string::pass_context& pc) { transfer->record(pc.rec.get_command_buffer()); });
+      .transfer([transfer](string::pass_context& pc) { transfer->record(pc.rec); });
 }
 
 std::function<void(float)> make_ui_scene(

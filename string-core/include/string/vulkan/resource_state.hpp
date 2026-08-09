@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <string/gpu/command_recorder.hpp>
 #include <string/gpu/resource.hpp>
 #include <string/vulkan/resource_usage.hpp>
 
@@ -68,7 +69,7 @@ public:
     // the tracked state. `discard` sources from UNDEFINED, for a subresource whose contents are
     // fully overwritten. Emits nothing when the request is already satisfied. Subresources whose
     // tracked state matches are coalesced into a single barrier.
-    void transition(VkCommandBuffer cmd, VkImage image, const subresource& sub, access how,
+    void transition(gpu::command_recorder& rec, VkImage image, const subresource& sub, access how,
                     VkPipelineStageFlags2 stage, bool discard = false);
 
     // Same, for a write the FRAMEWORK performs rather than a pass declaring it — currently only the
@@ -79,14 +80,14 @@ public:
     // the resolve nor covers it for the next reader. This is not new declaration vocabulary — no
     // pass can name it; it is the framework describing its own write to the tracker, which is
     // exactly what deleting `Access::DepthResolve` from the DECLARED surface presumed.
-    void transition_scope(VkCommandBuffer cmd, VkImage image, const subresource& sub,
+    void transition_scope(gpu::command_recorder& rec, VkImage image, const subresource& sub,
                           const access_scope& target, VkPipelineStageFlags2 stage,
                           bool write, bool discard = false);
 
     // Note a buffer access, accumulating any required global memory-barrier scopes into the pending
     // merge. flush_buffers() emits it before the consuming commands are recorded.
     void buffer_access(gpu::resource_id resource, access how, VkPipelineStageFlags2 stage);
-    void flush_buffers(VkCommandBuffer cmd);
+    void flush_buffers(gpu::command_recorder& rec);
 
     // Forget all tracked state (frame boundary with recreated backing, or a resize).
     void clear();

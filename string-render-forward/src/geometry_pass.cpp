@@ -889,12 +889,6 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
 
 
 
-// dbg.ibl_verify (brief 07 M1 numeric gate): read the DFG LUT + SH coefficients back and check
-// them against references. PASS criteria: (a) DFG matches the CPU double-precision integral at
-// probe points within 0.02 and A+B stays in (0, 1.01] (single-scatter albedo can't exceed 1);
-// (b) under r.furnace the SH DC reconstructs E/pi = 1 +- 0.02 with all higher bands ~0; without
-// the furnace, reconstructed sky irradiance is finite and up > down (sky brighter than ground).
-
 // Upload the meshlet heaps, build the DrawInfo table (materials + transforms + bounds + LOD ranges),
 // allocate the visibility bitfield + stats ring, and create the task/mesh/HiZ/reset pipelines.
 
@@ -1018,10 +1012,7 @@ geometry_pass::~geometry_pass()
     // Brief 03 meshlet resources.
     if (meshlet_model_.total_meshlets > 0)
     {
-        for (HizPyramid& hz : hiz_)
-        {
-            // Brief 20: nothing to unbind. The pyramid and its per-mip slots are graph resources.
-        }
+        // Brief 20: the HiZ pyramid and its per-mip slots are graph resources — nothing to unbind.
         // GTAO targets + their bindless slots are released in GtaoPass.s destructor now.
         // stats_buffer_ ring is owned + destroyed by the ResourceRegistry now (brief 16 M3).
         // Brief 21 D4: the work lists are graph transients — the graph frees them.
@@ -1481,8 +1472,7 @@ void geometry_pass::record_reset_lists(string::pass_context& ctx)
 {
     const auto zero = [&](string::gpu::buffer b) {
         if (const ::string::gpu::resource_id id = ctx.id(b); id != 0)
-            vkCmdFillBuffer(ctx.rec.get_command_buffer(), allocator_.get_buffer(id).buffer,
-                            0, VK_WHOLE_SIZE, 0u);
+            ctx.rec.fill_buffer(allocator_.get_buffer(id).buffer, 0, VK_WHOLE_SIZE, 0u);
         else
             lists_zeroed_ = false;   // not backed yet — try again next frame
     };
@@ -1503,10 +1493,9 @@ void geometry_pass::record_reset_stats(string::pass_context& ctx)
         .stats_words = sizeof(GpuMeshStats) / 4,
         ._pad = 0,
     };
-    VkCommandBuffer cmd = ctx.rec.get_command_buffer();
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rp.pipeline);
-    vkCmdPushConstants(cmd, rp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ResetPush), &rpush);
-    vkCmdDispatch(cmd, 1, 1, 1);
+    ctx.rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, rp.pipeline);
+    ctx.rec.push_constants(rp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(ResetPush), &rpush);
+    ctx.rec.dispatch(1, 1, 1);
 }
 
 // Clear the persistent visibility bitfield + last-LOD on demand (first frame, teleport, a full
@@ -1515,9 +1504,8 @@ void geometry_pass::record_reset_stats(string::pass_context& ctx)
 // that used to follow is derived from the task shaders' declared reads of the same buffers.
 void geometry_pass::record_reset_visbits(string::pass_context& ctx)
 {
-    VkCommandBuffer cmd = ctx.rec.get_command_buffer();
-    vkCmdFillBuffer(cmd, allocator_.get_buffer(visbits_buffer_).buffer, 0, VK_WHOLE_SIZE, 0u);
-    vkCmdFillBuffer(cmd, allocator_.get_buffer(prev_draw_lod_buffer_).buffer, 0, VK_WHOLE_SIZE, 0u);
+    ctx.rec.fill_buffer(allocator_.get_buffer(visbits_buffer_).buffer, 0, VK_WHOLE_SIZE, 0u);
+    ctx.rec.fill_buffer(allocator_.get_buffer(prev_draw_lod_buffer_).buffer, 0, VK_WHOLE_SIZE, 0u);
     visbits_clear_pending_ = false;
 }
 
@@ -1530,10 +1518,6 @@ void geometry_pass::record_reset_visbits(string::pass_context& ctx)
 
 void geometry_pass::record_phase1(string::pass_context& ctx)
 {
-    ::string::gpu::command_recorder& recorder = ctx.rec;
-    const uint32_t current_frame = ctx.frame_slot;
-    VkCommandBuffer& command_buffer = recorder.get_command_buffer();
-
     // The froxel buffer's device address is latched HERE rather than in update(), where it used to
     // depend on FroxelPass having updated first — an ordering nothing enforced. By record() time
     // every pass has updated, so this is always the live address. Patched straight into the
@@ -1766,7 +1750,6 @@ void geometry_pass::declare_hiz(string::frame_graph& fg, string::gpu::image dept
 void geometry_pass::record_hiz_mip(string::pass_context& ctx, uint32_t m, string::gpu::image depth,
                                    string::gpu::image pyramid)
 {
-    VkCommandBuffer command_buffer = ctx.rec.get_command_buffer();
     const HizPyramid& hz = hiz_[ctx.frame_slot];
     // Brief 11 step 2b: the inter-pass barriers this method used to hand-roll are GRAPH-DERIVED now:
     //   - hz.depth DEPTH_ATTACHMENT->SHADER_READ, waiting on the EndRendering MIN-resolve: from
@@ -1779,10 +1762,10 @@ void geometry_pass::record_hiz_mip(string::pass_context& ctx, uint32_t m, string
     // Only the INTRA-pass per-mip compute->compute barriers below remain — this pass building its own
     // multi-mip resource, a per-mip split the single-state tracker deliberately does not model.
     const ::string::gpu::pipeline& hp = hiz_program_->current();
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, hp.pipeline);
+    ctx.rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, hp.pipeline);
     VkDescriptorSet set = descriptor_table_.get_set();
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, hp.pipeline_layout,
-                            0, 1, &set, 0, nullptr);
+    ctx.rec.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE, hp.pipeline_layout,
+                                 0, 1, &set, 0, nullptr);
     const uint32_t dw = std::max(1u, hz.size.x >> m);
     const uint32_t dh = std::max(1u, hz.size.y >> m);
     HizPush hpush{};
@@ -1802,8 +1785,8 @@ void geometry_pass::record_hiz_mip(string::pass_context& ctx, uint32_t m, string
     }
     hpush.dst_slot = ctx.slot(pyramid.mip(m));
     hpush.dst_size = glm::uvec2(dw, dh);
-    vkCmdPushConstants(command_buffer, hp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(HizPush), &hpush);
-    vkCmdDispatch(command_buffer, (dw + 7) / 8, (dh + 7) / 8, 1);
+    ctx.rec.push_constants(hp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(HizPush), &hpush);
+    ctx.rec.dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
 
     // NO barrier here, and none at the end of the chain.
     //
@@ -1836,13 +1819,10 @@ void geometry_pass::record_hiz_mip(string::pass_context& ctx, uint32_t m, string
 // sets their bits, then the sorted transparency pass (tests vs the final opaque depth, as before).
 void geometry_pass::record_phase2(string::pass_context& ctx)
 {
-    ::string::gpu::command_recorder& recorder = ctx.rec;
-    const uint32_t current_frame = ctx.frame_slot;
     // Brief 11 step 2: this is now an ALWAYS-scheduled pass (geometry.phase2). In single-pass mode
     // record() already drew the disocclusion-free opaque + probe + transparency, so phase 2 must not
     // run — else it double-draws. Only the two-phase path uses it.
     if (!two_phase_active_ || !meshlet_program_ || !draw_info_mapped_) return;
-    VkCommandBuffer command_buffer = recorder.get_command_buffer();
     record_opaque_phase(ctx, /*phase*/ 2u, pyramid_, scene_data_, stats_);
     // Brief 09b: probe-debug spheres after opaque, depth-tested. Brief 11 M2: transparency moved OUT to
     // the standalone TransparencyPass, which draws last in this same reopened MSAA group (byte-identical).

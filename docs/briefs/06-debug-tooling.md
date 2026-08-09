@@ -8,6 +8,24 @@ per-pass HUD numbers match the Tracy baseline (~9.4 ms interior GPU total vs ~9.
 "tooling surfaces slice" status section at the end. NEEDS VISUAL VERIFY: console/HUD/inspector
 look-and-feel + debug-draw pattern (captures read by the agent, but aesthetic judgment is the user's).
 
+> **REGRESSED 2026-08-07, RESTORED 2026-08-09 — per-pass GPU timing (milestone 3's HUD half).**
+> Brief 20 (`12c1ebc`) deleted all **eight** `GpuProfiler::write_begin/write_end` call sites along
+> with the per-pass recording paths they lived in, and the graph executor never picked them up. For
+> two days `stats()` returned empty and `total_avg_ms()` returned 0 — while `enabled()` stayed TRUE,
+> so the HUD took its success branch and printed **"GPU total 0.000 ms"** with no pass rows, and the
+> DAG panel's `ms_of()` returned -1 for every pass. Nothing reported a failure. This "DONE" was false
+> for that window.
+>
+> Restored at ONE site — `compiled_frame::execute`'s per-pass loop, the only place that now runs per
+> pass — instead of the eight it used to take. Two limits are deliberate and recorded rather than
+> hidden: **main-lane passes only** (the pool is reset on the main recorder, and an async pass on the
+> compute queue could write timestamps before that reset executes; the profiler also tracks a single
+> `open_slot`, which cannot express two lanes in flight), and `max_pairs` raised 64 → 128 because the
+> graph now declares ~66 live passes and the old cap was silently dropping the tail.
+>
+> Verified by UI dump rather than by eye: 66 named pass rows, `GPU total 9.339 ms` on lookdev —
+> consistent with this brief's original ~9.4 ms Tracy baseline.
+
 ## Goal
 
 Promote the improvised debug levers that carried briefs 01–03 into first-class
@@ -140,7 +158,7 @@ GPU zones, and the standing per-pass GPU baseline table below.
   | `r.camera.pose`       | `STRING_CAM`               | string | ""      | startup camera pose               |
   | `dbg.transp_test`     | `STRING_TRANSP_TEST`       | bool   | false   | synthetic transparency quads      |
   | `dbg.transp_reverse`  | `STRING_TRANSP_REVERSE`    | bool   | false   | transparency sort A/B check       |
-  | `dbg.meshlet_validate`| `STRING_MESHLET_VALIDATE`  | bool   | false   | meshlet-builder validation        |
+  | ~~`dbg.meshlet_validate`~~| ~~`STRING_MESHLET_VALIDATE`~~ | — | — | **DELETED 2026-08-08 — registered but gated no code** |
   | `dbg.meshlet_readback`| `STRING_MESHLET_READBACK`  | bool   | false   | GPU-vs-CPU buffer memcmp           |
   | `dbg.meshlet_dump`    | `STRING_MESHLET_DUMP`      | int    | -1      | dump DrawInfo from index (-1 off) |
 

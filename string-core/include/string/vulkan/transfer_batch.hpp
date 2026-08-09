@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <string/gpu/device.hpp>
+#include <string/gpu/command_recorder.hpp>
 #include <string/gpu/resource_allocator.hpp>
 
 #include <volk.h>
@@ -70,9 +71,9 @@ public:
     bool is_complete(upload_ticket ticket) const { return ticket == 0 || retired_frame_ >= ticket; }
     bool pending() const { return !copies_.empty(); }
 
-    // Record every queued copy into `cmd`, with the barriers around them. Called by the declared
+    // Record every queued copy into `rec`, with the barriers around them. Called by the declared
     // uploads pass each frame, and once by the renderer for the construction-time backlog.
-    void record(VkCommandBuffer cmd);
+    void record(gpu::command_recorder& rec);
 
     // The frame index uploads staged from now on belong to, and the highest frame the GPU has
     // finished. Retiring a frame frees the staging its copies used.

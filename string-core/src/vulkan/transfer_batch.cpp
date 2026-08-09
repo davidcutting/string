@@ -127,7 +127,7 @@ TransferBatch::upload_ticket TransferBatch::upload_image_levels(
     return ticket_for_pending();
 }
 
-void TransferBatch::record(VkCommandBuffer cmd)
+void TransferBatch::record(gpu::command_recorder& rec)
 {
     if (buffer_copies_.empty() && copies_.empty()) return;
     STRING_PROFILE_SCOPE("transfer record")
@@ -147,12 +147,12 @@ void TransferBatch::record(VkCommandBuffer cmd)
     };
     const VkDependencyInfo war_dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                                        .memoryBarrierCount = 1, .pMemoryBarriers = &war };
-    vkCmdPipelineBarrier2(cmd, &war_dep);
+    rec.barrier(war_dep);
 
     for (const BufferCopy& bc : buffer_copies_)
     {
         const VkBufferCopy region{ .srcOffset = 0, .dstOffset = bc.dst_offset, .size = bc.size };
-        vkCmdCopyBuffer(cmd, allocator_.get_buffer(bc.staging).buffer,
+        rec.copy_buffer(allocator_.get_buffer(bc.staging).buffer,
                         allocator_.get_buffer(bc.dst).buffer, 1, &region);
     }
 
@@ -163,7 +163,7 @@ void TransferBatch::record(VkCommandBuffer cmd)
         // readable. Sourcing from UNDEFINED discards, which is right ONLY the first time these levels
         // are written; an already-live texture keeps its layout so its contents survive.
         const bool live = initialized(image.image, ic.base_mip, ic.level_count);
-        vku::transition_image(cmd, {
+        rec.transition_image({
             .image = image.image,
             .old_layout = live ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
             .new_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -175,7 +175,7 @@ void TransferBatch::record(VkCommandBuffer cmd)
             .level_count = ic.level_count,
         });
 
-        vkCmdCopyBufferToImage(cmd, allocator_.get_buffer(ic.staging).buffer, image.image,
+        rec.copy_buffer_to_image(allocator_.get_buffer(ic.staging).buffer, image.image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                static_cast<std::uint32_t>(ic.regions.size()), ic.regions.data());
 
@@ -186,7 +186,7 @@ void TransferBatch::record(VkCommandBuffer cmd)
             std::int32_t h = static_cast<std::int32_t>(image.extent.height);
             for (std::uint32_t level = 1; level < image.mip_levels; ++level)
             {
-                vku::transition_image(cmd, {
+                rec.transition_image({
                     .image = image.image,
                     .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     .new_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -205,7 +205,7 @@ void TransferBatch::record(VkCommandBuffer cmd)
                     .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1 },
                     .dstOffsets = { { 0, 0, 0 }, { nw, nh, 1 } },
                 };
-                vkCmdBlitImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                rec.blit_image(image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                1, &blit, VK_FILTER_LINEAR);
                 w = nw;
@@ -214,7 +214,7 @@ void TransferBatch::record(VkCommandBuffer cmd)
             // Levels 0..n-2 are SRC after the blits; the last is still DST.
             if (image.mip_levels > 1)
             {
-                vku::transition_image(cmd, {
+                rec.transition_image({
                     .image = image.image,
                     .old_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -226,7 +226,7 @@ void TransferBatch::record(VkCommandBuffer cmd)
                     .level_count = image.mip_levels - 1,
                 });
             }
-            vku::transition_image(cmd, {
+            rec.transition_image({
                 .image = image.image,
                 .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -243,7 +243,7 @@ void TransferBatch::record(VkCommandBuffer cmd)
         {
             // ALL_COMMANDS, not FRAGMENT_SHADER: the meshlet TASK shaders sample bindless textures
             // too, and a destination scope that names only the fragment stage does not cover them.
-            vku::transition_image(cmd, {
+            rec.transition_image({
                 .image = image.image,
                 .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -270,7 +270,7 @@ void TransferBatch::record(VkCommandBuffer cmd)
     };
     const VkDependencyInfo visible_dep = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                                            .memoryBarrierCount = 1, .pMemoryBarriers = &visible };
-    vkCmdPipelineBarrier2(cmd, &visible_dep);
+    rec.barrier(visible_dep);
 
     buffer_copies_.clear();
     copies_.clear();

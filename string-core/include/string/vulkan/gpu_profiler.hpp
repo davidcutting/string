@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <string/gpu/command_recorder.hpp>
 #include <volk.h>
 
 namespace string::gpu { class device; }
@@ -45,20 +46,26 @@ public:
     GpuProfiler& operator=(const GpuProfiler&) = delete;
 
     // Create the query-pool ring. frames_in_flight pools, each with room for max_pairs pairs.
-    void init(string::gpu::device& device, uint32_t frames_in_flight, uint32_t max_pairs = 64);
+    //
+    // 128, not 64: the graph declares ~66 live passes in a geometry scene, so a 64 cap was BINDING —
+    // and write_begin() skips silently when the pool is full, so the tail passes were timed only on
+    // frames where the amortized IBL chain sat out and freed slots. That biases their averages and
+    // makes "GPU total" understate, with nothing reporting a problem. Two queries per pair per frame
+    // in flight is a few KB; there is no reason to run this close to the edge.
+    void init(string::gpu::device& device, uint32_t frames_in_flight, uint32_t max_pairs = 128);
     void destroy(VkDevice device);
 
     bool enabled() const { return period_ns_ > 0.0; }
 
     // Start a new frame's timing: read back the pool that is about to be reused (its GPU work is
     // done), then reset that pool. Must be called after the renderer has waited on this frame index.
-    void begin_frame(VkCommandBuffer cmd, uint32_t frame_index);
+    void begin_frame(gpu::command_recorder& rec, uint32_t frame_index);
 
     // Bracket a pass phase. write_begin returns a pair-slot handle; pass it to write_end. The `name`
     // is copied into the frame's slot table so readback can attribute the result. phase is a short
     // suffix ("", " cs") to disambiguate the compute vs graphics phase of the same pass.
-    void write_begin(VkCommandBuffer cmd, uint32_t frame_index, const std::string& name);
-    void write_end(VkCommandBuffer cmd, uint32_t frame_index);
+    void write_begin(gpu::command_recorder& rec, uint32_t frame_index, const std::string& name);
+    void write_end(gpu::command_recorder& rec, uint32_t frame_index);
 
     // Forget every per-pass stat. For a scene switch: the pass set is replaced wholesale, so the
     // rolling averages describe passes that no longer exist and the HUD would otherwise show the two

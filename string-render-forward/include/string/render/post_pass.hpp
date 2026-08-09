@@ -144,7 +144,7 @@ public:
 
     // Brief 09 outline/rim slot: depth + reconstructed normals are available here. Intentionally a
     // no-op until the brief-10 style decision.
-    void record_outline_slot(VkCommandBuffer) {}
+    void record_outline_slot(::string::gpu::command_recorder&) {}
 };
 
 }  // namespace string::render

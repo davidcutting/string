@@ -10,6 +10,30 @@
 namespace string::gpu
 {
 
+// A single image layout transition, recorded with synchronization2 (VkImageMemoryBarrier2) and
+// caller-supplied src/dst scopes — the barrier primitive the graph's tracker and the transfer batch
+// both build on. Designated-initializer shaped, which is what makes each of its call sites a few
+// lines instead of a VkImageMemoryBarrier2 + VkDependencyInfo pair.
+struct image_transition
+{
+    VkImage image;
+    VkImageLayout old_layout;
+    VkImageLayout new_layout;
+    VkPipelineStageFlags2 src_stage;
+    VkAccessFlags2 src_access;
+    VkPipelineStageFlags2 dst_stage;
+    VkAccessFlags2 dst_access;
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    // Mip range to transition; defaults to just the base level (mip generation transitions
+    // individual levels as it blits down the chain).
+    uint32_t base_mip = 0;
+    uint32_t level_count = 1;
+    // Array layers to transition (6 for cube maps — brief 07's IBL environment). `base_layer` lets a
+    // single face be transitioned on its own, which per-subresource state tracking needs: an IBL
+    // cubemap's faces are written one at a time and genuinely hold different states between them.
+    uint32_t base_layer = 0;
+    uint32_t layer_count = 1;
+};
 
 class command_recorder
 {
@@ -45,12 +69,13 @@ public:
     // upload path so loads don't stall the CPU on vkQueueWaitIdle per batch.
     auto submit_async(VkSemaphore timeline, uint64_t signal_value) -> command_recorder&;
 
-    // Brief 16 (Layer 3): the recording VERBS. Thin, inline wrappers over vkCmd* on the owned
-    // primary buffer — the rich recording surface passes call instead of pulling the raw handle.
-    // `vk()` is the escape hatch for the paths not yet (or never) verb-migrated (transfer batch,
-    // raw async, render-pass setup owned by the executor). Grows as callers adopt verbs.
-    VkCommandBuffer vk() const { return primary_command_buffer_; }
-
+    // Thin, inline wrappers over vkCmd* on the owned primary buffer, so pass code names the verb
+    // instead of threading the raw handle. NOT a complete surface and not intended to become one:
+    // the framework below the graph (resource_state_tracker, compiled_frame::open_group/barrier_for,
+    // the vku:: helpers) takes a raw `VkCommandBuffer` parameter and has no recorder to call, which
+    // is why barriers and render-pass instances are recorded raw. Those paths use
+    // get_command_buffer(). This block was added in 450b9ac, three days AFTER that framework was
+    // written, which is why several verbs here have never had a caller.
     void dispatch(uint32_t x, uint32_t y, uint32_t z) { vkCmdDispatch(primary_command_buffer_, x, y, z); }
     void dispatch_indirect(VkBuffer buf, VkDeviceSize off) { vkCmdDispatchIndirect(primary_command_buffer_, buf, off); }
     void draw(uint32_t verts, uint32_t insts, uint32_t first_vert, uint32_t first_inst)
@@ -70,6 +95,35 @@ public:
     void set_viewport(const VkViewport& vp) { vkCmdSetViewport(primary_command_buffer_, 0, 1, &vp); }
     void set_scissor(const VkRect2D& sc) { vkCmdSetScissor(primary_command_buffer_, 0, 1, &sc); }
     void barrier(const VkDependencyInfo& dep) { vkCmdPipelineBarrier2(primary_command_buffer_, &dep); }
+    void transition_image(const image_transition& t)
+    {
+        const VkImageMemoryBarrier2 b = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .pNext = nullptr,
+            .srcStageMask = t.src_stage,
+            .srcAccessMask = t.src_access,
+            .dstStageMask = t.dst_stage,
+            .dstAccessMask = t.dst_access,
+            .oldLayout = t.old_layout,
+            .newLayout = t.new_layout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = t.image,
+            .subresourceRange = { t.aspect, t.base_mip, t.level_count, t.base_layer, t.layer_count },
+        };
+        const VkDependencyInfo dep = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 0,
+            .pMemoryBarriers = nullptr,
+            .bufferMemoryBarrierCount = 0,
+            .pBufferMemoryBarriers = nullptr,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &b,
+        };
+        vkCmdPipelineBarrier2(primary_command_buffer_, &dep);
+    }
     void fill_buffer(VkBuffer buf, VkDeviceSize off, VkDeviceSize size, uint32_t data)
         { vkCmdFillBuffer(primary_command_buffer_, buf, off, size, data); }
     void copy_buffer(VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy* regions)
@@ -84,8 +138,15 @@ public:
     void clear_color_image(VkImage img, VkImageLayout layout, const VkClearColorValue& color,
         uint32_t range_count, const VkImageSubresourceRange* ranges)
         { vkCmdClearColorImage(primary_command_buffer_, img, layout, &color, range_count, ranges); }
+    void clear_depth_stencil_image(VkImage img, VkImageLayout layout, const VkClearDepthStencilValue& value,
+        uint32_t range_count, const VkImageSubresourceRange* ranges)
+        { vkCmdClearDepthStencilImage(primary_command_buffer_, img, layout, &value, range_count, ranges); }
     void begin_rendering(const VkRenderingInfo& info) { vkCmdBeginRendering(primary_command_buffer_, &info); }
     void end_rendering() { vkCmdEndRendering(primary_command_buffer_); }
+    void reset_query_pool(VkQueryPool pool, uint32_t first, uint32_t count)
+        { vkCmdResetQueryPool(primary_command_buffer_, pool, first, count); }
+    void write_timestamp(VkPipelineStageFlags2 stage, VkQueryPool pool, uint32_t query)
+        { vkCmdWriteTimestamp2(primary_command_buffer_, stage, pool, query); }
 };
 
 } // namespace string::gpu

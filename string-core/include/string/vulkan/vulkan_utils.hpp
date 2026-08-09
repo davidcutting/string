@@ -7,7 +7,6 @@
 #include <vector>
 #include <fstream>
 #include <filesystem>
-#include "string/gpu/command_recorder.hpp"
 
 #include <volk.h>
 
@@ -16,62 +15,6 @@ namespace string
 
 namespace vku
 {
-
-// A single image layout transition recorded into an already-open command buffer, using
-// synchronization2 (VkImageMemoryBarrier2). Unlike transition_image_layout (which self-submits
-// a one-shot upload barrier and derives its scopes from the layout pair), this just records
-// into `command_buffer` with caller-supplied src/dst scopes — the barrier primitive the frame
-// loop (and, later, the render graph) builds on.
-struct ImageTransition
-{
-    VkImage image;
-    VkImageLayout old_layout;
-    VkImageLayout new_layout;
-    VkPipelineStageFlags2 src_stage;
-    VkAccessFlags2 src_access;
-    VkPipelineStageFlags2 dst_stage;
-    VkAccessFlags2 dst_access;
-    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    // Mip range to transition; defaults to just the base level (mip generation transitions
-    // individual levels as it blits down the chain).
-    uint32_t base_mip = 0;
-    uint32_t level_count = 1;
-    // Array layers to transition (6 for cube maps — brief 07's IBL environment). `base_layer` lets a
-    // single face be transitioned on its own, which per-subresource state tracking needs: an IBL
-    // cubemap's faces are written one at a time and genuinely hold different states between them.
-    uint32_t base_layer = 0;
-    uint32_t layer_count = 1;
-};
-
-inline void transition_image(VkCommandBuffer command_buffer, const ImageTransition& t)
-{
-    const VkImageMemoryBarrier2 barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .pNext = nullptr,
-        .srcStageMask = t.src_stage,
-        .srcAccessMask = t.src_access,
-        .dstStageMask = t.dst_stage,
-        .dstAccessMask = t.dst_access,
-        .oldLayout = t.old_layout,
-        .newLayout = t.new_layout,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = t.image,
-        .subresourceRange = { t.aspect, t.base_mip, t.level_count, t.base_layer, t.layer_count },
-    };
-    const VkDependencyInfo dependency = {
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .pNext = nullptr,
-        .dependencyFlags = 0,
-        .memoryBarrierCount = 0,
-        .pMemoryBarriers = nullptr,
-        .bufferMemoryBarrierCount = 0,
-        .pBufferMemoryBarriers = nullptr,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &barrier,
-    };
-    vkCmdPipelineBarrier2(command_buffer, &dependency);
-}
 
 inline std::vector<char> read_file(const std::filesystem::path& filepath)
 {
@@ -197,11 +140,6 @@ inline void default_debug_messenger_create_info(VkDebugUtilsMessengerCreateInfoE
         .pUserData = nullptr
     };
     // clang-format on
-}
-
-inline bool hasStencilComponent(VkFormat format)
-{
-    return format == VK_FORMAT_D32_SFLOAT_S8_UINT || format == VK_FORMAT_D24_UNORM_S8_UINT;
 }
 
 }  // namespace vku

@@ -417,7 +417,7 @@ void post_pass::record_bloom_apply(::string::pass_context& ctx, ::string::gpu::i
 
     // --- Outline/rim slot (brief 10 decides the style; depth + reconstructed normals are
     // available at this point in the frame) ---
-    record_outline_slot(ctx.rec.vk());
+    record_outline_slot(ctx.rec);
 }
 
 }  // namespace string::render

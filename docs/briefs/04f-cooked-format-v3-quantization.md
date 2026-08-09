@@ -36,7 +36,9 @@ every asset added.
   nondeterminism sources; round-to-nearest-even, document it).
 - **Streamer**: element size changes ripple through heap sizing/suballoc;
   CPU-side debug accessors (cpu_vertex) dequantize for validators.
-- **Error budget**: STRING_MESHLET_VALIDATE extended with a quantization
+- **Error budget**: ~~STRING_MESHLET_VALIDATE extended with~~ **(2026-08-08: `dbg.meshlet_validate`
+  was DELETED — the cvar was registered but gated no validation code, which never existed. This step
+  now has to write the validator, not extend one.)** a quantization
   error check (max position error vs float source < half a texel at
   reference viewing distance; report the number). Visual acceptance is
   capture-diff based: small AE is EXPECTED (sub-texel vertex movement);

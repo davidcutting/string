@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <string/vulkan/frame_graph.hpp>
+#include <string/vulkan/gpu_profiler.hpp>
 
 #include <string/gpu/pass_context.hpp>
 #include <string/vulkan/engine_context.hpp>
@@ -1111,7 +1112,7 @@ bool compiled_frame::producer_alive(gpu::image h) const
 // Derive and emit every barrier one pass's declarations imply, against tracked state. This is the
 // ONLY place image layout/access transitions originate for graph work: a pass declared what it
 // touches, so nothing is left for pass code to hand-roll.
-void compiled_frame::barrier_for(VkCommandBuffer cmd, const pass_decl& p, std::uint32_t slot,
+void compiled_frame::barrier_for(gpu::command_recorder& rec, const pass_decl& p, std::uint32_t slot,
                                  bool skip_attachments)
 {
     for (const resource_use& u : p.uses)
@@ -1131,7 +1132,7 @@ void compiled_frame::barrier_for(VkCommandBuffer cmd, const pass_decl& p, std::u
                 if (swapchain_image_ == VK_NULL_HANDLE) continue;
                 subresource sw;
                 states_.track(swapchain_image_, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
-                states_.transition(cmd, swapchain_image_, sw, u.how, u.stage);
+                states_.transition(rec, swapchain_image_, sw, u.how, u.stage);
                 continue;
             }
 
@@ -1147,7 +1148,7 @@ void compiled_frame::barrier_for(VkCommandBuffer cmd, const pass_decl& p, std::u
             sub.layer_count = u.img.layer_count == gpu::image_view::all ? img.array_layers : u.img.layer_count;
 
             states_.track(img.image, sub.aspect, img.mip_levels, img.array_layers);
-            states_.transition(cmd, img.image, sub, u.how, u.stage);
+            states_.transition(rec, img.image, sub, u.how, u.stage);
         }
         else if (u.buf.valid())
         {
@@ -1176,7 +1177,7 @@ VkImageAspectFlags compiled_frame::aspect_of(VkFormat format)
 // Framework-opens. The passes declared their attachments; the group's position in each attachment's
 // lifetime decides load/store, and a multisampled attachment paired with a 1-sample image of the
 // same extent resolves into it. No pass hand-codes a clear, a load, or an MSAA resolve chain.
-void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std::uint32_t slot,
+void compiled_frame::open_group(gpu::command_recorder& rec, const render_group& g, std::uint32_t slot,
                                 VkExtent2D frame_extent, bool clear_color, bool clear_depth)
 {
     std::vector<VkRenderingAttachmentInfo> colors;
@@ -1282,7 +1283,7 @@ void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std:
         .pDepthAttachment = has_depth ? &depth : nullptr,
         .pStencilAttachment = nullptr,
     };
-    vkCmdBeginRendering(cmd, &rendering);
+    rec.begin_rendering(rendering);
 
     const VkViewport viewport = { 0.0f, 0.0f, static_cast<float>(extent.width),
                                   static_cast<float>(extent.height), 0.0f, 1.0f };
@@ -1292,15 +1293,15 @@ void compiled_frame::open_group(VkCommandBuffer cmd, const render_group& g, std:
                         graph_->passes_[order_[g.first]].name,
                         extent.width, extent.height, frame_extent.width, frame_extent.height,
                         g.colors.size());
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    rec.set_viewport(viewport);
+    rec.set_scissor(scissor);
 }
 
 // Clear each fallback to its declared neutral, once, the first time the frame runs. It happens here
 // rather than at compile because a clear is a recorded command and compile records nothing — and it
 // is one-shot rather than per-frame because a 1x1 constant never changes.
 // Note: descriptor_for() is defined in the anonymous namespace above.
-void compiled_frame::init_fallbacks(VkCommandBuffer cmd)
+void compiled_frame::init_fallbacks(gpu::command_recorder& rec)
 {
     // FRESH TRANSIENT BACKING IS UNDEFINED, and undefined is not the same as harmless. A pass that
     // only reads back what it wrote (GTAO's hysteresis, the bloom up-chain's accumulate) propagates
@@ -1333,20 +1334,18 @@ void compiled_frame::init_fallbacks(VkCommandBuffer cmd)
             sub.base_layer = 0;
             sub.layer_count = img.array_layers;
             states_.track(img.image, aspect, img.mip_levels, img.array_layers);
-            states_.transition(cmd, img.image, sub, access::transfer_write,
+            states_.transition(rec, img.image, sub, access::transfer_write,
                                VK_PIPELINE_STAGE_2_CLEAR_BIT, /*discard=*/true);
 
             const VkImageSubresourceRange range{ aspect, 0, img.mip_levels, 0, img.array_layers };
             if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
             {
                 const VkClearDepthStencilValue value{ r.neutral.float32[0], 0 };
-                vkCmdClearDepthStencilImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                            &value, 1, &range);
+                rec.clear_depth_stencil_image(img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, value, 1, &range);
             }
             else
             {
-                vkCmdClearColorImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                     &r.neutral, 1, &range);
+                rec.clear_color_image(img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, r.neutral, 1, &range);
             }
         }
     }
@@ -1359,7 +1358,7 @@ void compiled_frame::init_fallbacks(VkCommandBuffer cmd)
         {
             if (pid == 0) continue;
             const gpu::allocated_buffer& buf = ctx_->allocator.get_buffer(pid);
-            vkCmdFillBuffer(cmd, buf.buffer, 0, VK_WHOLE_SIZE, 0u);
+            rec.fill_buffer(buf.buffer, 0, VK_WHOLE_SIZE, 0u);
         }
     }
     // One barrier for the whole fill: everything downstream reads these as shader/indirect data.
@@ -1375,7 +1374,7 @@ void compiled_frame::init_fallbacks(VkCommandBuffer cmd)
         VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         dep.memoryBarrierCount = 1;
         dep.pMemoryBarriers = &mb;
-        vkCmdPipelineBarrier2(cmd, &dep);
+        rec.barrier(dep);
         pending_buffer_inits_.clear();
     }
 
@@ -1391,7 +1390,7 @@ void compiled_frame::init_fallbacks(VkCommandBuffer cmd)
         subresource sub;
         sub.aspect = aspect;
         states_.track(img.image, aspect, 1, 1);
-        states_.transition(cmd, img.image, sub, access::transfer_write,
+        states_.transition(rec, img.image, sub, access::transfer_write,
                            VK_PIPELINE_STAGE_2_CLEAR_BIT, /*discard=*/true);
 
         const VkImageSubresourceRange range{ aspect, 0, 1, 0, 1 };
@@ -1400,16 +1399,14 @@ void compiled_frame::init_fallbacks(VkCommandBuffer cmd)
             // The neutral for a depth resource is carried in the same float slot; for a shadow map
             // that is 1.0 — fully lit, which is what "no shadow pass ran" must look like.
             const VkClearDepthStencilValue value{ r.neutral.float32[0], 0 };
-            vkCmdClearDepthStencilImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                        &value, 1, &range);
+            rec.clear_depth_stencil_image(img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, value, 1, &range);
         }
         else
         {
-            vkCmdClearColorImage(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                 &r.neutral, 1, &range);
+            rec.clear_color_image(img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, r.neutral, 1, &range);
         }
 
-        states_.transition(cmd, img.image, sub, access::sampled_read,
+        states_.transition(rec, img.image, sub, access::sampled_read,
                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
                                | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
@@ -1440,10 +1437,9 @@ void compiled_frame::execute(const execute_info& info)
             if (u.is_image() && is_write(u.how)) graph_->images_[u.img.img.index].ever_written = true;
     }
 
-    VkCommandBuffer cmd = info.rec.vk();
     const std::uint32_t slot = info.frame_slot;
 
-    init_fallbacks(cmd);
+    init_fallbacks(info.rec);
 
     // Clear ownership is decided PER FRAME, over the groups that actually survived. The compile-time
     // facts assume every group opens; a toggled-off first writer (gi.debug owned the scene color +
@@ -1495,7 +1491,7 @@ void compiled_frame::execute(const execute_info& info)
             {
                 const std::uint32_t pi = order_[g.first + k];
                 if (!alive_[pi]) continue;
-                barrier_for(cmd, graph_->passes_[pi], slot, /*skip_attachments=*/true);
+                barrier_for(info.rec, graph_->passes_[pi], slot, /*skip_attachments=*/true);
             }
             for (std::uint32_t k = 0; k < g.count; ++k)
             {
@@ -1540,7 +1536,7 @@ void compiled_frame::execute(const execute_info& info)
                     // against the framework's own clear.
                     const access how = (cleared && u.how == access::depth_read) ? access::depth_write
                                                                                : u.how;
-                    states_.transition(cmd, vk_img, sub, how, u.stage, discard);
+                    states_.transition(info.rec, vk_img, sub, how, u.stage, discard);
                 }
             }
             // The resolve targets are written by the render pass itself, at EndRendering, so the
@@ -1573,7 +1569,7 @@ void compiled_frame::execute(const execute_info& info)
                     is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
                              : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 };
-                states_.transition_scope(cmd, img.image, sub, resolve_scope,
+                states_.transition_scope(info.rec, img.image, sub, resolve_scope,
                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
                                    | (is_depth ? (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
                                                   | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
@@ -1581,9 +1577,9 @@ void compiled_frame::execute(const execute_info& info)
                                    /*write=*/true,
                                    /*discard=*/true);
             }
-            states_.flush_buffers(cmd);
+            states_.flush_buffers(info.rec);
 
-            open_group(cmd, g, slot, info.extent, frame_clears[group_i].first,
+            open_group(info.rec, g, slot, info.extent, frame_clears[group_i].first,
                        frame_clears[group_i].second);
             for (std::uint32_t k = 0; k < g.count; ++k)
             {
@@ -1594,7 +1590,7 @@ void compiled_frame::execute(const execute_info& info)
                 pc.pass_index = pi;
                 graph_->passes_[pi].record(pc);
             }
-            vkCmdEndRendering(cmd);
+            info.rec.end_rendering();
 
             idx += g.count;
             ++group_i;
@@ -1610,20 +1606,36 @@ void compiled_frame::execute(const execute_info& info)
             // one; otherwise it records here. Same graph, same declarations, different placement.
             const bool async = p.lane == pass_lane::async && info.async_rec != nullptr;
             gpu::command_recorder& rec = async ? *info.async_rec : info.rec;
-            VkCommandBuffer target = rec.vk();
 
             // Barriers recorded on the async lane land on a compute-only queue, which cannot name
             // graphics stages; the tracker widens them (see set_queue_scope) — the cross-queue
             // ordering itself is the lane timeline's job.
+            // Per-pass GPU timing (brief 06), restored 2026-08-09. Brief 20 deleted the eight
+            // write_begin/write_end sites along with the per-pass recording paths they lived in and
+            // never re-added them, so `stats()` was empty and the HUD printed "GPU total 0.000 ms"
+            // without ever reporting a failure. ONE site now, because this is the one place that
+            // runs per pass — the centralisation brief 20 was for.
+            //
+            // MAIN LANE ONLY. The pool is reset on the main recorder in begin_frame(); an async pass
+            // records onto a compute queue whose ordering against that reset is the lane timeline's
+            // job, so timestamps written there could land before their own pool reset. The profiler
+            // also tracks a single `open_slot`, which cannot express two lanes in flight. Timing
+            // async passes needs a per-lane pool and is deliberately not attempted here.
+            const bool timed = info.profiler != nullptr && !async;
+            // Begun BEFORE the barriers: a pass that needs an expensive transition should show that
+            // cost as its own, not push it onto whatever pass follows.
+            if (timed) info.profiler->write_begin(rec, slot, p.name);
+
             states_.set_queue_scope(async);
-            barrier_for(target, p, slot, /*skip_attachments=*/false);
-            states_.flush_buffers(target);
+            barrier_for(rec, p, slot, /*skip_attachments=*/false);
+            states_.flush_buffers(rec);
             states_.set_queue_scope(false);
 
             pass_context pc{ rec, slot, info.extent };
             pc.frame = this;
             pc.pass_index = pi;
             p.record(pc);
+            if (timed) info.profiler->write_end(rec, slot);
         }
         ++idx;
     }
@@ -1635,7 +1647,7 @@ void compiled_frame::execute(const execute_info& info)
         subresource sub;
         sub.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
         states_.track(swapchain_image_, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
-        states_.transition(cmd, swapchain_image_, sub, access::present,
+        states_.transition(info.rec, swapchain_image_, sub, access::present,
                            VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
     }
 

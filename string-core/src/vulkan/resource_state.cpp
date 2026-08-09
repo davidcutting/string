@@ -39,13 +39,13 @@ void resource_state_tracker::track(VkImage image, VkImageAspectFlags aspect,
     t.cells = std::move(grown);
 }
 
-void resource_state_tracker::transition(VkCommandBuffer cmd, VkImage image, const subresource& sub,
+void resource_state_tracker::transition(gpu::command_recorder& rec, VkImage image, const subresource& sub,
                                         access how, VkPipelineStageFlags2 stage, bool discard)
 {
-    transition_scope(cmd, image, sub, scope_of(how), stage, is_write(how), discard);
+    transition_scope(rec, image, sub, scope_of(how), stage, is_write(how), discard);
 }
 
-void resource_state_tracker::transition_scope(VkCommandBuffer cmd, VkImage image,
+void resource_state_tracker::transition_scope(gpu::command_recorder& rec, VkImage image,
                                               const subresource& sub, const access_scope& target,
                                               VkPipelineStageFlags2 stage, bool write, bool discard)
 {
@@ -96,7 +96,7 @@ void resource_state_tracker::transition_scope(VkCommandBuffer cmd, VkImage image
                 }
                 else
                 {
-                    string::vku::transition_image(cmd, {
+                    rec.transition_image({
                         .image = image,
                         .old_layout = before.layout,
                         .new_layout = before.layout,
@@ -121,7 +121,7 @@ void resource_state_tracker::transition_scope(VkCommandBuffer cmd, VkImage image
                 // every reader since it (WAR — an execution dependency; readers need no availability).
                 VkPipelineStageFlags2 src_stage = before.last_write_stage | before.reader_stages;
                 if (src_stage == 0) src_stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-                string::vku::transition_image(cmd, {
+                rec.transition_image({
                     .image = image,
                     .old_layout = discard ? VK_IMAGE_LAYOUT_UNDEFINED : before.layout,
                     .new_layout = target.layout,
@@ -221,7 +221,7 @@ VkPipelineStageFlags2 resource_state_tracker::legalize(VkPipelineStageFlags2 sta
     return (stages & kComputeLegal) | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 }
 
-void resource_state_tracker::flush_buffers(VkCommandBuffer cmd)
+void resource_state_tracker::flush_buffers(gpu::command_recorder& rec)
 {
     if (pending_dst_stage_ == 0) return;
     const VkMemoryBarrier2 barrier = {
@@ -243,7 +243,7 @@ void resource_state_tracker::flush_buffers(VkCommandBuffer cmd)
         .imageMemoryBarrierCount = 0,
         .pImageMemoryBarriers = nullptr,
     };
-    vkCmdPipelineBarrier2(cmd, &dependency);
+    rec.barrier(dependency);
     pending_src_stage_ = 0;
     pending_src_access_ = 0;
     pending_dst_stage_ = 0;

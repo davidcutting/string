@@ -1,7 +1,7 @@
 // Ground-truth ambient occlusion + bent normals (half res, temporally reprojected). Brief 20 — the
 // image rings, the bindless slots and the hand-rolled sampler are gone; the two targets are graph
 // resources the application declares, and the chain is TWO declared passes so the raw -> denoise
-// hand-over is a derived barrier rather than a vku::transition_image call. All three transitions this
+// hand-over is a derived barrier rather than a hand-written image transition. All three transitions this
 // file used to emit are deleted; see the header for which declaration replaces which.
 #include <algorithm>
 

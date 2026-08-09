@@ -107,13 +107,6 @@ public:
     uint64_t update_count() const { return ibl_update_count_; }
     static constexpr uint32_t env_mips() { return kEnvPrefilterMips; }
 
-    // dbg.ibl_verify: read the DFG LUT + SH back and check against CPU references. Stalls the device
-    // on its own submit and runs outside the frame graph — a pre-graph debug path, not a revoked
-    // hand-barrier site. It needs real backing, so the caller (which holds the compiled frame)
-    // resolves the two handles and passes the physical ids in.
-    void run_verification(bool furnace, ::string::gpu::resource_id sh_buffer,
-                          ::string::gpu::resource_id dfg_lut);
-
 private:
     void dispatch(::string::pass_context& ctx, ::string::gpu::shader_program* prog,
                   const IblPush& push, uint32_t gx, uint32_t gy, uint32_t gz) const;
@@ -126,7 +119,6 @@ private:
     void record_prefilter(::string::pass_context& ctx, uint32_t mip);
 
     ::string::gpu::device& device_;
-    ::string::gpu::resource_allocator& allocator_;   // run_verification's staging only
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
 
     // The declared handles, latched by declare(). Logical, never physical: the records resolve them

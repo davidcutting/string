@@ -46,15 +46,6 @@ CVar<float>& cv_lod_error_px()
 }
 
 
-CVar<bool>& cv_meshlet_validate()
-{
-    static CVar<bool> v{"dbg.meshlet_validate", false, "run meshlet-builder validation at load"};
-    static const bool a = [] { v.add_alias("meshlet_validate"); return true; }();
-    (void)a;
-    return v;
-}
-
-
 CVar<bool>& cv_meshlet_readback()
 {
     static CVar<bool> v{"dbg.meshlet_readback", false, "read meshlet buffers back and memcmp after upload"};
@@ -148,15 +139,6 @@ CVar<bool>& cv_furnace()
     return v;
 }
 
-
-CVar<bool>& cv_ibl_verify()
-{
-    static CVar<bool> v{"dbg.ibl_verify", false,
-                        "read back DFG LUT + SH coefficients and check against CPU references"};
-    static const bool a = [] { v.add_alias("ibl_verify"); return true; }();
-    (void)a;
-    return v;
-}
 
 
 CVar<bool>& cv_ibl_every_frame()
@@ -539,7 +521,6 @@ void register_render_cvars()
     cv_lod_enabled();
     cv_cull_enabled();
     cv_lod_error_px();
-    cv_meshlet_validate();
     cv_meshlet_readback();
     cv_meshlet_dump();
     cv_lights_enabled();
@@ -552,7 +533,6 @@ void register_render_cvars()
     cv_ui_dump();
     cv_ui_dump_frame();
     cv_furnace();
-    cv_ibl_verify();
     cv_ibl_every_frame();
     cv_time_of_day();
     cv_sun_lean();
