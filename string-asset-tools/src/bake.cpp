@@ -5,6 +5,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <stdexcept>
 #include <unordered_map>
 
 #include <meshoptimizer.h>
@@ -53,6 +54,7 @@ struct BakeChunk
     glm::mat4 transform{ 1.0f };
     uint32_t src_index_offset = 0;   // for the streamer-window parity (CookedDraw.index_offset)
     uint32_t src_index_count = 0;
+    int32_t skin = -1;               // brief 23: source draw's skin; split pieces inherit it
 };
 
 // Append the meshlets from one already-built meshopt result (LOD-local vertex/triangle heaps) into
@@ -134,6 +136,7 @@ void build_lods_for_chunk(CookedScene& scene, const std::vector<float>& all_posi
     const uint32_t first_meshlet = static_cast<uint32_t>(scene.meshlets.size());
     draw.transform = chunk.transform;
     draw.material = chunk.material;
+    draw.skin_plus_one = chunk.skin >= 0 ? static_cast<uint32_t>(chunk.skin) + 1u : 0u;
     draw.aabb_min = chunk.aabb_min;
     draw.aabb_max = chunk.aabb_max;
     draw.center = (chunk.aabb_min + chunk.aabb_max) * 0.5f;
@@ -291,6 +294,66 @@ void split_recursive(const std::vector<uint32_t>& src, const std::vector<float>&
     split_recursive(src, all_positions, std::move(hi), budget, out);
 }
 
+// Phase 2 of bake_scene — repack the vertex stream grouped per chunk (the format contract: every
+// draw's vertices are one contiguous range, so the streamer suballocates windows whose sum equals
+// the stream size — a split chunk must NOT window its parent's whole [vmin, vmax] span or the heap
+// explodes to the parent-range x chunk-count).
+//   - Unsplit chunks copy their source [vmin, vmax] range VERBATIM (identical local vertex order
+//     => meshopt output is bit-identical to the old per-draw path — the budget-0 parity gate).
+//   - Split chunks gather their unique vertices in first-use order (deterministic).
+// Chunk indices are remapped into the packed stream; [vmin, vmax] becomes the packed range.
+//
+// The skin stream (brief 23) is INDEX-PARALLEL to the vertex heap, so when present it must be
+// repacked by the identical moves in BOTH branches — one function so the two streams cannot drift.
+void repack_vertices(std::vector<BakeChunk>& chunks,
+                     const std::vector<string::Vertex>& vertices,
+                     const std::vector<SkinVertex>& skin,
+                     std::vector<string::Vertex>& out_vertices,
+                     std::vector<SkinVertex>& out_skin)
+{
+    const bool has_skin = !skin.empty();
+    out_vertices.reserve(vertices.size());
+    if (has_skin) out_skin.reserve(skin.size());
+    for (BakeChunk& c : chunks)
+    {
+        if (c.indices.empty())
+        {
+            c.vmin = 0;
+            c.vmax = 0;
+            continue;
+        }
+        const uint32_t base = static_cast<uint32_t>(out_vertices.size());
+        if (!c.gathered)
+        {
+            out_vertices.insert(out_vertices.end(),
+                                vertices.begin() + c.vmin, vertices.begin() + c.vmax + 1);
+            if (has_skin)
+                out_skin.insert(out_skin.end(), skin.begin() + c.vmin, skin.begin() + c.vmax + 1);
+            for (uint32_t& i : c.indices) i = (i - c.vmin) + base;
+            c.vmax = base + (c.vmax - c.vmin);
+            c.vmin = base;
+        }
+        else
+        {
+            std::unordered_map<uint32_t, uint32_t> remap;
+            remap.reserve(c.indices.size());
+            for (uint32_t& i : c.indices)
+            {
+                const auto [it, inserted] =
+                    remap.emplace(i, static_cast<uint32_t>(out_vertices.size()) - base);
+                if (inserted)
+                {
+                    out_vertices.push_back(vertices[i]);
+                    if (has_skin) out_skin.push_back(skin[i]);
+                }
+                i = base + it->second;
+            }
+            c.vmin = base;
+            c.vmax = static_cast<uint32_t>(out_vertices.size()) - 1;
+        }
+    }
+}
+
 }  // namespace
 
 uint64_t content_hash(const std::vector<string::Vertex>& vertices,
@@ -313,11 +376,25 @@ uint64_t content_hash(const std::vector<string::Vertex>& vertices,
 CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
                        const std::vector<uint32_t>& indices,
                        const std::vector<GltfDraw>& draws,
-                       const BakeParams& params)
+                       const BakeParams& params,
+                       const SkinSource& skin)
 {
+    if (!skin.vertices.empty() && skin.vertices.size() != vertices.size())
+        throw std::runtime_error("bake: skin stream is not parallel to the vertex stream");
+
     CookedScene scene;
     scene.chunk_max_meshlets = params.chunk_max_meshlets;
     scene.source_content_hash = content_hash(vertices, indices, draws);
+    if (!skin.vertices.empty())
+    {
+        // Fold the skin inputs — a weights-only edit must invalidate the cook.
+        uint64_t h = scene.source_content_hash;
+        h = fnv1a(skin.vertices.data(), skin.vertices.size() * sizeof(SkinVertex), h);
+        h = fnv1a(skin.skins.data(), skin.skins.size() * sizeof(CookedSkin), h);
+        h = fnv1a(skin.inverse_bind.data(), skin.inverse_bind.size() * sizeof(glm::mat4), h);
+        h = fnv1a(skin.joint_remap.data(), skin.joint_remap.size() * sizeof(uint32_t), h);
+        scene.source_content_hash = h;
+    }
 
     // Extract xyz positions once (meshopt wants a tightly-strided float array).
     std::vector<float> all_positions(vertices.size() * 3);
@@ -332,6 +409,24 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
     // positions). Chunking off (budget 0) => one chunk per draw, byte-identical meshletize to the old
     // per-draw path (the parity gate). Chunking on => oversized draws split spatially, each piece a
     // new draw with tight bounds + its own LOD chain, in a deterministic recursion order.
+    // A skinned draw's bounds are the SKIN's animated AABB (union over sampled clip poses,
+    // computed by the front-end), not the bind-pose geometry AABB — the `skinned` culling
+    // contract is "bounds pre-inflated". Split pieces of a skinned draw share the whole animated
+    // bound: a per-piece bound is meaningless once the pieces deform.
+    //
+    // A draw's skin index is honoured only when the SkinSource actually describes that skin —
+    // otherwise the cooked draw would point at a skin table entry that does not exist (a caller
+    // passing draws with skin indices but no SkinSource cooks a static scene, not a broken one).
+    const auto skinned_bounds = [&skin](const GltfDraw& d, BakeChunk& chunk) {
+        if (d.skin < 0 || static_cast<size_t>(d.skin) >= skin.skins.size() ||
+            static_cast<size_t>(d.skin) >= skin.skin_anim_min.size())
+            return false;
+        chunk.skin = d.skin;
+        chunk.aabb_min = skin.skin_anim_min[d.skin];
+        chunk.aabb_max = skin.skin_anim_max[d.skin];
+        return true;
+    };
+
     std::vector<BakeChunk> chunks;
     for (const GltfDraw& d : draws)
     {
@@ -344,6 +439,7 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
             empty.aabb_max = d.aabb_max;
             empty.src_index_offset = d.index_offset;
             empty.src_index_count = 0;
+            skinned_bounds(d, empty);
             chunks.push_back(std::move(empty));
             continue;
         }
@@ -363,6 +459,7 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
             chunk.aabb_max = d.aabb_max;
             chunk.src_index_offset = d.index_offset;
             chunk.src_index_count = d.index_count;
+            skinned_bounds(d, chunk);
             chunks.push_back(std::move(chunk));
             continue;
         }
@@ -382,9 +479,10 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
             chunk.gathered = true;
             chunk.material = d.material;
             chunk.transform = d.transform;
-            chunk_aabb(chunk.indices, all_positions, d.transform, chunk.aabb_min, chunk.aabb_max);
             chunk.src_index_offset = d.index_offset;
             chunk.src_index_count = static_cast<uint32_t>(chunk.indices.size());
+            if (!skinned_bounds(d, chunk))
+                chunk_aabb(chunk.indices, all_positions, d.transform, chunk.aabb_min, chunk.aabb_max);
             chunks.push_back(std::move(chunk));
         }
     }
@@ -418,47 +516,12 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
     }
 
 
-    // Phase 2 — repack the vertex stream grouped per chunk (the format contract: every draw's
-    // vertices are one contiguous range, so the streamer suballocates windows whose sum equals the
-    // stream size — a split chunk must NOT window its parent's whole [vmin, vmax] span or the heap
-    // explodes to the parent-range x chunk-count).
-    //   - Unsplit chunks copy their source [vmin, vmax] range VERBATIM (identical local vertex order
-    //     => meshopt output is bit-identical to the old per-draw path — the budget-0 parity gate).
-    //   - Split chunks gather their unique vertices in first-use order (deterministic).
-    // Chunk indices are remapped into the packed stream; [vmin, vmax] becomes the packed range.
-    std::vector<string::Vertex> packed;
-    packed.reserve(vertices.size());
-    for (BakeChunk& c : chunks)
-    {
-        if (c.indices.empty())
-        {
-            c.vmin = 0;
-            c.vmax = 0;
-            continue;
-        }
-        const uint32_t base = static_cast<uint32_t>(packed.size());
-        if (!c.gathered)
-        {
-            packed.insert(packed.end(), vertices.begin() + c.vmin, vertices.begin() + c.vmax + 1);
-            for (uint32_t& i : c.indices) i = (i - c.vmin) + base;
-            c.vmax = base + (c.vmax - c.vmin);
-            c.vmin = base;
-        }
-        else
-        {
-            std::unordered_map<uint32_t, uint32_t> remap;
-            remap.reserve(c.indices.size());
-            for (uint32_t& i : c.indices)
-            {
-                const auto [it, inserted] = remap.emplace(i, static_cast<uint32_t>(packed.size()) - base);
-                if (inserted) packed.push_back(vertices[i]);
-                i = base + it->second;
-            }
-            c.vmin = base;
-            c.vmax = static_cast<uint32_t>(packed.size()) - 1;
-        }
-    }
-    scene.vertices = std::move(packed);
+    // Phase 2 — repack the vertex stream (and the parallel skin stream) grouped per chunk; see
+    // repack_vertices for the contract.
+    repack_vertices(chunks, vertices, skin.vertices, scene.vertices, scene.skin_vertices);
+    scene.skins = skin.skins;
+    scene.inverse_bind = skin.inverse_bind;
+    scene.joint_remap = skin.joint_remap;
 
     std::vector<float> packed_positions(scene.vertices.size() * 3);
     for (size_t i = 0; i < scene.vertices.size(); ++i)

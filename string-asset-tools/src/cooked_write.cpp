@@ -26,6 +26,10 @@ std::vector<uint8_t> write_cooked(const CookedScene& scene)
     plan[kSecDraws]         = { scene.draws.size(),             sizeof(CookedDraw),     scene.draws.data() };
     plan[kSecMaterials]     = { scene.materials.size(),         sizeof(CookedMaterial), scene.materials.data() };
     plan[kSecTextures]      = { scene.textures.size(),          sizeof(CookedTexture),  scene.textures.data() };
+    plan[kSecSkinVerts]     = { scene.skin_vertices.size(),     sizeof(SkinVertex),     scene.skin_vertices.data() };
+    plan[kSecSkins]         = { scene.skins.size(),             sizeof(CookedSkin),     scene.skins.data() };
+    plan[kSecInverseBind]   = { scene.inverse_bind.size(),      sizeof(glm::mat4),      scene.inverse_bind.data() };
+    plan[kSecJointRemap]    = { scene.joint_remap.size(),       sizeof(uint32_t),       scene.joint_remap.data() };
 
     // Header value-initialized so its padding bytes are zero (determinism).
     CookedHeader header{};
@@ -59,12 +63,14 @@ std::vector<uint8_t> write_cooked(const CookedScene& scene)
     return blob;
 }
 
-void write_cooked_file(const CookedScene& scene, const std::filesystem::path& out_path)
+namespace
 {
-    const std::vector<uint8_t> blob = write_cooked(scene);
+
+// Temp-then-rename so a crash mid-write never leaves a truncated file.
+void write_atomic(const std::vector<uint8_t>& blob, const std::filesystem::path& out_path)
+{
     std::error_code ec;
     std::filesystem::create_directories(out_path.parent_path(), ec);
-    // Temp-then-rename so a crash mid-write never leaves a truncated cooked file.
     const std::filesystem::path tmp = out_path.string() + ".tmp";
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
@@ -74,6 +80,18 @@ void write_cooked_file(const CookedScene& scene, const std::filesystem::path& ou
     }
     std::filesystem::rename(tmp, out_path, ec);
     if (ec) throw std::runtime_error("cook: rename failed for " + out_path.string());
+}
+
+}  // namespace
+
+void write_cooked_file(const CookedScene& scene, const std::filesystem::path& out_path)
+{
+    write_atomic(write_cooked(scene), out_path);
+}
+
+void write_anim_pack_file(const std::vector<uint8_t>& pack, const std::filesystem::path& out_path)
+{
+    write_atomic(pack, out_path);
 }
 
 }  // namespace string::asset::tools

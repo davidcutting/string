@@ -112,6 +112,8 @@ LoadedScene load_cooked_scenes(const std::filesystem::path& resources_path,
         const uint32_t mtri_base     = static_cast<uint32_t>(out.meshlet_triangles.size());
         const int32_t  tex_base      = static_cast<int32_t>(out.textures.size());
         const int32_t  material_base = static_cast<int32_t>(out.materials.size());
+        const uint32_t skin_base     = static_cast<uint32_t>(out.skins.size());
+        const uint32_t skin_vert_base = static_cast<uint32_t>(out.skin_vertices.size());
 
         const std::filesystem::path base_dir = src.parent_path();
 
@@ -151,6 +153,31 @@ LoadedScene load_cooked_scenes(const std::filesystem::path& resources_path,
         for (const CookedTexture& ct : scene.textures)
             out.textures.push_back(to_gltf_texture(ct, base_dir));
 
+        // Skins (brief 23): append the file's skin stream COMPACTLY (parallel to ITS vertices, so
+        // the per-draw rebase delta below is uniform per file) and rebase the per-skin table
+        // windows into the merged IBM/remap arrays.
+        if (!scene.skin_vertices.empty())
+        {
+            out.skin_vertices.insert(out.skin_vertices.end(),
+                                     scene.skin_vertices.begin(), scene.skin_vertices.end());
+            const uint32_t ibm_base = static_cast<uint32_t>(out.inverse_bind.size());
+            const uint32_t remap_base = static_cast<uint32_t>(out.joint_remap.size());
+            for (const CookedSkin& cs : scene.skins)
+            {
+                out.skins.push_back(LoadedSkin{
+                    .skeleton_hash = cs.skeleton_hash,
+                    .joint_count = cs.joint_count,
+                    .ibm_offset = cs.ibm_offset + ibm_base,
+                    .remap_offset = cs.remap_offset + remap_base,
+                    .anim_pack = anim_path_for(src),
+                });
+            }
+            out.inverse_bind.insert(out.inverse_bind.end(),
+                                    scene.inverse_bind.begin(), scene.inverse_bind.end());
+            out.joint_remap.insert(out.joint_remap.end(),
+                                   scene.joint_remap.begin(), scene.joint_remap.end());
+        }
+
         // Draws: build the geometry-only GpuDrawInfo (LOD ranges + bounds, rebased into the merged
         // meshlet heap + vertex window) + the GltfDraw meta the pass keeps for culling/streaming.
         for (const CookedDraw& cd : scene.draws)
@@ -180,6 +207,16 @@ LoadedScene load_cooked_scenes(const std::filesystem::path& resources_path,
             meta.transform = cd.transform;
             meta.aabb_min = cd.aabb_min;
             meta.aabb_max = cd.aabb_max;
+
+            // Brief 23: bind the draw to its merged skin. The skin heap is compact, so the
+            // rebase delta is (this file's skin base - this file's vertex base) — the same for
+            // every draw of the file, carried per draw for the paperdoll future.
+            const bool skinned = cd.skin_plus_one > 0 && !scene.skin_vertices.empty();
+            meta.skin = skinned ? static_cast<int32_t>(skin_base + cd.skin_plus_one - 1) : -1;
+            out.draw_skin.push_back(meta.skin);
+            out.draw_skin_delta.push_back(
+                skinned ? static_cast<int32_t>(skin_vert_base) - static_cast<int32_t>(vertex_base)
+                        : 0);
             out.draws_meta.push_back(meta);
         }
     }

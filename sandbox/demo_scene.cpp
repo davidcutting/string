@@ -26,6 +26,7 @@
 #include <string/vulkan/frame_graph.hpp>
 #include <string/vulkan/content_root.hpp>
 #include <string/vulkan/scene_registry.hpp>
+#include "anim_demo.hpp"
 #include "debug_cvars.hpp"
 #include <string/render/debug_line_pass.hpp>
 #include <string/render/geometry_pass.hpp>
@@ -312,6 +313,7 @@ struct scene_resources
     ::string::render::WorklistSet worklists;
     string::gpu::buffer scene_data, lights, stats;
     string::gpu::buffer gi_active, gi_offset, gi_meshlet_table;
+    string::gpu::buffer joint_palette;   // brief 23: the anim tick's palette ring
     uint32_t bloom_mips = 0;
 };
 
@@ -330,6 +332,10 @@ struct scene_backing
     std::vector<string::gpu::resource_id> hiz_depth;
     // Host-write pacing rings: the CPU fills frame N+1's slot while the GPU still reads frame N's.
     std::vector<string::gpu::resource_id> scene_data, lights, stats, transparency_list;
+    // Brief 23: the joint-palette ring — the anim tick writes slot N+1's palettes while the GPU
+    // skins with slot N's. Identical layout every slot (palette offsets are load-time constants;
+    // only the base address rotates, through SceneData).
+    std::vector<string::gpu::resource_id> joint_palette;
     // Probe-GI accumulators: captured/relit tiles persist across the amortized rounds, and readers
     // must see REAL accumulated data on frames when no producer pass runs — as transients they were
     // degrade-substituted with the 1x1 neutral on exactly those frames.
@@ -342,7 +348,8 @@ struct scene_backing
     string::gpu::resource_id env_capture = 0, env_prefiltered = 0, dfg_lut = 0, ibl_sh = 0;
 
     void create(string::engine_context& c, VkExtent2D viewport, uint32_t max_draws,
-                const ::string::render::ProbeVolume& gi_volume, std::size_t gi_table_entries)
+                const ::string::render::ProbeVolume& gi_volume, std::size_t gi_table_entries,
+                uint32_t palette_joints)
     {
         ctx = &c;
         const uint32_t slots = c.frames_in_flight;
@@ -371,6 +378,22 @@ struct scene_backing
                                   .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
                                   .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
                                                     | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT });
+        // Brief 23: sized to the loaded scene's total palette joints (a scene with no skins gets
+        // one identity-sized slot so the handle stays valid and the graph stays static).
+        ring(joint_palette, { .size = sizeof(glm::mat4) * std::max(1u, palette_joints),
+                              .usage = host_ssbo,
+                              .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
+                              .allocation_flags = mapped });
+        // Every slot defaults to IDENTITY palettes — an identity palette skins the bind pose (the
+        // skinned vertices are authored in bind space), so a character whose animation never
+        // arrives (no driver yet, skeleton-hash mismatch) stands in bind pose instead of
+        // rendering whatever VMA recycled into the ring.
+        for (string::gpu::resource_id id : joint_palette)
+        {
+            auto* mats = static_cast<glm::mat4*>(
+                c.allocator.get_buffer(id).allocation_info.pMappedData);
+            for (uint32_t j = 0; j < std::max(1u, palette_joints); ++j) mats[j] = glm::mat4(1.0f);
+        }
 
         const glm::uvec2 gi_tiles = gi_volume.tile_grid();
         const string::gpu::sampler_info gi_sampler{ .mag_filter = VK_FILTER_LINEAR,
@@ -472,7 +495,7 @@ struct scene_backing
     {
         if (ctx == nullptr) return;
         for (string::gpu::resource_id id : hiz_depth) ctx->allocator.destroy_resource(id);
-        for (auto* v : { &scene_data, &lights, &stats, &transparency_list })
+        for (auto* v : { &scene_data, &lights, &stats, &transparency_list, &joint_palette })
             for (string::gpu::resource_id id : *v) ctx->allocator.destroy_resource(id);
         for (string::gpu::resource_id id : { gi_irradiance, gi_cap_gbuf, gi_cap_albedo, gi_visibility,
                                              gi_active, gi_offset, gi_meshlet_table,
@@ -670,6 +693,8 @@ scene_resources declare_resources(string::frame_graph& fg, VkExtent2D viewport,
     // SceneData, the animated light ring and the GPU stats block — host-write pacing rings,
     // app-backed (see scene_backing).
     r.scene_data = persist_buf("scene.data",   backing != nullptr ? &backing->scene_data : nullptr);
+    r.joint_palette = persist_buf("anim.palette",
+                                  backing != nullptr ? &backing->joint_palette : nullptr);
     r.lights     = persist_buf("scene.lights", backing != nullptr ? &backing->lights : nullptr);
     r.stats      = persist_buf("scene.stats",  backing != nullptr ? &backing->stats : nullptr);
 
@@ -955,6 +980,7 @@ struct geometry_scene_state
     std::unique_ptr<ui_pass> ui;
     std::unique_ptr<post_pass> post;
     std::unique_ptr<string::composite_pass> composite;
+    std::unique_ptr<sandbox::anim_demo> anim;   // brief 23: null when the scene has no skins
     scene_resources res;
     string::frame_graph* graph = nullptr;
 
@@ -1092,7 +1118,8 @@ std::function<void(float)> make_geometry_scene(
         probe_gi_component::fit_volume(scene->scene_aabb_min_, scene->scene_aabb_max_);
     // The app allocates the temporal backings BEFORE declaring, so every persistent handle is
     // backed at compile and its descriptor slots bind once, up front (brief 21 D3).
-    s->backing.create(ctx, viewport, scene->cull_max_draws_, gi_volume, s->geo->gi_capture_entries());
+    s->backing.create(ctx, viewport, scene->cull_max_draws_, gi_volume, s->geo->gi_capture_entries(),
+                      s->geo->palette_joints_total());
     // The work-list sizes come from the meshlet build (which has already run, in the geometry_pass
     // constructor above): both sides read the SAME numbers, so a declaration cannot drift from the
     // layout the shaders index with.
@@ -1118,6 +1145,13 @@ std::function<void(float)> make_geometry_scene(
         make_ui_observer(ui_slot), make_deferred_author(ui_slot));
     s->post         = std::make_unique<post_pass>(ctx);
     s->composite    = std::make_unique<string::composite_pass>(ctx, swapchain_format);
+    // Brief 23: the animation driver, only when the loaded scene actually has skins (a null
+    // pointer keeps the tick free for every static scene).
+    if (!s->geo->skins().empty())
+    {
+        s->anim = std::make_unique<sandbox::anim_demo>(*s->geo);
+        if (s->anim->empty()) s->anim.reset();
+    }
 
     const std::span<const string::gpu::image> cascades{ r.shadow, scene->settings_.cascade_count };
     const probe_gi_component::resources gi_res{
@@ -1131,11 +1165,12 @@ std::function<void(float)> make_geometry_scene(
     s->ibl->declare(fg, r.env_capture, r.env_prefiltered, r.dfg_lut, r.ibl_sh);
     s->gtao->declare(fg, r.hiz_depth_prev, r.gtao_raw, r.gtao_ao);
     s->gi->declare(fg, gi_res, r.ibl_sh, r.scene_data, cascades, r.color, r.depth);
-    s->shadow->declare(fg, cascades, r.worklists);
+    s->shadow->declare(fg, cascades, r.worklists, r.scene_data, r.joint_palette);
     s->sky->declare(fg, r.color, r.depth, [] { return ::string::render::cv_pass_sky().get(); });
     s->geo->declare(fg, r.color, r.hdr, r.depth, r.hiz_depth, r.hiz_pyramid,
                     r.worklists, r.scene_data, r.lights, r.stats,
-                    cascades, r.gtao_ao, r.env_prefiltered, r.dfg_lut, r.ibl_sh, r.froxels);
+                    cascades, r.gtao_ao, r.env_prefiltered, r.dfg_lut, r.ibl_sh, r.froxels,
+                    r.joint_palette);
     s->transparency->declare(fg, r.color, r.depth, r.transparency_list, r.scene_data, r.stats);
     s->debug_lines->declare(fg, r.color, r.depth);
     s->ui->declare(fg, r.color);
@@ -1180,6 +1215,17 @@ std::function<void(float)> make_geometry_scene(
         // the UI most visibly — computes against a 0x0 screen and draws nothing.
         scene_ptr->screen_size = rp->extent();
         const std::uint32_t slot = rp->frame_slot();
+        // Brief 23: sample + blend + build palettes into THIS slot's ring physical BEFORE the
+        // geometry tick (geo derives culling/residency state that should see current poses). The
+        // per-frame safety is the RING — the GPU is reading an older slot behind its fence while
+        // this writes slot `slot`.
+        if (s->anim != nullptr)
+        {
+            auto* palettes = static_cast<glm::mat4*>(
+                s->backing.ctx->allocator.get_buffer(s->backing.joint_palette[slot])
+                    .allocation_info.pMappedData);
+            s->anim->tick(dt, { palettes, s->geo->palette_joints_total() });
+        }
         s->geo->tick(dt, slot);
         s->gtao->tick(rp->extent(), static_cast<uint16_t>(slot));
         s->ibl->tick(scene_ptr->ibl_lighting(), false);

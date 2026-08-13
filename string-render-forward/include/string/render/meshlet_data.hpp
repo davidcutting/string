@@ -33,8 +33,9 @@ using ::string::asset::kMeshletConeWeight;
 using ::string::asset::kMeshletMaxTriangles;
 using ::string::asset::kMeshletMaxVertices;
 
-// Per-draw table (ArrayStride 208). `resident` is the streaming gate (host-visible write), `skinned`
-// is reserved for Phase B (bounds inflation + cone-cull bypass).
+// Per-draw table. `resident` is the streaming gate (host-visible write); `skinned` (brief 23) marks
+// a draw whose vertices deform through load_vertex's palette blend — its bounds carry the ANIMATED
+// whole-character sphere and the cone cull is bypassed.
 struct GpuDrawInfo
 {
     glm::mat4 model;               // 0
@@ -61,6 +62,14 @@ struct GpuDrawInfo
     // Material rendering flags (brief 04): bit 0 = cutout (alpha-test), bit 1 = double-sided.
     uint32_t flags;                // 208
     float alpha_cutoff;            // 212 (MASK threshold; base-color alpha < this => clip())
+    // Brief 23 skinning (appended; Slang mirror in meshlet.slang — offsets re-verified from the
+    // SPIR-V natural-layout ground truth per the header note). skin_offset is the SIGNED delta
+    // (int32 bits) rebasing the ORIGINAL global vertex index into the COMPACT skin heap — the
+    // vertex_offset idiom, so it is immune to geometry streaming.
+    uint32_t skin_offset;          // 216
+    uint32_t palette_offset;       // 220 first joint of this draw's palette in the ring (mat4 units)
+    uint32_t joint_count;          // 224 palette length
+    uint32_t _pad_skin;            // 228 -> 232
 };
 // Brief 04 material flag bits (must match meshlet.slang kDrawFlag*).
 inline constexpr uint32_t kDrawFlagCutout = 1u;
@@ -81,7 +90,10 @@ static_assert(offsetof(GpuDrawInfo, total_meshlets) == 200);
 static_assert(offsetof(GpuDrawInfo, vertex_offset) == 204);
 static_assert(offsetof(GpuDrawInfo, flags) == 208);
 static_assert(offsetof(GpuDrawInfo, alpha_cutoff) == 212);
-static_assert(sizeof(GpuDrawInfo) == 216);
+static_assert(offsetof(GpuDrawInfo, skin_offset) == 216);
+static_assert(offsetof(GpuDrawInfo, palette_offset) == 220);
+static_assert(offsetof(GpuDrawInfo, joint_count) == 224);
+static_assert(sizeof(GpuDrawInfo) == 232);
 
 // Scan block size — must match kScanBlock in meshlet.slang (the compaction two-pass block scan).
 inline constexpr uint32_t kScanBlock = 256;

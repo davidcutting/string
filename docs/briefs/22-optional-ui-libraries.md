@@ -311,10 +311,13 @@ natural node-editor target and nothing in the spec conflicts.
 
 **Animation — a real conflict.** The spec (item 1) locks *"engine does sampling + blending only;
 state machines are game code"*. A **blend-tree** editor fits that. A **state-machine** editor does
-not — it would be authoring game code in the engine, against an explicit decision. Also note no
+not — it would be authoring game code in the engine, against an explicit decision. ~~Also note no
 animation library is named anywhere in the spec: **ozz is a new proposal, not a locked choice**, and
-picking it is its own decision (the spec's paperdoll + shared-skeleton + animation-LOD constraints
-are what should drive it).
+picking it is its own decision.~~ **Superseded 2026-08-13: ozz-animation 0.17.0 is LOCKED (user
+decision, brief 23).** The sampling/blending-only boundary in this paragraph still stands — brief 23
+takes exactly ozz's SamplingJob/BlendingJob/LocalToModelJob + offline builders, nothing stateful —
+and the paperdoll + shared-skeleton + animation-LOD constraints are carried as format hooks there
+(`palette_offset` sharing, per-part `CookedSkin`, separable `.anim` packs).
 
 **The render graph — the sharpest one.** Brief 20 locked **AUTHORED ONCE, COMPILED ONCE**: a toggle
 is an in-graph conditional, a resize swaps backing, and neither re-authors or re-plans. The only

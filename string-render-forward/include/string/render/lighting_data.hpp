@@ -113,6 +113,12 @@ struct SceneData
     // 1 = full sky (leak); tuned live via r.gi.occluded_floor. The collapse is ramped smoothly on the
     // cage weight in-shader, so this only sets the floor the ramp lands on.
     float probe_occluded_floor;     // 848 (float, 4-aligned; sizeof pads to 856 for the 8-aligned ptrs)
+
+    // Brief 23 skinning tail (appended — earlier offsets unchanged; asserts below). The palette
+    // pointer is THIS FRAME SLOT's ring physical, which is exactly why these live in the ringed
+    // SceneData rather than the non-ringed draw table. 0 = no skinned geometry this scene.
+    VkDeviceAddress skin_stream;    // 856 SkinVertexBuffer (compact skin heap)
+    VkDeviceAddress joint_palette;  // 864 PaletteBuffer (this slot's palettes)
 };
 
 // Lock the layout against Slang's NATURAL layout for pointer-loaded structs (scalar packing:
@@ -151,7 +157,10 @@ static_assert(offsetof(SceneData, probe_gi) == 828);
 static_assert(offsetof(SceneData, probe_offsets) == 832);
 static_assert(offsetof(SceneData, probe_active) == 840);
 static_assert(offsetof(SceneData, probe_occluded_floor) == 848);
-static_assert(sizeof(SceneData) == 856);
+// Brief 23 tail (verified against %SceneData_natural OpMemberDecorate offsets, see the brief log).
+static_assert(offsetof(SceneData, skin_stream) == 856);
+static_assert(offsetof(SceneData, joint_palette) == 864);
+static_assert(sizeof(SceneData) == 872);
 
 
 // Push for the half-res GTAO chain (matches Push in shaders/gtao.slang).

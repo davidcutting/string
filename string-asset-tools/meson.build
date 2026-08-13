@@ -57,6 +57,23 @@ meshopt_dep = dependency('meshoptimizer',
                          method : 'cmake', modules : ['meshoptimizer::meshoptimizer'],
                          fallback : ['meshoptimizer', 'meshoptimizer_dep'])
 
+# ozz-animation offline builders (SkeletonBuilder/AnimationBuilder; brief 23). ozz is resolved
+# ONCE, in string-core/meson.build (single-resolution, the libktx precedent — see the note there
+# and in its wrap); string-core exports this override carrying the offline + runtime + base link
+# set. The string-core dependency() above already configured that subproject, so the override is
+# registered by the time this line runs. The find_library fallback covers the case where
+# string-core came from a system install (no subproject, no override) — ozz exports no CMake
+# config and no pkg-config, so find_library is the only system probe that works.
+ozz_offline_dep = dependency('ozz-animation-offline', required : false)
+if not ozz_offline_dep.found()
+    cpp = meson.get_compiler('cpp')
+    ozz_offline_dep = declare_dependency(dependencies : [
+        cpp.find_library('ozz_animation_offline'),
+        cpp.find_library('ozz_animation'),
+        cpp.find_library('ozz_base'),
+    ])
+endif
+
 # Vendored MikkTSpace reference lib (tangent generation for meshes without glTF TANGENT). Built as
 # its own static lib so the project's -Wall/-Wextra don't drown in this third-party C file.
 mikktspace_lib = static_library(
@@ -77,11 +94,12 @@ asset_tools_lib = static_library(
         'src/bake_gltf.cpp',
         'src/cooked_write.cpp',
         'src/gltf_loader.cpp',
+        'src/gltf_skin.cpp',
         'src/texture_cook.cpp',
     ],
     include_directories : [ include_dir, private_inc ],
     link_with : [ mikktspace_lib ],
-    dependencies : [ string_dep, asset_dep, meshopt_dep, ktx_dep ],
+    dependencies : [ string_dep, asset_dep, meshopt_dep, ktx_dep, ozz_offline_dep ],
     install : true,
 )
 
@@ -90,7 +108,7 @@ install_subdir('include/string', install_dir : 'include')
 project_deps = declare_dependency(
     include_directories : include_dir,
     link_with : [ asset_tools_lib, mikktspace_lib ],
-    dependencies : [ string_dep, asset_dep, meshopt_dep, ktx_dep ],
+    dependencies : [ string_dep, asset_dep, meshopt_dep, ktx_dep, ozz_offline_dep ],
 )
 
 meson.override_dependency(meson.project_name(), project_deps)
@@ -136,6 +154,26 @@ if get_option('tests')
         executable(
             'texture_cook_tests',
             [ 'test/texture_cook_test.cpp' ],
+            dependencies : [ project_deps, gtest_dep ],
+            install : false,
+        )
+    )
+    # Brief 23 M0: proves the ozz offline builders resolve + link (see meson.build's
+    # ozz_offline_dep note). The real skeleton/clip cook tests grow beside this.
+    test('ozz_offline_tests',
+        executable(
+            'ozz_offline_tests',
+            [ 'test/ozz_offline_test.cpp' ],
+            dependencies : [ project_deps, gtest_dep ],
+            install : false,
+        )
+    )
+    # Brief 23 M1: the skin cook — quantization, lockstep repack, v4 sections, the .anim pack,
+    # and cook-twice byte determinism over a real in-memory skinned .glb.
+    test('skin_cook_tests',
+        executable(
+            'skin_cook_tests',
+            [ 'test/skin_cook_test.cpp' ],
             dependencies : [ project_deps, gtest_dep ],
             install : false,
         )

@@ -7,6 +7,7 @@
 #include <sstream>
 #include <string>
 
+#include <string/anim/anim_pack.hpp>
 #include <string/core/logger.hpp>
 
 #include <string/asset/cooked_format.hpp>
@@ -83,6 +84,13 @@ std::filesystem::path cooked_path_for(const std::filesystem::path& source, uint3
     return out;
 }
 
+std::filesystem::path anim_path_for(const std::filesystem::path& source)
+{
+    std::filesystem::path out = source;
+    out.replace_extension(".anim");
+    return out;
+}
+
 bool needs_recook(const std::filesystem::path& source, const std::filesystem::path& cooked_path,
                   uint32_t chunk_budget)
 {
@@ -90,16 +98,31 @@ bool needs_recook(const std::filesystem::path& source, const std::filesystem::pa
     if (!std::filesystem::exists(cooked_path, ec) || ec) return true;
 
     // Format-version fast check (the size/mtime manifest can't see a code-side format bump — the
-    // SOURCE didn't change): peek the cooked header's magic + version; mismatch => recook.
+    // SOURCE didn't change): peek the cooked header's magic + version; mismatch => recook. The
+    // full header is read because the skins section count decides the `.anim` check below.
     {
         std::ifstream in(cooked_path, std::ios::binary);
-        char magic[8] = {};
-        uint32_t version = 0;
-        in.read(magic, sizeof(magic));
-        in.read(reinterpret_cast<char*>(&version), sizeof(version));
-        if (!in || std::memcmp(magic, kCookedMagic, sizeof(magic)) != 0 ||
-            version != kCookedFormatVersion)
+        CookedHeader header{};
+        in.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!in || std::memcmp(header.magic, kCookedMagic, sizeof(header.magic)) != 0 ||
+            header.format_version != kCookedFormatVersion)
             return true;
+
+        // Brief 23: a skinned scene's `.anim` sibling must exist with a current magic + version
+        // (a deleted pack, or a pack-format bump with an unchanged source, re-cooks). Static
+        // scenes (no skins) skip this entirely — no perpetual re-cook for sponza.
+        if (header.sections[kSecSkins].count > 0)
+        {
+            std::ifstream anim_in(anim_path_for(source), std::ios::binary);
+            char anim_magic[8] = {};
+            uint32_t anim_version = 0;
+            anim_in.read(anim_magic, sizeof(anim_magic));
+            anim_in.read(reinterpret_cast<char*>(&anim_version), sizeof(anim_version));
+            if (!anim_in ||
+                std::memcmp(anim_magic, anim::kAnimPackMagic, sizeof(anim_magic)) != 0 ||
+                anim_version != anim::kAnimPackVersion)
+                return true;
+        }
     }
 
     const std::map<std::string, Entry> entries = load_manifest(manifest_path(source));

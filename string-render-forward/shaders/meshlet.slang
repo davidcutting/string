@@ -6,6 +6,10 @@
 //     | grep 'OpMemberDecorate %<Struct>_natural'
 // NEVER trust hand-computed std430 rules for these.
 
+// SkinVertexBuffer/PaletteBuffer (SceneData carries their pointers) — re-exported so every
+// consumer of this module keeps seeing the full meshlet data model in one import.
+__exported import scene_data;
+
 // meshopt build limits (must match meshlet_data.hpp). Mesh-shader output-array sizes reference these.
 static const uint kMeshletMaxVertices = 64;
 static const uint kMeshletMaxTriangles = 124;
@@ -77,6 +81,39 @@ struct MeshletBuffer { Meshlet meshlets[]; };
 struct MeshletVertexBuffer { uint indices[]; };
 struct MeshletTriangleBuffer { uint packed[]; };
 
+// The two pointers load_vertex needs to skin (from SceneData — see scene_data.slang for the
+// SkinVertexBuffer/PaletteBuffer formats). Zero pointers = a pipeline that never skins (probe
+// capture) or a frame with no skinned geometry; load_vertex only dereferences them behind
+// di.skinned.
+struct SkinContext
+{
+    SkinVertexBuffer *skin;
+    PaletteBuffer *palette;
+};
+
+// Unpack the vertex's 10:10:10:2 tangent (matching VK_FORMAT_A2B10G10R10_SNORM_PACK32 and the
+// cook's pack_tangent). Sign is the bitangent handedness (B = sign * cross(N, T)).
+void unpack_tangent(uint packed, out float3 tangent, out float sign)
+{
+    int xi = int(packed << 22) >> 22;
+    int yi = int(packed << 12) >> 22;
+    int zi = int(packed << 2) >> 22;
+    int wi = int(packed << 0) >> 30;
+    tangent = float3(max(xi / 511.0, -1.0), max(yi / 511.0, -1.0), max(zi / 511.0, -1.0));
+    sign = wi < 0 ? -1.0 : 1.0;
+}
+
+// One loaded vertex, OBJECT space — the caller applies di.model exactly as before the seam.
+struct LoadedVertex
+{
+    float3 pos;
+    float3 normal;
+    float3 tangent;
+    float tangent_sign;
+    float2 uv;
+    float3 color;
+};
+
 // Per source draw, one per LOD level: the meshlet range for that LOD and its simplification error.
 struct MeshletLod
 {
@@ -114,12 +151,68 @@ struct DrawInfo
     // (bypass cone cull, rasterizer CULL_NONE via a separate command list, flip normal to viewer).
     uint flags;
     float alpha_cutoff;    // MASK threshold, sampled base-color alpha < this => clip()
+    // --- Brief 23 skinning (appended; meshlet_data.hpp asserts the offsets) -----------------
+    // Signed delta rebasing the ORIGINAL global vertex index into the COMPACT skin heap (the
+    // vertex_offset idiom — immune to geometry streaming, which rebases only vertex_offset).
+    uint skin_offset;
+    uint palette_offset;   // first joint of this draw's palette in the ring, in mat4 units
+    uint joint_count;      // palette length (indexing clamp + debug)
+    uint _pad_skin;
 };
 // Brief 04 material flag bits (shared C++/Slang meaning).
 static const uint kDrawFlagCutout = 1u;
 static const uint kDrawFlagDoubleSided = 2u;
 static const uint kDrawFlagBlend = 4u;    // alpha-blend: excluded from opaque lists, drawn sorted in the transparency pass
 struct DrawInfoBuffer { DrawInfo draws[]; };
+
+// THE one vertex-fetch seam (brief 03 promised it, brief 23 built it; 04f's shared dequant
+// lands here too). `global_v` is the raw meshlet-vertex remap entry — the ORIGINAL global
+// vertex index, BEFORE the streamer's heap rebase, which happens here. Returns object-space
+// attributes; the CALLER applies di.model, keeping its transform arithmetic byte-identical to
+// the pre-seam inline fetch (the M3a parity gate). The unused loads of a depth-only caller
+// (shadow) are pure and dead-code-eliminated.
+LoadedVertex load_vertex(SkinContext sc, DrawInfo di, uint global_v, VertexBuffer *vertices)
+{
+    uint gv = uint(int(global_v) + int(di.vertex_offset));
+    Vertex v = vertices.verts[gv];
+    LoadedVertex o;
+    o.pos = v.pos;
+    o.normal = v.normal;
+    o.uv = v.texCoord;
+    o.color = v.color;
+    unpack_tangent(v.tangent, o.tangent, o.tangent_sign);
+
+    // Brief 23: inline GPU skinning in the vertex pull. Blend the 4 influences' palette
+    // matrices into one (weights sum to exactly 255 by cook-time construction — no
+    // renormalization), then transform position AND frames by it. The frames use the plain
+    // 3x3, a DELIBERATE divergence from transform_normal's cofactor: skinning matrices are
+    // rotation+translation from the animation (no non-uniform scale in this content), and a
+    // per-vertex cofactor costs three cross products for a case that cannot arise. The
+    // caller's transform_normal(di.model, ...) for the MODEL matrix is unchanged.
+    if (di.skinned != 0u && sc.skin != nullptr && sc.palette != nullptr)
+    {
+        uint2 sv = sc.skin.v[uint(int(global_v) + int(di.skin_offset))];
+        // Accumulate with INTEGER-valued weights and divide once. Not a style choice: the
+        // weights sum to exactly 255 by construction, so identical palette matrices blend to
+        // exactly (M*255)/255 == M (x/x and 0/x are exact float divisions) — the identity
+        // palette skins BIT-EXACTLY to the unskinned path, which is what makes the M3b parity
+        // gate a binary answer. Per-influence w*(1/255) would round each term and smear mesh
+        // edges by an ulp (~0.1% of pixels).
+        float4x4 m = 0;
+        [unroll]
+        for (uint i = 0; i < 4; ++i)
+        {
+            uint joint = min((sv.x >> (i * 8u)) & 0xffu, di.joint_count - 1u);
+            float weight = float((sv.y >> (i * 8u)) & 0xffu);
+            m += sc.palette.m[di.palette_offset + joint] * weight;
+        }
+        m = m / 255.0;
+        o.pos = mul(m, float4(o.pos, 1.0)).xyz;
+        o.normal = mul((float3x3)m, o.normal);
+        o.tangent = mul((float3x3)m, o.tangent);
+    }
+    return o;
+}
 
 // --- Brief 03b: GPU-driven draw generation --------------------------------------------------------
 // The draw-cull compute (meshlet_draw_cull.slang) writes one entry per surviving draw into two

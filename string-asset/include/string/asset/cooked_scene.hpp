@@ -34,6 +34,10 @@ struct CookedScene
     std::vector<CookedDraw> draws;               // per-draw table (bounds + LOD ranges + vertex window)
     std::vector<CookedMaterial> materials;
     std::vector<CookedTexture> textures;
+    std::vector<SkinVertex> skin_vertices;       // brief 23: parallel to `vertices` (empty = no skins)
+    std::vector<CookedSkin> skins;
+    std::vector<glm::mat4> inverse_bind;         // glTF skin.joints[] order, per CookedSkin window
+    std::vector<uint32_t> joint_remap;           // glTF joint -> ozz joint, per CookedSkin window
     uint32_t total_meshlets = 0;
     uint64_t source_content_hash = 0;
     uint32_t chunk_max_meshlets = 0;             // the budget this scene was cooked with

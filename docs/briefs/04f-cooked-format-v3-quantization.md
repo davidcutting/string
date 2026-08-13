@@ -4,6 +4,14 @@ Status: not started. Runs after 04e (or opportunistically between briefs —
 it is independent of the graph work but touches the mesh-shader vertex pull,
 so do not overlap it with 04c/04d agents).
 
+**Inherited constraint from brief 23 (2026-08-13):** skinning landed first, on a SEPARATE
+skin stream (`kSecSkinVerts`, index-parallel to `kSecVertices`). This brief may re-quantize
+the vertex sections freely but **must never reorder or renumber vertices** — the skin stream
+rides the same indices and never re-cooks. Two gifts 23 left behind: the mesh-shader vertex
+pull now goes through ONE seam (`meshlet.slang::load_vertex`) — the "single shared dequant
+function" this brief mandates is exactly where that seam already is — and the on-disk format
+is now v4 (this brief's bump is v5, not v3 as the old title says).
+
 ## Goal
 
 Halve the vertex footprint before content accumulates: cooked format v3

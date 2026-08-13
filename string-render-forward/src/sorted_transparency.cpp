@@ -162,11 +162,20 @@ void sorted_transparency::declare(::string::frame_graph& fg, ::string::gpu::imag
                                   ::string::gpu::image depth, ::string::gpu::buffer list,
                                   ::string::gpu::buffer scene_data, ::string::gpu::buffer stats)
 {
-    fg.pass("transparency")
+    ::string::pass_spec transparency = fg.pass("transparency");
+    transparency
       .color(color)
       .depth_read(depth)
       .reads(list, access::indirect_read)
       .reads(list, access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
+      // Brief 23: the MESH stage pulls the skin stream + palettes through SceneData (raster
+      // reads default to FRAGMENT; a skinned blended draw would otherwise be under-barriered).
+      .reads(scene_data)
+      .reads(scene_data, access::storage_read, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+    if (scene_ != nullptr && scene_->joint_palette_.valid())
+        transparency.reads(scene_->joint_palette_, access::storage_read,
+                           VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+    transparency
       // r.pass.transparency drops the blended draw -> opaque geometry only. No degrade needed:
       // transparency is a pure over-draw with no consumer.
       .toggle([] { return cv_pass_transparency().get(); })

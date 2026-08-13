@@ -463,6 +463,33 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     draw_windows.reserve(loaded.draw_windows.size());
     for (const auto& w : loaded.draw_windows) draw_windows.push_back({ w.offset, w.count });
 
+    // Brief 23: adopt the skin tables and assign each skin's palette window — a running sum, all
+    // draws of one skin sharing the window (the paperdoll shape). The ring's layout is identical
+    // in every frame slot, so these offsets are assigned exactly once, here; only the ring's base
+    // address rotates (through SceneData).
+    skin_vertices_ = std::move(loaded.skin_vertices);
+    skin_inverse_bind_ = std::move(loaded.inverse_bind);
+    skin_joint_remap_ = std::move(loaded.joint_remap);
+    draw_skin_ = std::move(loaded.draw_skin);
+    draw_skin_delta_ = std::move(loaded.draw_skin_delta);
+    palette_joints_total_ = 0;
+    skins_.reserve(loaded.skins.size());
+    for (const LoadedSkin& ls : loaded.skins)
+    {
+        skins_.push_back(GeometryScene::SkinInstance{
+            .skeleton_hash = ls.skeleton_hash,
+            .joint_count = ls.joint_count,
+            .ibm_offset = ls.ibm_offset,
+            .remap_offset = ls.remap_offset,
+            .palette_offset = palette_joints_total_,
+            .anim_pack = ls.anim_pack,
+        });
+        palette_joints_total_ += ls.joint_count;
+    }
+    if (!skins_.empty())
+        STRING_LOG_INFO("[load] skins: {} instance(s), {} palette joints, {} skinned vertices",
+                        skins_.size(), palette_joints_total_, skin_vertices_.size());
+
     STRING_LOG_INFO("[load] cooked scenes: {} files ({} fresh, {} cooked in-process) in {:.1f} ms",
                     model_paths.size(), loaded.cooked_hits, loaded.cooked_misses, loaded.load_ms);
 
@@ -1492,9 +1519,11 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
                             string::gpu::buffer lights, string::gpu::buffer stats,
                             std::span<const string::gpu::image> cascades, string::gpu::image gtao_ao,
                             string::gpu::image env_prefiltered, string::gpu::image dfg_lut,
-                            string::gpu::buffer ibl_sh, string::gpu::buffer froxels)
+                            string::gpu::buffer ibl_sh, string::gpu::buffer froxels,
+                            string::gpu::buffer joint_palette)
 {
     scene_data_ = scene_data;
+    joint_palette_ = joint_palette;
     lights_buffer_ = lights;
     stats_ = stats;
     wl_ = worklists;
@@ -1528,6 +1557,10 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
     upload.writes(scene_data).writes(lights)
           .reads(gtao_ao).reads(env_prefiltered).reads(dfg_lut)
           .reads(ibl_sh).reads(froxels);
+    // Brief 23: the palette ring. The CPU-side write safety is the RING (frames_in_flight
+    // physicals + the per-slot fence), not this declaration — declaring the write here is what
+    // orders the GPU-side readers and keeps this slot's address resolvable at record time.
+    if (joint_palette_.valid()) upload.writes(joint_palette_);
     for (std::size_t c = 0; c < cascades.size(); ++c) upload.reads(cascades[c]);
     // COMPUTE, not transfer: this pass records no GPU commands at all (it fills a host-visible ring
     // and resolves slots), so its kind is nominal — but the kind picks the default stage for its
@@ -1584,6 +1617,10 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
           .reads(wl_.twosided, string::access::indirect_read)
           .reads(wl_.twosided, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
           .reads(scene_data)
+          // Brief 23: the MESH stage pulls the skin stream + palettes through SceneData. Raster
+          // reads default to FRAGMENT (resolve_stages), so the mesh-stage consumption must be
+          // said explicitly or it is silently under-barriered.
+          .reads(scene_data, string::access::storage_read, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT)
           .writes(stats);
     // The lit fragments SAMPLE the cascades, GTAO, the IBL products and the froxel list through
     // SceneData's bindless slots — the slots are RESOLVED by scene.upload, but the contents are
@@ -1597,6 +1634,9 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
         for (const string::gpu::image& c : cascades) p.reads(c);
         p.reads(gtao_ao).reads(env_prefiltered).reads(dfg_lut).reads(ibl_sh).reads(froxels);
     };
+    if (joint_palette_.valid())
+        phase1.reads(joint_palette_, string::access::storage_read,
+                     VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
     lit_reads(phase1);
     if (visbits_.valid())
         phase1.writes(visbits_, string::access::storage_write, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
@@ -1614,7 +1654,16 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
           .reads(wl_.opaque, string::access::indirect_read)
           .reads(wl_.opaque, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
           .reads(wl_.twosided, string::access::indirect_read)
-          .reads(wl_.twosided, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
+          .reads(wl_.twosided, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
+          // Brief 23: phase 2 had NO scene_data read at all (its fragments shade through the
+          // same SceneData as phase 1's — the fragment-stage read below via lit_reads' set was
+          // carried by phase1 only). Both consumption stages declared: FRAGMENT (shading) and
+          // MESH (the skin stream + palette pull).
+          .reads(scene_data)
+          .reads(scene_data, string::access::storage_read, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+    if (joint_palette_.valid())
+        phase2.reads(joint_palette_, string::access::storage_read,
+                     VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
     lit_reads(phase2);   // phase-2 fragments shade exactly like phase 1's — same consumed set
     if (visbits_.valid())
         phase2.writes(visbits_, string::access::storage_write, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
@@ -1877,6 +1926,13 @@ void geometry_pass::record_scene_upload(string::pass_context& ctx)
 
         // Brief 09b probe GI: the component owns the gate + volume + atlas slots.
         if (gi != nullptr) gi->fill_scene_data(scene, ctx); else scene.probe_gi = 0u;
+
+        // Brief 23 skinning: the compact skin heap + THIS frame slot's palette ring physical.
+        // Resolved at record time like every address here (never latched). Zero = no skinned
+        // geometry; load_vertex never dereferences behind skinned == 0 draws.
+        scene.skin_stream = skin_buffer_ != 0
+            ? allocator_.get_buffer(skin_buffer_).device_address : 0;
+        scene.joint_palette = joint_palette_.valid() ? ctx.address(joint_palette_) : 0;
 
         std::memcpy(ctx.mapped(scene_data_), &scene, sizeof(SceneData));
     }

@@ -110,10 +110,10 @@ struct MeshletShadowPush
     VkDeviceAddress mtris;       // 88
     VkDeviceAddress draws;       // 96
     VkDeviceAddress records;     // 104 (brief 04c: compacted {draw_index, lod} per indirect draw)
-    uint32_t _pad0;              // 112
-    uint32_t _pad1;              // 116
+    VkDeviceAddress scene;       // 112 (brief 23: SceneData — skin stream + this slot's palettes)
 };
 static_assert(offsetof(MeshletShadowPush, records) == 104);
+static_assert(offsetof(MeshletShadowPush, scene) == 112);
 static_assert(sizeof(MeshletShadowPush) == 120);
 
 // Push for the GPU draw-cull compute (matches Push in shaders/meshlet_draw_cull.slang; std430).
@@ -439,6 +439,17 @@ class geometry_pass final : private GeometryScene
 public:
     // Latest GPU culling stats (read back one frame late) for the UI overlay.
     const GpuMeshStats& mesh_stats() const { return stats_latest_; }
+
+    // --- Brief 23: the skinning tables the app's animation driver needs ------------------------
+    // One SkinInstance per merged skin: its palette window in the ring (all its draws share it),
+    // joint count, IBM/remap windows into the two spans below, and its `.anim` pack path. The
+    // driver samples clips (string::anim), builds palettes via build_palette(model_space,
+    // joint_remap window, inverse_bind window), and writes them into its ring at palette_offset.
+    std::span<const GeometryScene::SkinInstance> skins() const { return skins_; }
+    std::span<const glm::mat4> skin_inverse_bind() const { return skin_inverse_bind_; }
+    std::span<const uint32_t> skin_joint_remap() const { return skin_joint_remap_; }
+    // Ring sizing: total palette joints across all skins (mat4 units per frame slot).
+    uint32_t palette_joints_total() const { return palette_joints_total_; }
     // model_paths are .gltf/.glb files resolved relative to context.resources_path, flattened and
     // merged into one draw set (shared vertex/index/material/texture tables — the NewSponza packs
     // overlay the same world space). `overlay_stats` (may be null) receives the meshlet culling
@@ -470,7 +481,10 @@ public:
                  // producer to the draws that read SceneData.
                  std::span<const string::gpu::image> cascades, string::gpu::image gtao_ao,
                  string::gpu::image env_prefiltered, string::gpu::image dfg_lut,
-                 string::gpu::buffer ibl_sh, string::gpu::buffer froxels);
+                 string::gpu::buffer ibl_sh, string::gpu::buffer froxels,
+                 // Brief 23: the app-backed joint-palette ring (one physical per frame slot, CPU
+                 // written by the anim tick). Invalid handle = scene never skins.
+                 string::gpu::buffer joint_palette = {});
 
     // How many entries the probe-GI capture table needs for this scene's meshlets. The app sizes the
     // table buffer from it, so the declaration and the fill agree by construction.

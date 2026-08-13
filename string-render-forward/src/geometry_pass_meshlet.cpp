@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -59,6 +60,12 @@ void geometry_pass::build_meshlet_gpu(engine_context& context)
     meshlet_triangles_ = make_device_buffer(meshlet_model_.meshlet_triangles.data(),
         sizeof(uint32_t) * meshlet_model_.meshlet_triangles.size(), 0);
 
+    // Brief 23: the compact skin heap, whole-uploaded like the meshlet heaps (never suballocated —
+    // DrawInfo.skin_offset rebases ORIGINAL global indices, so geometry streaming never touches it).
+    if (!skin_vertices_.empty())
+        skin_buffer_ = make_device_buffer(skin_vertices_.data(),
+            sizeof(::string::asset::SkinVertex) * skin_vertices_.size(), 0);
+
     if (const int32_t dump_start = cv_meshlet_dump().get(); dump_start >= 0)
     {
         const uint32_t d0 = uint32_t(dump_start);
@@ -97,7 +104,29 @@ void geometry_pass::build_meshlet_gpu(engine_context& context)
         GpuDrawInfo& info = meshlet_model_.draws[i];
         info.model = draw.transform;
         info.resident = 0;       // flipped on residency (up-front loop / streaming)
-        info.skinned = 0;        // Phase B reserves this (bounds inflation + cone-cull bypass)
+        // Brief 23: bind the draw to its skin. Set HERE, not in the scene loader — this loop runs
+        // after load and used to stomp the flag back to 0, and probe-GI's capture_table (built
+        // after this, in the probe component's ctor) reads it to exclude skinned draws from the
+        // static capture. STRING_SKIN_OFF=1 is the kill-switch: every draw renders static bind
+        // pose through the unskinned load_vertex path — the A/B lever for the identity-palette
+        // parity gate, and the first bisect step when a character renders wrong.
+        static const bool skin_off = std::getenv("STRING_SKIN_OFF") != nullptr;
+        const int32_t skin = (!skin_off && i < draw_skin_.size()) ? draw_skin_[i] : -1;
+        if (skin >= 0)
+        {
+            const GeometryScene::SkinInstance& si = skins_[skin];
+            info.skinned = 1;
+            info.skin_offset = static_cast<uint32_t>(draw_skin_delta_[i]);
+            info.palette_offset = si.palette_offset;
+            info.joint_count = si.joint_count;
+        }
+        else
+        {
+            info.skinned = 0;
+            info.skin_offset = 0;
+            info.palette_offset = 0;
+            info.joint_count = 0;
+        }
         info.flags = 0;
         info.alpha_cutoff = 0.5f;
         if (draw.material >= 0)

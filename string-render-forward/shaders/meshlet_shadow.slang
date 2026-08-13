@@ -23,8 +23,9 @@ struct Push
     MeshletTriangleBuffer *mtris;
     DrawInfoBuffer *draws;
     DrawRecordBuffer *records;   // brief 04c: compacted {draw_index, lod} per indirect draw (SV_DrawIndex)
-    uint _pad0;
-    uint _pad1;
+    // Brief 23: skinned casters read the skin stream + this frame slot's palette through
+    // SceneData (the only per-frame-slot-ringed block; filled the pads at offset 112).
+    SceneData *scene;
 };
 [[vk::push_constant]] Push pc;
 
@@ -62,10 +63,19 @@ void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint draw : 
         float3 sy = float3(di.model[0][1], di.model[1][1], di.model[2][1]);
         float3 sz = float3(di.model[0][2], di.model[1][2], di.model[2][2]);
         float smax = sqrt(max(max(dot(sx,sx), dot(sy,sy)), dot(sz,sz)));
+        float radius_ws = ml.radius * smax;
+        // Brief 23: skinned casters cull against the draw's animated whole-character sphere —
+        // the cook-time meshlet sphere is a bind-pose bound deformation escapes (a limb swung
+        // outside it would hole the shadow). Same substitution as the camera task shader.
+        if (di.skinned != 0)
+        {
+            center_ws = mul(di.model, float4(di.center, 1.0)).xyz;
+            radius_ws = di.radius * smax;
+        }
         float4 planes[6];
         frustum_planes(pc.light_view_proj, planes);
         // No cone cull for shadows: a backfacing meshlet can still cast into the light view.
-        survive = sphere_in_frustum(planes, center_ws, ml.radius * smax);
+        survive = sphere_in_frustum(planes, center_ws, radius_ws);
     }
 
     if (survive) InterlockedOr(gs_task_ballot, 1u << tid);
@@ -101,12 +111,14 @@ void mesh_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID,
 
     if (tid < ml.vertex_count)
     {
-        // Rebase the ORIGINAL global vertex index into the suballocated heap (see DrawInfo).
-        uint gv = uint(int(pc.mverts.indices[ml.vertex_offset + tid]) + int(di.vertex_offset));
-        Vertex v = pc.vertices.verts[gv];
+        // Fetch through THE vertex seam (meshlet.slang::load_vertex). The normal/tangent loads
+        // a depth-only pass never reads are pure and dead-code-eliminated. The SkinContext is
+        // LIVE here — a skinned caster's shadow must deform with the body, not stay bind-pose.
+        SkinContext sc = { pc.scene.skin_stream, pc.scene.joint_palette };
+        LoadedVertex v = load_vertex(sc, di, pc.mverts.indices[ml.vertex_offset + tid], pc.vertices);
         MeshOut o;
         o.position = mul(pc.light_view_proj, mul(di.model, float4(v.pos, 1.0)));
-        o.uv = v.texCoord;
+        o.uv = v.uv;
         o.base_slot = di.base_slot;
         o.base_alpha = di.base_color.w;
         o.cutout_alpha = (di.flags & kDrawFlagCutout) != 0u ? di.alpha_cutoff : -1.0;

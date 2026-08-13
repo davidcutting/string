@@ -33,6 +33,18 @@ using ::string::asset::CookedScene;
 //   - `textures`         : merged GltfTexture list (path + srgb), for the pass's KTX/stb upload
 //   - `draws_meta`       : merged GltfDraw records (transform, aabb, material, vertex/index window)
 //                          — what the pass keeps in draws_ for per-frame culling + streamer set_draws
+// One merged skin (brief 23): the palette-building inputs for every draw bound to it, plus the
+// path of the `.anim` pack that animates it (skeleton_hash pairs the two — a mismatch degrades
+// to bind pose at the app layer, never garbage).
+struct LoadedSkin
+{
+    uint64_t skeleton_hash = 0;
+    uint32_t joint_count = 0;
+    uint32_t ibm_offset = 0;     // window into LoadedScene::inverse_bind
+    uint32_t remap_offset = 0;   // window into LoadedScene::joint_remap
+    std::filesystem::path anim_pack;
+};
+
 struct LoadedScene
 {
     std::vector<string::Vertex> vertices;
@@ -50,6 +62,16 @@ struct LoadedScene
     // [vmin, vmax+1].
     struct VertexWindow { uint32_t offset; uint32_t count; };
     std::vector<VertexWindow> draw_windows;
+
+    // Brief 23 skinning. skin_vertices is the COMPACT merged skin heap — only files with skins
+    // contribute, so per-draw the ORIGINAL global vertex index rebases into it by a SIGNED delta
+    // (draw_skin_delta), exactly the vertex_offset idiom. Both per-draw vectors parallel `draws`.
+    std::vector<asset::SkinVertex> skin_vertices;
+    std::vector<LoadedSkin> skins;
+    std::vector<glm::mat4> inverse_bind;     // glTF skin.joints order, per LoadedSkin window
+    std::vector<uint32_t> joint_remap;       // glTF joint -> ozz joint, per LoadedSkin window
+    std::vector<int32_t> draw_skin;          // index into `skins`, -1 = static
+    std::vector<int32_t> draw_skin_delta;    // skin_index = global_vertex + this (when skinned)
 
     // Load diagnostics.
     double load_ms = 0.0;

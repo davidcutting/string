@@ -137,6 +137,32 @@ Its cruft copy also carried a **stale hash**: GitHub's auto-generated archive ta
 byte-stable across regenerations, so the pinned hash no longer matched what the URL serves. Anything
 pinning a GitHub `/archive/refs/tags/` tarball is exposed to this.
 
+## ozz-animation (brief 23, added 2026-08-13)
+
+`string-core/subprojects/ozz-animation.wrap` — ozz 0.17.0 source tarball, `method = cmake`,
+resolved in exactly ONE place (`string-core/meson.build`, the libktx single-resolution pattern)
+with the offline half exported as the `ozz-animation-offline` dependency for string-asset-tools.
+The wrap's version **must track the flake.nix derivation** (the meshoptimizer lesson); the
+compile-time tripwire is the archive-type-version static_asserts in
+`string-core/test/ozz_version_test.cpp` (ozz has no version macro).
+
+Cross-build facts to know before touching it:
+
+- **ozz 0.17.0 requires CMake >= 3.30** (0.16.0 only needed 3.24). If the cross toolchain's
+  cmake is older, the pin has to drop to 0.16.0 — in both the wrap AND flake.nix, together.
+- The `[cmake]` section of `tools/mingw-w64.cross` is load-bearing for this wrap exactly as it
+  is for ktx/fastgltf: built-in options do not reach CMake subprojects.
+- `CMAKE_COMPILE_WARNING_AS_ERROR=OFF` is passed by `string-core/meson.build` because 0.17.0
+  hard-enables it — without the override, any new GCC warning kills the dependency build
+  (the same class of failure as KTX's bundled fmt vs GCC 15).
+- `ozz_build_postfix=OFF` is mandatory: the default appends per-config suffixes
+  (`libozz_animation_r.a`) that no probe resolves.
+- ozz is plain C++17 with SSE2 SIMD; if a cross target ever chokes on the intrinsics,
+  `-Dozz_build_simd_ref=ON` exists but is an ABI trap — it switches `SimdFloat4` between
+  `__m128` and a struct via a compile definition that does NOT propagate to consumers, so
+  our own TUs would need `-DOZZ_BUILD_SIMD_REF` too or it is a silent ODR violation. Leave
+  it OFF on x86_64.
+
 ## Remaining gaps
 
 1. **SDL3 built from the wrap needs Linux platform dev packages** — configure walks udev, then dbus,

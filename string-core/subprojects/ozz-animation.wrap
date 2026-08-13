@@ -1,0 +1,36 @@
+[wrap-file]
+directory = ozz-animation-0.17.0
+source_url = https://github.com/guillaumeblanc/ozz-animation/archive/refs/tags/0.17.0.tar.gz
+source_filename = ozz-animation-0.17.0.tar.gz
+source_hash = 22b4401c77a2be68acb0a8aa2e857f94dbaccfed3ab25e304a1ddea4c546e86b
+# ozz-animation (brief 23): skeletal animation. Runtime sampling/blending (ozz_base +
+# ozz_animation) links into string-core; the offline builders (ozz_animation_offline) are
+# cook-time only, consumed by string-asset-tools. Built via Meson's CMake integration
+# (upstream is CMake-only and recommends the sub-project route — it exports NO CMake config
+# package, so a system install is only findable by find_library, which string-core's
+# meson.build probes first).
+#
+# Resolved in EXACTLY ONE place: string-core/meson.build (the libktx single-resolution
+# precedent — a second cmake.subproject('ozz-animation') in the same super-build would
+# collide). string-core re-exports the runtime half through project_deps and the offline
+# half as the 'ozz-animation-offline' dependency for string-asset-tools.
+#
+# No [provide] section, same reason as ktx.wrap: CMake defines can only be set through
+# cmake.subproject(), and ozz needs several (tools/samples/tests off, ozz_build_postfix=OFF
+# so libraries aren't name-suffixed per config, CMAKE_COMPILE_WARNING_AS_ERROR=OFF because
+# 0.17.0 hard-enables it and a new compiler warning must not break the dependency build).
+#
+# THIS VERSION MUST TRACK THE flake.nix DERIVATION (and vice versa). Only the off-nix build
+# resolves this wrap — on nix the pinned mkDerivation supplies the libraries — so a stale
+# wrap ships the artist a different animation runtime from the one we test against,
+# silently. The cooked `.anim` packs depend on ozz's archive type versions (Animation=7,
+# Skeleton=2 at 0.17.0); string-core static_asserts those so a divergence is a compile
+# error, not a runtime deserialization failure.
+#
+# 0.17.0 requires CMake >= 3.30 (0.16.0 only needed 3.24) — the off-nix toolchain doc
+# (docs/off-nix-build.md) records this floor.
+#
+# The hash is of the GitHub auto-generated tag archive. Those are not byte-stable across
+# regenerations, so if the download ever fails its integrity check, re-fetch and update it
+# here rather than assuming the file was tampered with.
+method = cmake

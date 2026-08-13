@@ -207,14 +207,17 @@ void mesh_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint view : 
     float4x4 vp = face_view_proj(view);
     if (tid < ml.vertex_count)
     {
-        uint gv = uint(int(pc.mverts.indices[ml.vertex_offset + tid]) + int(di.vertex_offset));
-        Vertex v = pc.vertices.verts[gv];
+        // Fetch through THE vertex seam (meshlet.slang::load_vertex). The probe capture is a
+        // static bake — skinned draws are excluded from its table — so the context stays null
+        // by design, belt-and-braces with the CPU-side exclusion.
+        SkinContext sc = { nullptr, nullptr };
+        LoadedVertex v = load_vertex(sc, di, pc.mverts.indices[ml.vertex_offset + tid], pc.vertices);
         float4 world = mul(di.model, float4(v.pos, 1.0));
         MeshOut o;
         o.position = mul(vp, world);
         o.world_pos = world.xyz;
         o.world_normal = transform_normal(di.model, v.normal);   // inverse transpose — see meshlet.slang
-        o.uv = v.texCoord;
+        o.uv = v.uv;
         o.base_color = di.base_color;
         o.base_slot = di.base_slot;
         o.cutout_alpha = (di.flags & kDrawFlagCutout) != 0u ? di.alpha_cutoff : -1.0;

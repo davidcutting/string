@@ -48,9 +48,12 @@ public:
     // Author onto the graph: ONE pass per cascade, each a depth-only render into its own cascade
     // image plus the indirect work list the meshlet culler filled earlier this frame. `cascades` is
     // the application's declared cascade images, in cascade order; `worklists` carries the per-cascade
-    // list buffers the culler writes and these draws consume.
+    // list buffers the culler writes and these draws consume. `scene_data`/`joint_palette` (brief 23):
+    // skinned casters pull the skin stream + this slot's palettes through SceneData at the MESH
+    // stage — the cascades must deform with the body, not shadow the bind pose.
     void declare(::string::frame_graph& fg, std::span<const ::string::gpu::image> cascades,
-                 const WorklistSet& worklists);
+                 const WorklistSet& worklists, ::string::gpu::buffer scene_data,
+                 ::string::gpu::buffer joint_palette = {});
 
     uint32_t cascade_count() const { return scene_ != nullptr ? scene_->settings_.cascade_count : 0u; }
 
@@ -67,6 +70,9 @@ private:
     ::string::gpu::descriptor_table* descriptors_ = nullptr;
     GeometryScene* scene_ = nullptr;
     ::string::gpu::shader_program* program_ = nullptr;
+    // Brief 23: SceneData's graph handle, resolved per cascade record for the push (the skin
+    // stream + palette pointers live in it).
+    ::string::gpu::buffer scene_data_{};
 
 };
 

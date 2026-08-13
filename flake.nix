@@ -35,6 +35,39 @@
             "-DFASTGLTF_ENABLE_EXAMPLES=OFF"
           ];
         };
+
+        # ozz-animation (brief 23): skeletal animation — runtime sampling/blending (ozz_base +
+        # ozz_animation, linked by string-core) and the offline builders (ozz_animation_offline,
+        # consumed by string-asset-tools at cook time). Not in nixpkgs, so hash-pinned like
+        # fastgltf. Unlike fastgltf, ozz exports NO CMake config package (no install(EXPORT)) —
+        # the install is plain lib/ + include/ — so string-core's meson.build probes it with
+        # find_library(), not dependency(method:'cmake'). Off-nix builds use the meson wrap
+        # under string-core/subprojects/ instead; ITS VERSION MUST TRACK THIS ONE.
+        ozz-animation = pkgs.stdenv.mkDerivation {
+          pname = "ozz-animation";
+          version = "0.17.0";
+          src = pkgs.fetchFromGitHub {
+            owner = "guillaumeblanc";
+            repo = "ozz-animation";
+            rev = "0.17.0"; # tags carry no `v` prefix
+            hash = "sha256-ugAjnJZye7VxnTuVsrY8Hb0Q8AD+/NaoDaAlCzSzTBA=";
+          };
+          nativeBuildInputs = [ pkgs.cmake ]; # 0.17.0 needs cmake >= 3.30
+          cmakeFlags = [
+            "-Dozz_build_samples=OFF"
+            "-Dozz_build_howtos=OFF"
+            "-Dozz_build_tests=OFF"
+            "-Dozz_build_tools=OFF" # also force-disables the fbx/gltf importers
+            "-Dozz_build_data=OFF"
+            # Default ON appends per-config suffixes (libozz_animation_r.a) that find_library
+            # can never resolve.
+            "-Dozz_build_postfix=OFF"
+            # 0.17.0 sets CMAKE_COMPILE_WARNING_AS_ERROR unconditionally; a new compiler
+            # warning must not break the dependency build.
+            "-DCMAKE_COMPILE_WARNING_AS_ERROR=OFF"
+            "-DBUILD_SHARED_LIBS=OFF"
+          ];
+        };
       in {
 
         # `nix flake check` builds the engine with the gtest suite enabled and runs it. This is
@@ -111,6 +144,7 @@
             shader-slang               # libslang runtime (shader.hpp)
             fastgltf                   # glTF 2.0 importer (custom derivation below; not in nixpkgs)
             simdjson                   # system fastgltf does not bundle simdjson; link it alongside
+            ozz-animation              # skeletal animation runtime (custom derivation; brief 23)
           ];
 
           mesonFlags = [
@@ -153,6 +187,7 @@
             spdlog glm entt sdl3
             vulkan-headers vulkan-memory-allocator vulkan-volk
             shader-slang fastgltf simdjson
+            ozz-animation   # skeletal animation: runtime for the engine + offline builders for the cook
             ktx-tools       # libktx: the sandbox loader reads/transcodes .ktx2 (KTX::ktx cmake config)
             meshoptimizer   # meshlet build + LOD simplify (brief 03; meshoptimizer::meshoptimizer)
             nlohmann_json   # `.scene.json` descriptors, parsed app-side (brief 18)
@@ -211,6 +246,7 @@
               spdlog glm entt sdl3
               vulkan-headers vulkan-memory-allocator vulkan-volk
               fastgltf simdjson
+              ozz-animation               # skeletal animation runtime + offline builders (brief 23)
               ktx-tools                   # libktx + `ktx` CLI (texture cook + runtime load)
               meshoptimizer               # meshlet build + LOD simplify (brief 03)
               gtest                       # for -Dtests=true in-shell

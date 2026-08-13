@@ -130,6 +130,58 @@ else
     deps += slang_dep
 endif
 
+# --- ozz-animation (skeletal animation; brief 23) -----------------------------
+# Runtime half (ozz_base + ozz_animation: sampling, blending, local-to-model) links into the
+# engine for the string::anim module. ozz exports NO CMake config package and no pkg-config —
+# its install is a plain lib/ + include/ — so the system probe is find_library + has_header
+# (nix: the hash-pinned derivation in flake.nix), and the fallback drives ozz's CMake through
+# the wrap (upstream's own recommended integration).
+#
+# The ONLY place ozz is resolved (the libktx single-resolution precedent: a second
+# cmake.subproject('ozz-animation') in the same super-build would collide). The OFFLINE half
+# (ozz_animation_offline — SkeletonBuilder/AnimationBuilder, cook-time only) is resolved here
+# for that reason but NOT linked into the engine; string-asset-tools consumes it via the
+# 'ozz-animation-offline' override below.
+ozz_base_lib = compiler.find_library('ozz_base', required : false)
+ozz_anim_lib = compiler.find_library('ozz_animation', required : false)
+ozz_offline_lib = compiler.find_library('ozz_animation_offline', required : false)
+if ozz_base_lib.found() and ozz_anim_lib.found() and ozz_offline_lib.found() and \
+   compiler.has_header('ozz/animation/runtime/skeleton.h')
+    # Static archives: dependents before their dependencies on the link line.
+    ozz_runtime_dep = declare_dependency(dependencies : [ ozz_anim_lib, ozz_base_lib ])
+    ozz_offline_dep = declare_dependency(
+        dependencies : [ ozz_offline_lib, ozz_anim_lib, ozz_base_lib ])
+else
+    cmake = import('cmake')
+    ozz_opts = cmake.subproject_options()
+    ozz_opts.add_cmake_defines({
+        'ozz_build_samples': 'OFF',
+        'ozz_build_howtos': 'OFF',
+        'ozz_build_tests': 'OFF',
+        'ozz_build_tools': 'OFF',   # also force-disables the fbx/gltf importer targets
+        'ozz_build_data': 'OFF',
+        # Default ON appends per-config suffixes (libozz_animation_r.a); every consumer
+        # (and the nix derivation) expects the plain names.
+        'ozz_build_postfix': 'OFF',
+        # 0.17.0 hard-enables warnings-as-errors; a new compiler warning must not break
+        # the dependency build.
+        'CMAKE_COMPILE_WARNING_AS_ERROR': 'OFF',
+        'BUILD_SHARED_LIBS': 'OFF',
+    })
+    ozz_sub = cmake.subproject('ozz-animation', options : ozz_opts)
+    ozz_runtime_dep = declare_dependency(dependencies : [
+        ozz_sub.dependency('ozz_animation'),
+        ozz_sub.dependency('ozz_base'),
+    ])
+    ozz_offline_dep = declare_dependency(dependencies : [
+        ozz_sub.dependency('ozz_animation_offline'),
+        ozz_sub.dependency('ozz_animation'),
+        ozz_sub.dependency('ozz_base'),
+    ])
+endif
+deps += ozz_runtime_dep
+meson.override_dependency('ozz-animation-offline', ozz_offline_dep)
+
 # --- WSI backend (selectable via -Dwsi=) -------------------------------------
 wsi = get_option('wsi')
 message('WSI backend: ' + wsi)
@@ -188,6 +240,9 @@ include_dir = include_directories('include')
 
 core_src = [
     'src/application.cpp',
+    'src/anim/anim_pack.cpp',
+    'src/anim/anim_set.cpp',
+    'src/anim/player.cpp',
     'src/scene.cpp',
     'src/core/job_system.cpp',
     'src/core/cvar.cpp',

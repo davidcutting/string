@@ -5,6 +5,9 @@
 
 #include <string/core/logger.hpp>
 
+#include <string/asset/manifest.hpp>
+#include <string/asset/tools/gltf_skin.hpp>
+
 namespace string::asset::tools
 {
 namespace
@@ -109,7 +112,23 @@ CookedScene bake_gltf(const std::filesystem::path& gltf_path, const BakeParams& 
     std::vector<GltfTexture> textures = parsed.textures;
     GltfGeometry geometry = flatten_geometry(parsed);
 
-    CookedScene scene = bake_scene(geometry.vertices, geometry.indices, geometry.draws, params);
+    // Skins + skeleton + clips (brief 23). The `.anim` sibling is written HERE, not by the
+    // caller, so both cook paths (CLI and in-process) produce the pair together — the manifest's
+    // staleness check assumes a skinned .cooked always has its pack beside it. Same side-effect
+    // precedent as extract_embedded above.
+    SkinCook skin_cook = cook_skins(parsed, geometry);
+    SkinSource skin_source;
+    skin_source.vertices = std::move(skin_cook.skin_vertices);
+    skin_source.skins = std::move(skin_cook.skins);
+    skin_source.inverse_bind = std::move(skin_cook.inverse_bind);
+    skin_source.joint_remap = std::move(skin_cook.joint_remap);
+    skin_source.skin_anim_min = std::move(skin_cook.skin_anim_min);
+    skin_source.skin_anim_max = std::move(skin_cook.skin_anim_max);
+    if (!skin_cook.anim_pack.empty())
+        write_anim_pack_file(skin_cook.anim_pack, anim_path_for(gltf_path));
+
+    CookedScene scene =
+        bake_scene(geometry.vertices, geometry.indices, geometry.draws, params, skin_source);
 
     // Materials (texture indices are file-local; the engine rebases them at merge, same as before).
     scene.materials.reserve(materials.size());

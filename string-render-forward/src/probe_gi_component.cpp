@@ -94,6 +94,11 @@ std::vector<glm::uvec2> probe_gi_component::capture_table(const MeshletModel& mo
     {
         const GpuDrawInfo& di = model.draws[d];
         if (di.lod_count == 0) continue;
+        // Brief 23: skinned draws are EXCLUDED — this capture is a static per-probe bake, and a
+        // character baked in bind pose would ghost into the probes forever. (build_meshlet_gpu
+        // sets the flag before this table is built; the raster shader also passes a null skin
+        // context, belt and braces.)
+        if (di.skinned != 0) continue;
         const uint32_t coarse = di.lod_count - 1;
         const uint32_t off = di.lods[coarse].meshlet_offset;
         const uint32_t cnt = di.lods[coarse].meshlet_count;

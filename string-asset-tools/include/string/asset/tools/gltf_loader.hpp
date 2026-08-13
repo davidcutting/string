@@ -62,6 +62,11 @@ struct GltfDraw
     glm::mat4 transform{ 1.0f };
     glm::vec3 aabb_min{ 0.0f };
     glm::vec3 aabb_max{ 0.0f };
+    // glTF skin index instancing this primitive, -1 = static (brief 23). Skinned draws carry an
+    // IDENTITY transform and a LOCAL-space AABB: glTF specifies that a skinned mesh ignores its
+    // node transform — the joint matrices place it in scene space. Baking the node transform
+    // anyway (the static path) would double-transform the character.
+    int32_t skin = -1;
 };
 
 // Geometry flattened from a parsed glTF: a single shared vertex + index buffer (deduplicated
@@ -72,6 +77,12 @@ struct GltfGeometry
     std::vector<string::Vertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<GltfDraw> draws;
+    // Skinning attributes (brief 23), parallel to `vertices`; EMPTY when the source has no
+    // skinned primitives. Joints are glTF skin-local indices (u8/u16 sources widened to u16);
+    // weights are normalized floats (unorm sources converted by fastgltf). Vertices of static
+    // primitives in a mixed file hold zeroes — quantization canonicalizes them.
+    std::vector<glm::u16vec4> joints;
+    std::vector<glm::vec4> weights;
 };
 
 // A parsed glTF: resolved (still-encoded) texture sources + materials, plus an opaque handle to

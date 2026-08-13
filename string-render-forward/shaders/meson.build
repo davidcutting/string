@@ -12,6 +12,7 @@ slang_shaders = files(
     'shadertoy_default.slang',  # brief 18 M4: default/template shader for Shadertoy scenes
     'sky_shader.slang',
     'sky.slang',        # imported by sky_shader.slang, lighting.slang and ibl.slang
+    'scene_data.slang', # SceneData + light/froxel structs (brief 23: split from lighting so depth-only passes import it)
     'lighting.slang',   # shared lit-shading module (was missing from the install set pre-07)
     'ibl.slang',        # brief 07: sky->cubemap capture, GGX prefilter, SH projection, DFG LUT
     'froxel_cull.slang', # clustered light-binning compute (brief 02)

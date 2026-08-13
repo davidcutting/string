@@ -46,6 +46,12 @@ bool read_cooked(const std::vector<uint8_t>& blob, CookedScene& out)
     if (!load_section(blob, header.sections[kSecDraws], out.draws)) return false;
     if (!load_section(blob, header.sections[kSecMaterials], out.materials)) return false;
     if (!load_section(blob, header.sections[kSecTextures], out.textures)) return false;
+    if (!load_section(blob, header.sections[kSecSkinVerts], out.skin_vertices)) return false;
+    if (!load_section(blob, header.sections[kSecSkins], out.skins)) return false;
+    if (!load_section(blob, header.sections[kSecInverseBind], out.inverse_bind)) return false;
+    if (!load_section(blob, header.sections[kSecJointRemap], out.joint_remap)) return false;
+    // The skin stream is index-parallel to the vertex heap: present means same length.
+    if (!out.skin_vertices.empty() && out.skin_vertices.size() != out.vertices.size()) return false;
     return true;
 }
 

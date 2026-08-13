@@ -19,6 +19,7 @@
 #include <fastgltf/types.hpp>
 #include <fastgltf/glm_element_traits.hpp>   // ElementTraits for glm::vec2/3/4 accessor reads
 
+#include "gltf_impl.hpp"
 #include "third_party/mikktspace/mikktspace.h"
 
 namespace string::asset::tools
@@ -197,13 +198,6 @@ struct MeshPrimitive
 
 }  // namespace
 
-// Holds the parsed fastgltf asset alive between parse_gltf() and flatten_geometry(), keeping
-// fastgltf out of the public header.
-struct GltfParsed::Impl
-{
-    fastgltf::Asset asset;
-};
-
 GltfParsed::GltfParsed() = default;
 GltfParsed::~GltfParsed() = default;
 GltfParsed::GltfParsed(GltfParsed&&) noexcept = default;
@@ -303,6 +297,7 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
         glm::vec3 local_min{ 0.0f };   // primitive's local-space AABB, filled by the parallel pass
         glm::vec3 local_max{ 0.0f };
         bool has_tangent = false;      // glTF supplied TANGENT (else MikkTSpace generates it)
+        bool has_skin = false;         // glTF supplied JOINTS_0 + WEIGHTS_0 (brief 23)
     };
 
     std::vector<PrimitivePlan> plans;
@@ -335,6 +330,8 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
                 .vertex_count = vertex_count,
                 .index_offset = static_cast<uint32_t>(total_indices),
                 .index_count = index_count,
+                .has_skin = primitive.findAttribute("JOINTS_0") != primitive.attributes.end() &&
+                            primitive.findAttribute("WEIGHTS_0") != primitive.attributes.end(),
             });
             total_vertices += vertex_count;
             total_indices += index_count;
@@ -342,6 +339,17 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
     }
     model.vertices.resize(total_vertices);
     model.indices.resize(total_indices);
+
+    // Any skinned primitive => the joints/weights arrays exist for the WHOLE stream (they are
+    // index-parallel to vertices; static primitives' entries stay zero, canonicalized at
+    // quantization). No skinned primitives => both stay empty and downstream skips skinning.
+    bool any_skin = false;
+    for (const PrimitivePlan& plan : plans) any_skin = any_skin || plan.has_skin;
+    if (any_skin)
+    {
+        model.joints.resize(total_vertices, glm::u16vec4(0));
+        model.weights.resize(total_vertices, glm::vec4(0.0f));
+    }
 
     // Parallel fill: each primitive writes only its own [base_vertex, +count) vertex range and
     // [index_offset, +count) index range, so the workers never touch the same element. Reads of
@@ -382,6 +390,28 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
                     fastgltf::iterateAccessorWithIndex<glm::vec2>(
                         casset, casset.accessors[uv->accessorIndex], [&](glm::vec2 value, std::size_t i) {
                             model.vertices[plan.base_vertex + i].texCoord = value;
+                        });
+                }
+
+                // Skinning attributes (brief 23): joints widen to u16 (source is u8 or u16), weights
+                // convert to float (fastgltf handles unorm8/unorm16/float sources). Both land in the
+                // parallel arrays this plan's vertex range owns exclusively, like every fill above.
+                if (plan.has_skin)
+                {
+                    if (primitive.findAttribute("JOINTS_1") != primitive.attributes.end())
+                    {
+                        STRING_LOG_WARN("[load]   JOINTS_1/WEIGHTS_1 present but unsupported: "
+                                        "influences beyond the first set are dropped");
+                    }
+                    fastgltf::iterateAccessorWithIndex<glm::u16vec4>(
+                        casset, casset.accessors[primitive.findAttribute("JOINTS_0")->accessorIndex],
+                        [&](glm::u16vec4 value, std::size_t i) {
+                            model.joints[plan.base_vertex + i] = value;
+                        });
+                    fastgltf::iterateAccessorWithIndex<glm::vec4>(
+                        casset, casset.accessors[primitive.findAttribute("WEIGHTS_0")->accessorIndex],
+                        [&](glm::vec4 value, std::size_t i) {
+                            model.weights[plan.base_vertex + i] = value;
                         });
                 }
 
@@ -495,7 +525,13 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
                 {
                     return;
                 }
-                const glm::mat4 transform = glm::make_mat4(world.data());
+                // A SKINNED node's transform is IGNORED per the glTF spec — the joint matrices
+                // place the mesh in scene space — so its draw gets identity + the local (bind
+                // pose) AABB. Baking `world` anyway double-transforms the character. The bake
+                // later replaces the bind-pose AABB with the animated bound.
+                const bool skinned = node.skinIndex.has_value();
+                const glm::mat4 transform =
+                    skinned ? glm::mat4(1.0f) : glm::make_mat4(world.data());
                 for (const auto& primitive : mesh_primitives[node.meshIndex.value()])
                 {
                     // World-space AABB: transform the 8 corners of the local AABB and re-bound.
@@ -519,6 +555,7 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
                         transform,
                         world_min,
                         world_max,
+                        skinned ? static_cast<int32_t>(node.skinIndex.value()) : -1,
                     });
                 }
             });

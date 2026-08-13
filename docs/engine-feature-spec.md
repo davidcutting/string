@@ -96,7 +96,13 @@ roadmap (Slang, mesh shaders, Forward+, SDL3, 3rd-party audio) are kept.
 
 ### Tier 1 — Can't ship a character without these
 
-**1. Skeletal animation & GPU skinning.** The single biggest absent pillar. Spec:
+**1. Skeletal animation & GPU skinning.** The single biggest absent pillar.
+*(Brief 23, 2026-08-13: the first three bullets LANDED on ozz-animation 0.17.0 — import/cook,
+`string::anim` N-way sampling+blending, and inline vertex-pull skinning. Layered masks,
+paperdoll and animation LOD remain open; their hooks are in place — shared `palette_offset`
+per skin, per-part `CookedSkin` + separable `.anim` packs, `Skeleton::find_joint` for
+sockets. The "locked 44B Vertex" below was stale — it is the 48B `string::Vertex`, still
+unchanged.)* Spec:
 - glTF skin/animation import (fastgltf already in tree); joint hierarchy, sampled
   keyframe curves (step/linear/cubic).
 - CPU animation sampling + blending: N-way blend + layered masks (upper/lower

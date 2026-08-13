@@ -88,12 +88,15 @@ bool shadow_maps::ready() const
 // Every layout, every barrier and the write-after-read edge against the previous frame's samples
 // derive from that.
 void shadow_maps::declare(::string::frame_graph& fg, std::span<const ::string::gpu::image> cascades,
-                          const WorklistSet& worklists)
+                          const WorklistSet& worklists, ::string::gpu::buffer scene_data,
+                          ::string::gpu::buffer joint_palette)
 {
+    scene_data_ = scene_data;
     for (uint32_t c = 0; c < cascades.size() && c < kMaxCascades; ++c)
     {
         const ::string::gpu::buffer list = worklists.cascade[c];
-        fg.pass("shadow.cascade" + std::to_string(c))
+        ::string::pass_spec cascade = fg.pass("shadow.cascade" + std::to_string(c));
+        cascade
           .depth(cascades[c])
           // The two stages the work list is consumed at are genuinely different and the graph cannot
           // recover them from the pass kind: the indirect draw/count words are fetched at
@@ -103,6 +106,13 @@ void shadow_maps::declare(::string::frame_graph& fg, std::span<const ::string::g
           // shared arena) is what keeps the cascades independent of each other in the graph.
           .reads(list, access::indirect_read)
           .reads(list, access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
+          // Brief 23: the MESH stage pulls the skin stream + palettes through SceneData for
+          // skinned casters (raster reads default to FRAGMENT — the stage must be explicit).
+          .reads(scene_data, access::storage_read, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+        if (joint_palette.valid())
+            cascade.reads(joint_palette, access::storage_read,
+                          VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+        cascade
           // r.pass.shadow, plus "is there anything to draw". A skipped cascade is not a black screen:
           // its consumers read the declared neutral (1.0, unshadowed) fallback.
           .toggle([this] { return cv_pass_shadow().get() && ready(); })
@@ -137,6 +147,10 @@ void shadow_maps::record_cascade(::string::pass_context& ctx, uint32_t cascade,
     mspush.mverts = allocator_->get_buffer(s.meshlet_vertices_).device_address;
     mspush.mtris = allocator_->get_buffer(s.meshlet_triangles_).device_address;
     mspush.draws = allocator_->get_buffer(s.draw_info_buffer_).device_address;
+    // Brief 23: SceneData carries the skin stream + this slot's palette pointers — resolved at
+    // record time so the ring's rotation is always current. A frozen or bind-pose shadow under
+    // an animating body means THIS line (or the pass's mesh-stage read) went missing.
+    mspush.scene = scene_data_.valid() ? ctx.address(scene_data_) : 0;
     // Brief 04c: each cascade draws its OWN worklist (resident-only, draw-culled vs THIS cascade's
     // light sphere; camera-selected LOD via the shared draw_lod). One indirect draw.
     const ::string::gpu::resource_id list_id = ctx.id(list);

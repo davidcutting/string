@@ -120,6 +120,17 @@ void task_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID, uint draw : 
         float smax = sqrt(max(max(dot(sx,sx), dot(sy,sy)), dot(sz,sz)));
         float radius_ws = ml.radius * smax;
 
+        // Brief 23: a skinned meshlet's cook-time sphere is its BIND-pose bound — deformation
+        // escapes it. Substitute the draw's animated whole-character sphere (the cook-time
+        // union over sampled clip poses). Every test below (frustum, HiZ) stays LIVE against
+        // that conservative proxy — no bypass, no holes; per-meshlet skinned bounds are a
+        // deferred refinement.
+        if (di.skinned != 0)
+        {
+            center_ws = mul(di.model, float4(di.center, 1.0)).xyz;
+            radius_ws = di.radius * smax;
+        }
+
         // Count this meshlet as considered.
         InterlockedAdd(pc.stats[0], 1u);
 
@@ -229,16 +240,6 @@ struct MeshOut
     nointerpolation float cutout_alpha : TEXCOORD10;  // brief 04: >=0 alpha-test threshold, <0 = off
 };
 
-void unpack_tangent_m(uint packed, out float3 tangent, out float sign)
-{
-    int xi = int(packed << 22) >> 22;
-    int yi = int(packed << 12) >> 22;
-    int zi = int(packed << 2) >> 22;
-    int wi = int(packed << 0) >> 30;
-    tangent = float3(max(xi / 511.0, -1.0), max(yi / 511.0, -1.0), max(zi / 511.0, -1.0));
-    sign = wi < 0 ? -1.0 : 1.0;
-}
-
 [shader("mesh")]
 [outputtopology("triangle")]
 [numthreads(kMeshletMaxVertices)]
@@ -263,21 +264,19 @@ void mesh_main(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID,
     // Emit vertices (one lane per vertex; up to 64).
     if (tid < ml.vertex_count)
     {
-        // Rebase the ORIGINAL global vertex index into the suballocated heap (see DrawInfo).
-        uint gv = uint(int(pc.mverts.indices[ml.vertex_offset + tid]) + int(di.vertex_offset));
-        Vertex v = pc.vertices.verts[gv];
+        // Fetch through THE vertex seam (meshlet.slang::load_vertex — rebases the original
+        // global index, unpacks the tangent, and skins when di.skinned != 0).
+        SkinContext sc = { pc.scene.skin_stream, pc.scene.joint_palette };
+        LoadedVertex v = load_vertex(sc, di, pc.mverts.indices[ml.vertex_offset + tid], pc.vertices);
         float4 world = mul(di.model, float4(v.pos, 1.0));
-
-        float3 t; float sign;
-        unpack_tangent_m(v.tangent, t, sign);
 
         MeshOut o;
         o.position = mul(pc.view_proj, world);
-        o.uv = v.texCoord;
+        o.uv = v.uv;
         o.world_pos = world.xyz;
         o.world_normal = transform_normal(di.model, v.normal);
-        o.world_tangent = mul(tmat, t);
-        o.tangent_sign = sign;
+        o.world_tangent = mul(tmat, v.tangent);
+        o.tangent_sign = v.tangent_sign;
         o.base_color = di.base_color;
         o.slots = uint4(di.base_slot, di.normal_slot, di.mr_slot, di.occlusion_slot);
         o.metal_rough = float2(di.metallic, di.roughness);

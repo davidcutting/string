@@ -36,7 +36,11 @@ inline constexpr char kCookedMagic[8] = { 'S', 'T', 'R', 'C', 'O', 'O', 'K', '1'
 // v3: triangle winding is reversed at bake for negative-determinant (mirrored) node transforms, so
 // every draw is counter-clockwise once its model matrix is applied. A v2 file's mirrored draws are
 // still inside-out and cannot be corrected at load, so they must be re-cooked.
-inline constexpr uint32_t kCookedFormatVersion = 3;
+// v4 (brief 23): four skinning sections (kSecSkinVerts/kSecSkins/kSecInverseBind/kSecJointRemap)
+// and CookedDraw's trailing pad becomes skin_plus_one (0 for static draws, so a static scene's
+// draw bytes are unchanged). Skinned draws' bounds carry the ANIMATED bound (union over sampled
+// clip poses), not the bind-pose geometry AABB.
+inline constexpr uint32_t kCookedFormatVersion = 4;
 
 // A cooked draw: the geometry-only record the engine needs to reconstruct a GpuDrawInfo and to
 // register the draw's vertex window with the streamer. Material/transform come from CookedMaterial +
@@ -61,7 +65,8 @@ struct CookedDraw
     uint32_t total_meshlets;         // 136 total meshlets across LODs
     uint32_t lod_count;              // 140
     GpuMeshletLod lods[kMaxLods];    // 144 per-LOD {meshlet_offset, meshlet_count, error, _pad} (16B ea)
-    uint32_t _pad2[2];               // 208 -> pad to 16-aligned 216
+    uint32_t skin_plus_one;          // 208 0 = static; else index into kSecSkins + 1 (brief 23)
+    uint32_t _pad2;                  // 212 -> pad to 16-aligned 216
 };
 static_assert(sizeof(CookedDraw) == 216);
 static_assert(offsetof(CookedDraw, aabb_min) == 64);
@@ -69,6 +74,7 @@ static_assert(offsetof(CookedDraw, center) == 96);
 static_assert(offsetof(CookedDraw, material) == 112);
 static_assert(offsetof(CookedDraw, first_meshlet) == 132);
 static_assert(offsetof(CookedDraw, lods) == 144);
+static_assert(offsetof(CookedDraw, skin_plus_one) == 208);
 
 // glTF alpha mode, baked (mirrors GltfAlphaMode; kept independent so the cooked format doesn't
 // depend on the glTF front-end).
@@ -109,6 +115,42 @@ struct CookedTexture
 };
 static_assert(sizeof(CookedTexture) == 256);
 
+// One skinned vertex: the SECOND vertex stream (brief 23), strictly PARALLEL to kSecVertices —
+// same index space, same count, repacked by bake Phase 2 in lockstep with the vertex heap. The
+// LOCKED format (8 B/vertex, final — the end-of-Phase-A quantization brief re-quantizes only
+// kSecVertices and must never reorder or renumber vertices, or this parallel index breaks):
+//
+//   joints[i]  index into the DRAW's joint palette (glTF skin-local), 0..255. A skin with more
+//              than 256 joints is a hard cook error naming the skin.
+//   weights[i] unorm8. THE FOUR SUM TO EXACTLY 255 by construction, so shaders do NOT
+//              renormalize. Quantization (normative, deterministic):
+//                - merge JOINTS_0/WEIGHTS_0 (+ _1 sets if present), sort influences by
+//                  descending weight, ascending joint index as tie-break, keep 4;
+//                - renormalize, floor(w*255), then hand the remainder out one unit at a time
+//                  to the largest fractional parts (ties to the LOWER influence index);
+//                - degenerate input (weight sum 0) -> joints {0,0,0,0}, weights {255,0,0,0};
+//                - unused influence slots are joint 0 / weight 0 (canonical padding).
+struct SkinVertex
+{
+    uint8_t joints[4];    // 0
+    uint8_t weights[4];   // 4
+};
+static_assert(sizeof(SkinVertex) == 8);
+
+// One glTF skin cooked: the palette-building inputs for every draw that references it. The ozz
+// skeleton + clips live in the sibling `.anim` pack (see string-core's string/anim/anim_pack.hpp);
+// skeleton_hash pairs this record to that pack (an FNV-1a of the pack's skeleton blob), so a
+// paperdoll part cooked against a stale pack degrades to bind pose instead of exploding.
+struct CookedSkin
+{
+    uint64_t skeleton_hash;   // 0   pairing check against the .anim pack
+    uint32_t joint_count;     // 8   == glTF skin.joints.size()
+    uint32_t ibm_offset;      // 12  first element in kSecInverseBind
+    uint32_t remap_offset;    // 16  first element in kSecJointRemap
+    uint32_t _pad[3];         // 20 -> 32
+};
+static_assert(sizeof(CookedSkin) == 32);
+
 // Section indices in the header's section table.
 enum CookedSection : uint32_t
 {
@@ -119,6 +161,10 @@ enum CookedSection : uint32_t
     kSecDraws,          // CookedDraw[]        per-draw table
     kSecMaterials,      // CookedMaterial[]
     kSecTextures,       // CookedTexture[]
+    kSecSkinVerts,      // SkinVertex[]        parallel to kSecVertices (count 0 or == vertices)
+    kSecSkins,          // CookedSkin[]        one per distinct glTF skin in this file
+    kSecInverseBind,    // glm::mat4[]         inverse-bind matrices, glTF skin.joints[] order
+    kSecJointRemap,     // uint32_t[]          remap[gltf_joint] = ozz joint index (depth-first)
     kSecCount
 };
 

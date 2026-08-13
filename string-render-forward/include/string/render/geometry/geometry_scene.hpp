@@ -2,11 +2,14 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <vector>
 
 #include <string/gpu/resource.hpp>
 #include <string/scene/camera.hpp>
+
+#include <string/asset/cooked_format.hpp>   // brief 23: SkinVertex (the compact skin heap's element)
 
 #include <string/render/gltf_types.hpp>
 #include <string/render/lighting_data.hpp>
@@ -205,6 +208,32 @@ struct GeometryScene
     // The vertex heap. In the scene tables (not GeometryPass) because the cascade draws push its
     // device address too, exactly like the meshlet heaps above.
     ::string::gpu::resource_id vertex_buffer_ = 0;
+
+    // --- Brief 23 skinning ------------------------------------------------------------------------
+    // One entry per merged skin: palette inputs + the `.anim` pack path + the palette window this
+    // skin was assigned in the ring (all draws of one skin share it — the paperdoll shape).
+    struct SkinInstance
+    {
+        uint64_t skeleton_hash = 0;
+        uint32_t joint_count = 0;
+        uint32_t ibm_offset = 0;      // window into skin_inverse_bind_
+        uint32_t remap_offset = 0;    // window into skin_joint_remap_
+        uint32_t palette_offset = 0;  // first joint in the palette ring, mat4 units
+        std::filesystem::path anim_pack;
+    };
+    std::vector<SkinInstance> skins_;
+    std::vector<glm::mat4> skin_inverse_bind_;
+    std::vector<uint32_t> skin_joint_remap_;
+    std::vector<::string::asset::SkinVertex> skin_vertices_;   // CPU copy; uploaded once at build
+    std::vector<int32_t> draw_skin_;         // per draw: index into skins_, -1 = static
+    std::vector<int32_t> draw_skin_delta_;   // per draw: skin heap rebase (the vertex_offset idiom)
+    uint32_t palette_joints_total_ = 0;      // sum of joint_count over skins_ (ring occupancy)
+    // The compact skin heap on the GPU (whole-uploaded at build, never suballocated — the delta
+    // above is against ORIGINAL global indices, so geometry streaming does not touch it).
+    ::string::gpu::resource_id skin_buffer_ = 0;
+    // The app-backed palette ring's graph handle (declare() stores it; scene.upload publishes this
+    // slot's address into SceneData).
+    ::string::gpu::buffer joint_palette_{};
     // Cascaded shadow maps + their per-cascade work lists, owned by ShadowPass. Published here so
     // GeometryPass's SceneData can read the bindless cascade slots and the culler can fill the lists.
     shadow_maps* shadow = nullptr;
