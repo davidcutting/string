@@ -1,0 +1,3 @@
+# Build the scene library's headless gtest suite (camera, and later: world tables, asset registry).
+option('tests', type: 'boolean', value: false,
+       description: 'Build the test suite')

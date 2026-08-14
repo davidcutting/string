@@ -8,6 +8,8 @@
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 
+#include <string/core/gpu_types.hpp>
+
 namespace string::render
 {
 
@@ -23,18 +25,11 @@ inline constexpr uint32_t kFroxelDepthSlices = 24; // log-depth slices
 // Max lights indexed per froxel. Overflow is dropped (heatmap makes gross over-binning visible).
 inline constexpr uint32_t kMaxLightsPerFroxel = 128;
 
-// A dynamic local light (point or spot). std430-friendly (4x vec4 = 64B). Matches GpuLight in
-// lighting.slang and froxel_cull.slang.
-enum class LightType : uint32_t { POINT = 0, SPOT = 1 };
-
-struct GpuLight
-{
-    glm::vec4 position_radius;   // xyz world position, w = range (radius) for attenuation
-    glm::vec4 color_intensity;   // rgb linear color, w = intensity (radiant scale)
-    glm::vec4 direction_type;    // xyz spot direction (normalized), w = LightType as float
-    glm::vec4 cone;              // x = cos(inner), y = cos(outer); zw unused (point ignores all)
-};
-static_assert(sizeof(GpuLight) == 64);
+// GpuLight/LightType moved to string-core (string/core/gpu_types.hpp): they are the GPU layout of
+// a SCENE object, and the scene layer must be able to name them without a renderer dependency.
+// Re-exported here so existing renderer code keeps its spelling.
+using ::string::GpuLight;
+using ::string::LightType;
 
 // Per-frame scene lighting/shadow/froxel constants, bound as an SSBO (persistent-mapped ring) and
 // reached by device address from the meshlet push. Moved out of the push constant because the CSM +

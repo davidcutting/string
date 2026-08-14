@@ -39,56 +39,32 @@ using namespace string;
 
 void geometry_pass::build_meshlet_gpu(engine_context& context)
 {
+    (void)context;
     if (meshlet_model_.total_meshlets == 0) return;
 
-    auto make_device_buffer = [&](const void* data, VkDeviceSize size, VkBufferUsageFlags extra) {
-        ::string::gpu::resource_id id = allocator_.create_resource(::string::gpu::buffer_info{
-            .size = size,
-            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                   | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | extra,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-            .allocation_flags = {},
-        });
-        context.transfer.upload_buffer(data, size, id);
-        return id;
-    };
+    // The meshlet/vertex/skin heaps were created + uploaded by the ASSET REGISTRY (its declare()
+    // ran before this pass was constructed); their graph handles were latched in the constructor.
 
-    meshlet_buffer_ = make_device_buffer(meshlet_model_.meshlets.data(),
-        sizeof(GpuMeshlet) * meshlet_model_.meshlets.size(), 0);
-    meshlet_vertices_ = make_device_buffer(meshlet_model_.meshlet_vertices.data(),
-        sizeof(uint32_t) * meshlet_model_.meshlet_vertices.size(), 0);
-    meshlet_triangles_ = make_device_buffer(meshlet_model_.meshlet_triangles.data(),
-        sizeof(uint32_t) * meshlet_model_.meshlet_triangles.size(), 0);
-
-    // Brief 23: the compact skin heap, whole-uploaded like the meshlet heaps (never suballocated —
-    // DrawInfo.skin_offset rebases ORIGINAL global indices, so geometry streaming never touches it).
-    if (!skin_vertices_.empty())
-        skin_buffer_ = make_device_buffer(skin_vertices_.data(),
-            sizeof(::string::asset::SkinVertex) * skin_vertices_.size(), 0);
-
-    if (const int32_t dump_start = cv_meshlet_dump().get(); dump_start >= 0)
+    if (const int32_t dump_start = cv_meshlet_dump().get(); dump_start >= 0 && draw_info_mapped_)
     {
         const uint32_t d0 = uint32_t(dump_start);
-        for (uint32_t d = d0; d < std::min<uint32_t>(d0 + 6, uint32_t(meshlet_model_.draws.size())); ++d)
+        const std::span<const scene_bridge::row_meta> rows = bridge_.rows();
+        for (uint32_t d = d0; d < std::min<uint32_t>(d0 + 6, bridge_.row_count()); ++d)
         {
-            // Compare the CPU model against what the GPU actually reads (mapped DrawInfo).
-            if (draw_info_mapped_ && std::memcmp(&draw_info_mapped_[d], &meshlet_model_.draws[d],
-                                                 sizeof(GpuDrawInfo)) != 0)
-                STRING_LOG_WARN("[dump] draw {} MAPPED DrawInfo DIFFERS from CPU model!", d);
-            const GpuDrawInfo& info = meshlet_model_.draws[d];
+            const GpuDrawInfo& info = draw_info_mapped_[d];
             const GpuMeshlet& m0 = meshlet_model_.meshlets[info.lods[0].meshlet_offset];
-            STRING_LOG_INFO("[dump] draw {} idx_cnt {} lod0 off {} cnt {} | m0 voff {} vcnt {} tcnt {} center ({:.2f},{:.2f},{:.2f}) r {:.2f} | model[3] ({:.2f},{:.2f},{:.2f})",
-                d, draws_[d].index_count, info.lods[0].meshlet_offset, info.lods[0].meshlet_count,
+            const ::string::assets::mesh_part& part = assets_.mesh_parts()[rows[d].mesh.index];
+            STRING_LOG_INFO("[dump] draw {} vtx_cnt {} lod0 off {} cnt {} | m0 voff {} vcnt {} tcnt {} center ({:.2f},{:.2f},{:.2f}) r {:.2f} | model[3] ({:.2f},{:.2f},{:.2f})",
+                d, part.vertex_count, info.lods[0].meshlet_offset, info.lods[0].meshlet_count,
                 m0.vertex_offset, m0.vertex_count, m0.triangle_count,
                 m0.center.x, m0.center.y, m0.center.z, m0.radius,
-                draws_[d].transform[3].x, draws_[d].transform[3].y, draws_[d].transform[3].z);
+                info.model[3].x, info.model[3].y, info.model[3].z);
             // Real extent of m0's vertices straight from the meshlet-vertex remap.
             glm::vec3 lo(1e30f), hi(-1e30f);
             for (uint32_t v = 0; v < m0.vertex_count; ++v)
             {
                 const uint32_t gv = meshlet_model_.meshlet_vertices[m0.vertex_offset + v];
-                // NOTE: geometry vectors moved into the streamer; use its CPU copy.
-                const glm::vec3 p = geometry_streamer_->cpu_vertex(gv).pos;
+                const glm::vec3 p = assets_.vertices()[gv].pos;
                 lo = glm::min(lo, p); hi = glm::max(hi, p);
             }
             STRING_LOG_INFO("[dump]   m0 REAL extent lo ({:.2f},{:.2f},{:.2f}) hi ({:.2f},{:.2f},{:.2f})",
@@ -96,85 +72,11 @@ void geometry_pass::build_meshlet_gpu(engine_context& context)
         }
     }
 
-    // DrawInfo table (host-visible + mapped: DrawInfo.resident is the per-frame streaming gate, and
-    // the crowd stress scene rewrites transforms live). Fill material/transform/bounds from draws_.
-    for (std::size_t i = 0; i < meshlet_model_.draws.size(); ++i)
-    {
-        const GltfDraw& draw = draws_[i];
-        GpuDrawInfo& info = meshlet_model_.draws[i];
-        info.model = draw.transform;
-        info.resident = 0;       // flipped on residency (up-front loop / streaming)
-        // Brief 23: bind the draw to its skin. Set HERE, not in the scene loader — this loop runs
-        // after load and used to stomp the flag back to 0, and probe-GI's capture_table (built
-        // after this, in the probe component's ctor) reads it to exclude skinned draws from the
-        // static capture. STRING_SKIN_OFF=1 is the kill-switch: every draw renders static bind
-        // pose through the unskinned load_vertex path — the A/B lever for the identity-palette
-        // parity gate, and the first bisect step when a character renders wrong.
-        static const bool skin_off = std::getenv("STRING_SKIN_OFF") != nullptr;
-        const int32_t skin = (!skin_off && i < draw_skin_.size()) ? draw_skin_[i] : -1;
-        if (skin >= 0)
-        {
-            const GeometryScene::SkinInstance& si = skins_[skin];
-            info.skinned = 1;
-            info.skin_offset = static_cast<uint32_t>(draw_skin_delta_[i]);
-            info.palette_offset = si.palette_offset;
-            info.joint_count = si.joint_count;
-        }
-        else
-        {
-            info.skinned = 0;
-            info.skin_offset = 0;
-            info.palette_offset = 0;
-            info.joint_count = 0;
-        }
-        info.flags = 0;
-        info.alpha_cutoff = 0.5f;
-        if (draw.material >= 0)
-        {
-            const GltfMaterial& m = materials_[draw.material];
-            info.base_color = m.base_color_factor;
-            info.base_slot = m.base_color_texture >= 0 ? texture_slots_[m.base_color_texture] : white_slot_;
-            info.normal_slot = m.normal_texture >= 0 ? texture_slots_[m.normal_texture] : flat_normal_slot_;
-            info.mr_slot = m.metallic_roughness_texture >= 0 ? texture_slots_[m.metallic_roughness_texture] : white_slot_;
-            info.metallic = m.metallic_factor;
-            info.roughness = m.roughness_factor;
-            info.occlusion_slot = m.occlusion_texture >= 0 ? texture_slots_[m.occlusion_texture] : white_slot_;
-            // Brief 04: MASK => alpha-tested cutout; BLEND => routed to the sorted transparency pass
-            // (excluded from the opaque lists); doubleSided => two-sided (bypass cull both places).
-            if (m.alpha_mode == GltfAlphaMode::Mask)  info.flags |= kDrawFlagCutout;
-            if (m.alpha_mode == GltfAlphaMode::Blend) info.flags |= kDrawFlagBlend;
-            if (m.double_sided)                       info.flags |= kDrawFlagDoubleSided;
-            info.alpha_cutoff = m.alpha_cutoff;
-        }
-        else
-        {
-            info.base_color = glm::vec4(1.0f);
-            info.base_slot = white_slot_;
-            info.normal_slot = flat_normal_slot_;
-            info.mr_slot = white_slot_;
-            info.metallic = 1.0f;
-            info.roughness = 1.0f;
-            info.occlusion_slot = white_slot_;
-        }
-        // Brief 20: the BLEND draw list is built by sorted_transparency from the same flags.
-    }
-
-    // Size the DrawInfo table for base + the full crowd grid (extra copies referencing the same
-    // meshlets, only the transform differs). Crowd entries are filled/cleared on the K toggle.
-    base_draw_count_ = static_cast<uint32_t>(meshlet_model_.draws.size());
-    active_draw_count_ = base_draw_count_;
-    const uint32_t max_draws = base_draw_count_ * kCrowdGrid * kCrowdGrid;
-    const VkDeviceSize draw_info_size = sizeof(GpuDrawInfo) * max_draws;
-    draw_info_buffer_ = allocator_.create_resource(::string::gpu::buffer_info{
-        .size = draw_info_size,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-        .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
-    });
-    draw_info_mapped_ = static_cast<GpuDrawInfo*>(
-        allocator_.get_buffer(draw_info_buffer_).allocation_info.pMappedData);
-    std::copy(meshlet_model_.draws.begin(), meshlet_model_.draws.end(), draw_info_mapped_);
-
+    // The DrawInfo TABLE is the scene bridge's (rows = world instances x registry parts, material
+    // slots resolved, residency gate installed there). This function keeps only what is genuinely
+    // this technique's: the worklist layout, the visibility bitfield, and the pipelines. The table
+    // capacity (the app's spawn budget) sizes the cull worklists.
+    const uint32_t max_draws = bridge_.max_rows();
     // GPU-written stats, read back one frame late. Brief 20: the stats ring is an APP-DECLARED graph
     // buffer; the passes that write it declare it and resolve its address through pass_context.
     stats_readback_.resize(frames_in_flight_);
@@ -334,51 +236,6 @@ void geometry_pass::build_meshlet_gpu(engine_context& context)
     hiz_.resize(frames_in_flight_);
 }
 
-void geometry_pass::build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_max)
-{
-    if (!draw_info_mapped_) return;
-    if (!crowd_enabled_)
-    {
-        active_draw_count_ = base_draw_count_;
-        return;
-    }
-    const glm::vec3 extent = aabb_max - aabb_min;
-    const float spacing_x = extent.x * 1.1f;
-    const float spacing_z = extent.z * 1.1f;
-    const int side = static_cast<int>(kCrowdGrid);   // kCrowdGrid x kCrowdGrid cells total
-    uint32_t dst = base_draw_count_;
-    for (int gx = 0; gx < side; ++gx)
-    for (int gz = 0; gz < side; ++gz)
-    {
-        // Center the grid on the origin cell (occupied by the base scene).
-        const int cx = gx - side / 2;
-        const int cz = gz - side / 2;
-        if (cx == 0 && cz == 0) continue;   // the base scene occupies the origin cell
-        const glm::mat4 offset = glm::translate(glm::mat4(1.0f),
-            glm::vec3(static_cast<float>(cx) * spacing_x, 0.0f, static_cast<float>(cz) * spacing_z));
-        for (uint32_t b = 0; b < base_draw_count_; ++b)
-        {
-            GpuDrawInfo copy = meshlet_model_.draws[b];   // geometry-only record (bounds + LOD ranges)
-            const GpuDrawInfo& base_live = draw_info_mapped_[b];  // material/transform/resident live
-            copy.model = offset * base_live.model;
-            // DrawInfo.center is WORLD-space (draw-level frustum cull + LOD select read it raw), so
-            // the grid translation must be applied to the copy's bounds too.
-            copy.center = glm::vec3(offset[3]) + copy.center;
-            copy.base_color = base_live.base_color;
-            copy.base_slot = base_live.base_slot;
-            copy.normal_slot = base_live.normal_slot;
-            copy.mr_slot = base_live.mr_slot;
-            copy.metallic = base_live.metallic;
-            copy.roughness = base_live.roughness;
-            copy.occlusion_slot = base_live.occlusion_slot;
-            copy.resident = base_live.resident;
-            draw_info_mapped_[dst++] = copy;
-        }
-    }
-    active_draw_count_ = dst;
-    STRING_LOG_INFO("[crowd] {} draws active ({} base x {} grid cells)",
-                    active_draw_count_, base_draw_count_, kCrowdGrid * kCrowdGrid);
-}
 
 // --- Brief 20: the cull/expand chain as declarations ----------------------------------------------
 //
@@ -640,12 +497,13 @@ void geometry_pass::record_meshlet_draws(::string::pass_context& ctx, const ::st
     MeshletPush push{};
     push.view_proj = vp;
     push.cull_view_proj = cull_enabled_ ? cull_vp : vp;   // (frustum planes; C disables via wide test)
-    // The geometry heaps are NOT graph resources — they are load-time device buffers this pass owns,
-    // so they keep resolving through the allocator. Only the declared handles go through ctx.
-    push.vertices = allocator_.get_buffer(vertex_buffer_).device_address;
-    push.meshlets = allocator_.get_buffer(meshlet_buffer_).device_address;
-    push.mverts = allocator_.get_buffer(meshlet_vertices_).device_address;
-    push.mtris = allocator_.get_buffer(meshlet_triangles_).device_address;
+    // The geometry heaps are registry-owned graph persistents now (assets::gpu_view); this pass
+    // declares its reads of them, so the addresses resolve through the pass_context like every
+    // other declared handle — the allocator escape is gone.
+    push.vertices = ctx.address(vertex_buffer_);
+    push.meshlets = ctx.address(meshlet_buffer_);
+    push.mverts = ctx.address(meshlet_vertices_);
+    push.mtris = ctx.address(meshlet_triangles_);
     push.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
     push.scene = ctx.address(scene_data);
     push.stats = ctx.address(stats);

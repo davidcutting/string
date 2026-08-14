@@ -26,9 +26,9 @@ struct anim_demo::Character
     std::shared_ptr<AnimSet> set;
     AnimPlayer player;
     CrossFade fade;
-    GeometryScene::SkinInstance meta;
+    ::string::render::scene_bridge::skin_instance meta;
 
-    Character(std::shared_ptr<AnimSet> s, const GeometryScene::SkinInstance& m)
+    Character(std::shared_ptr<AnimSet> s, const ::string::render::scene_bridge::skin_instance& m)
     : set(std::move(s)), player(set->skeleton()), meta(m)
     {
     }
@@ -43,7 +43,7 @@ struct anim_demo::Character
 
 anim_demo::anim_demo(const ::string::render::geometry_pass& geo) : geo_(&geo)
 {
-    for (const GeometryScene::SkinInstance& skin : geo.skins())
+    for (const ::string::render::scene_bridge::skin_instance& skin : geo.skins())
     {
         std::shared_ptr<AnimSet> set = AnimSet::load(skin.anim_pack);
         if (!set) continue;   // load already WARNed; bind pose via the ring's identity default

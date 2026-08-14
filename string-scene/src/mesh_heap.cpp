@@ -1,44 +1,28 @@
 #include <algorithm>
 #include <limits>
 
-#include <string/render/geometry_streamer.hpp>
+#include <string/scene/mesh_heap.hpp>
 
-namespace string::render
+namespace string::assets
 {
 using namespace string;
 
-GeometryStreamer::GeometryStreamer(::string::gpu::resource_allocator& allocator, TransferBatch& transfer,
+mesh_heap::mesh_heap(::string::gpu::resource_allocator& allocator, TransferBatch& transfer,
                                    ::string::gpu::resource_id vertex_buffer,
-                                   std::vector<Vertex> vertices, std::vector<std::uint32_t> indices,
+                                   std::span<const Vertex> vertices,
                                    std::uint64_t vertex_capacity,
                                    std::uint32_t frames_in_flight)
 : allocator_(allocator)
 , transfer_(transfer)
 , vertex_buffer_(vertex_buffer)
-, vertices_(std::move(vertices))
-, indices_(std::move(indices))
+, vertices_(vertices)
 , vheap_(vertex_capacity)
 , frames_in_flight_(frames_in_flight)
 {
     (void)allocator_;  // held for symmetry with other providers
 }
 
-GeometryStreamer::GeometryStreamer(::string::gpu::resource_allocator& allocator, TransferBatch& transfer,
-                                   ::string::gpu::resource_id vertex_buffer,
-                                   std::vector<Vertex> vertices,
-                                   std::uint64_t vertex_capacity,
-                                   std::uint32_t frames_in_flight)
-: allocator_(allocator)
-, transfer_(transfer)
-, vertex_buffer_(vertex_buffer)
-, vertices_(std::move(vertices))
-, vheap_(vertex_capacity)
-, frames_in_flight_(frames_in_flight)
-{
-    (void)allocator_;  // held for symmetry with other providers
-}
-
-void GeometryStreamer::set_windows(const std::vector<Window>& windows)
+void mesh_heap::set_windows(const std::vector<Window>& windows)
 {
     ranges_.resize(windows.size());
     allocs_.assign(windows.size(), Alloc{});
@@ -53,33 +37,7 @@ void GeometryStreamer::set_windows(const std::vector<Window>& windows)
     }
 }
 
-void GeometryStreamer::set_draws(const std::vector<GltfDraw>& draws)
-{
-    ranges_.resize(draws.size());
-    allocs_.assign(draws.size(), Alloc{});
-    for (std::size_t i = 0; i < draws.size(); ++i)
-    {
-        const GltfDraw& d = draws[i];
-        DrawRange r;
-        r.index_offset = d.index_offset;
-        r.index_count = d.index_count;
-
-        std::uint32_t vmin = std::numeric_limits<std::uint32_t>::max();
-        std::uint32_t vmax = 0;
-        for (std::uint32_t k = 0; k < d.index_count; ++k)
-        {
-            const std::uint32_t v = indices_[d.index_offset + k];
-            vmin = std::min(vmin, v);
-            vmax = std::max(vmax, v);
-        }
-        if (d.index_count == 0) { vmin = 0; vmax = 0; }
-        r.vertex_offset = vmin;
-        r.vertex_count = (d.index_count == 0) ? 0 : (vmax - vmin + 1);
-        ranges_[i] = r;
-    }
-}
-
-void GeometryStreamer::begin_frame(std::uint64_t frame)
+void mesh_heap::begin_frame(std::uint64_t frame)
 {
     current_frame_ = frame;
     // Reclaim ranges whose deferred-free window has elapsed (every in-flight frame that might still
@@ -99,13 +57,13 @@ void GeometryStreamer::begin_frame(std::uint64_t frame)
     }
 }
 
-bool GeometryStreamer::can_stream(::string::gpu::resource_id id, std::uint32_t /*to_detail*/)
+bool mesh_heap::can_stream(::string::gpu::resource_id id, std::uint32_t /*to_detail*/)
 {
     const DrawRange& r = ranges_[id];
     return vheap_.can_allocate(r.vertex_count);
 }
 
-std::uint64_t GeometryStreamer::stream(::string::gpu::resource_id id, std::uint32_t /*from_detail*/,
+std::uint64_t mesh_heap::stream(::string::gpu::resource_id id, std::uint32_t /*from_detail*/,
                                        std::uint32_t /*to_detail*/)
 {
     const DrawRange& r = ranges_[id];
@@ -125,12 +83,12 @@ std::uint64_t GeometryStreamer::stream(::string::gpu::resource_id id, std::uint3
                                    vertex_buffer_, a.vheap * sizeof(Vertex));
 }
 
-bool GeometryStreamer::is_complete(std::uint64_t ticket)
+bool mesh_heap::is_complete(std::uint64_t ticket)
 {
     return transfer_.is_complete(ticket);
 }
 
-void GeometryStreamer::on_resident(::string::gpu::resource_id id, std::uint32_t detail)
+void mesh_heap::on_resident(::string::gpu::resource_id id, std::uint32_t detail)
 {
     if (detail < 1 || !set_cull_)
     {
@@ -147,7 +105,7 @@ void GeometryStreamer::on_resident(::string::gpu::resource_id id, std::uint32_t 
     streamed_bytes_ += cost(id, detail);
 }
 
-void GeometryStreamer::evict(::string::gpu::resource_id id, std::uint32_t /*from_detail*/, std::uint32_t to_detail)
+void mesh_heap::evict(::string::gpu::resource_id id, std::uint32_t /*from_detail*/, std::uint32_t to_detail)
 {
     if (to_detail != 0)
     {
@@ -169,7 +127,7 @@ void GeometryStreamer::evict(::string::gpu::resource_id id, std::uint32_t /*from
     ++evicted_draws_;
 }
 
-VkDeviceSize GeometryStreamer::cost(::string::gpu::resource_id id, std::uint32_t detail)
+VkDeviceSize mesh_heap::cost(::string::gpu::resource_id id, std::uint32_t detail)
 {
     if (detail == 0)
     {
@@ -179,4 +137,4 @@ VkDeviceSize GeometryStreamer::cost(::string::gpu::resource_id id, std::uint32_t
     return VkDeviceSize(r.vertex_count) * sizeof(Vertex);  // vertex heap only (no GPU index heap, M3)
 }
 
-}  // namespace string::render
+}  // namespace string::assets

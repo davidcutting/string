@@ -175,6 +175,20 @@ void sorted_transparency::declare(::string::frame_graph& fg, ::string::gpu::imag
     if (scene_ != nullptr && scene_->joint_palette_.valid())
         transparency.reads(scene_->joint_palette_, access::storage_read,
                            VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+    // The registry's content heaps (assets::gpu_view, latched into the scene tables): the blended
+    // draws pull geometry through the same task/mesh path as the opaque phases.
+    if (scene_ != nullptr)
+    {
+        const ::string::gpu::buffer heaps[] = { scene_->vertex_buffer_, scene_->meshlet_buffer_,
+                                                scene_->meshlet_vertices_,
+                                                scene_->meshlet_triangles_, scene_->skin_buffer_ };
+        for (const ::string::gpu::buffer& h : heaps)
+        {
+            if (!h.valid()) continue;
+            transparency.reads(h, access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
+            transparency.reads(h, access::storage_read, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+        }
+    }
     transparency
       // r.pass.transparency drops the blended draw -> opaque geometry only. No degrade needed:
       // transparency is a pure over-draw with no consumer.
@@ -201,10 +215,10 @@ void sorted_transparency::record(::string::pass_context& ctx, ::string::gpu::buf
     MeshletPush push{};
     push.view_proj = vp;
     push.cull_view_proj = s.cull_enabled_ ? (s.mesh_cull_frozen_ ? s.mesh_frozen_view_proj_ : vp) : vp;
-    push.vertices = allocator_->get_buffer(s.vertex_buffer_).device_address;
-    push.meshlets = allocator_->get_buffer(s.meshlet_buffer_).device_address;
-    push.mverts = allocator_->get_buffer(s.meshlet_vertices_).device_address;
-    push.mtris = allocator_->get_buffer(s.meshlet_triangles_).device_address;
+    push.vertices = ctx.address(s.vertex_buffer_);
+    push.meshlets = ctx.address(s.meshlet_buffer_);
+    push.mverts = ctx.address(s.meshlet_vertices_);
+    push.mtris = ctx.address(s.meshlet_triangles_);
     push.draws = allocator_->get_buffer(s.draw_info_buffer_).device_address;
     push.scene = ctx.address(scene_data);
     push.stats = ctx.address(stats);

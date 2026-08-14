@@ -10,8 +10,8 @@
 #include <string/scene/camera.hpp>
 
 #include <string/asset/cooked_format.hpp>   // brief 23: SkinVertex (the compact skin heap's element)
+#include <string/scene/asset.hpp>           // assets::material / assets::mesh_part (runtime tables)
 
-#include <string/render/gltf_types.hpp>
 #include <string/render/lighting_data.hpp>
 #include <string/render/geometry/sky_component.hpp>
 #include <string/render/geometry/froxel_component.hpp>
@@ -115,21 +115,22 @@ struct GeometryScene
     IblLighting ibl_lighting() const;
 
     // --- Geometry / draw tables ------------------------------------------------------------------
-    std::vector<GltfMaterial> materials_;
-    std::vector<GltfDraw> draws_;
+    // The material/part tables live in the ASSET REGISTRY and the draw rows in the SCENE BRIDGE
+    // now; what remains here are the shared counts + handles every technique reads.
     uint32_t draw_count_ = 0;
     uint32_t base_draw_count_ = 0;   // draws in the base (non-crowd) scene
     uint32_t active_draw_count_ = 0; // base, or base + crowd when the crowd is on
     glm::vec3 scene_aabb_min_{ 0.0f };
     glm::vec3 scene_aabb_max_{ 0.0f };
 
-    // Built at load from the flattened geometry: the GPU-side meshlet/vertex/triangle heaps + the
-    // per-draw DrawInfo table. Metadata buffers are small and always resident; only the vertex/index
-    // heaps stream (DrawInfo.resident is the streaming gate).
+    // The CPU meshlet tables (still pass-adopted copies, transitional) + the per-draw DrawInfo
+    // table. The GPU heaps themselves belong to the ASSET REGISTRY now — these are its graph
+    // handles (assets::gpu_view), latched at construction; every consumer declares its own read
+    // and resolves the address through its pass_context (no allocator escape).
     MeshletModel meshlet_model_;
-    ::string::gpu::resource_id meshlet_buffer_ = 0;      // GpuMeshlet[]
-    ::string::gpu::resource_id meshlet_vertices_ = 0;    // uint[] global vertex remap
-    ::string::gpu::resource_id meshlet_triangles_ = 0;   // uint[] packed local tris
+    ::string::gpu::buffer meshlet_buffer_{};      // GpuMeshlet[]
+    ::string::gpu::buffer meshlet_vertices_{};    // uint[] global vertex remap
+    ::string::gpu::buffer meshlet_triangles_{};   // uint[] packed local tris
     ::string::gpu::resource_id draw_info_buffer_ = 0;    // GpuDrawInfo[] (host-visible; resident gate)
     GpuDrawInfo* draw_info_mapped_ = nullptr;
 
@@ -205,32 +206,16 @@ struct GeometryScene
     // them to size the declarations (worklist_bytes / draw_lod_bytes).
     WorklistLayout wl_layout_;
     uint32_t cull_max_draws_ = 0;
-    // The vertex heap. In the scene tables (not GeometryPass) because the cascade draws push its
-    // device address too, exactly like the meshlet heaps above.
-    ::string::gpu::resource_id vertex_buffer_ = 0;
+    // The vertex heap's graph handle (registry-owned backing). In the scene tables (not
+    // GeometryPass) because the cascade draws push its device address too, like the meshlet heaps.
+    ::string::gpu::buffer vertex_buffer_{};
 
     // --- Brief 23 skinning ------------------------------------------------------------------------
-    // One entry per merged skin: palette inputs + the `.anim` pack path + the palette window this
-    // skin was assigned in the ring (all draws of one skin share it — the paperdoll shape).
-    struct SkinInstance
-    {
-        uint64_t skeleton_hash = 0;
-        uint32_t joint_count = 0;
-        uint32_t ibm_offset = 0;      // window into skin_inverse_bind_
-        uint32_t remap_offset = 0;    // window into skin_joint_remap_
-        uint32_t palette_offset = 0;  // first joint in the palette ring, mat4 units
-        std::filesystem::path anim_pack;
-    };
-    std::vector<SkinInstance> skins_;
-    std::vector<glm::mat4> skin_inverse_bind_;
-    std::vector<uint32_t> skin_joint_remap_;
-    std::vector<::string::asset::SkinVertex> skin_vertices_;   // CPU copy; uploaded once at build
-    std::vector<int32_t> draw_skin_;         // per draw: index into skins_, -1 = static
-    std::vector<int32_t> draw_skin_delta_;   // per draw: skin heap rebase (the vertex_offset idiom)
-    uint32_t palette_joints_total_ = 0;      // sum of joint_count over skins_ (ring occupancy)
-    // The compact skin heap on the GPU (whole-uploaded at build, never suballocated — the delta
-    // above is against ORIGINAL global indices, so geometry streaming does not touch it).
-    ::string::gpu::resource_id skin_buffer_ = 0;
+    // The skin tables live in the asset registry and the palette windows in the scene bridge now.
+    // The compact skin heap's graph handle (registry-owned backing, whole-uploaded at load, never
+    // suballocated — DrawInfo.skin_offset rebases ORIGINAL global indices, so geometry streaming
+    // does not touch it).
+    ::string::gpu::buffer skin_buffer_{};
     // The app-backed palette ring's graph handle (declare() stores it; scene.upload publishes this
     // slot's address into SceneData).
     ::string::gpu::buffer joint_palette_{};

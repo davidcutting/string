@@ -31,20 +31,13 @@ project(
 string_dep = dependency('string-core', fallback : ['string-core', 'project_deps'])
 ui_dep = dependency('string-ui', fallback : ['string-ui', 'project_deps'])
 asset_dep = dependency('string-asset', fallback : ['string-asset', 'project_deps'])
-# The in-process cook fallback (cook-on-load when a .cooked is missing or stale) is an editor
-# convenience the demo relies on. A shipped client would load cooked-only and drop this.
-asset_tools_dep = dependency('string-asset-tools', fallback : ['string-asset-tools', 'project_deps'])
-
-# libktx: cooked .ktx2 textures are already BC7, so the streamer uploads blocks with no transcode.
-# System KTX-Software CMake config (nix: nixpkgs' ktx-tools). Off-nix there is no system install and
-# this probe fails — libktx then arrives transitively through asset_tools_dep, which owns the wrap
-# and re-exports it. Resolving it a second time here would mean two cmake.subproject('ktx') calls in
-# one build.
-ktx_dep = dependency('Ktx', method : 'cmake', modules : ['KTX::ktx'],
-                     required : false, allow_fallback : false)
-if not ktx_dep.found()
-    ktx_dep = declare_dependency()
-endif
+# The scene library: the renderer consumes the world/asset layers through their view types
+# (and, transitionally, string::Camera which now lives there).
+scene_dep = dependency('string-scene', fallback : ['string-scene', 'project_deps'])
+# string-asset-tools is GONE from this library's deps (asset-layer split): cook-on-load moved
+# behind the asset registry's injected cook_provider, so a shipped client linking this renderer no
+# longer links the importer (fastgltf/meshoptimizer/MikkTSpace/ozz-offline) — the brief-18 rule,
+# now true in the link graph.
 
 include_dir = include_directories('include')
 
@@ -63,9 +56,6 @@ render_lib = static_library(
         'src/sky_component.cpp',
         'src/froxel_component.cpp',
         'src/ibl_component.cpp',
-        'src/texture_streamer.cpp',
-        'src/geometry_streamer.cpp',
-        'src/scene_loader.cpp',
         'src/post_pass.cpp',
         'src/ui_pass.cpp',
         'src/ui_background_pass.cpp',
@@ -74,9 +64,10 @@ render_lib = static_library(
         'src/grid_2d_pass.cpp',
         'src/render_cvars.cpp',
         'src/render_debug.cpp',
+        'src/scene_bridge.cpp',
     ],
     include_directories : include_dir,
-    dependencies : [ string_dep, ui_dep, asset_dep, asset_tools_dep, ktx_dep ],
+    dependencies : [ string_dep, ui_dep, asset_dep, scene_dep ],
     install : true,
 )
 
@@ -85,7 +76,7 @@ install_subdir('include/string', install_dir : 'include')
 project_deps = declare_dependency(
     include_directories : include_dir,
     link_with : [ render_lib ],
-    dependencies : [ string_dep, ui_dep, asset_dep, asset_tools_dep, ktx_dep ],
+    dependencies : [ string_dep, ui_dep, asset_dep, scene_dep ],
 )
 
 meson.override_dependency(meson.project_name(), project_deps)

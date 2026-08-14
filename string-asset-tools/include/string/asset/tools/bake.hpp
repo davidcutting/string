@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <vector>
 
-#include <string/vulkan/render_data.hpp>
+#include <string/core/vertex.hpp>
 
 #include <string/asset/cooked_scene.hpp>
 #include <string/asset/tools/gltf_loader.hpp>

@@ -30,14 +30,6 @@
 #include "string/gpu/resource.hpp"
 #include "vulkan/vulkan_core.h"
 
-// The single stb_image implementation for the sandbox lives here (this pass decodes textures).
-#define STB_IMAGE_IMPLEMENTATION
-#include <string/core/stb_image.h>
-
-// libktx: cooked .ktx2 textures are already BC7 (see string-asset-tools texture_cook) and stream in without
-// any CPU pixel decode or transcode — the fast path that avoids the stb_image load-time floor.
-// ktxvulkan.h (VkFormat query) requires the Vulkan headers above it and pulls in ktx.h itself.
-#include <ktxvulkan.h>
 
 namespace string::render
 {
@@ -64,36 +56,11 @@ inline constexpr ::string::ActionId toggle_lights    = ::string::action_id("togg
 inline constexpr ::string::ActionId toggle_heatmap   = ::string::action_id("toggle_heatmap");
 }  // namespace debug_actions
 
-// A texture decoded to RGBA8 on a worker thread, ready for a (single-threaded) GPU upload. The
-// pixels are owned by stb_image and freed via its own deallocator when this is destroyed, so
-// decode jobs can run in parallel without an extra copy.
-struct DecodedTexture
-{
-    struct StbiDeleter { void operator()(stbi_uc* p) const { stbi_image_free(p); } };
-    std::unique_ptr<stbi_uc, StbiDeleter> pixels;
-    int width = 0;
-    int height = 0;
-    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
-};
-
-// The coarse-tail detail (resident mip levels from the coarsest) whose finest level is ~floor_px
-// wide — the LOD floor every streamed texture is pinned to. detail == levels means all mips.
-std::uint32_t coarse_detail_for(std::uint32_t levels, std::uint32_t base_extent, std::uint32_t floor_px)
-{
-    std::uint32_t base_mip = base_extent <= floor_px
-        ? 0u
-        : static_cast<std::uint32_t>(std::floor(std::log2(static_cast<float>(base_extent) / floor_px)));
-    base_mip = std::min(base_mip, levels - 1);
-    return levels - base_mip;
-}
-
-// Rough screen-coverage LOD: project the draw's world AABB, take its largest screen-space pixel
-// span, and pick the mip whose texel count matches that span (aim for texel:pixel ~ 1). Returns a
-// detail in [coarse_detail, levels]. Deliberately cheap and per-draw (v1 CPU feedback) — no UVs, so
-// it assumes the texture maps ~once across the surface, which is fine for a first pass.
-std::uint32_t desired_detail(const glm::mat4& view_proj, const glm::vec3& mn, const glm::vec3& mx,
-                             VkExtent2D screen, std::uint32_t levels, std::uint32_t base_extent,
-                             std::uint32_t coarse_detail)
+// The projected screen-pixel span of a world AABB — the coverage half of the texture-LOD feedback
+// (the asset registry turns coverage into a desired mip). Returns 0 when every corner is behind /
+// on the near plane or the span is sub-pixel, which the registry maps to its coarse floor.
+float aabb_coverage_px(const glm::mat4& view_proj, const glm::vec3& mn, const glm::vec3& mx,
+                       VkExtent2D screen)
 {
     glm::vec2 lo(std::numeric_limits<float>::max());
     glm::vec2 hi(std::numeric_limits<float>::lowest());
@@ -114,120 +81,10 @@ std::uint32_t desired_detail(const glm::mat4& view_proj, const glm::vec3& mn, co
     }
     if (in_front == 0)
     {
-        return coarse_detail;
+        return 0.0f;
     }
     const float span = std::max(hi.x - lo.x, hi.y - lo.y);
-    if (span <= 1.0f)
-    {
-        return coarse_detail;
-    }
-    // base_extent texels spread across `span` pixels: minified by base_extent/span. The matching mip
-    // is log2 of that ratio; ratio <= 1 (magnified) wants mip 0 (full detail).
-    const float ratio = static_cast<float>(base_extent) / span;
-    std::uint32_t base_mip = ratio <= 1.0f ? 0u : static_cast<std::uint32_t>(std::floor(std::log2(ratio)));
-    base_mip = std::min(base_mip, levels - 1);
-    return std::max(levels - base_mip, coarse_detail);
-}
-
-// A 1x1 opaque white stand-in. Multiplying by white is the identity for every slot that takes a
-// colour map, so a texture we could not decode costs that surface its detail and nothing else.
-DecodedTexture white_fallback(bool srgb)
-{
-    auto* pixels = static_cast<stbi_uc*>(STBI_MALLOC(4));
-    pixels[0] = pixels[1] = pixels[2] = pixels[3] = 0xFF;
-    DecodedTexture decoded;
-    decoded.pixels.reset(pixels);
-    decoded.width = 1;
-    decoded.height = 1;
-    decoded.format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-    return decoded;
-}
-
-// Decode one texture source (file or embedded bytes) to RGBA8. Pure CPU work — safe to run on a job
-// thread. NEVER throws: a texture is content, and bad content must not be able to kill the engine.
-// This used to throw, and because a source with neither a file nor bytes decodes to nothing, a .glb
-// whose embedded images had been dropped at bake reached here and took the process down.
-DecodedTexture decode_texture(const GltfTexture& source)
-{
-    if (source.file.empty() && source.encoded.empty())
-    {
-        STRING_LOG_WARN("[load] texture has no source (embedded image lost at bake?); using white");
-        return white_fallback(source.srgb);
-    }
-
-    int width = 0;
-    int height = 0;
-    int channels = 0;
-    stbi_uc* pixels = source.file.empty()
-        ? stbi_load_from_memory(source.encoded.data(), static_cast<int>(source.encoded.size()),
-                                &width, &height, &channels, STBI_rgb_alpha)
-        : stbi_load(source.file.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
-    if (!pixels || width <= 0 || height <= 0)
-    {
-        if (pixels) stbi_image_free(pixels);
-        STRING_LOG_WARN("[load] failed to decode texture {}: {}; using white",
-                        source.file.empty() ? std::string("<embedded>") : source.file.string(),
-                        stbi_failure_reason() ? stbi_failure_reason() : "unknown");
-        return white_fallback(source.srgb);
-    }
-
-    DecodedTexture decoded;
-    decoded.pixels.reset(pixels);
-    decoded.width = width;
-    decoded.height = height;
-    decoded.format = source.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-    return decoded;
-}
-
-// Records the (already decoded) texture's upload into a device-local image and binds it into the
-// bindless table. Stays on the main thread — allocation + command recording are single-threaded.
-void upload_decoded(::string::gpu::resource_allocator& allocator,
-                    ::string::gpu::descriptor_table& descriptor_table, TransferBatch& transfer,
-                    const DecodedTexture& decoded,
-                    ::string::gpu::resource_id& out_image, uint32_t& out_slot)
-{
-    // Full mip chain: floor(log2(max dimension)) + 1 levels. TRANSFER_SRC is needed too because
-    // mip generation blits from each level down to the next.
-    const uint32_t max_dim = static_cast<uint32_t>(std::max(decoded.width, decoded.height));
-    const uint32_t mip_levels = static_cast<uint32_t>(std::floor(std::log2(max_dim))) + 1;
-
-    out_image = allocator.create_resource(::string::gpu::image_info{
-        .extent = { static_cast<uint32_t>(decoded.width), static_cast<uint32_t>(decoded.height), 1 },
-        .format = decoded.format,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-               | VK_IMAGE_USAGE_SAMPLED_BIT,
-        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-        .mip_levels = mip_levels,
-    });
-    // upload_image copies the pixels into staging immediately; the batch streams it to the GPU
-    // asynchronously (bounded by its staging budget), so no per-texture stall.
-    const VkDeviceSize size = static_cast<VkDeviceSize>(decoded.width) * decoded.height * 4;
-    transfer.upload_image(decoded.pixels.get(), size, out_image);
-
-    descriptor_table.bind(out_image, ::string::gpu::descriptor_type::TEXTURE);
-    out_slot = descriptor_table.get_binding_slot(out_image, ::string::gpu::descriptor_type::TEXTURE);
-}
-
-// The cooked `.ktx2` sibling of an external texture source, if one exists on disk. Embedded
-// textures (no file path) have no sibling and always take the stb path. This lets cooking be
-// incremental: a texture with a sibling loads via the fast KTX path, the rest fall back to stb.
-std::optional<std::filesystem::path> ktx_sibling(const GltfTexture& source)
-{
-    if (source.file.empty())
-    {
-        return std::nullopt;
-    }
-    std::filesystem::path candidate = source.file;
-    candidate.replace_extension(".ktx2");
-    std::error_code ec;
-    if (std::filesystem::exists(candidate, ec))
-    {
-        return candidate;
-    }
-    return std::nullopt;
+    return span <= 1.0f ? 0.0f : span;
 }
 
 // Is the world-space AABB inside the frustum? Gribb-Hartmann planes from the view-projection
@@ -252,167 +109,17 @@ bool aabb_in_frustum(const glm::mat4& vp, const glm::vec3& mn, const glm::vec3& 
     return true;
 }
 
-// Pack a tangent + handedness into the 10:10:10:2 vertex layout meshlet_mesh.slang unpacks.
-uint32_t pack_tangent(const glm::vec3& t, float sign)
-{
-    const auto sn = [](float v) {
-        return static_cast<uint32_t>(static_cast<int32_t>(std::round(glm::clamp(v, -1.0f, 1.0f) * 511.0f))) & 0x3FFu;
-    };
-    const uint32_t w = sign < 0.0f ? 3u : 1u;   // signed 2-bit: 1 -> +1, 3 (-1 as 2-bit) -> -1
-    return sn(t.x) | (sn(t.y) << 10) | (sn(t.z) << 20) | (w << 30);
-}
-
-// Brief 07: the standing material-probe (lookdev) scene, baked through the same cook library as
-// real content so the whole meshlet path is exercised. A roughness x metallic sphere grid (cols =
-// perceptual roughness 0..1, rows = metallic 0..1), a white/mirror pair on the ground in front,
-// and a neutral ground slab (shadow catcher). Vertices are pre-transformed (identity draw
-// transforms) so DrawInfo.center stays world-space, matching the cooked-scene convention.
-LoadedScene build_lookdev_scene()
-{
-    std::vector<string::Vertex> vertices;
-    std::vector<uint32_t> indices;
-    std::vector<GltfDraw> draws;
-    std::vector<GltfMaterial> materials;
-
-    // Unit-sphere template (UV sphere; normal = position, tangent along +phi).
-    constexpr int kStacks = 24, kSlices = 48;
-    std::vector<string::Vertex> sphere_verts;
-    std::vector<uint32_t> sphere_indices;
-    for (int st = 0; st <= kStacks; ++st)
-    {
-        const float theta = glm::pi<float>() * float(st) / float(kStacks);
-        for (int sl = 0; sl <= kSlices; ++sl)
-        {
-            const float phi = 2.0f * glm::pi<float>() * float(sl) / float(kSlices);
-            const glm::vec3 n(std::sin(theta) * std::cos(phi), std::cos(theta),
-                              std::sin(theta) * std::sin(phi));
-            const glm::vec3 t(-std::sin(phi), 0.0f, std::cos(phi));
-            sphere_verts.push_back(string::Vertex{ n, glm::vec3(1.0f),
-                { float(sl) / kSlices, float(st) / kStacks }, n, pack_tangent(t, 1.0f) });
-        }
-    }
-    for (int st = 0; st < kStacks; ++st)
-        for (int sl = 0; sl < kSlices; ++sl)
-        {
-            const uint32_t a = uint32_t(st * (kSlices + 1) + sl);
-            const uint32_t b = a + kSlices + 1;
-            // CCW when viewed from outside (matches the back-face-cull main pipeline).
-            sphere_indices.insert(sphere_indices.end(), { a, a + 1, b, b, a + 1, b + 1 });
-        }
-
-    const auto add_sphere = [&](const glm::vec3& center, float radius, int material) {
-        const uint32_t v0 = static_cast<uint32_t>(vertices.size());
-        const uint32_t i0 = static_cast<uint32_t>(indices.size());
-        for (string::Vertex v : sphere_verts)
-        {
-            v.pos = v.pos * radius + center;
-            vertices.push_back(v);
-        }
-        for (uint32_t i : sphere_indices) indices.push_back(i + v0);
-        GltfDraw d;
-        d.index_offset = i0;
-        d.index_count = static_cast<uint32_t>(sphere_indices.size());
-        d.material = material;
-        d.transform = glm::mat4(1.0f);
-        d.aabb_min = center - glm::vec3(radius);
-        d.aabb_max = center + glm::vec3(radius);
-        draws.push_back(d);
-    };
-    const auto add_material = [&](glm::vec3 albedo, float metallic, float roughness) {
-        GltfMaterial m;
-        m.base_color_factor = glm::vec4(albedo, 1.0f);
-        m.metallic_factor = metallic;
-        m.roughness_factor = roughness;
-        materials.push_back(m);
-        return static_cast<int>(materials.size()) - 1;
-    };
-
-    // The grid: 8 roughness columns (0..1, perceptual) x 5 metallic rows (0..1), radius-0.5
-    // spheres on a wall in the XY plane. Neutral albedo (brighter for metals so the ladder reads).
-    constexpr int kCols = 8, kRows = 5;
-    constexpr float kSpacing = 1.4f, kRadius = 0.5f;
-    for (int row = 0; row < kRows; ++row)
-        for (int col = 0; col < kCols; ++col)
-        {
-            const float metallic = float(row) / float(kRows - 1);
-            const float roughness = float(col) / float(kCols - 1);
-            const glm::vec3 albedo = glm::mix(glm::vec3(0.5f), glm::vec3(0.9f), metallic);
-            add_sphere(glm::vec3((float(col) - (kCols - 1) * 0.5f) * kSpacing,
-                                 1.2f + float(row) * kSpacing, 0.0f),
-                       kRadius, add_material(albedo, metallic, roughness));
-        }
-    // The white/mirror pair, on the ground in front of the grid.
-    add_sphere(glm::vec3(-1.0f, 0.62f, 2.2f), 0.6f, add_material(glm::vec3(1.0f), 0.0f, 1.0f));
-    add_sphere(glm::vec3(1.0f, 0.62f, 2.2f), 0.6f, add_material(glm::vec3(1.0f), 1.0f, 0.0f));
-
-    // Ground slab (two triangles), neutral 40% grey.
-    {
-        const int mat = add_material(glm::vec3(0.4f), 0.0f, 0.85f);
-        const float s = 24.0f;
-        const uint32_t v0 = static_cast<uint32_t>(vertices.size());
-        const uint32_t i0 = static_cast<uint32_t>(indices.size());
-        const glm::vec3 n(0.0f, 1.0f, 0.0f);
-        const uint32_t tan = pack_tangent(glm::vec3(1, 0, 0), 1.0f);
-        const glm::vec3 corners[4] = { { -s, 0, -s }, { s, 0, -s }, { s, 0, s }, { -s, 0, s } };
-        const glm::vec2 uvs[4] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
-        for (int i = 0; i < 4; ++i)
-            vertices.push_back(string::Vertex{ corners[i], glm::vec3(1.0f), uvs[i], n, tan });
-        const uint32_t quad[6] = { v0, v0 + 2, v0 + 1, v0, v0 + 3, v0 + 2 };   // CCW from +Y
-        for (uint32_t i : quad) indices.push_back(i);
-        GltfDraw d;
-        d.index_offset = i0;
-        d.index_count = 6;
-        d.material = mat;
-        d.transform = glm::mat4(1.0f);
-        d.aabb_min = { -s, -0.01f, -s };
-        d.aabb_max = { s, 0.01f, s };
-        draws.push_back(d);
-    }
-
-    const auto t0 = std::chrono::steady_clock::now();
-    CookedScene cs = ::string::asset::tools::bake_scene(vertices, indices, draws, ::string::asset::tools::BakeParams{});
-
-    LoadedScene out;
-    out.vertices = std::move(cs.vertices);
-    out.meshlets = std::move(cs.meshlets);
-    out.meshlet_vertices = std::move(cs.meshlet_vertices);
-    out.meshlet_triangles = std::move(cs.meshlet_triangles);
-    out.total_meshlets = cs.total_meshlets;
-    out.materials = std::move(materials);
-    for (const CookedDraw& cd : cs.draws)
-    {
-        GpuDrawInfo info{};
-        info.center = cd.center;
-        info.radius = cd.radius;
-        info.lod_count = cd.lod_count;
-        info.first_meshlet = cd.first_meshlet;
-        info.total_meshlets = cd.total_meshlets;
-        for (uint32_t l = 0; l < kMaxLods; ++l) info.lods[l] = cd.lods[l];
-        out.draws.push_back(info);
-        out.draw_windows.push_back({ cd.vertex_count == 0 ? 0u : cd.vertex_offset, cd.vertex_count });
-        GltfDraw meta;
-        meta.index_offset = cd.index_offset;
-        meta.index_count = cd.index_count;
-        meta.material = cd.material;
-        meta.transform = cd.transform;
-        meta.aabb_min = cd.aabb_min;
-        meta.aabb_max = cd.aabb_max;
-        out.draws_meta.push_back(meta);
-    }
-    out.load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    return out;
-}
-
 }  // namespace
 
 geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samples,
-                             std::vector<std::filesystem::path> model_paths,
-                           std::shared_ptr<MeshOverlayStats> overlay_stats, bool lookdev)
+                             ::string::assets::registry& assets, scene_bridge& bridge,
+                             std::shared_ptr<MeshOverlayStats> overlay_stats, bool lookdev)
 : device_(context.device)
 , allocator_(context.allocator)
 , descriptor_table_(context.descriptor_table)
 , input_map_(context.input_map)
-, residency_(kTextureBudget, kTextureStreamPerFrame)
+, assets_(assets)
+, bridge_(bridge)
 , gpu_profiler_ctx_(context.gpu_profiler_ctx)
 {
     scene_samples_ = samples;
@@ -425,389 +132,65 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     // override is applied, rather than lazily at frame 1. The toggle is declared in declare().
     (void)cv_pass_geometry();
     // Brief 21 D4: the work lists are graph transients the app declares; nothing is reserved here.
-    // Brief 16 M1: the resource-virtualization hub, for the registry-owned SceneData ring (below)
-    // and, later, the light/stats rings (M3).
-    // Brief 04b: load the COOKED scenes (bake library did the parse/flatten/MikkTSpace/meshletize
-    // offline). Per source glTF: read a fresh cooked file, or cook in-process via the library when
-    // missing/stale (WARN + CLI hint), then merge N cooked scenes into one draw set (vertex/index/
-    // material/texture/meshlet-heap rebasing). No fastgltf/MikkTSpace/meshopt runs here when the
-    // cooked files are present — this is the whole point of the brief.
-    const auto load_start = std::chrono::steady_clock::now();
-    // Brief 04b M4: chunking budget defaults to kChunkMaxMeshlets (on). STRING_CHUNK overrides it for
-    // A/B measurement (STRING_CHUNK=0 selects the unchunked .c0 cooked variant); the value also picks
-    // the .c<budget>.cooked file, so both variants must be pre-cooked.
-    // Brief 06: CVar-backed (r.chunk.budget; legacy STRING_CHUNK alias). Default = kChunkMaxMeshlets.
-    uint32_t chunk_budget = static_cast<uint32_t>(std::max(0, cv_chunk_budget().get()));
+    // Asset-layer split: the cooked scenes were loaded/merged into the APP-OWNED asset registry
+    // before this pass was constructed (cook-on-load lives behind its injected provider). Adopt
+    // runtime copies of the registry's global tables here — transitional: the GPU heaps move
+    // behind the registry next, and these copies die with GeometryScene.
     lookdev_ = lookdev;
-    // Brief 07: the lookdev scene is generated in-process through the same bake library instead
-    // of loading cooked glTF (no textures, factors drive the materials).
-    LoadedScene loaded = lookdev_
-        ? build_lookdev_scene()
-        : load_cooked_scenes(context.resources_path, model_paths, chunk_budget);
+    meshlet_model_.meshlets.assign(assets.meshlets().begin(), assets.meshlets().end());
+    meshlet_model_.meshlet_vertices.assign(assets.meshlet_vertices().begin(),
+                                           assets.meshlet_vertices().end());
+    meshlet_model_.meshlet_triangles.assign(assets.meshlet_triangles().begin(),
+                                            assets.meshlet_triangles().end());
+    meshlet_model_.total_meshlets = assets.total_meshlets();
 
-    // Adopt the merged geometry-only tables into the runtime containers (the rest of the pass is
-    // unchanged: build_meshlet_gpu fills material/transform onto meshlet_model_.draws, the streamer
-    // takes the vertex heap + per-draw windows).
-    GltfGeometry geometry;
-    geometry.vertices = std::move(loaded.vertices);
-    // No CPU index buffer in the cooked path (indices were consumed at cook into meshlets).
-    geometry.draws = loaded.draws_meta;
-    materials_ = std::move(loaded.materials);
-    std::vector<GltfTexture> textures = std::move(loaded.textures);
-    meshlet_model_.meshlets = std::move(loaded.meshlets);
-    meshlet_model_.meshlet_vertices = std::move(loaded.meshlet_vertices);
-    meshlet_model_.meshlet_triangles = std::move(loaded.meshlet_triangles);
-    meshlet_model_.draws = std::move(loaded.draws);
-    meshlet_model_.total_meshlets = loaded.total_meshlets;
-    std::vector<GeometryStreamer::Window> draw_windows;
-    draw_windows.reserve(loaded.draw_windows.size());
-    for (const auto& w : loaded.draw_windows) draw_windows.push_back({ w.offset, w.count });
+    // Latch the registry's heap graph handles into the shared scene tables: every consumer
+    // (this pass, shadow, transparency, probe GI) declares its own read and resolves the address
+    // through its pass_context.
+    vertex_buffer_ = assets.view().vertices;
+    meshlet_buffer_ = assets.view().meshlets;
+    meshlet_vertices_ = assets.view().meshlet_vertices;
+    meshlet_triangles_ = assets.view().meshlet_triangles;
+    skin_buffer_ = assets.view().skin_stream;
 
-    // Brief 23: adopt the skin tables and assign each skin's palette window — a running sum, all
-    // draws of one skin sharing the window (the paperdoll shape). The ring's layout is identical
-    // in every frame slot, so these offsets are assigned exactly once, here; only the ring's base
-    // address rotates (through SceneData).
-    skin_vertices_ = std::move(loaded.skin_vertices);
-    skin_inverse_bind_ = std::move(loaded.inverse_bind);
-    skin_joint_remap_ = std::move(loaded.joint_remap);
-    draw_skin_ = std::move(loaded.draw_skin);
-    draw_skin_delta_ = std::move(loaded.draw_skin_delta);
-    palette_joints_total_ = 0;
-    skins_.reserve(loaded.skins.size());
-    for (const LoadedSkin& ls : loaded.skins)
-    {
-        skins_.push_back(GeometryScene::SkinInstance{
-            .skeleton_hash = ls.skeleton_hash,
-            .joint_count = ls.joint_count,
-            .ibm_offset = ls.ibm_offset,
-            .remap_offset = ls.remap_offset,
-            .palette_offset = palette_joints_total_,
-            .anim_pack = ls.anim_pack,
-        });
-        palette_joints_total_ += ls.joint_count;
-    }
-    if (!skins_.empty())
-        STRING_LOG_INFO("[load] skins: {} instance(s), {} palette joints, {} skinned vertices",
-                        skins_.size(), palette_joints_total_, skin_vertices_.size());
+    // The draw/row state is the BRIDGE's now (world instances x registry parts): wire the shared
+    // scene fields to its table. The pass owns no scene content — only the technique.
+    draw_info_buffer_ = bridge.draw_info_buffer();
+    draw_info_mapped_ = bridge.mapped();
+    draw_count_ = bridge.row_count();
+    base_draw_count_ = bridge.row_count();
+    active_draw_count_ = bridge.row_count();
+    scene_aabb_min_ = bridge.bounds_min();
+    scene_aabb_max_ = bridge.bounds_max();
 
     STRING_LOG_INFO("[load] cooked scenes: {} files ({} fresh, {} cooked in-process) in {:.1f} ms",
-                    model_paths.size(), loaded.cooked_hits, loaded.cooked_misses, loaded.load_ms);
-
-    // Brief 04 (STRING_TRANSP_TEST=1): inject a synthetic set of alpha-blended quads at STAGGERED
-    // depths + lateral offsets so the sorted transparency pass can be verified visually. The quads
-    // are baked through the SAME library (bake_scene over a tiny synthetic vertex/index/draw set),
-    // then merged into the loaded tables so meshlets/windows/DrawInfo all come from one path.
-    if (cv_transp_test().get())
-    {
-        const int base_mat = static_cast<int>(materials_.size());
-        const uint32_t meshlet_base = static_cast<uint32_t>(meshlet_model_.meshlets.size());
-        const uint32_t mvert_base = static_cast<uint32_t>(meshlet_model_.meshlet_vertices.size());
-        const uint32_t mtri_base = static_cast<uint32_t>(meshlet_model_.meshlet_triangles.size());
-        const uint32_t vertex_base = static_cast<uint32_t>(geometry.vertices.size());
-
-        const glm::vec4 colors[5] = {
-            { 1.0f, 0.2f, 0.2f, 0.5f }, { 0.2f, 1.0f, 0.2f, 0.5f }, { 0.2f, 0.2f, 1.0f, 0.5f },
-            { 1.0f, 1.0f, 0.2f, 0.5f }, { 1.0f, 0.2f, 1.0f, 0.5f },
-        };
-        std::vector<string::Vertex> qv;
-        std::vector<uint32_t> qi;
-        std::vector<GltfDraw> qd;
-        for (int q = 0; q < 5; ++q)
-        {
-            GltfMaterial m;
-            m.base_color_factor = colors[q];
-            m.alpha_mode = GltfAlphaMode::Blend;
-            m.double_sided = true;
-            materials_.push_back(m);
-
-            const float x = 6.0f - static_cast<float>(q) * 1.0f;
-            const float cy = 4.5f;
-            const float lateral = (static_cast<float>(q) - 2.0f) * 0.4f;
-            const float s = 1.6f;
-            const uint32_t v0 = static_cast<uint32_t>(qv.size());
-            const glm::vec3 nrm{ 1.0f, 0.0f, 0.0f };
-            const glm::vec3 col = glm::vec3(colors[q]);
-            const glm::vec3 corners[4] = {
-                { x, cy - s, lateral - s }, { x, cy - s, lateral + s },
-                { x, cy + s, lateral + s }, { x, cy + s, lateral - s },
-            };
-            for (const glm::vec3& c : corners)
-                qv.push_back(string::Vertex{ c, col, { 0.0f, 0.0f }, nrm, 0u });
-            const uint32_t idx0 = static_cast<uint32_t>(qi.size());
-            const uint32_t quad[6] = { v0, v0 + 1, v0 + 2, v0, v0 + 2, v0 + 3 };
-            for (uint32_t k : quad) qi.push_back(k);
-
-            GltfDraw d;
-            d.index_offset = idx0;
-            d.index_count = 6;
-            d.material = q;   // file-local; the merge below rebases by base_mat (as the loader does)
-            d.transform = glm::mat4(1.0f);
-            d.aabb_min = { x - 0.01f, cy - s, lateral - s };
-            d.aabb_max = { x + 0.01f, cy + s, lateral + s };
-            qd.push_back(d);
-        }
-        // Bake the quads (chunking off) and merge into the loaded tables, rebasing meshlet heaps +
-        // vertex windows by the current bases.
-        CookedScene qs = ::string::asset::tools::bake_scene(qv, qi, qd, ::string::asset::tools::BakeParams{});
-        geometry.vertices.insert(geometry.vertices.end(), qs.vertices.begin(), qs.vertices.end());
-        for (uint32_t v : qs.meshlet_vertices) meshlet_model_.meshlet_vertices.push_back(v + vertex_base);
-        meshlet_model_.meshlet_triangles.insert(meshlet_model_.meshlet_triangles.end(),
-                                                qs.meshlet_triangles.begin(), qs.meshlet_triangles.end());
-        for (GpuMeshlet ml : qs.meshlets)
-        {
-            ml.vertex_offset += mvert_base;
-            ml.triangle_offset += mtri_base;
-            meshlet_model_.meshlets.push_back(ml);
-        }
-        for (const CookedDraw& cd : qs.draws)
-        {
-            GpuDrawInfo info{};
-            info.center = cd.center;
-            info.radius = cd.radius;
-            info.lod_count = cd.lod_count;
-            info.first_meshlet = cd.first_meshlet + meshlet_base;
-            info.total_meshlets = cd.total_meshlets;
-            for (uint32_t l = 0; l < kMaxLods; ++l)
-            {
-                info.lods[l] = cd.lods[l];
-                if (l < cd.lod_count) info.lods[l].meshlet_offset += meshlet_base;
-            }
-            meshlet_model_.draws.push_back(info);
-            draw_windows.push_back({ cd.vertex_count == 0 ? 0u : cd.vertex_offset + vertex_base,
-                                     cd.vertex_count });
-            GltfDraw meta;
-            meta.index_offset = cd.index_offset;
-            meta.index_count = cd.index_count;
-            meta.material = cd.material >= 0 ? cd.material + base_mat : -1;
-            meta.transform = cd.transform;
-            meta.aabb_min = cd.aabb_min;
-            meta.aabb_max = cd.aabb_max;
-            geometry.draws.push_back(meta);
-        }
-        meshlet_model_.total_meshlets = static_cast<uint32_t>(meshlet_model_.meshlets.size());
-        STRING_LOG_INFO("[brief04] STRING_TRANSP_TEST: injected 5 blended quads (baked)");
-    }
-
-    draws_ = geometry.draws;
-
+                    assets.stats().files, assets.stats().cooked_hits, assets.stats().cooked_misses,
+                    assets.stats().load_ms);
     STRING_LOG_INFO("scene loaded: {} files, {} vertices, {} draws, {} materials, {} textures, {} meshlets",
-                    model_paths.size(), geometry.vertices.size(),
-                    geometry.draws.size(), materials_.size(), textures.size(), meshlet_model_.total_meshlets);
+                    assets.stats().files, assets.vertices().size(), bridge.row_count(),
+                    assets.materials().size(), assets.textures().size(),
+                    meshlet_model_.total_meshlets);
 
-    // Heap capacities (in elements). The streamer suballocates a SEPARATE range per draw, so shared
-    // vertices (instanced primitives) are duplicated — size to the sum of per-draw ranges, not the
-    // deduplicated vertex count, or everything can't fit even at 100%. kGeometryResidentPercent < 100
-    // caps below that to exercise reclaim (with pop-in / possible thrash when the visible set exceeds
-    // the budget); 100 keeps everything resident (reclaim still happens for geometry left behind as
-    // you look around, freeing ranges — visible in the [geo] logs — but no artifacts).
-    // Sum the per-draw vertex windows (the streamer suballocates one range per draw, so shared
-    // instanced vertices are duplicated — size to the window sum, not the deduplicated vertex count).
-    // Windows are baked at cook, so no runtime index scan is needed.
-    uint64_t vertex_units = 0;
-    for (const GeometryStreamer::Window& w : draw_windows) vertex_units += w.count;
-    const uint64_t vertex_capacity = std::max<uint64_t>(1, vertex_units * kGeometryResidentPercent / 100);
-    const VkDeviceSize vertex_size = VkDeviceSize(sizeof(string::Vertex)) * vertex_capacity;
-    // Brief 04 M3/04b: no GPU index heap AND no CPU index buffer — the task/mesh shaders pull vertices
-    // via the meshlet-vertex remap heap (baked at cook); the streamer uploads per-draw vertex windows.
-
-    // Model AABB, computed now (before the geometry arrays are moved into the streamer below) for
-    // framing the camera.
-    // WORLD space, from the per-draw bounds — not the raw vertex positions, which are MODEL space.
-    // A glTF places its meshes with node transforms, so an asset authored around the origin and then
-    // positioned somewhere else has vertices that say one thing and a location that says another.
-    // Framing the model-space box aims the camera at empty space, which reads as "I loaded my asset
-    // and there is nothing there". The cook already computed each draw's world AABB (it transforms
-    // the 8 corners); union those.
-    glm::vec3 aabb_min(std::numeric_limits<float>::max());
-    glm::vec3 aabb_max(std::numeric_limits<float>::lowest());
-    for (const auto& d : geometry.draws)
-    {
-        aabb_min = glm::min(aabb_min, d.aabb_min);
-        aabb_max = glm::max(aabb_max, d.aabb_max);
-    }
-    // Fall back to model space only if no draw carried bounds, and to a unit box if there is no
-    // geometry at all — a degenerate box would make the framing maths produce NaNs.
-    if (geometry.draws.empty())
-    {
-        for (const auto& vertex : geometry.vertices)
-        {
-            aabb_min = glm::min(aabb_min, vertex.pos);
-            aabb_max = glm::max(aabb_max, vertex.pos);
-        }
-    }
-    if (!(aabb_min.x <= aabb_max.x && aabb_min.y <= aabb_max.y && aabb_min.z <= aabb_max.z))
+    // Camera framing bounds: the bridge's world-space union of row AABBs; unit box for an empty
+    // world so the framing maths cannot produce NaNs.
+    glm::vec3 aabb_min = bridge.bounds_min();
+    glm::vec3 aabb_max = bridge.bounds_max();
+    if (draw_count_ == 0
+        || !(aabb_min.x <= aabb_max.x && aabb_min.y <= aabb_max.y && aabb_min.z <= aabb_max.z))
     {
         aabb_min = glm::vec3(-1.0f);
         aabb_max = glm::vec3(1.0f);
     }
 
-    // Shared geometry buffers allocated whole up front, but NOT uploaded here: the geometry
-    // streamer uploads each draw's vertex/index sub-range on demand (when the draw enters view).
-    // Vertices are pulled by device address in the vertex shader, so the buffer needs
-    // SHADER_DEVICE_ADDRESS (which populates allocated_buffer.device_address) rather than VERTEX_BUFFER.
-    vertex_buffer_ = allocator_.create_resource(::string::gpu::buffer_info{
-        .size = vertex_size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-               | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-    });
-
-    // 1x1 white fallback for draws without a base-color texture (the factor still tints it).
-    const std::array<uint8_t, 4> white_pixel = { 255, 255, 255, 255 };
-    white_image_ = allocator_.create_resource(::string::gpu::image_info{
-        .extent = { 1, 1, 1 },
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-    });
-    context.transfer.upload_image(white_pixel.data(), white_pixel.size(), white_image_);
-    descriptor_table_.bind(white_image_, ::string::gpu::descriptor_type::TEXTURE);
-    white_slot_ = descriptor_table_.get_binding_slot(white_image_, ::string::gpu::descriptor_type::TEXTURE);
-
-    // 1x1 flat-normal fallback (tangent-space +Z): draws with no normal map sample this and get the
-    // geometric normal back, so the fragment shader never branches on "has a normal map".
-    const std::array<uint8_t, 4> flat_normal_pixel = { 128, 128, 255, 255 };
-    flat_normal_image_ = allocator_.create_resource(::string::gpu::image_info{
-        .extent = { 1, 1, 1 },
-        .format = VK_FORMAT_R8G8B8A8_UNORM,   // linear, not sRGB — it's data, not colour
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
-        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
-        .allocation_flags = {},
-    });
-    context.transfer.upload_image(flat_normal_pixel.data(), flat_normal_pixel.size(), flat_normal_image_);
-    descriptor_table_.bind(flat_normal_image_, ::string::gpu::descriptor_type::TEXTURE);
-    flat_normal_slot_ = descriptor_table_.get_binding_slot(flat_normal_image_, ::string::gpu::descriptor_type::TEXTURE);
-
-    // Texture sources come from the cooked scenes (path + srgb). Cooked .ktx2 siblings register with
-    // the streamer; the rest decode via stb on a worker pool. (Textures are unchanged this brief; the
-    // cooked format just carries the paths, so the decode/upload path below is the same as before.)
-    ::string::core::job_system decode_pool;
-    std::vector<std::optional<std::filesystem::path>> ktx_paths(textures.size());
-    std::vector<std::future<DecodedTexture>> decode_jobs(textures.size());
-    for (std::size_t i = 0; i < textures.size(); ++i)
-    {
-        ktx_paths[i] = ktx_sibling(textures[i]);
-        if (!ktx_paths[i])
-        {
-            const GltfTexture* source = &textures[i];
-            decode_jobs[i] = decode_pool.enqueue([source]() { return decode_texture(*source); });
-        }
-    }
-
-    // Collect textures: cooked KTX2 register with the streamer (BC7 image + placeholder slot now,
-    // mips streamed in on demand from the coarse tail up); stb fallbacks upload whole here.
-    texture_streamer_ = std::make_unique<TextureStreamer>(
-        allocator_, descriptor_table_, context.transfer);
-    texture_images_.resize(textures.size());
-    texture_slots_.resize(textures.size());
-    texture_lod_.resize(textures.size());
-    frame_desired_detail_.resize(textures.size(), 0);
-    for (std::size_t i = 0; i < textures.size(); ++i)
-    {
-        if (ktx_paths[i])
-        {
-            const TextureStreamer::Registered reg =
-                texture_streamer_->add(*ktx_paths[i], textures[i].srgb);
-            texture_images_[i] = reg.image;
-            texture_slots_[i] = reg.slot;
-            residency_.register_resource(reg.image, *texture_streamer_, reg.min_detail,
-                                         reg.max_detail, reg.min_detail);
-            streamed_textures_.push_back(reg.image);
-            texture_lod_[i] = TextureLod{
-                .levels = reg.max_detail,
-                .base_extent = reg.base_extent,
-                .coarse_detail = coarse_detail_for(reg.max_detail, reg.base_extent, kCoarseFloorPixels),
-            };
-        }
-        else
-        {
-            const DecodedTexture decoded = decode_jobs[i].get();
-            upload_decoded(allocator_, descriptor_table_, context.transfer, decoded,
-                           texture_images_[i], texture_slots_[i]);
-        }
-    }
-    const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - load_start).count();
-    STRING_LOG_INFO("[load] total ({} textures, {} decode workers): {} ms",
-                    textures.size(), decode_pool.worker_count(), load_ms);
-    STRING_LOG_INFO("[stream] {} of {} textures streamed (BC7, coarse tail first); rest stb",
-                    texture_streamer_->count(), textures.size());
-    // The renderer drains the transfer batch (wait_idle) once after all passes are built; no
-    // per-pass flush needed here.
-
     // --- GPU-driven draw data ------------------------------------------------------------------
-    draw_count_ = static_cast<uint32_t>(draws_.size());
     if (draw_count_ > 0)
     {
-        // Brief 04b: meshlets + LOD chain were baked offline (loaded above into meshlet_model_).
-        // The GPU meshlet buffers are uploaded in build_meshlet_gpu() below; the DrawInfo table's
-        // material/transform fields are filled there too (the cooked draws are geometry-only records).
         STRING_LOG_INFO("[meshlet] {} draws -> {} meshlets, {} vtx-remap, {} tri-words (cooked)",
-                        meshlet_model_.draws.size(), meshlet_model_.total_meshlets,
-                        meshlet_model_.meshlet_vertices.size(), meshlet_model_.meshlet_triangles.size());
-
-        // Geometry streaming: hand the shared vertex heap to the streamer (suballocates + uploads
-        // per-draw windows on demand, frees on eviction) and register every draw with the geometry
-        // residency manager. The manager's byte budget matches the heap capacity so it evicts once
-        // full. On residency the streamer flips the draw's DrawInfo gate (resident + vertex_offset).
-        // No CPU index buffer now (cooked path): windows come from the baked per-draw vertex ranges.
-        geometry_streamer_ = std::make_unique<GeometryStreamer>(
-            allocator_, context.transfer, vertex_buffer_,
-            std::move(geometry.vertices), vertex_capacity, frames_in_flight_);
-        geometry_streamer_->set_windows(draw_windows);
-        geometry_streamer_->set_residency_callback(
-            [this](std::uint32_t draw, std::uint32_t vertex_offset, std::uint32_t resident) {
-                // Streaming seam: DrawInfo.resident is the ONLY draw gate. vertex_offset (heap delta)
-                // rides along — meshlet-vertices hold ORIGINAL global indices and the mesh shaders
-                // rebase them into the suballocated heap.
-                if (draw_info_mapped_)
-                {
-                    draw_info_mapped_[draw].resident = resident;
-                    draw_info_mapped_[draw].vertex_offset = vertex_offset;
-                    // Brief 04d: a residency change makes this draw's meshlets "new" — their persistent
-                    // visibility bits are stale. Flag a bitfield clear so every meshlet re-validates via
-                    // phase 2 next frame (a cleared bit is correct: one phase-2 frame, no popping). The
-                    // clear is a cheap fill of a small buffer; flagging (not clearing per-range here from
-                    // the CPU — the bitfield is device-local) keeps the streaming callback trivial.
-                    visbits_clear_pending_ = true;
-                }
-            });
-
-        // Build the GPU meshlet buffers + the DrawInfo table (host-visible resident gate) now, so the
-        // up-front streaming loop below can flip DrawInfo.resident via the callback.
+                        draw_count_, meshlet_model_.total_meshlets,
+                        meshlet_model_.meshlet_vertices.size(),
+                        meshlet_model_.meshlet_triangles.size());
+        // Worklist layout + visbits + pipelines (the DrawInfo table itself is the bridge's).
         build_meshlet_gpu(context);
-
-        geometry_streaming_ = kGeometryResidentPercent < 100;
-        if (geometry_streaming_)
-        {
-            // Doesn't fit: register with the manager and stream per-frame by visibility (update()).
-            // Brief 04 M3: the budget is vertex-heap only now (the GPU index heap is gone), matching
-            // the streamer's vertex-only cost() so eviction decisions stay coherent with what's uploaded.
-            const VkDeviceSize geometry_budget = VkDeviceSize(vertex_capacity) * sizeof(string::Vertex);
-            geometry_residency_ = std::make_unique<::string::gpu::residency_manager>(
-                geometry_budget, kGeometryStreamPerFrame);
-            for (std::uint32_t d = 0; d < draw_count_; ++d)
-            {
-                geometry_residency_->register_resource(d, *geometry_streamer_, /*min=*/0, /*max=*/1, /*initial=*/0);
-            }
-        }
-        else
-        {
-            // Fits: upload every draw's geometry now (drained once by the renderer's wait_idle before
-            // frame 0) and reveal it. No per-frame streaming/eviction — same clean up-front load as
-            // before geometry streaming existed.
-            for (std::uint32_t d = 0; d < draw_count_; ++d)
-            {
-                geometry_streamer_->stream(d, 0, 1);
-                geometry_streamer_->on_resident(d, 1);
-            }
-        }
     }
 
     // The bounds the camera is about to be framed on. Printed because "I loaded my asset and see
@@ -862,14 +245,7 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     // --- Cascaded shadow maps + Forward+ scene/light/froxel buffers ---------------------------
     if (draw_count_ > 0)
     {
-        scene_aabb_min_ = glm::vec3(std::numeric_limits<float>::max());
-        scene_aabb_max_ = glm::vec3(std::numeric_limits<float>::lowest());
-        for (const GltfDraw& d : draws_)
-        {
-            scene_aabb_min_ = glm::min(scene_aabb_min_, d.aabb_min);
-            scene_aabb_max_ = glm::max(scene_aabb_max_, d.aabb_max);
-        }
-
+        // scene_aabb_min_/max_ came from the bridge above (world-space union of row AABBs).
         // Shadow sampler + cascade images are allocated by the ShadowMaps component ShadowPass owns.
 
         // --- Per-frame SceneData SSBO ring (device-addressed, persistent-mapped) ---
@@ -1027,49 +403,12 @@ geometry_pass::~geometry_pass()
     if (meshlet_model_.total_meshlets > 0)
     {
         // Brief 20: the HiZ pyramid and its per-mip slots are graph resources — nothing to unbind.
-        // GTAO targets + their bindless slots are released in GtaoPass.s destructor now.
-        // stats_buffer_ ring is owned + destroyed by the ResourceRegistry now (brief 16 M3).
         // Brief 21 D4: the work lists are graph transients — the graph frees them.
+        // The content heaps (vertex/meshlet/skin) and EVERY texture — streamed, stb-decoded and the
+        // white/flat-normal fallbacks — are owned and destroyed by the ASSET REGISTRY: one owner,
+        // one destructor, no set-difference over who created what.
         allocator_.destroy_resource(draw_info_buffer_);
-        allocator_.destroy_resource(meshlet_triangles_);
-        allocator_.destroy_resource(meshlet_vertices_);
-        allocator_.destroy_resource(meshlet_buffer_);
     }
-
-    {
-        // Shadow maps + sampler freed in ShadowPass.s destructor now.
-        // scene_buffer_ ring is owned + destroyed by the ResourceRegistry now (brief 16 M1).
-        // light_buffer_ ring is owned + destroyed by the ResourceRegistry now (brief 16 M3).
-        // froxel index buffers freed in FroxelPass's destructor now (brief 11 step 3).
-    }
-
-    // Brief 07 IBL resources torn down in IblPass's destructor now (brief 11 step 3).
-    // Brief 09/09b: GTAO sampler + probe volume were created in the same ctor block as the IBL
-    // resources; their own inner guards make the former `env_capture_ != 0` gate unnecessary.
-    {
-        // Probe GI atlases + sampler freed in GiPass.s destructor now.
-    }
-
-    descriptor_table_.unbind(white_image_, ::string::gpu::descriptor_type::TEXTURE);
-    allocator_.destroy_resource(white_image_);
-    descriptor_table_.unbind(flat_normal_image_, ::string::gpu::descriptor_type::TEXTURE);
-    allocator_.destroy_resource(flat_normal_image_);
-    // Only the stb-fallback textures are OURS — the KTX2 ones were created by (and are destroyed by)
-    // the TextureStreamer, which we merely cached the id of. texture_streamer_ is a member, so it is
-    // destroyed right after this body runs.
-    const std::unordered_set<::string::gpu::resource_id> streamed(streamed_textures_.begin(),
-                                                                 streamed_textures_.end());
-    for (const ::string::gpu::resource_id image : texture_images_)
-    {
-        if (streamed.contains(image))
-        {
-            continue;
-        }
-        descriptor_table_.unbind(image, ::string::gpu::descriptor_type::TEXTURE);
-        allocator_.destroy_resource(image);
-    }
-
-    allocator_.destroy_resource(vertex_buffer_);
 }
 
 void geometry_pass::tick(float delta_time, uint32_t current_frame)
@@ -1158,7 +497,9 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
     if (input_map_.pressed(debug_actions::toggle_crowd))
     {
         crowd_enabled_ = !crowd_enabled_;
-        build_crowd(scene_aabb_min_, scene_aabb_max_);
+        // The crowd is CONTENT now, not a renderer table trick: the app's hook spawns/despawns
+        // the grid entities in the world and the bridge re-derives the rows.
+        if (crowd_hook_) crowd_hook_(crowd_enabled_);
         STRING_LOG_INFO("Crowd stress scene {}", crowd_enabled_ ? "ON" : "OFF");
     }
 
@@ -1208,96 +549,40 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
         animate_lights(delta_time);
     }
 
-    // Residency feedback — textures and geometry both driven by the SAME per-draw frustum visibility.
-    // Textures: pinned to a coarse-tail floor, raised toward each visible draw's screen-coverage mip
-    // (finest request wins, aggregated in frame_desired_detail_), and never released. Geometry: only
-    // when streaming, want visible draws and release the rest so their heap space is reused.
-    for (std::size_t i = 0; i < texture_lod_.size(); ++i)
+    // The bridge already re-derived this frame's rows (the app ticks world -> bridge -> passes);
+    // refresh the shared counts + the residency-driven visbits invalidation.
+    draw_count_ = bridge_.row_count();
+    active_draw_count_ = bridge_.row_count();
+    if (bridge_.take_residency_changed())
     {
-        frame_desired_detail_[i] = texture_lod_[i].coarse_detail;  // 0 for non-streamed (stb) textures
+        // Brief 04d: a residency change makes those rows' meshlets "new" — their persistent
+        // visibility bits are stale; clear so every meshlet re-validates via phase 2 next frame.
+        visbits_clear_pending_ = true;
     }
+
+    // Residency feedback — textures and geometry both driven by the SAME per-row frustum
+    // visibility, through the asset registry (which owns the streamers, the budgets and the
+    // texture-LOD heuristic): the pass reports "this part is on screen at this coverage", the
+    // registry does the rest.
     const glm::mat4 vp = camera_.view_proj();
-    if (geometry_streaming_)
+    assets_.begin_frame();
+    visibility_scratch_.clear();
+    const std::span<const scene_bridge::row_meta> rows = bridge_.rows();
+    for (const scene_bridge::row_meta& row : rows)
     {
-        geometry_streamer_->begin_frame(stream_frame_);
+        if (!aabb_in_frustum(vp, row.aabb_min, row.aabb_max)) continue;
+        visibility_scratch_.push_back(::string::assets::visibility_sample{
+            .mesh = row.mesh,
+            .coverage_px = aabb_coverage_px(vp, row.aabb_min, row.aabb_max, screen_size) });
     }
-    for (uint32_t d = 0; d < draw_count_; ++d)
-    {
-        const bool visible = aabb_in_frustum(vp, draws_[d].aabb_min, draws_[d].aabb_max);
-        if (visible && draws_[d].material >= 0)
-        {
-            const int tex = materials_[draws_[d].material].base_color_texture;
-            if (tex >= 0 && texture_lod_[tex].levels > 0)
-            {
-                const std::uint32_t want = desired_detail(vp, draws_[d].aabb_min, draws_[d].aabb_max,
-                                                          screen_size, texture_lod_[tex].levels,
-                                                          texture_lod_[tex].base_extent,
-                                                          texture_lod_[tex].coarse_detail);
-                frame_desired_detail_[tex] = std::max(frame_desired_detail_[tex], want);
-            }
-        }
-        if (geometry_streaming_)
-        {
-            if (visible)
-                geometry_residency_->want(d, 1, ::string::gpu::resource_priority::LAZY, stream_frame_);
-            else
-                geometry_residency_->release(d);
-        }
-    }
-    // Issue one want() per streamed texture with its aggregated desired detail. A texture wanted
-    // above its coarse floor this frame is on screen and needs sharpening now → IMMEDIATE; one still
-    // at the floor is background → LAZY (so it fills in without stalling the visible ones).
-    for (std::size_t i = 0; i < texture_lod_.size(); ++i)
-    {
-        if (texture_lod_[i].levels == 0)
-        {
-            continue;  // non-streamed (stb) texture
-        }
-        const bool on_screen = frame_desired_detail_[i] > texture_lod_[i].coarse_detail;
-        const auto priority = on_screen ? ::string::gpu::resource_priority::IMMEDIATE
-                                        : ::string::gpu::resource_priority::LAZY;
-        residency_.want(texture_images_[i], frame_desired_detail_[i], priority, stream_frame_);
-    }
-    residency_.tick(stream_frame_);
-    if (draw_count_ > 0 && geometry_streaming_)
-    {
-        geometry_residency_->tick(stream_frame_);
-        if (stream_frame_ == 1 || stream_frame_ == 5 || stream_frame_ == 60 || stream_frame_ == 300)
-        {
-            STRING_LOG_INFO("[geo] frame {}: {} of {} draws resident, {} MB streamed, {} evictions",
-                            stream_frame_, geometry_streamer_->resident_count(), draw_count_,
-                            geometry_streamer_->streamed_bytes() / (1024 * 1024),
-                            geometry_streamer_->evicted_count());
-        }
-    }
+    assets_.observe(visibility_scratch_);
+    assets_.tick();
 
-    // One-shot: report the frame at which every streamed texture reached full residency (all CACHED
-    // at their desired detail), so streaming progress is observable against the load logs.
-    if (!logged_full_resident_ && !streamed_textures_.empty())
+    // Crowd seeded from the headless lever on the first tick (r.crowd.enabled / STRING_CROWD).
+    if (crowd_enabled_ && !crowd_seeded_)
     {
-        bool all_full = true;
-        for (const ::string::gpu::resource_id id : streamed_textures_)
-        {
-            if (residency_.status_of(id) != ::string::gpu::stream_status::CACHED)
-            {
-                all_full = false;
-                break;
-            }
-        }
-        if (all_full)
-        {
-            STRING_LOG_INFO("[stream] all {} textures fully resident at frame {}",
-                            streamed_textures_.size(), stream_frame_);
-            logged_full_resident_ = true;
-        }
-    }
-
-    // Crowd built lazily the first time it's enabled once geometry residency is known (so crowd
-    // copies inherit the base draws' resident flags). Cheap no-op once active_draw_count_ reflects it.
-    if (draw_info_mapped_ && crowd_enabled_ && active_draw_count_ == base_draw_count_
-        && base_draw_count_ > 0)
-    {
-        build_crowd(scene_aabb_min_, scene_aabb_max_);
+        crowd_seeded_ = true;
+        if (crowd_hook_) crowd_hook_(true);
     }
 
     // --- Brief 03b: LOD select moved to the GPU draw-cull compute (record_draw_cull). Here we only
@@ -1324,13 +609,13 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
             overlay_stats_->view_proj = camera_.view_proj();
             overlay_stats_->camera_pos = camera_.position();
 
-            if (overlay_stats_->draws.size() != meshlet_model_.draws.size())
+            if (draw_info_mapped_ && overlay_stats_->draws.size() != draw_count_)
             {
                 overlay_stats_->draws.clear();
-                overlay_stats_->draws.reserve(meshlet_model_.draws.size());
-                for (uint32_t d = 0; d < meshlet_model_.draws.size(); ++d)
+                overlay_stats_->draws.reserve(draw_count_);
+                for (uint32_t d = 0; d < draw_count_; ++d)
                 {
-                    const GpuDrawInfo& info = meshlet_model_.draws[d];
+                    const GpuDrawInfo& info = draw_info_mapped_[d];
                     InspectorDraw id;
                     id.name = "draw " + std::to_string(d);
                     id.index = d;
@@ -1561,6 +846,10 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
     // physicals + the per-slot fence), not this declaration — declaring the write here is what
     // orders the GPU-side readers and keeps this slot's address resolvable at record time.
     if (joint_palette_.valid()) upload.writes(joint_palette_);
+    // The registry's skin heap: scene.upload resolves its address into SceneData, so it declares
+    // the handle (the mesh-stage consumption is declared on phase1/phase2 below with the rest of
+    // the heaps).
+    if (skin_buffer_.valid()) upload.reads(skin_buffer_, string::access::storage_read);
     for (std::size_t c = 0; c < cascades.size(); ++c) upload.reads(cascades[c]);
     // COMPUTE, not transfer: this pass records no GPU commands at all (it fills a host-visible ring
     // and resolves slots), so its kind is nominal — but the kind picks the default stage for its
@@ -1634,6 +923,21 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
         for (const string::gpu::image& c : cascades) p.reads(c);
         p.reads(gtao_ao).reads(env_prefiltered).reads(dfg_lut).reads(ibl_sh).reads(froxels);
     };
+    // The registry's content heaps (assets::gpu_view): the task shaders read meshlets for cone/
+    // frustum culling, the mesh shaders pull meshlets + remap + triangles + vertices (+ the skin
+    // stream when skinned). Declaring them here is what lets the addresses resolve through the
+    // pass_context — the allocator escape is gone.
+    const auto heap_reads = [&](string::pass_spec& p) {
+        const string::gpu::buffer heaps[] = { vertex_buffer_, meshlet_buffer_, meshlet_vertices_,
+                                              meshlet_triangles_, skin_buffer_ };
+        for (const string::gpu::buffer& h : heaps)
+        {
+            if (!h.valid()) continue;
+            p.reads(h, string::access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
+            p.reads(h, string::access::storage_read, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+        }
+    };
+    heap_reads(phase1);
     if (joint_palette_.valid())
         phase1.reads(joint_palette_, string::access::storage_read,
                      VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
@@ -1665,6 +969,7 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
         phase2.reads(joint_palette_, string::access::storage_read,
                      VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
     lit_reads(phase2);   // phase-2 fragments shade exactly like phase 1's — same consumed set
+    heap_reads(phase2);
     if (visbits_.valid())
         phase2.writes(visbits_, string::access::storage_write, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
     phase2.toggle([this] { return two_phase_active_ && cv_pass_geometry().get(); })
@@ -1930,8 +1235,7 @@ void geometry_pass::record_scene_upload(string::pass_context& ctx)
         // Brief 23 skinning: the compact skin heap + THIS frame slot's palette ring physical.
         // Resolved at record time like every address here (never latched). Zero = no skinned
         // geometry; load_vertex never dereferences behind skinned == 0 draws.
-        scene.skin_stream = skin_buffer_ != 0
-            ? allocator_.get_buffer(skin_buffer_).device_address : 0;
+        scene.skin_stream = skin_buffer_.valid() ? ctx.address(skin_buffer_) : 0;
         scene.joint_palette = joint_palette_.valid() ? ctx.address(joint_palette_) : 0;
 
         std::memcpy(ctx.mapped(scene_data_), &scene, sizeof(SceneData));

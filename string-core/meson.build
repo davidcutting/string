@@ -250,7 +250,6 @@ core_src = [
     'src/core/file_watch_service.cpp',
     'src/platform/input_map.cpp',
     'src/platform/input_names.cpp',
-    'src/scene/camera.cpp',
     'src/vulkan/frame_graph.cpp',
     'src/vulkan/renderer.cpp',
     'src/vulkan/passes/composite_pass.cpp',

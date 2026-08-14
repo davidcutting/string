@@ -10,6 +10,7 @@
 !string-render-forward
 !string-debug
 !string-client
+!string-scene
 
 # Hand-authored wrap (not a meson-generated redirect): the JSON reader for `.scene.json`
 # descriptors, which are parsed app-side. Tracked by name so it is not mistaken for an artifact.

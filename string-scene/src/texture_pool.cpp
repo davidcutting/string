@@ -1,15 +1,18 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
-#include <string/render/texture_streamer.hpp>
+#include <string/scene/texture_pool.hpp>
 
 #include <string/core/logger.hpp>
 
 #include <ktxvulkan.h>
 
-namespace string::render
+namespace string::assets
 {
 using namespace string;
 
@@ -19,7 +22,7 @@ namespace
 // CPU work (safe on a job thread): open a cooked .ktx2 and its image data (inflating the zstd
 // payload). Cooked files are already BC7, so this is just a load; a UASTC->BC7 transcode is only
 // done as a fallback for a file that still needs it (an un-baked UASTC .ktx2). Returns an owning
-// ktxTexture2* (freed by the streamer). Throws on failure (rethrown at the future's .get()).
+// ktxTexture2* (freed by the pool). Throws on failure (rethrown at the future's .get()).
 ktxTexture2* load_ktx2_bc7(const std::filesystem::path& path)
 {
     ktxTexture2* ktx = nullptr;
@@ -46,15 +49,47 @@ ktxTexture2* load_ktx2_bc7(const std::filesystem::path& path)
 
 }  // namespace
 
-TextureStreamer::TextureStreamer(::string::gpu::resource_allocator& allocator,
-                                 ::string::gpu::descriptor_table& descriptor_table, TransferBatch& transfer)
+texture_pool::texture_pool(::string::gpu::resource_allocator& allocator,
+                           ::string::gpu::descriptor_table& descriptor_table, TransferBatch& transfer)
 : allocator_(allocator)
 , descriptor_table_(descriptor_table)
 , transfer_(transfer)
 {
+    // 1x1 white fallback for materials without a base-color texture (the factor still tints it).
+    const std::array<uint8_t, 4> white_pixel = { 255, 255, 255, 255 };
+    white_image_ = allocator_.create_resource(::string::gpu::image_info{
+        .extent = { 1, 1, 1 },
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    });
+    transfer_.upload_image(white_pixel.data(), white_pixel.size(), white_image_);
+    descriptor_table_.bind(white_image_, ::string::gpu::descriptor_type::TEXTURE);
+    white_slot_ =
+        descriptor_table_.get_binding_slot(white_image_, ::string::gpu::descriptor_type::TEXTURE);
+
+    // 1x1 flat-normal fallback (tangent-space +Z): materials with no normal map sample this and get
+    // the geometric normal back, so the fragment shader never branches on "has a normal map".
+    const std::array<uint8_t, 4> flat_normal_pixel = { 128, 128, 255, 255 };
+    flat_normal_image_ = allocator_.create_resource(::string::gpu::image_info{
+        .extent = { 1, 1, 1 },
+        .format = VK_FORMAT_R8G8B8A8_UNORM,   // linear, not sRGB — it's data, not colour
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+    });
+    transfer_.upload_image(flat_normal_pixel.data(), flat_normal_pixel.size(), flat_normal_image_);
+    descriptor_table_.bind(flat_normal_image_, ::string::gpu::descriptor_type::TEXTURE);
+    flat_normal_slot_ = descriptor_table_.get_binding_slot(flat_normal_image_,
+                                                          ::string::gpu::descriptor_type::TEXTURE);
 }
 
-TextureStreamer::~TextureStreamer()
+texture_pool::~texture_pool()
 {
     for (auto& [id, t] : textures_)
     {
@@ -67,27 +102,63 @@ TextureStreamer::~TextureStreamer()
             catch (...) {}
         }
 
-        // The GPU side of each streamed texture: bindless slot, view, image. This used to be left to
-        // the device teardown, which was harmless while a streamer only ever died with the process.
-        // It stops being harmless the moment a scene can be UNLOADED while the app keeps running —
-        // Sponza's texture set would leak its VRAM and its bindless slots on every switch away.
-        // `t.view` is a CACHED COPY of the allocator's own view (see stream-in), not a second view
-        // this class created — so destroying it here as well as in destroy_resource() is a
-        // double-free that validation catches as VUID-vkDestroyImageView-imageView-parameter.
-        // The allocator owns the image, its view and its sampler; this only has to give back the
-        // bindless slot it took.
+        // The GPU side of each streamed texture: bindless slot, view, image. `t.view` is a CACHED
+        // COPY of the allocator's own view (see add), not a second view — the allocator owns the
+        // image, its view and its sampler; this only has to give back the bindless slot it took.
         if (t.image != 0)
         {
             descriptor_table_.unbind(t.image, ::string::gpu::descriptor_type::TEXTURE);
             allocator_.destroy_resource(t.image);
         }
     }
-    // No samplers to destroy: minLod samplers are shared out of the allocator's cache now (see
-    // rebind), so the streamer creates no Vulkan objects of its own beyond its images.
+    // The whole-uploaded set + the two fallbacks: same ownership rule, one place.
+    for (const ::string::gpu::resource_id id : uploaded_)
+    {
+        descriptor_table_.unbind(id, ::string::gpu::descriptor_type::TEXTURE);
+        allocator_.destroy_resource(id);
+    }
+    for (const ::string::gpu::resource_id id : { white_image_, flat_normal_image_ })
+    {
+        if (id != 0)
+        {
+            descriptor_table_.unbind(id, ::string::gpu::descriptor_type::TEXTURE);
+            allocator_.destroy_resource(id);
+        }
+    }
 }
 
-std::uint64_t TextureStreamer::upload_levels(Texture& t, ktxTexture2* ktx, std::uint32_t first_level,
-                                             std::uint32_t last_level)
+texture_pool::Uploaded texture_pool::add_decoded(const decoded_image& decoded)
+{
+    // Full mip chain: floor(log2(max dimension)) + 1 levels. TRANSFER_SRC is needed too because
+    // mip generation blits from each level down to the next.
+    const uint32_t max_dim = static_cast<uint32_t>(std::max(decoded.width, decoded.height));
+    const uint32_t mip_levels = static_cast<uint32_t>(std::floor(std::log2(max_dim))) + 1;
+
+    const ::string::gpu::resource_id image = allocator_.create_resource(::string::gpu::image_info{
+        .extent = { static_cast<uint32_t>(decoded.width), static_cast<uint32_t>(decoded.height), 1 },
+        .format = decoded.format,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+               | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT,
+        .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .allocation_flags = {},
+        .mip_levels = mip_levels,
+    });
+    // upload_image copies the pixels into staging immediately; the batch streams it to the GPU
+    // asynchronously (bounded by its staging budget), so no per-texture stall.
+    const VkDeviceSize size = static_cast<VkDeviceSize>(decoded.width) * decoded.height * 4;
+    transfer_.upload_image(decoded.pixels.get(), size, image);
+
+    descriptor_table_.bind(image, ::string::gpu::descriptor_type::TEXTURE);
+    const uint32_t slot =
+        descriptor_table_.get_binding_slot(image, ::string::gpu::descriptor_type::TEXTURE);
+    uploaded_.push_back(image);
+    return Uploaded{ .image = image, .slot = slot };
+}
+
+std::uint64_t texture_pool::upload_levels(Texture& t, ktxTexture2* ktx, std::uint32_t first_level,
+                                          std::uint32_t last_level)
 {
     const ktx_uint8_t* blob = ktxTexture_GetData(ktxTexture(ktx));
     std::uint64_t ticket = 0;
@@ -105,7 +176,7 @@ std::uint64_t TextureStreamer::upload_levels(Texture& t, ktxTexture2* ktx, std::
     return ticket;
 }
 
-TextureStreamer::Registered TextureStreamer::add(const std::filesystem::path& path, bool srgb)
+texture_pool::Registered texture_pool::add(const std::filesystem::path& path, bool srgb)
 {
     // Header-only read: numLevels + base extent, so we can create the image now without transcoding.
     ktxTexture2* header = nullptr;
@@ -164,7 +235,7 @@ TextureStreamer::Registered TextureStreamer::add(const std::filesystem::path& pa
                        .base_extent = base_extent };
 }
 
-bool TextureStreamer::finish_load(Texture& t)
+bool texture_pool::finish_load(Texture& t)
 {
     if (t.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
     {
@@ -178,7 +249,7 @@ bool TextureStreamer::finish_load(Texture& t)
         // The file's BC7 variant disagreed with the format the image was created with — sampling
         // will be off (sRGB vs linear). Shouldn't happen for cooked assets (add() reads the file's
         // own format), so this flags a bad cook / wrong glTF-usage assumption on the fallback path.
-        STRING_LOG_WARN("TextureStreamer: BC7 format mismatch for {} (created {}, loaded {})",
+        STRING_LOG_WARN("texture_pool: BC7 format mismatch for {} (created {}, loaded {})",
                         t.path.string(), static_cast<int>(t.format),
                         static_cast<int>(ktxTexture2_GetVkFormat(ktx)));
     }
@@ -191,8 +262,8 @@ bool TextureStreamer::finish_load(Texture& t)
     return true;
 }
 
-std::uint64_t TextureStreamer::stream(::string::gpu::resource_id id, std::uint32_t /*from_detail*/,
-                                      std::uint32_t to_detail)
+std::uint64_t texture_pool::stream(::string::gpu::resource_id id, std::uint32_t /*from_detail*/,
+                                   std::uint32_t to_detail)
 {
     Texture& t = textures_.at(id);
     const std::uint64_t token = next_token_++;
@@ -217,7 +288,7 @@ std::uint64_t TextureStreamer::stream(::string::gpu::resource_id id, std::uint32
     return token;
 }
 
-bool TextureStreamer::is_complete(std::uint64_t token)
+bool texture_pool::is_complete(std::uint64_t token)
 {
     auto it = token_to_id_.find(token);
     if (it == token_to_id_.end())
@@ -249,10 +320,8 @@ bool TextureStreamer::is_complete(std::uint64_t token)
 //
 // This is the residency rebinding brief 20 left without a verb (brief 21's G8): the sampler is a
 // property of the image now, so raising detail is a sampler swap plus a rebind, not a descriptor
-// write from outside. Without it every streamed texture sampled from mip 0 — memory no upload had
-// ever touched — which is why large near-camera surfaces read as black albedo and zero roughness
-// (a sky mirror) while distant ones, sampling the coarse mips that WERE uploaded, looked right.
-void TextureStreamer::rebind(Texture& t, std::uint32_t detail)
+// write from outside.
+void texture_pool::rebind(Texture& t, std::uint32_t detail)
 {
     const std::uint32_t resident_base = std::max(base_of(t, detail), t.phys_base);
     const float min_lod = static_cast<float>(std::min(resident_base, t.levels - 1));
@@ -270,19 +339,19 @@ void TextureStreamer::rebind(Texture& t, std::uint32_t detail)
     }
 }
 
-void TextureStreamer::on_resident(::string::gpu::resource_id id, std::uint32_t detail)
+void texture_pool::on_resident(::string::gpu::resource_id id, std::uint32_t detail)
 {
     rebind(textures_.at(id), detail);
 }
 
-void TextureStreamer::evict(::string::gpu::resource_id id, std::uint32_t /*from_detail*/, std::uint32_t to_detail)
+void texture_pool::evict(::string::gpu::resource_id id, std::uint32_t /*from_detail*/, std::uint32_t to_detail)
 {
     // v1: logical only — no VRAM is reclaimed, so this just raises minLod back up. phys_base keeps
     // the physically-uploaded levels, which is why re-wanting the detail later uploads nothing.
     rebind(textures_.at(id), to_detail);
 }
 
-VkDeviceSize TextureStreamer::cost(::string::gpu::resource_id id, std::uint32_t detail)
+VkDeviceSize texture_pool::cost(::string::gpu::resource_id id, std::uint32_t detail)
 {
     Texture& t = textures_.at(id);
     if (detail == 0)
@@ -301,4 +370,4 @@ VkDeviceSize TextureStreamer::cost(::string::gpu::resource_id id, std::uint32_t 
     return bytes;
 }
 
-}  // namespace string::render
+}  // namespace string::assets

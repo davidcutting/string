@@ -39,7 +39,12 @@
 #include <string/client/screens.hpp>
 #include <string/render/render_debug.hpp>
 #include <string/render/render_cvars.hpp>
-#include <string/render/scene_loader.hpp>
+#include <string/render/scene_bridge.hpp>
+#include <string/scene/asset_registry.hpp>
+#include <string/scene/world.hpp>
+#include <string/asset/tools/scene_cook.hpp>
+#include "content_tools.hpp"
+#include <glm/gtc/matrix_transform.hpp>
 #include <nlohmann/json.hpp>
 
 namespace sandbox
@@ -967,6 +972,17 @@ struct geometry_scene_state
     // Declared FIRST so it is destroyed LAST: passes may record against these backings up to the
     // wait_idle that precedes scene teardown, and the ids must outlive every pass that named them.
     scene_backing backing;
+    // The asset registry (declared before the passes so it outlives them: the geometry streamer
+    // uploads from a non-owning view of its vertex heap). Per-scene for now; the application-level
+    // registry that survives scene switches arrives with the public-API step.
+    tools_cook_provider cook;
+    std::unique_ptr<string::assets::registry> assets;
+    // The WORLD (what exists, where) and the BRIDGE (its GPU mirror: the DrawInfo rows) — the
+    // scene-layer split. Declared before the passes: every pass consumes what the bridge derives.
+    std::unique_ptr<string::scene::world> world;
+    std::unique_ptr<string::render::scene_bridge> bridge;
+    std::vector<string::scene::entity> base_entities;    // one per loaded asset, spawn order
+    std::vector<string::scene::entity> crowd_entities;   // the K-toggle stress grid
     std::shared_ptr<MeshOverlayStats> mesh_stats = std::make_shared<MeshOverlayStats>();
     std::unique_ptr<geometry_pass> geo;
     std::unique_ptr<froxel_component> froxel;
@@ -1111,7 +1127,92 @@ std::function<void(float)> make_geometry_scene(
     auto s = std::make_shared<geometry_scene_state>();
     s->graph = &fg;
 
-    s->geo = std::make_unique<geometry_pass>(ctx, samples, std::move(models), s->mesh_stats, lookdev);
+    // Load this scene's content into the app-owned asset registry BEFORE any renderer object
+    // exists (asset-layer split): models via the cooked path (cook-on-load through the injected
+    // tools provider), generated content via bake_scene + load_baked. Order matters for parity —
+    // models first, then the synthetic transparency test set, exactly like the old in-pass merge.
+    s->assets = std::make_unique<string::assets::registry>(
+        ctx,
+        string::assets::registry_config{
+            .chunk_budget =
+                static_cast<uint32_t>(std::max(0, ::string::render::cv_chunk_budget().get())) },
+        &s->cook);
+    std::vector<string::assets::asset_id> loaded;
+    if (lookdev)
+    {
+        loaded.push_back(load_lookdev_asset(*s->assets));
+    }
+    else
+    {
+        for (const std::filesystem::path& m : models)
+        {
+            const string::assets::asset_id id = s->assets->load(ctx.resources_path / m);
+            if (id.valid()) loaded.push_back(id);
+        }
+    }
+    if (::string::render::cv_transp_test().get())
+    {
+        const string::assets::asset_id id = load_transp_test_asset(*s->assets);
+        if (id.valid()) loaded.push_back(id);
+    }
+    // Mint the content heaps' graph handles + upload their backing (rides the construction-upload
+    // flush). Before any pass exists: the geometry pass latches these handles at construction.
+    s->assets->declare(fg);
+
+    // The world: one entity per loaded asset, identity placement, in load order — which is what
+    // keeps the bridge's row order identical to the old merged draw order (byte parity).
+    s->world = std::make_unique<string::scene::world>(*s->assets);
+    for (const string::assets::asset_id id : loaded)
+    {
+        const string::assets::asset* a = s->assets->get(id);
+        s->base_entities.push_back(s->world->spawn(
+            { .asset = id, .debug_name = a != nullptr ? a->name() : std::string_view{} }));
+    }
+
+    // The bridge: the world's GPU mirror. Row budget = base parts x the crowd grid (the K-toggle
+    // stress scene spawns kCrowdGrid^2-1 extra copies of every base entity).
+    constexpr uint32_t kCrowdGrid = 6;
+    const uint32_t base_parts = static_cast<uint32_t>(s->assets->mesh_parts().size());
+    s->bridge = std::make_unique<string::render::scene_bridge>(
+        ctx, *s->assets, *s->world, std::max(1u, base_parts * kCrowdGrid * kCrowdGrid));
+
+    s->geo = std::make_unique<geometry_pass>(ctx, samples, *s->assets, *s->bridge, s->mesh_stats,
+                                             lookdev);
+
+    // The crowd stress scene as CONTENT: the K toggle (or r.crowd.enabled) spawns/despawns a
+    // kCrowdGrid x kCrowdGrid grid of copies of every base entity around the origin cell.
+    s->geo->set_crowd_hook([sp = s.get(), kCrowdGrid](bool on) {
+        if (!on)
+        {
+            for (const string::scene::entity e : sp->crowd_entities) sp->world->despawn(e);
+            sp->crowd_entities.clear();
+            return;
+        }
+        if (!sp->crowd_entities.empty()) return;
+        const glm::vec3 extent = sp->bridge->bounds_max() - sp->bridge->bounds_min();
+        const float spacing_x = extent.x * 1.1f;
+        const float spacing_z = extent.z * 1.1f;
+        const int side = static_cast<int>(kCrowdGrid);
+        for (int gx = 0; gx < side; ++gx)
+            for (int gz = 0; gz < side; ++gz)
+            {
+                const int cx = gx - side / 2;
+                const int cz = gz - side / 2;
+                if (cx == 0 && cz == 0) continue;   // the base scene occupies the origin cell
+                const glm::mat4 offset = glm::translate(
+                    glm::mat4(1.0f), glm::vec3(static_cast<float>(cx) * spacing_x, 0.0f,
+                                               static_cast<float>(cz) * spacing_z));
+                for (const string::scene::entity base : sp->base_entities)
+                {
+                    sp->crowd_entities.push_back(sp->world->spawn(
+                        { .asset = sp->world->asset_of(base), .transform = offset,
+                          .debug_name = "crowd" }));
+                }
+            }
+        STRING_LOG_INFO("[crowd] {} entities spawned ({} base x {} grid cells)",
+                        sp->crowd_entities.size(), sp->base_entities.size(),
+                        kCrowdGrid * kCrowdGrid);
+    });
     ::string::render::GeometryScene* scene = s->geo->scene();
 
     const ::string::render::ProbeVolume gi_volume =
@@ -1226,6 +1327,10 @@ std::function<void(float)> make_geometry_scene(
                     .allocation_info.pMappedData);
             s->anim->tick(dt, { palettes, s->geo->palette_joints_total() });
         }
+        // Scene-layer order: the world flushes its hierarchy + snapshot, the bridge re-derives
+        // the draw rows from it, THEN the passes tick against current rows.
+        s->world->tick(dt);
+        s->bridge->tick();
         s->geo->tick(dt, slot);
         s->gtao->tick(rp->extent(), static_cast<uint16_t>(slot));
         s->ibl->tick(scene_ptr->ibl_lighting(), false);
@@ -1298,7 +1403,7 @@ string::Application::scene_fn build_demo_scene(const std::filesystem::path& reso
             static_cast<uint32_t>(std::max(0, ::string::render::cv_chunk_budget().get()));
         STRING_LOG_INFO("[cook] '{}': {} asset(s) — the engine will be unresponsive until this "
                         "finishes", scene.name, scene.assets.size());
-        ::string::render::cook_scene_textures_for(resources_dir, scene.assets, chunk_budget);
+        ::string::asset::tools::cook_scene_textures_for(resources_dir, scene.assets, chunk_budget);
     });
 
     // `dbg.scene` (STRING_SCENE) is a LOOKUP, not a branch. An unknown name falls back rather than

@@ -87,12 +87,12 @@ ProbeVolume probe_gi_component::fit_volume(glm::vec3 aabb_min, glm::vec3 aabb_ma
 // and the coarse LOD cuts the meshlet count ~an order of magnitude (Sponza: 122k LOD0 meshlets over
 // 450 draws). GI capture on proxy/low-LOD geometry is the shipped-engine standard; the slight surface
 // shift is far below the probe grid's spatial resolution.
-std::vector<glm::uvec2> probe_gi_component::capture_table(const MeshletModel& model)
+std::vector<glm::uvec2> probe_gi_component::capture_table(std::span<const GpuDrawInfo> draws)
 {
     std::vector<glm::uvec2> mdraw;
-    for (uint32_t d = 0; d < model.draws.size(); ++d)
+    for (uint32_t d = 0; d < draws.size(); ++d)
     {
-        const GpuDrawInfo& di = model.draws[d];
+        const GpuDrawInfo& di = draws[d];
         if (di.lod_count == 0) continue;
         // Brief 23: skinned draws are EXCLUDED — this capture is a static per-probe bake, and a
         // character baked in bind pose would ghost into the probes forever. (build_meshlet_gpu
@@ -290,7 +290,10 @@ probe_gi_component::probe_gi_component(engine_context& ctx, GeometryScene* scene
     // The capture table's host copy. The TABLE is a graph buffer the app declares; this is the
     // staging the one-shot gi.clear pass copies from, so the upload is a declared transfer with a
     // derived edge into the capture task shader rather than a construction-time submit.
-    const std::vector<glm::uvec2> mdraw = capture_table(scene_->meshlet_model_);
+    const std::vector<glm::uvec2> mdraw = capture_table(
+        scene_->draw_info_mapped_ != nullptr
+            ? std::span<const GpuDrawInfo>(scene_->draw_info_mapped_, scene_->active_draw_count_)
+            : std::span<const GpuDrawInfo>{});
     probe_total_meshlets_ = static_cast<uint32_t>(mdraw.size());
     table_bytes_ = sizeof(glm::uvec2) * std::max<size_t>(mdraw.size(), 1);
     table_staging_ = allocator_->create_resource(::string::gpu::buffer_info{
@@ -306,7 +309,7 @@ probe_gi_component::probe_gi_component(engine_context& ctx, GeometryScene* scene
     else std::copy(mdraw.begin(), mdraw.end(), dst);
     STRING_LOG_INFO("[gi] capture dispatch domain: {} coarse-LOD meshlets over {} draws "
                     "(per-probe task groups: {})", probe_total_meshlets_,
-                    scene_->meshlet_model_.draws.size(), (probe_total_meshlets_ + 31u) / 32u);
+                    scene_->active_draw_count_, (probe_total_meshlets_ + 31u) / 32u);
 
     scene_->gi = this;
 }
@@ -372,7 +375,8 @@ void probe_gi_component::declare(::string::frame_graph& fg, const resources& res
     //    (:498, :507, :587 and :631 all delete).
     for (uint32_t slot = 0; slot < kProbesPerFrame; ++slot)
     {
-        fg.pass("gi.capture." + std::to_string(slot))
+        ::string::pass_spec capture = fg.pass("gi.capture." + std::to_string(slot));
+        capture
           .color(all_faces(res_.cube_albedo))
           .color(all_faces(res_.cube_nd))
           .depth(all_faces(res_.cube_depth))
@@ -382,7 +386,19 @@ void probe_gi_component::declare(::string::frame_graph& fg, const resources& res
           .reads(res_.meshlet_table, ::string::access::storage_read,
                  VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT)
           .reads(res_.offset, ::string::access::storage_read,
-                 VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT)
+                 VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+        // The registry's content heaps (assets::gpu_view, latched into the scene tables): the
+        // capture's meshlet path pulls geometry exactly like the main phases.
+        for (const ::string::gpu::buffer& h :
+             { scene_->vertex_buffer_, scene_->meshlet_buffer_, scene_->meshlet_vertices_,
+               scene_->meshlet_triangles_ })
+        {
+            if (!h.valid()) continue;
+            capture.reads(h, ::string::access::storage_read,
+                          VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT
+                              | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+        }
+        capture
           .toggle([this, slot] { return capture_slot_runs(slot); })
           .raster([this, slot](::string::pass_context& ctx) { record_capture(ctx, slot); });
 
@@ -587,10 +603,10 @@ void probe_gi_component::record_capture(::string::pass_context& ctx, uint32_t sl
     // The geometry heaps are the scene's, not this pass's: they are long-lived allocator resources
     // every meshlet path pushes by address (the same shape shadow_maps uses).
     ProbeRasterPush push{};
-    push.vertices = allocator_->get_buffer(scene_->vertex_buffer_).device_address;
-    push.meshlets = allocator_->get_buffer(scene_->meshlet_buffer_).device_address;
-    push.mverts = allocator_->get_buffer(scene_->meshlet_vertices_).device_address;
-    push.mtris = allocator_->get_buffer(scene_->meshlet_triangles_).device_address;
+    push.vertices = ctx.address(scene_->vertex_buffer_);
+    push.meshlets = ctx.address(scene_->meshlet_buffer_);
+    push.mverts = ctx.address(scene_->meshlet_vertices_);
+    push.mtris = ctx.address(scene_->meshlet_triangles_);
     push.draws = allocator_->get_buffer(scene_->draw_info_buffer_).device_address;
     push.mdraw = ctx.address(res_.meshlet_table);
     push.probe_pos = probe_pos;

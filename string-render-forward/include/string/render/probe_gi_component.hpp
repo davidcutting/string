@@ -123,9 +123,9 @@ public:
     // The probe grid fit for a scene AABB, at the current r.gi.spacing. A pure function so the
     // application can size its atlas declarations from exactly the grid this component captures into.
     static ProbeVolume fit_volume(glm::vec3 aabb_min, glm::vec3 aabb_max);
-    // The flat capture dispatch domain: {draw index, global meshlet id} per COARSEST-LOD meshlet,
-    // built once from the meshlet model. Pure, so the app can size the table buffer with it.
-    static std::vector<glm::uvec2> capture_table(const MeshletModel& model);
+    // The flat capture dispatch domain: {row index, global meshlet id} per COARSEST-LOD meshlet,
+    // built once from the bridge's DrawInfo rows. Pure, so the app can size the table buffer.
+    static std::vector<glm::uvec2> capture_table(std::span<const GpuDrawInfo> draws);
 
     // Author the chain onto the graph. Called once, at startup, before the first tick().
     //   res          the graph resources above

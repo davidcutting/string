@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <vector>
 
-#include <string/vulkan/render_data.hpp>
+#include <string/core/vertex.hpp>
 
 #include <string/asset/cooked_format.hpp>
 #include <string/asset/geometry.hpp>

@@ -10,7 +10,7 @@
 
 #include <string/gpu/command_recorder.hpp>
 #include <string/gpu/device.hpp>
-#include <string/vulkan/render_data.hpp>
+#include <string/core/vertex.hpp>
 #include <string/vulkan/frame_graph.hpp>
 #include <string/gpu/pass_context.hpp>
 #include <string/vulkan/engine_context.hpp>
@@ -21,14 +21,13 @@
 #include "string/gpu/resource.hpp"
 #include "string/gpu/resource_allocator.hpp"
 
-#include <string/render/gltf_types.hpp>
-#include <string/render/geometry_streamer.hpp>
-#include <string/render/texture_streamer.hpp>
+#include <string/scene/asset_registry.hpp>
+
+#include <string/render/scene_bridge.hpp>
 #include <string/render/lighting_data.hpp>
 #include <string/render/meshlet_data.hpp>
 #include <string/render/probe_gi.hpp>
 #include <string/render/meshlet_builder.hpp>
-#include <string/render/scene_loader.hpp>
 #include <string/render/render_cvars.hpp>
 #include <string/render/geometry/geometry_scene.hpp>
 #include <string/render/shadow_maps.hpp>
@@ -223,33 +222,12 @@ class geometry_pass final : private GeometryScene
     // Brief 20: the colour/depth sentinels are gone. The scene attachments are viewport-scaled
     // transients the application declares and hands to declare() as logical handles.
 
-    // Geometry residency streaming: per-draw vertex/index ranges suballocate into heaps SMALLER than
-    // the whole model as draws enter the view frustum, and are freed (reclaimed) on eviction. A
-    // not-yet-resident draw stays hidden (DrawInfo.resident 0). Capping resident geometry below the full
-    // model is what exercises reclaim; raise toward 100 for a VRAM-fitting scene with no pop-in.
-    static constexpr std::uint64_t kGeometryResidentPercent = 100;
-    static constexpr VkDeviceSize kGeometryStreamPerFrame = 32ull * 1024 * 1024;
-    // Per-model budget (heap capacity), so this is a unique_ptr built once sizes are known.
-    std::unique_ptr<::string::gpu::residency_manager> geometry_residency_;
-    std::unique_ptr<GeometryStreamer> geometry_streamer_;
-    // Only stream per-frame when the model doesn't fit the budget (< 100%). When it fits, all
-    // geometry is uploaded up front (no per-frame streaming/eviction cost) — streaming a scene that
-    // fits in VRAM just adds startup lag for no benefit.
-    bool geometry_streaming_ = false;
-
-    // Per glTF-image backing resource + its bindless slot (index-aligned with the loaded
-    // model's textures, so a material's texture index maps straight to a slot).
-    std::vector<::string::gpu::resource_id> texture_images_;
-    std::vector<uint32_t> texture_slots_;
-    // 1x1 white fallback, used for draws whose material has no base-color texture (the
-    // base-color factor still tints it) — also the metallic-roughness fallback (white .g/.b = 1,
-    // so metallic/roughness reduce to the scalar factors).
-    ::string::gpu::resource_id white_image_;
-    uint32_t white_slot_ = 0;
-    // 1x1 flat-normal fallback (tangent-space +Z = RGBA 128,128,255), for draws with no normal map:
-    // sampling it yields the geometric normal, so the shader needs no branch.
-    ::string::gpu::resource_id flat_normal_image_;
-    uint32_t flat_normal_slot_ = 0;
+    // Content residency (geometry heaps, textures, budgets) belongs to the ASSET REGISTRY, and
+    // the draw-row table to the SCENE BRIDGE (asset/scene-layer split). The pass keeps
+    // references: it feeds per-frame visibility samples to the registry and consumes the bridge's
+    // rows — it owns neither.
+    ::string::assets::registry& assets_;
+    scene_bridge& bridge_;
 
     // Cascaded shadow maps. A depth-only prepass (ShadowPass) renders the scene from the sun's
     // orthographic view into cascade_count per-frame-in-flight D32 images (one per cascade), sampled
@@ -271,35 +249,12 @@ class geometry_pass final : private GeometryScene
     std::vector<LightAnim> light_anim_;
     bool froxel_heatmap_ = false;  // H toggles the froxel light-count heatmap
 
-    // Texture residency streaming: the streamer (a residency_provider) owns each texture's mip
-    // levels and adjustable-minLod sampler; the manager drives what streams in per frame. Only
-    // cooked KTX2 textures stream — stb-decoded fallbacks upload whole as before. Budget is large
-    // (no physical VRAM reclaim yet — see TextureStreamer), so all wanted detail streams in.
-    static constexpr VkDeviceSize kTextureBudget = 6ull * 1024 * 1024 * 1024;
-    // Cap new streaming per frame so the coarse scene appears instantly and sharpens over ~a second,
-    // rather than stalling frame 0 on the whole fine-mip upload.
-    static constexpr VkDeviceSize kTextureStreamPerFrame = 64ull * 1024 * 1024;
-    // Coarse-mip LOD floor: the coarsest resident mip every streamed texture is pinned to is roughly
-    // this wide, so the whole scene renders blurry-but-real up front and only visible surfaces pull
-    // finer mips (screen-coverage feedback in update()).
-    static constexpr std::uint32_t kCoarseFloorPixels = 64;
-    ::string::gpu::residency_manager residency_;
-    std::unique_ptr<TextureStreamer> texture_streamer_;
-    std::vector<::string::gpu::resource_id> streamed_textures_;
-    // Per glTF texture (index-aligned with texture_images_): the info the coverage heuristic needs
-    // to pick a desired mip. levels == 0 marks a non-streamed (stb) texture the feedback skips.
-    struct TextureLod
-    {
-        std::uint32_t levels = 0;         // total mip levels
-        std::uint32_t base_extent = 0;    // max(width, height) of mip 0
-        std::uint32_t coarse_detail = 0;  // pinned coarse-tail detail (never wanted below this)
-    };
-    std::vector<TextureLod> texture_lod_;
-    // Scratch reused each frame: the finest detail any visible draw wants per texture (starts at the
-    // coarse floor, raised by coverage), issued as one want() per texture after the draw loop.
-    std::vector<std::uint32_t> frame_desired_detail_;
+    // Scratch reused each frame: the visibility samples fed to the registry (frustum-visible parts
+    // + their projected screen coverage — the registry turns coverage into texture mip wants).
+    std::vector<::string::assets::visibility_sample> visibility_scratch_;
+    // Frames since scene start (drives the two-phase warm-up gate + the periodic cull logs; the
+    // registry keeps its own equivalent for streaming).
     uint64_t stream_frame_ = 0;
-    bool logged_full_resident_ = false;
 
     // --- Brief 03: task/mesh meshlet pipeline --------------------------------------------------
     // Built at load from the flattened geometry: the GPU-side meshlet/vertex/triangle heaps + the
@@ -404,9 +359,11 @@ class geometry_pass final : private GeometryScene
     // prove 500+-crowd geometry throughput (brief M6). Crowd draws are extra DrawInfo entries that
     // reference the SAME meshlet buffers (only the transform differs); active_draw_count_ switches
     // between the base set and base+crowd. Grid side N gives (N*N - 1) extra copies of the model.
-    static constexpr uint32_t kCrowdGrid = 6;   // 6x6 = 35 extra copies (+ base) of the model
+    // The crowd stress scene is CONTENT (world entities) now: the K toggle / r.crowd.enabled call
+    // the app-installed hook, which spawns/despawns the grid entities; the bridge re-derives rows.
     bool crowd_enabled_ = false;
-    void build_crowd(const glm::vec3& aabb_min, const glm::vec3& aabb_max);
+    bool crowd_seeded_ = false;
+    std::function<void(bool)> crowd_hook_;
     void build_meshlet_gpu(string::engine_context& context);
     // Brief 04d: `phase` (0 legacy/transparency, 1 = bit-set only, 2 = bit-clear+HiZ+update) is pushed
     // into MeshletPush so the task shader partitions the worklist's meshlets across the two phases.
@@ -440,26 +397,26 @@ public:
     // Latest GPU culling stats (read back one frame late) for the UI overlay.
     const GpuMeshStats& mesh_stats() const { return stats_latest_; }
 
-    // --- Brief 23: the skinning tables the app's animation driver needs ------------------------
-    // One SkinInstance per merged skin: its palette window in the ring (all its draws share it),
-    // joint count, IBM/remap windows into the two spans below, and its `.anim` pack path. The
-    // driver samples clips (string::anim), builds palettes via build_palette(model_space,
-    // joint_remap window, inverse_bind window), and writes them into its ring at palette_offset.
-    std::span<const GeometryScene::SkinInstance> skins() const { return skins_; }
-    std::span<const glm::mat4> skin_inverse_bind() const { return skin_inverse_bind_; }
-    std::span<const uint32_t> skin_joint_remap() const { return skin_joint_remap_; }
+    // The app's crowd hook (spawn/despawn the stress-scene entities in the world).
+    void set_crowd_hook(std::function<void(bool)> hook) { crowd_hook_ = std::move(hook); }
+
+    // --- Brief 23: the skinning tables the app's animation driver needs, forwarded from their
+    // owners (palette windows: the bridge; IBM/remap tables: the asset registry) ----------------
+    std::span<const scene_bridge::skin_instance> skins() const { return bridge_.skins(); }
+    std::span<const glm::mat4> skin_inverse_bind() const { return assets_.inverse_bind(); }
+    std::span<const uint32_t> skin_joint_remap() const { return assets_.joint_remap(); }
     // Ring sizing: total palette joints across all skins (mat4 units per frame slot).
-    uint32_t palette_joints_total() const { return palette_joints_total_; }
-    // model_paths are .gltf/.glb files resolved relative to context.resources_path, flattened and
-    // merged into one draw set (shared vertex/index/material/texture tables — the NewSponza packs
-    // overlay the same world space). `overlay_stats` (may be null) receives the meshlet culling
-    // stats + path/HiZ/view flags each frame for the UI overlay.
-    // `lookdev` (brief 07): ignore model_paths and build the standing material-probe scene
-    // instead — a roughness x metallic sphere grid + a white/mirror pair over a neutral ground
-    // slab, baked through the same cook library (one draw per sphere; factors drive the
-    // materials, no textures). The permanent lookdev sandbox: STRING_SCENE=lookdev ./run.sh.
+    uint32_t palette_joints_total() const { return bridge_.palette_joints_total(); }
+    // `assets` is the app-owned asset registry with this scene's content already loaded (the app
+    // loads models / generated content before constructing the pass); the pass renders EVERY mesh
+    // part in it, in registry order. The registry must outlive the pass — the geometry streamer
+    // uploads from a non-owning view of its vertex heap. `overlay_stats` (may be null) receives
+    // the meshlet culling stats + path/HiZ/view flags each frame for the UI overlay.
+    // `lookdev` (brief 07): the standing material-probe preset — kills the local-light stress set
+    // by default so material response reads under sun + sky IBL alone (content itself is loaded by
+    // the app via sandbox content tools). STRING_SCENE=lookdev ./run.sh.
     geometry_pass(string::engine_context& context, VkSampleCountFlagBits samples,
-                  std::vector<std::filesystem::path> model_paths,
+                  ::string::assets::registry& assets, scene_bridge& bridge,
                   std::shared_ptr<MeshOverlayStats> overlay_stats = nullptr, bool lookdev = false);
     ~geometry_pass();
 

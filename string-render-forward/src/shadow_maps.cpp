@@ -112,6 +112,21 @@ void shadow_maps::declare(::string::frame_graph& fg, std::span<const ::string::g
         if (joint_palette.valid())
             cascade.reads(joint_palette, access::storage_read,
                           VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+        // The registry's content heaps (assets::gpu_view, latched into the scene tables): the
+        // shadow task shader culls against the meshlets, the mesh shader pulls geometry (+ skin).
+        // Declared so the pushed addresses resolve through this pass's context.
+        {
+            const ::string::gpu::buffer heaps[] = { scene_->vertex_buffer_, scene_->meshlet_buffer_,
+                                                    scene_->meshlet_vertices_,
+                                                    scene_->meshlet_triangles_,
+                                                    scene_->skin_buffer_ };
+            for (const ::string::gpu::buffer& h : heaps)
+            {
+                if (!h.valid()) continue;
+                cascade.reads(h, access::storage_read, VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
+                cascade.reads(h, access::storage_read, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
+            }
+        }
         cascade
           // r.pass.shadow, plus "is there anything to draw". A skipped cascade is not a black screen:
           // its consumers read the declared neutral (1.0, unshadowed) fallback.
@@ -142,10 +157,10 @@ void shadow_maps::record_cascade(::string::pass_context& ctx, uint32_t cascade,
     // shader against this light_view_proj.
     MeshletShadowPush mspush{};
     mspush.light_view_proj = s.cascade_view_proj_[cascade];
-    mspush.vertices = allocator_->get_buffer(s.vertex_buffer_).device_address;
-    mspush.meshlets = allocator_->get_buffer(s.meshlet_buffer_).device_address;
-    mspush.mverts = allocator_->get_buffer(s.meshlet_vertices_).device_address;
-    mspush.mtris = allocator_->get_buffer(s.meshlet_triangles_).device_address;
+    mspush.vertices = ctx.address(s.vertex_buffer_);
+    mspush.meshlets = ctx.address(s.meshlet_buffer_);
+    mspush.mverts = ctx.address(s.meshlet_vertices_);
+    mspush.mtris = ctx.address(s.meshlet_triangles_);
     mspush.draws = allocator_->get_buffer(s.draw_info_buffer_).device_address;
     // Brief 23: SceneData carries the skin stream + this slot's palette pointers — resolved at
     // record time so the ring's rotation is always current. A frozen or bind-pose shadow under

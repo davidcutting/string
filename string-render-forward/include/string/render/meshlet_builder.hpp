@@ -4,7 +4,6 @@
 #include <filesystem>
 #include <vector>
 
-#include <string/render/gltf_types.hpp>
 #include <string/render/meshlet_data.hpp>
 
 namespace string::render

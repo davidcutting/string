@@ -103,6 +103,15 @@
           mesonFlags = old.mesonFlags ++ [ "-Dstring-ui:tests=true" ];
         });
 
+        # `nix flake check` also runs the scene library's suite (camera; later the world tables and
+        # the asset registry). Separate check so a failure names the library, same as checks.ui.
+        checks.scene = self'.packages.demo.overrideAttrs (old: {
+          pname = "string-scene-tests";
+          doCheck = true;
+          buildInputs = old.buildInputs ++ [ pkgs.gtest ];
+          mesonFlags = old.mesonFlags ++ [ "-Dstring-scene:tests=true" ];
+        });
+
         # `.#cook` (brief 04b M3): the offline asset-cook CLI. packages.demo installs the
         # `string_cook` binary from the string-asset-tools subproject, so the app just points at
         # it. Usage: `nix run .#cook -- [--chunk N | --no-chunk] [--no-textures] <file.gltf> ...` —

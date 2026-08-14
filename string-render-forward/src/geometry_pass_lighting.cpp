@@ -262,7 +262,8 @@ IblLighting GeometryScene::ibl_lighting() const
 
 std::size_t geometry_pass::gi_capture_entries() const
 {
-    return probe_gi_component::capture_table(meshlet_model_).size();
+    if (draw_info_mapped_ == nullptr) return 0;
+    return probe_gi_component::capture_table({ draw_info_mapped_, draw_count_ }).size();
 }
 
 }  // namespace string::render

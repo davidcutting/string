@@ -7,7 +7,7 @@
 
 #include <glm/glm.hpp>
 
-#include <string/vulkan/render_data.hpp>
+#include <string/core/vertex.hpp>
 
 namespace string::asset::tools
 {

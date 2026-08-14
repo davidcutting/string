@@ -95,6 +95,7 @@ asset_tools_lib = static_library(
         'src/cooked_write.cpp',
         'src/gltf_loader.cpp',
         'src/gltf_skin.cpp',
+        'src/scene_cook.cpp',
         'src/texture_cook.cpp',
     ],
     include_directories : [ include_dir, private_inc ],

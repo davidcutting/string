@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <future>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -19,61 +20,67 @@
 // libktx: the transcoded BC7 blob per texture (mip levels we stream from).
 #include <ktx.h>
 
-namespace string::render
+namespace string::assets
 {
 
-// Streams a glTF model's KTX2 textures, as a residency_provider driving the engine's
-// residency_manager. The cooked files hold BC7 already (baked by string-asset-tools' texture cook,
-// which `string_cook` runs alongside the geometry bake), so streaming a
-// mip is a plain read + upload with no transcode: the dominant ~1.5 GB UASTC->BC7 transcode has
-// moved offline. libktx still opens the file on a background worker (it inflates the zstd payload,
-// I/O + decompress worth keeping off the render thread), and a UASTC->BC7 transcode fallback is
-// kept for any .ktx2 that isn't already BC7 — but for cooked assets nothing is transcoded.
+// A texture decoded to RGBA8 on a worker thread, ready for a (single-threaded) GPU upload. The
+// pixels carry their own deleter (stb_image's, bound at the decode site) so decode jobs run in
+// parallel without an extra copy and this header stays stb-free.
+struct decoded_image
+{
+    std::unique_ptr<uint8_t, void (*)(void*)> pixels{ nullptr, nullptr };
+    int width = 0;
+    int height = 0;
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+};
+
+// The asset registry's texture pool: owns EVERY content texture's GPU image + bindless slot — the
+// streamed KTX2/BC7 set (as a residency_provider driving the registry's residency_manager), the
+// stb-decoded whole uploads, and the shared 1x1 white / flat-normal fallbacks. One owner, one
+// destructor: the old split (streamer owns KTX images, the render pass owns stb ones) needed a
+// set-difference in the pass destructor to know who frees what.
 //
-// At load a texture's BC7 image is created at full mip count (only partially populated) and its
-// bindless slot points at a shared placeholder (a flat white texture, tinted by the material's base
-// color). The residency_manager then drives detail up: it first streams a coarse tail (the coarsest
-// few mips — tiny) so the whole scene renders blurry-but-real within a frame or two, then streams
-// finer mips into the visible textures on demand (screen-coverage feedback in GeometryPass).
-//
-// "detail" (the residency_manager's currency) is the number of resident mip levels counted from the
-// coarsest, so detail == mip_levels means every level is resident (finest base mip 0) and detail 0
-// means the placeholder. base_mip = mip_levels - detail = the sampler's minLod.
-//
-// Memory: no blob is cached. A stream loads the whole BC7 file, records the mip uploads it needs
-// (the TransferBatch copies the bytes into staging immediately), then frees the file — so RAM holds
-// only the blobs of streams currently in flight, not every texture. A later stream to finer detail
-// re-reads the file (cheap: a zstd inflate, or a transcode on the fallback path). `phys_base` tracks
-// the finest mip already physically uploaded, so re-wanting detail after a *logical* eviction (v1
-// eviction is minLod-only, no VRAM reclaim) uploads nothing.
-class TextureStreamer final : public ::string::gpu::residency_provider
+// Streaming model (unchanged from the render-side streamer this absorbs): a texture's BC7 image is
+// created at full mip count (partially populated) with sampling pinned to its coarsest mip;
+// residency drives detail up — "detail" = resident mip levels counted from the coarsest, so
+// detail == levels means every level is resident and base_mip = levels - detail = the sampler's
+// minLod. No blob is cached: a stream loads the file, records its mip uploads, frees the blob.
+// `phys_base` tracks the finest mip physically uploaded (v1 eviction is minLod-only, no reclaim).
+class texture_pool final : public ::string::gpu::residency_provider
 {
 public:
-    // No placeholder image any more: a streamed texture is pinned to its coarsest mip until finer
-    // levels land (see rebind), so its own image is always something legal to sample.
-    TextureStreamer(::string::gpu::resource_allocator& allocator,
-                    ::string::gpu::descriptor_table& descriptor_table, string::TransferBatch& transfer);
-    ~TextureStreamer() override;
+    // Creates the shared fallbacks (1x1 white, 1x1 flat-normal) immediately: their uploads ride
+    // the construction-upload flush, and every material resolution needs their slots.
+    texture_pool(::string::gpu::resource_allocator& allocator,
+                 ::string::gpu::descriptor_table& descriptor_table, string::TransferBatch& transfer);
+    ~texture_pool() override;
 
-    TextureStreamer(const TextureStreamer&) = delete;
-    TextureStreamer& operator=(const TextureStreamer&) = delete;
+    texture_pool(const texture_pool&) = delete;
+    texture_pool& operator=(const texture_pool&) = delete;
+
+    uint32_t white_slot() const { return white_slot_; }
+    uint32_t flat_normal_slot() const { return flat_normal_slot_; }
 
     struct Registered
     {
         ::string::gpu::resource_id image;
         std::uint32_t slot;         // bindless texture slot (stable for the image's lifetime)
-        std::uint32_t min_detail;   // 0 (placeholder is the pinned floor)
+        std::uint32_t min_detail;   // 0 (the pinned coarse floor)
         std::uint32_t max_detail;   // finest (all levels)
-        std::uint32_t base_extent;  // max(width, height) of mip 0 — for the caller's LOD heuristic
+        std::uint32_t base_extent;  // max(width, height) of mip 0 — for the coverage LOD heuristic
     };
     // Register a cooked KTX2 by path (data load deferred to the first stream). `srgb` selects the
     // BC7 format variant when the file must be transcoded; an already-BC7 file's own format wins.
-    // Reads only the header (dimensions + level count) to create the image; returns the handle to
-    // register with the residency_manager.
+    // The caller (the registry) registers the returned image with its residency_manager.
     Registered add(const std::filesystem::path& path, bool srgb);
 
+    // Upload a whole decoded RGBA8 image (the stb fallback path — no streaming, full mip chain
+    // generated by blit). Returns the image + its bindless slot; the pool owns the image.
+    struct Uploaded { ::string::gpu::resource_id image; std::uint32_t slot; };
+    Uploaded add_decoded(const decoded_image& decoded);
+
     // residency_provider (note: the returned/queried value is an internal token, not a transfer
-    // ticket — a stream spans an async transcode phase then a GPU upload phase):
+    // ticket — a stream spans an async file-load phase then a GPU upload phase):
     std::uint64_t stream(::string::gpu::resource_id id, std::uint32_t from_detail, std::uint32_t to_detail) override;
     bool is_complete(std::uint64_t token) override;
     void on_resident(::string::gpu::resource_id id, std::uint32_t detail) override;
@@ -103,16 +110,12 @@ private:
         std::uint64_t gpu_ticket = 0;
     };
 
-    // Record the uploads for mip levels [first_level, last_level] from an opened BC7 blob, advancing
-    // phys_base. Returns the last upload's transfer ticket.
     std::uint64_t upload_levels(Texture& t, ktxTexture2* ktx, std::uint32_t first_level,
                                 std::uint32_t last_level);
     static std::uint32_t base_of(const Texture& t, std::uint32_t detail) { return t.levels - detail; }
     // Publish a texture's resident mip range to its bindless slot: swap the image's sampler to the
     // matching minLod, then rebind. Every residency transition (in or out) goes through here.
     void rebind(Texture& t, std::uint32_t detail);
-    // Once a texture's load future is ready: collect the blob, record the uploads it needs (down to
-    // pending_base), free the blob, and set gpu_ticket. Returns true if the blob is ready.
     bool finish_load(Texture& t);
 
     ::string::gpu::resource_allocator& allocator_;
@@ -126,6 +129,13 @@ private:
     std::unordered_map<::string::gpu::resource_id, Texture> textures_;
     std::unordered_map<std::uint64_t, ::string::gpu::resource_id> token_to_id_;
     std::uint64_t next_token_ = 1;
+
+    // Whole-uploaded (stb) images + the two fallbacks — owned here, freed in the destructor.
+    std::vector<::string::gpu::resource_id> uploaded_;
+    ::string::gpu::resource_id white_image_ = 0;
+    std::uint32_t white_slot_ = 0;
+    ::string::gpu::resource_id flat_normal_image_ = 0;
+    std::uint32_t flat_normal_slot_ = 0;
 };
 
-}  // namespace string::render
+}  // namespace string::assets

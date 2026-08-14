@@ -38,6 +38,10 @@ ui_dep = dependency('string-ui', fallback : ['string-ui', 'project_deps'])
 asset_dep = dependency('string-asset', fallback : ['string-asset', 'project_deps'])
 asset_tools_dep = dependency('string-asset-tools', fallback : ['string-asset-tools', 'project_deps'])
 
+# The asset registry + world layer. The APP owns a registry and injects the tools-backed cook
+# provider into it (content_tools.cpp) — the engine libraries never link the importer.
+scene_dep = dependency('string-scene', fallback : ['string-scene', 'project_deps'])
+
 # The forward+ renderer: the concrete pass set the demo authors into its RenderPlan. Swapping this
 # for a sibling renderer library is the whole point of the split.
 render_dep = dependency('string-render-forward', fallback : ['string-render-forward', 'project_deps'])
@@ -64,11 +68,12 @@ executable(
     [
         'main.cpp',
         'anim_demo.cpp',
+        'content_tools.cpp',
         'debug_cvars.cpp',
         'demo_scene.cpp',
     ],
     include_directories : sandbox_inc,
     dependencies : [ string_dep, ui_dep, render_dep, debug_dep, client_dep, asset_dep, asset_tools_dep,
-                    json_dep ],
+                    scene_dep, json_dep ],
     install : true,
 )
