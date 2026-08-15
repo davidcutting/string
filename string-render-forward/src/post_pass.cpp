@@ -55,11 +55,12 @@ glm::uvec2 bloom_mip_size(const glm::uvec2& base, uint32_t m)
 
 }  // namespace
 
-post_pass::post_pass(string::engine_context& ctx)
+post_pass::post_pass(string::engine_context& ctx, string::composite_pass* composite)
 : device_(ctx.device)
 , allocator_(ctx.allocator)
 , descriptor_table_(ctx.descriptor_table)
 , frames_in_flight_(ctx.frames_in_flight)
+, composite_(composite)
 {
     // Register/touch the post CVars (central sandbox registration in debug_cvars handles the env
     // bridge; these accessors just make first use explicit here).
@@ -295,7 +296,7 @@ void post_pass::tick(float dt)
                 // requires the settled state to be history-free.
                 if (std::abs(target - ev100_) < 1e-3f) ev100_ = target;
             }
-            string::composite_pass::set_auto_ev100(ev100_);
+            composite_->set_auto_ev100(ev100_);
         }
     }
     ++frame_index_;

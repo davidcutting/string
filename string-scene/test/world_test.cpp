@@ -112,3 +112,61 @@ TEST_F(world_fixture, LightsPublishGpuMirrors)
 }
 
 }  // namespace
+
+namespace
+{
+
+// The fixture asset gains a skin so double-spawn independence is testable headlessly (no .anim
+// pack on disk -> the animators exist but are INVALID = bind pose; independence is structural).
+struct skinned_world_fixture : ::testing::Test
+{
+    skinned_world_fixture() : reg(string::assets::registry_config{}), w(reg)
+    {
+        using namespace string::asset;
+        CookedScene s;
+        s.vertices.resize(3);
+        GpuMeshlet m{};
+        m.vertex_count = 3;
+        m.triangle_count = 1;
+        s.meshlets.push_back(m);
+        s.meshlet_vertices = { 0, 1, 2 };
+        s.meshlet_triangles = { 0x00020100 };
+        s.total_meshlets = 1;
+        CookedDraw d{};
+        d.lod_count = 1;
+        d.total_meshlets = 1;
+        d.material = -1;
+        d.skin_plus_one = 1;
+        s.draws.push_back(d);
+        s.skin_vertices.resize(3, SkinVertex{ { 0, 0, 0, 0 }, { 255, 0, 0, 0 } });
+        CookedSkin sk{};
+        sk.skeleton_hash = 0x1234;
+        sk.joint_count = 4;
+        s.skins.push_back(sk);
+        s.inverse_bind.resize(4, glm::mat4(1.0f));
+        s.joint_remap = { 0, 1, 2, 3 };
+        id = reg.load_baked(std::move(s), "skinned");
+    }
+    string::assets::registry reg;
+    string::scene::world w;
+    string::assets::asset_id id;
+};
+
+TEST_F(skinned_world_fixture, DoubleSpawnHasIndependentAnimators)
+{
+    const string::scene::entity a = w.spawn({ .asset = id });
+    const string::scene::entity b = w.spawn({ .asset = id });
+    ASSERT_EQ(w.animators_of(a).size(), 1u);   // one animator per skin, PER ENTITY
+    ASSERT_EQ(w.animators_of(b).size(), 1u);
+    // Distinct playback objects — the old shared-window model had exactly one driver per SKIN,
+    // which is what made two instances of one character impossible.
+    EXPECT_NE(w.animators_of(a)[0].get(), w.animators_of(b)[0].get());
+    // No .anim pack on disk: both are invalid (bind pose), never null.
+    EXPECT_FALSE(w.animators_of(a)[0]->valid());
+    // Despawning one leaves the other's animator untouched.
+    w.despawn(a);
+    EXPECT_EQ(w.animators_of(b).size(), 1u);
+    EXPECT_TRUE(w.animators_of(a).empty());
+}
+
+}  // namespace

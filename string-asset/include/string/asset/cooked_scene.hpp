@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string_view>
 #include <filesystem>
 #include <vector>
 
@@ -38,9 +39,18 @@ struct CookedScene
     std::vector<CookedSkin> skins;
     std::vector<glm::mat4> inverse_bind;         // glTF skin.joints[] order, per CookedSkin window
     std::vector<uint32_t> joint_remap;           // glTF joint -> ozz joint, per CookedSkin window
+    std::vector<char> names;                     // v5: NUL-terminated name blob (byte 0 = '\0')
     uint32_t total_meshlets = 0;
     uint64_t source_content_hash = 0;
     uint32_t chunk_max_meshlets = 0;             // the budget this scene was cooked with
+
+    // The name a name_offset points at, bounds-checked. 0 (or a baked scene with no blob) reads
+    // as the empty string — unnamed is a state, not an error.
+    std::string_view name_at(uint32_t offset) const
+    {
+        if (offset == 0 || offset >= names.size()) return {};
+        return std::string_view(&names[offset]);   // blob entries are NUL-terminated by the writer
+    }
 };
 
 // Parse a cooked blob back into a CookedScene. Returns false on a bad magic / version / stride

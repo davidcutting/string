@@ -4,10 +4,12 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <unordered_map>
 #include <span>
 #include <string_view>
 #include <vector>
 
+#include <string/anim/anim.hpp>
 #include <string/core/vertex.hpp>
 #include <string/gpu/residency_manager.hpp>
 #include <string/gpu/resource.hpp>
@@ -145,6 +147,11 @@ public:
     const material& material_of(material_id id) const { return materials_[id.index]; }
     const skin_binding& skin_of(skin_id id) const { return skins_[id.index]; }
 
+    // The deduped runtime animation set for a skin: one load per .anim pack, shared by every
+    // skin and every spawned instance (the old app driver deserialized the pack once PER SKIN).
+    // nullptr = no pack / failed load (callers degrade to bind pose).
+    std::shared_ptr<::string::anim::AnimSet> anim_set(skin_id id);
+
     // Resolved bindless slots (stable under streaming: only the sampler's minLod moves).
     uint32_t texture_slot(texture_id id) const { return texture_runtime_[id.index].slot; }
     uint32_t white_slot() const { return pool_ ? pool_->white_slot() : 0; }
@@ -200,6 +207,7 @@ private:
     std::vector<skin_binding> skins_;
 
     load_stats stats_;
+    std::unordered_map<std::string, std::shared_ptr<::string::anim::AnimSet>> anim_cache_;
 
     // --- texture runtime (index-aligned with textures_) -----------------------------------------
     struct texture_runtime

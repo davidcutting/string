@@ -41,6 +41,8 @@
 namespace string
 {
 
+class composite_pass;
+
 // Brief 20 — the renderer owns what is DERIVED from the graph, never what is declared in it.
 //
 // It does not own passes, does not own a graph, and does not author anything. The application
@@ -100,10 +102,12 @@ public:
     // Refill the debug snapshot from a compiled graph. Called by the app after it compiles.
     void publish_introspection(const compiled_frame& frame);
 
-    // Declare the headless capture onto the app's graph: which logical image it reads, and the pass
-    // that copies it. The transitions around that copy are DERIVED from the declaration, which is
-    // what retired the pair of hand-written ones that had to assume a layout.
-    void declare_capture(frame_graph& fg, gpu::image source);
+    // Declare the headless capture onto the app's graph: which logical image it reads, the pass
+    // that copies it, and the COMPOSITE it renders through — the writer applies that instance's
+    // display encode (exposure + LUT) on the CPU so the file matches the screen. The transitions
+    // around the copy are DERIVED from the declaration, which is what retired the pair of
+    // hand-written ones that had to assume a layout.
+    void declare_capture(frame_graph& fg, gpu::image source, const composite_pass* encode);
 
     // The OWNER half of a resize (brief 21 D3): the app re-backs its viewport-sized persistents
     // (the hiz depth-history ring) and re-points their handles via set_images. Called by resize()
@@ -169,6 +173,8 @@ private:
     // Always-on per-pass GPU timing feeding the in-game profiler HUD and the periodic
     // [frametime] log line. Independent of Tracy.
     gpu::image capture_source_{};
+    // The composite whose display encode the capture writer applies (see declare_capture).
+    const composite_pass* capture_encode_ = nullptr;
     // Filled by the declared capture pass; read (and written to disk) after that frame retires.
     gpu::resource_id capture_staging_ = 0;
     VkDeviceSize capture_staging_bytes_ = 0;

@@ -13,13 +13,18 @@
 #include <string/vulkan/engine_context.hpp>
 #include <string/vulkan/frame_graph.hpp>
 
-#include <string/render/geometry/geometry_scene.hpp>
+#include <string/render/scene_bridge.hpp>
 #include <string/render/lighting_data.hpp>
 #include <string/render/meshlet_data.hpp>
 #include <string/render/probe_gi.hpp>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
+
+namespace string
+{
+class composite_pass;
+}
 
 namespace string::render
 {
@@ -113,7 +118,8 @@ public:
     // cube, no view, no sampler and no bindless slot. `scene_samples` is the MSAA sample count of the
     // scene attachments the debug spheres draw into (engine_context no longer supplies one: the app
     // declares the scene attachments, so the app is what chooses the sample count).
-    probe_gi_component(string::engine_context& ctx, GeometryScene* scene,
+    probe_gi_component(string::engine_context& ctx, const scene_bridge* bridge,
+                       const ibl_component* ibl, const string::composite_pass* composite,
                        VkSampleCountFlagBits scene_samples);
     ~probe_gi_component();
 
@@ -175,7 +181,10 @@ private:
     ::string::gpu::device* device_ = nullptr;
     ::string::gpu::resource_allocator* allocator_ = nullptr;   // scene meshlet heaps + the table staging
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
-    GeometryScene* scene_ = nullptr;
+    const scene_bridge* bridge_ = nullptr;
+    const ibl_component* ibl_ = nullptr;
+    // Exposure source for the probe debug view (ctor-injected; never null).
+    const string::composite_pass* composite_ = nullptr;
 
     // The declared handles, latched by declare(). Logical, never physical.
     resources res_{};

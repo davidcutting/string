@@ -60,7 +60,6 @@ build_args += public_args
 deps = [
     dependency('threads'),
     dependency('spdlog', static : true),
-    dependency('fastgltf'),   # built via CMake integration; pulls its own simdjson
     dependency('glm'),
     dependency('entt'),
     # Vulkan headers only — no loader link. volk loads the loader dynamically at runtime,
@@ -82,15 +81,6 @@ if not vma_dep.found()
     endif
 endif
 deps += vma_dep
-
-# --- simdjson (fastgltf's dependency) ----------------------------------------
-# Only linked when a *system* simdjson is present. The fastgltf wrap bundles its own
-# simdjson (self-contained), so off-nix this is absent and skipped; a system/nixpkgs
-# fastgltf, however, does not bundle it and needs simdjson linked alongside.
-simdjson_dep = dependency('simdjson', required : false)
-if simdjson_dep.found()
-    deps += simdjson_dep
-endif
 
 # --- volk (Vulkan meta-loader) -----------------------------------------------
 # Provided by the volk wrap (header-only; the engine compiles the impl in driver.cpp).
@@ -288,7 +278,14 @@ static_target = static_library(
     cpp_args : build_args
 )
 
-install_subdir('include/string', install_dir : 'include')
+# The public API is the installed tree MINUS the headers only this library's .cpps include:
+# vk_check (error-reporting internals) and the wayland WSI backend. They lived under include/
+# for the src tree's include-path convenience and were ACCIDENTAL API — nothing outside
+# string-core references either (verified before excluding). resource_state.hpp stays installed
+# because frame_graph.hpp (public) embeds a resource_state_tracker; it is structurally public.
+install_subdir('include/string', install_dir : 'include',
+               exclude_files : [ 'gpu/vk_check.hpp' ],
+               exclude_directories : [ 'platform/wayland' ])
 # NOTE: assets are intentionally NOT copied here
 
 # --------------------------------------------------

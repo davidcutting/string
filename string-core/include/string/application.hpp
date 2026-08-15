@@ -37,6 +37,18 @@ public:
     /// Closes the application
     void close();
 
+    /// Anchor an app-level service (asset registry, game state) to the application's teardown
+    /// order. Type-erased on purpose: string-core cannot name string-scene types, but it IS the
+    /// only place that knows the one legal destruction order — adopted services die in
+    /// ~Application AFTER the scene's passes (which record against their GPU state) and BEFORE
+    /// the renderer (whose allocator their destructors free through). Services survive scene
+    /// switches; that is the point of adopting them here instead of capturing them in a scene.
+    /// Destroyed in reverse adoption order.
+    void adopt(std::shared_ptr<void> service) { adopted_.push_back(std::move(service)); }
+
+    /// The info initialize() ran with, with the platform-derived directories filled in.
+    const ApplicationInfo& info() const { return info_; }
+
 private:
     /// A handle for the application's window.
     std::shared_ptr<Window> window_;
@@ -49,6 +61,10 @@ private:
     std::function<void(float)> tick_;
     /// A window resize latched by the event callback, applied between frames in run().
     std::optional<View::Extent> pending_resize_;
+    /// App-level services anchored to the teardown order (see adopt()).
+    std::vector<std::shared_ptr<void>> adopted_;
+    /// The resolved ApplicationInfo (empty directory fields filled from the platform).
+    ApplicationInfo info_;
     /// Whether or not the application is/should be running.
     bool application_running_ = true;
     /// Whether or not a frame should be rendered

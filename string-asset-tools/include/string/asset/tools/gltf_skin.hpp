@@ -35,6 +35,9 @@ struct SkinCook
     std::vector<glm::vec3> skin_anim_min;
     std::vector<glm::vec3> skin_anim_max;
 
+    // v5: authored skin names (glTF skin.name), indexed like `skins`.
+    std::vector<std::string> names;
+
     // The serialized `.anim` pack (see string/anim/anim_pack.hpp). Empty when no skins.
     std::vector<uint8_t> anim_pack;
     uint32_t clip_count = 0;

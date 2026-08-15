@@ -7,7 +7,7 @@
 #include <string/vulkan/engine_context.hpp>
 #include <string/vulkan/frame_graph.hpp>
 
-#include <string/render/geometry/geometry_scene.hpp>
+#include <string/render/scene_bridge.hpp>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
@@ -36,7 +36,7 @@ namespace string::render
 class gtao_chain
 {
 public:
-    gtao_chain(string::engine_context& ctx, GeometryScene* scene);
+    gtao_chain(string::engine_context& ctx, const scene_bridge* bridge);
     ~gtao_chain();
 
     gtao_chain(const gtao_chain&) = delete;
@@ -79,7 +79,7 @@ private:
 
     ::string::gpu::device* device_ = nullptr;
     ::string::gpu::descriptor_table* descriptors_ = nullptr;
-    GeometryScene* scene_ = nullptr;
+    const scene_bridge* bridge_ = nullptr;
     uint32_t frames_in_flight_ = 0;
 
     glm::uvec2 size_{ 0, 0 };

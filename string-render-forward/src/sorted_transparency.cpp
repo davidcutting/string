@@ -33,11 +33,11 @@ sorted_transparency::list_layout sorted_transparency::layout_for(uint32_t max_dr
     return l;
 }
 
-sorted_transparency::sorted_transparency(string::engine_context& ctx, GeometryScene* scene, VkSampleCountFlagBits samples)
+sorted_transparency::sorted_transparency(string::engine_context& ctx, const scene_bridge* bridge, VkSampleCountFlagBits samples)
 : device_(&ctx.device)
 , allocator_(&ctx.allocator)
 , descriptors_(&ctx.descriptor_table)
-, scene_(scene)
+, bridge_(bridge)
 {
     samples_ = samples;
     // Blend, no depth write, two-sided (transparent surfaces show their back faces).
@@ -89,25 +89,25 @@ sorted_transparency::~sorted_transparency()
 
 void sorted_transparency::ensure()
 {
-    if (ready_ || scene_ == nullptr) return;
-    if (scene_->draw_count_ == 0 || scene_->draw_info_mapped_ == nullptr
-        || scene_->cull_max_draws_ == 0)
+    if (ready_ || bridge_ == nullptr) return;
+    if (bridge_->frame().draw_count_ == 0 || bridge_->frame().draw_info_mapped_ == nullptr
+        || bridge_->frame().cull_max_draws_ == 0)
         return;
     ready_ = true;
 
     // The blend-flagged draws, collected once from the DrawInfo table the meshlet build filled.
     blend_draws_.clear();
-    for (uint32_t i = 0; i < scene_->base_draw_count_; ++i)
-        if (scene_->draw_info_mapped_[i].flags & kDrawFlagBlend) blend_draws_.push_back(i);
+    for (uint32_t i = 0; i < bridge_->frame().base_draw_count_; ++i)
+        if (bridge_->frame().draw_info_mapped_[i].flags & kDrawFlagBlend) blend_draws_.push_back(i);
 
-    layout_ = layout_for(scene_->cull_max_draws_);
+    layout_ = layout_for(bridge_->frame().cull_max_draws_);
 }
 
 uint32_t sorted_transparency::build_list(void* mapped)
 {
-    GeometryScene& s = *scene_;
+    const scene_frame& s = bridge_->frame();
     if (blend_draws_.empty() || mapped == nullptr) return 0;
-    const glm::vec3 eye = s.camera_.position();
+    const glm::vec3 eye = s.camera_pos;
 
     // Sort a scratch copy back-to-front (farthest first) by squared distance eye->draw center.
     std::vector<std::pair<float, uint32_t>> order;
@@ -172,16 +172,16 @@ void sorted_transparency::declare(::string::frame_graph& fg, ::string::gpu::imag
       // reads default to FRAGMENT; a skinned blended draw would otherwise be under-barriered).
       .reads(scene_data)
       .reads(scene_data, access::storage_read, VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
-    if (scene_ != nullptr && scene_->joint_palette_.valid())
-        transparency.reads(scene_->joint_palette_, access::storage_read,
+    if (bridge_ != nullptr && bridge_->frame().joint_palette_.valid())
+        transparency.reads(bridge_->frame().joint_palette_, access::storage_read,
                            VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT);
     // The registry's content heaps (assets::gpu_view, latched into the scene tables): the blended
     // draws pull geometry through the same task/mesh path as the opaque phases.
-    if (scene_ != nullptr)
+    if (bridge_ != nullptr)
     {
-        const ::string::gpu::buffer heaps[] = { scene_->vertex_buffer_, scene_->meshlet_buffer_,
-                                                scene_->meshlet_vertices_,
-                                                scene_->meshlet_triangles_, scene_->skin_buffer_ };
+        const ::string::gpu::buffer heaps[] = { bridge_->frame().vertex_buffer_, bridge_->frame().meshlet_buffer_,
+                                                bridge_->frame().meshlet_vertices_,
+                                                bridge_->frame().meshlet_triangles_, bridge_->frame().skin_buffer_ };
         for (const ::string::gpu::buffer& h : heaps)
         {
             if (!h.valid()) continue;
@@ -202,15 +202,15 @@ void sorted_transparency::record(::string::pass_context& ctx, ::string::gpu::buf
                                  ::string::gpu::buffer scene_data, ::string::gpu::buffer stats)
 {
     ensure();
-    if (scene_ == nullptr || program_ == nullptr || !ready_) return;
-    GeometryScene& s = *scene_;
+    if (bridge_ == nullptr || program_ == nullptr || !ready_) return;
+    const scene_frame& s = bridge_->frame();
     if (s.draw_count_ == 0 || s.draw_info_mapped_ == nullptr) return;
 
     const uint32_t count = build_list(ctx.mapped(list));
     if (count == 0) return;
 
     const ::string::gpu::pipeline& tp = program_->current();
-    const glm::mat4 vp = s.camera_.view_proj();
+    const glm::mat4 vp = s.view_proj;
 
     MeshletPush push{};
     push.view_proj = vp;
@@ -223,7 +223,7 @@ void sorted_transparency::record(::string::pass_context& ctx, ::string::gpu::buf
     push.scene = ctx.address(scene_data);
     push.stats = ctx.address(stats);
     push.records = ctx.address(list) + layout_.records_off;   // compacted {draw_index, lod=0}, back-to-front
-    push.camera_pos = s.mesh_cull_frozen_ ? s.mesh_frozen_camera_pos_ : s.camera_.position();
+    push.camera_pos = s.mesh_cull_frozen_ ? s.mesh_frozen_camera_pos_ : s.camera_pos;
     push.debug_view = static_cast<uint32_t>(s.debug_view_);
     // No HiZ occlusion for transparent draws: transparent surfaces are frequently coplanar with (or
     // just in front of) the opaque geometry that built the pyramid, where the conservative HiZ test

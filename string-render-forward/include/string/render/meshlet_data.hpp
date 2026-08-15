@@ -151,9 +151,8 @@ struct MeshOverlayStats
     uint32_t total_meshlets = 0;
     uint32_t draw_count = 0;
 
-    // Brief 06: camera + scene snapshot for the debug-line pass and the scene/draw inspector.
-    glm::mat4 view_proj{ 1.0f };
-    glm::vec3 camera_pos{ 0.0f };
+    // Brief 06 inspector tables (the debug-line pass reads its camera from the bridge's frame
+    // snapshot now, not from here).
     std::vector<InspectorDraw> draws;   // rebuilt when the draw set changes (load / crowd toggle)
     std::vector<InspectorLight> lights; // refreshed each frame (lights animate)
 };

@@ -39,6 +39,8 @@ struct mesh_part
     // When skinned: skin-stream index = global vertex index + this signed delta (the compact
     // skin heap idiom from brief 23). 0 for static parts.
     int32_t skin_delta = 0;
+    // v5: the authored name from the cooked name blob (node/mesh name; empty = unnamed).
+    std::string name;
 };
 
 // The RUNTIME material record: texture references are handles, not file-local ints, so a material
@@ -56,6 +58,8 @@ struct material
     texture_id occlusion{};
     ::string::asset::CookedAlphaMode alpha_mode = ::string::asset::CookedAlphaMode::Opaque;
     bool double_sided = false;
+    // v5: the authored material name (empty = unnamed).
+    std::string name;
 };
 
 // A texture the registry knows about. At this stage of the migration it is the source reference
@@ -77,6 +81,8 @@ struct skin_binding
     uint32_t ibm_offset = 0;      // window into registry inverse_bind()
     uint32_t remap_offset = 0;    // window into registry joint_remap()
     std::filesystem::path anim_pack;
+    // v5: the authored skin name (empty = unnamed).
+    std::string name;
 };
 
 // One loaded asset: a name plus contiguous ranges into the registry's global tables. Handed out

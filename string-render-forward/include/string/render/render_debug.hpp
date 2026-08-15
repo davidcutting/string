@@ -4,6 +4,11 @@
 
 #include <string/render/meshlet_data.hpp>
 
+namespace string::scene
+{
+class world;
+}
+
 namespace string::render
 {
 
@@ -30,9 +35,12 @@ public:
     // `stats` may be null (a scene with no geometry pass) — then nothing is added.
     void hud_rows(::string::ui::Ui& p, const MeshOverlayStats* stats) const;
 
-    // The scene/draw inspector panel's contents: virtualized draw table + light list, with
-    // hover/selection driving in-world debug-draw highlights.
-    void inspector(::string::ui::Ui& p, const MeshOverlayStats* stats);
+    // The scene/draw inspector panel's contents: entity list (enumerated from the WORLD — the
+    // scene layer is the authority on what exists), virtualized draw table + light list, with
+    // hover/selection driving in-world debug-draw highlights. `world` may be null (a scene
+    // without one) — then only the renderer-side tables show.
+    void inspector(::string::ui::Ui& p, const MeshOverlayStats* stats,
+                   const ::string::scene::world* world = nullptr);
 
 private:
     int selected_draw_ = -1;

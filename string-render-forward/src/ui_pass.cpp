@@ -259,11 +259,13 @@ void ui_pass::make_ring(std::vector<Ring>& ring, std::uint32_t frames_in_flight,
 }
 
 ui_pass::ui_pass(engine_context& context, VkSampleCountFlagBits samples,
+                 const string::composite_pass* composite,
                  std::shared_ptr<::string::dynamic_font_atlas> atlas,
                  Author author, PostLayout post_layout, DeferredAuthor deferred)
 : device_(context.device)
 , allocator_(context.allocator)
 , descriptor_table_(context.descriptor_table)
+, composite_(composite)
 , atlas_(std::move(atlas))
 , author_(std::move(author))
 , post_layout_(std::move(post_layout))
@@ -910,7 +912,7 @@ void ui_pass::record(::string::pass_context& ctx)
     // multiply the whole frame by the EV100 exposure scale before the tonemap LUT. Pre-divide the
     // UI colors by that same scale (same frame, same value the composite's record() reads) so the
     // exposure cancels and the console/HUD keep their authored brightness at any scene EV.
-    const float inv_exposure = 1.0f / string::composite_pass::exposure_scale();
+    const float inv_exposure = 1.0f / composite_->exposure_scale();
 
     // The atlas's bindless slot, resolved from THIS pass's own declaration of it (.reads(atlas_handle_)) —
     // never handed in from outside, never latched at init.

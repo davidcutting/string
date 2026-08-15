@@ -152,18 +152,6 @@ uint16_t float_to_half(float f)
     return uint16_t(sign | (uint32_t(exp) << 10) | (man >> 13));
 }
 
-// The active pass instance (there is exactly one, renderer-owned) + the published auto EV, for
-// the static exposure_scale()/encode_display() the capture writer shares.
-composite_pass* s_active = nullptr;
-const std::vector<float>* s_lut = nullptr;
-uint32_t s_lut_size = 0;
-string::core::tonemap::Curve s_curve{};
-string::core::tonemap::Grading s_grading{};
-float s_auto_ev100 = 0.0f;
-bool s_auto_valid = false;
-float s_override_ev100 = 0.0f;
-bool s_override_active = false;
-
 }  // namespace
 
 composite_pass::composite_pass(string::engine_context& ctx, VkFormat color_format)
@@ -226,13 +214,10 @@ composite_pass::composite_pass(string::engine_context& ctx, VkFormat color_forma
     grading_from_cvars();
 
 
-    s_active = this;
 }
 
 composite_pass::~composite_pass()
 {
-    s_active = nullptr;
-    s_lut = nullptr;
     if (lut_image_ != 0)
     {
         descriptor_table_.unbind(lut_image_, string::gpu::descriptor_type::TEXTURE);
@@ -335,11 +320,6 @@ void composite_pass::bake_and_upload_lut(bool first)
     }
     transfer_.upload_image(rgba.data(), rgba.size() * sizeof(uint16_t), lut_image_);
 
-    s_lut = &lut_cpu_;
-    s_lut_size = lut_size_;
-    s_curve = baked_curve_;
-    s_grading = baked_grading_;
-
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     STRING_LOG_INFO("[tonemap] {} {} LUT {}^3 ({}x{} strip) in {} ms{}",
@@ -349,35 +329,35 @@ void composite_pass::bake_and_upload_lut(bool first)
                     baked_grading_.neutral() ? "" : " (graded)");
 }
 
-float composite_pass::exposure_scale()
+float composite_pass::exposure_scale() const
 {
     // Calibration override (white furnace) beats both auto and manual — the gate needs a pinned,
     // scene-independent exposure.
-    const float ev100 = s_override_active
-        ? s_override_ev100
-        : (exposure_auto_cvar().get() && s_auto_valid) ? s_auto_ev100 : ev100_cvar().get();
+    const float ev100 = override_active_
+        ? override_ev100_
+        : (exposure_auto_cvar().get() && auto_valid_) ? auto_ev100_ : ev100_cvar().get();
     return 1000.0f / (1.2f * std::exp2(ev100));
 }
 
 void composite_pass::set_exposure_override(float ev100, bool active)
 {
-    s_override_ev100 = ev100;
-    s_override_active = active;
+    override_ev100_ = ev100;
+    override_active_ = active;
 }
 
 void composite_pass::set_auto_ev100(float ev100)
 {
-    s_auto_ev100 = ev100;
-    s_auto_valid = true;
+    auto_ev100_ = ev100;
+    auto_valid_ = true;
 }
 
-glm::vec3 composite_pass::encode_display(glm::vec3 hdr)
+glm::vec3 composite_pass::encode_display(glm::vec3 hdr) const
 {
     const glm::vec3 exposed = glm::max(hdr, glm::vec3(0.0f)) * exposure_scale();
-    if (s_lut && !s_lut->empty())
-        return string::core::tonemap::sample_lut(*s_lut, s_lut_size, exposed);
+    if (!lut_cpu_.empty())
+        return string::core::tonemap::sample_lut(lut_cpu_, lut_size_, exposed);
     // Pre-first-bake fallback (never hit in a normal frame loop): the exact transform.
-    return string::core::tonemap::transform(s_curve, s_grading, exposed);
+    return string::core::tonemap::transform(baked_curve_, baked_grading_, exposed);
 }
 
 void composite_pass::tick()

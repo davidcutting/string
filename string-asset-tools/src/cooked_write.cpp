@@ -30,6 +30,7 @@ std::vector<uint8_t> write_cooked(const CookedScene& scene)
     plan[kSecSkins]         = { scene.skins.size(),             sizeof(CookedSkin),     scene.skins.data() };
     plan[kSecInverseBind]   = { scene.inverse_bind.size(),      sizeof(glm::mat4),      scene.inverse_bind.data() };
     plan[kSecJointRemap]    = { scene.joint_remap.size(),       sizeof(uint32_t),       scene.joint_remap.data() };
+    plan[kSecNames]         = { scene.names.size(),             sizeof(char),           scene.names.data() };
 
     // Header value-initialized so its padding bytes are zero (determinism).
     CookedHeader header{};

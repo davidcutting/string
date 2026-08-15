@@ -79,7 +79,6 @@ void geometry_pass::build_meshlet_gpu(engine_context& context)
     const uint32_t max_draws = bridge_.max_rows();
     // GPU-written stats, read back one frame late. Brief 20: the stats ring is an APP-DECLARED graph
     // buffer; the passes that write it declare it and resolve its address through pass_context.
-    stats_readback_.resize(frames_in_flight_);
 
     // --- Brief 04c (resolution b): GPU meshlet worklist buffers (per frame in flight). Each worklist
     // packs, at 16B-aligned regions: counts[max_draws] (uint), offsets[max_draws] (uint, scratch),
@@ -133,6 +132,11 @@ void geometry_pass::build_meshlet_gpu(engine_context& context)
         .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY,
         .allocation_flags = {},
     });
+
+    // Publish the shared technique state into the bridge frame: the shadow cascades + the
+    // transparency pass consume the worklist layout/capacity, and scene sizing (the app's backing)
+    // reads cull_max_draws_ from the frame.
+    bridge_.set_worklists(wl_layout_, cull_max_draws_, visbits_buffer_);
 
     // Brief 20: the sorted-transparency list buffers are owned by sorted_transparency, which builds
     // them in the same compacted shape from the same BLEND flags.
@@ -291,7 +295,7 @@ void geometry_pass::declare_cull(string::frame_graph& fg, string::gpu::buffer st
           .writes(wl_.cascade[c])
           .writes(stats)
           .toggle([this, ready, c] {
-              return ready() && shadow != nullptr && c < shadow->cascade_count();
+              return ready() && c < bridge_.frame().settings_.cascade_count;
           })
           .compute([this, stats, c](string::pass_context& ctx) {
               record_draw_cull(ctx, stats, static_cast<int>(c));
@@ -337,7 +341,7 @@ void geometry_pass::declare_expand(string::frame_graph& fg)
     for (uint32_t c = 0; c < kMaxCascades; ++c)
         declare_list(kListCascade0 + c, "shadow" + std::to_string(c),
                      [this, ready, c] {
-                         return ready() && shadow != nullptr && c < shadow->cascade_count();
+                         return ready() && c < bridge_.frame().settings_.cascade_count;
                      });
 }
 
@@ -350,7 +354,7 @@ void geometry_pass::record_draw_cull(::string::pass_context& ctx, ::string::gpu:
     // draws outside the CASCADE's light sphere (never the camera frustum).
     ::string::gpu::command_recorder& recorder = ctx.rec;
     const bool shadow_pass = cascade >= 0;
-    if (shadow_pass && (shadow == nullptr || uint32_t(cascade) >= shadow->cascade_count())) return;
+    if (shadow_pass && uint32_t(cascade) >= bridge_.frame().settings_.cascade_count) return;
 
     const VkDeviceAddress opaque_base = ctx.address(wl_.opaque);
     const VkDeviceAddress twosided_base = ctx.address(wl_.twosided);
@@ -360,12 +364,12 @@ void geometry_pass::record_draw_cull(::string::pass_context& ctx, ::string::gpu:
 
     const float lod_error_px = cv_lod_error_px().get();   // CVar r.lod.error_px (STRING_LOD_PX alias)
     const float half_h = screen_size.height * 0.5f;
-    const float focal = half_h / std::tan(glm::radians(camera_.fov_degrees() * 0.5f));
+    const float focal = half_h / std::tan(glm::radians(bridge_.frame().fov_degrees * 0.5f));
 
     const ::string::gpu::pipeline& cp = draw_cull_program_->current();
     DrawCullPush cull{};
     // Freeze-aware inputs: when F is held EVERY camera-derived cull input comes from the frozen pose.
-    cull.cull_view_proj = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : camera_.view_proj();
+    cull.cull_view_proj = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : bridge_.frame().view_proj;
     cull.draws = allocator_.get_buffer(draw_info_buffer_).device_address;
     if (shadow_pass)
     {
@@ -395,7 +399,7 @@ void geometry_pass::record_draw_cull(::string::pass_context& ctx, ::string::gpu:
     cull.force_lod0 = 0u;                                       // (dead: brief 04d deleted the LOD0 prepass)
     cull.isolate_draw = cv_isolate_draw().get();               // brief 06: >=0 keeps only that draw
     cull.frustum_cull = cull_enabled_ ? 1u : 0u;              // C toggle disables DRAW-level camera cull
-    cull.camera_pos = mesh_cull_frozen_ ? mesh_frozen_camera_pos_ : camera_.position();
+    cull.camera_pos = mesh_cull_frozen_ ? mesh_frozen_camera_pos_ : bridge_.frame().camera_pos;
     cull.lod_error_px = lod_error_px;
     cull.focal = focal;
     // Histogram only on the camera opaque/twosided pass (not shadow) — matches pre-04c meaning.
@@ -403,8 +407,8 @@ void geometry_pass::record_draw_cull(::string::pass_context& ctx, ::string::gpu:
     cull.shadow_mode = (shadow_pass && cull_enabled_) ? 1u : 0u;
     if (shadow_pass)
     {
-        cull.shadow_center = cascade_center_[cascade];
-        cull.shadow_radius = cascade_cull_radius_[cascade];
+        cull.shadow_center = bridge_.frame().cascade_center_[cascade];
+        cull.shadow_radius = bridge_.frame().cascade_cull_radius_[cascade];
     }
     recorder.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
     recorder.push_constants(cp.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(DrawCullPush), &cull);
@@ -488,7 +492,7 @@ void geometry_pass::record_meshlet_draws(::string::pass_context& ctx, const ::st
     if (wl_id == 0) return;
     if (current_frame >= hiz_.size()) return;
 
-    const glm::mat4 vp = camera_.view_proj();
+    const glm::mat4 vp = bridge_.frame().view_proj;
     const glm::mat4 cull_vp = mesh_cull_frozen_ ? mesh_frozen_view_proj_ : vp;
     const HizPyramid& hz = hiz_[current_frame];
     const bool hiz_ready = hiz_enabled_ && hz.mips != 0;
@@ -510,7 +514,7 @@ void geometry_pass::record_meshlet_draws(::string::pass_context& ctx, const ::st
     push.records = base + wl_layout_.records_off;
     // Frozen-aware eye: cone backface + HiZ nearest-point tests must use the SAME eye the frustum
     // froze from, or freeze-cull mixes live/frozen inputs (visible as bogus culling when flying).
-    push.camera_pos = mesh_cull_frozen_ ? mesh_frozen_camera_pos_ : camera_.position();
+    push.camera_pos = mesh_cull_frozen_ ? mesh_frozen_camera_pos_ : bridge_.frame().camera_pos;
     push.debug_view = static_cast<uint32_t>(debug_view_);
     // Brief 04d: phase 1 renders bit-set (last-frame-visible) meshlets with NO HiZ test (the pyramid
     // isn't built yet); phase 2 tests the bit-clear complement against the freshly-built pyramid. Phase

@@ -138,7 +138,7 @@
             meson
             ninja
             pkg-config
-            cmake         # lets Meson's cmake dependency method read fastgltf's config (no .pc)
+            cmake         # meson's cmake dependency method (ozz subproject; formerly fastgltf too)
             glslang       # glslangValidator, for GLSL -> SPIR-V
           ];
 
@@ -151,8 +151,8 @@
             vulkan-memory-allocator    # vk_mem_alloc.h
             vulkan-volk                # volk.h (impl compiled in src/gpu/driver.cpp)
             shader-slang               # libslang runtime (shader.hpp)
-            fastgltf                   # glTF 2.0 importer (custom derivation below; not in nixpkgs)
-            simdjson                   # system fastgltf does not bundle simdjson; link it alongside
+            # fastgltf/simdjson are gone from here on purpose: the importer is TOOL-SIDE now
+            # (string-asset-tools) — the engine core builds without any source-asset format.
             ozz-animation              # skeletal animation runtime (custom derivation; brief 23)
           ];
 

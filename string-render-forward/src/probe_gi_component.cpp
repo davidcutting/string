@@ -157,14 +157,18 @@ glm::vec4 probe_origin_spacing(const ProbeVolume& v) { return glm::vec4(v.origin
 
 // --- construction --------------------------------------------------------------------------------
 
-probe_gi_component::probe_gi_component(engine_context& ctx, GeometryScene* scene,
+probe_gi_component::probe_gi_component(engine_context& ctx, const scene_bridge* bridge,
+                                       const ibl_component* ibl,
+                                       const string::composite_pass* composite,
                                        VkSampleCountFlagBits scene_samples)
 : device_(&ctx.device)
 , allocator_(&ctx.allocator)
 , descriptor_set_(ctx.descriptor_table.get_set())
-, scene_(scene)
+, bridge_(bridge)
+, ibl_(ibl)
+, composite_(composite)
 {
-    probe_volume_ = fit_volume(scene_->scene_aabb_min_, scene_->scene_aabb_max_);
+    probe_volume_ = fit_volume(bridge_->frame().scene_aabb_min_, bridge_->frame().scene_aabb_max_);
 
     // ANALYTIC capture distance-cull radius (derived, not tuned). The visibility atlas only ever
     // answers Chebyshev queries from shading points inside a probe's ADJACENT cells (the 8-probe
@@ -179,7 +183,7 @@ probe_gi_component::probe_gi_component(engine_context& ctx, GeometryScene* scene
     // open sky. Acceptable for Sponza-class scenes.
     if (probe_volume_.valid)
     {
-        const glm::vec3 ext = scene_->scene_aabb_max_ - scene_->scene_aabb_min_;
+        const glm::vec3 ext = bridge_->frame().scene_aabb_max_ - bridge_->frame().scene_aabb_min_;
         const glm::vec3 sp = probe_volume_.spacing;
         const float r_vis = glm::length(sp) + 0.5f * std::max(sp.x, std::max(sp.y, sp.z))
                           + 0.75f * std::min(sp.x, std::min(sp.y, sp.z));
@@ -291,8 +295,8 @@ probe_gi_component::probe_gi_component(engine_context& ctx, GeometryScene* scene
     // staging the one-shot gi.clear pass copies from, so the upload is a declared transfer with a
     // derived edge into the capture task shader rather than a construction-time submit.
     const std::vector<glm::uvec2> mdraw = capture_table(
-        scene_->draw_info_mapped_ != nullptr
-            ? std::span<const GpuDrawInfo>(scene_->draw_info_mapped_, scene_->active_draw_count_)
+        bridge_->frame().draw_info_mapped_ != nullptr
+            ? std::span<const GpuDrawInfo>(bridge_->frame().draw_info_mapped_, bridge_->frame().active_draw_count_)
             : std::span<const GpuDrawInfo>{});
     probe_total_meshlets_ = static_cast<uint32_t>(mdraw.size());
     table_bytes_ = sizeof(glm::uvec2) * std::max<size_t>(mdraw.size(), 1);
@@ -309,14 +313,12 @@ probe_gi_component::probe_gi_component(engine_context& ctx, GeometryScene* scene
     else std::copy(mdraw.begin(), mdraw.end(), dst);
     STRING_LOG_INFO("[gi] capture dispatch domain: {} coarse-LOD meshlets over {} draws "
                     "(per-probe task groups: {})", probe_total_meshlets_,
-                    scene_->active_draw_count_, (probe_total_meshlets_ + 31u) / 32u);
+                    bridge_->frame().active_draw_count_, (probe_total_meshlets_ + 31u) / 32u);
 
-    scene_->gi = this;
 }
 
 probe_gi_component::~probe_gi_component()
 {
-    if (scene_ != nullptr) scene_->gi = nullptr;
     const auto kill = [this](::string::gpu::shader_program* prog) {
         if (prog == nullptr) return;
         const ::string::gpu::pipeline& p = prog->current();
@@ -390,8 +392,8 @@ void probe_gi_component::declare(::string::frame_graph& fg, const resources& res
         // The registry's content heaps (assets::gpu_view, latched into the scene tables): the
         // capture's meshlet path pulls geometry exactly like the main phases.
         for (const ::string::gpu::buffer& h :
-             { scene_->vertex_buffer_, scene_->meshlet_buffer_, scene_->meshlet_vertices_,
-               scene_->meshlet_triangles_ })
+             { bridge_->frame().vertex_buffer_, bridge_->frame().meshlet_buffer_, bridge_->frame().meshlet_vertices_,
+               bridge_->frame().meshlet_triangles_ })
         {
             if (!h.valid()) continue;
             capture.reads(h, ::string::access::storage_read,
@@ -471,7 +473,7 @@ void probe_gi_component::tick()
     const bool enabled = cv_gi_enabled().get();
     debug_mode_ = enabled ? static_cast<uint32_t>(std::max(0, cv_gi_probe_debug().get())) : 0u;
 
-    if (scene_ == nullptr || !probe_volume_.valid || !enabled || scene_->ibl == nullptr)
+    if (false || !probe_volume_.valid || !enabled || ibl_ == nullptr)
     {
         capture_count_ = 0;
         relight_runs_ = false;
@@ -483,8 +485,8 @@ void probe_gi_component::tick()
     // relight goes idle until the next trigger (~0 static-sun cost). Relight depends on the sky-SH
     // (miss/fallback source), so the IBL must have primed first.
     constexpr float kSunDeltaCos = 0.999998477f;   // cos(0.1 deg) — matches the IBL trigger
-    const float align = glm::dot(glm::normalize(scene_->sun_dir_), relit_sun_dir_);
-    if (scene_->ibl->primed() && (!primed_ || cv_ibl_every_frame().get() || align < kSunDeltaCos))
+    const float align = glm::dot(glm::normalize(bridge_->frame().env.sun_dir), relit_sun_dir_);
+    if (ibl_->primed() && (!primed_ || cv_ibl_every_frame().get() || align < kSunDeltaCos))
     {
         relight_passes_left_ = kRelightConvergePasses;
         relight_pending_ = true;
@@ -498,7 +500,7 @@ void probe_gi_component::tick()
     const uint32_t total = probe_volume_.total();
     const uint32_t total_work = total * 2;
     const bool capture_ready = clear_program_ != nullptr && capture_program_ != nullptr
-                            && collapse_program_ != nullptr && scene_->draw_info_mapped_ != nullptr;
+                            && collapse_program_ != nullptr && bridge_->frame().draw_info_mapped_ != nullptr;
     capture_base_ = capture_cursor_;
     // The bake may start in the SAME frame the init pass runs: gi.clear is authored first and the
     // edges into it are real (the table the capture reads, the atlases the collapse writes), so the
@@ -517,7 +519,7 @@ void probe_gi_component::tick()
     // their capture landed. It also guarantees the CSM shadow maps this slot samples have been
     // rendered at least once.
     relight_runs_ = captured_ && relight_pending_ && relight_program_ != nullptr
-                 && scene_->ibl->primed() && sky_sh_.valid() && scene_data_.valid();
+                 && ibl_->primed() && sky_sh_.valid() && scene_data_.valid();
     if (!relight_runs_) return;
 
     relight_base_ = relight_cursor_;
@@ -530,7 +532,7 @@ void probe_gi_component::tick()
     {
         relight_cursor_ = 0;
         primed_ = true;
-        relit_sun_dir_ = glm::normalize(scene_->sun_dir_);
+        relit_sun_dir_ = glm::normalize(bridge_->frame().env.sun_dir);
         if (relight_passes_left_ > 0) --relight_passes_left_;
         relight_pending_ = relight_passes_left_ > 0;
     }
@@ -565,7 +567,7 @@ void probe_gi_component::record_clear(::string::pass_context& ctx)
     cp.cap_gbuf_slot = ctx.slot(res_.capture_gbuf);
     cp.cap_albedo_slot = ctx.slot(res_.capture_albedo);
     cp.vis_slot = ctx.slot(res_.visibility);
-    cp.far_distance = glm::length(scene_->scene_aabb_max_ - scene_->scene_aabb_min_);
+    cp.far_distance = glm::length(bridge_->frame().scene_aabb_max_ - bridge_->frame().scene_aabb_min_);
 
     const ::string::gpu::pipeline& p = clear_program_->current();
     rec.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
@@ -603,11 +605,11 @@ void probe_gi_component::record_capture(::string::pass_context& ctx, uint32_t sl
     // The geometry heaps are the scene's, not this pass's: they are long-lived allocator resources
     // every meshlet path pushes by address (the same shape shadow_maps uses).
     ProbeRasterPush push{};
-    push.vertices = ctx.address(scene_->vertex_buffer_);
-    push.meshlets = ctx.address(scene_->meshlet_buffer_);
-    push.mverts = ctx.address(scene_->meshlet_vertices_);
-    push.mtris = ctx.address(scene_->meshlet_triangles_);
-    push.draws = allocator_->get_buffer(scene_->draw_info_buffer_).device_address;
+    push.vertices = ctx.address(bridge_->frame().vertex_buffer_);
+    push.meshlets = ctx.address(bridge_->frame().meshlet_buffer_);
+    push.mverts = ctx.address(bridge_->frame().meshlet_vertices_);
+    push.mtris = ctx.address(bridge_->frame().meshlet_triangles_);
+    push.draws = allocator_->get_buffer(bridge_->frame().draw_info_buffer_).device_address;
     push.mdraw = ctx.address(res_.meshlet_table);
     push.probe_pos = probe_pos;
     push.meshlet_count = probe_total_meshlets_;
@@ -641,7 +643,7 @@ void probe_gi_component::record_collapse(::string::pass_context& ctx, uint32_t s
     cp.cap_gbuf_slot = ctx.slot(res_.capture_gbuf);
     cp.cap_albedo_slot = ctx.slot(res_.capture_albedo);
     cp.vis_slot = ctx.slot(res_.visibility);
-    cp.far_distance = glm::length(scene_->scene_aabb_max_ - scene_->scene_aabb_min_);
+    cp.far_distance = glm::length(bridge_->frame().scene_aabb_max_ - bridge_->frame().scene_aabb_min_);
     cp.cube_albedo_slot = ctx.slot(res_.cube_albedo);
     cp.cube_nd_slot = ctx.slot(res_.cube_nd);
     cp.probe_pos = probe_volume_.origin + glm::vec3(c) * probe_volume_.spacing;
@@ -670,11 +672,11 @@ void probe_gi_component::record_relight(::string::pass_context& ctx)
     push.origin_spacing = probe_origin_spacing(probe_volume_);
     push.spacing = glm::vec4(probe_volume_.spacing, 0.0f);
     push.counts = glm::uvec4(probe_volume_.counts, probe_volume_.total());
-    push.sun_dir = glm::vec4(glm::normalize(scene_->sun_dir_), scene_->sun_intensity_);
-    push.sun_color = glm::vec4(scene_->sun_color_,
+    push.sun_dir = glm::vec4(glm::normalize(bridge_->frame().env.sun_dir), bridge_->frame().env.sun_intensity);
+    push.sun_color = glm::vec4(bridge_->frame().env.sun_color,
         relight_first_ ? 0.0f : std::clamp(cv_gi_hysteresis().get(), 0.0f, 0.99f));
-    push.sky_zenith = glm::vec4(scene_->sky_zenith_, 0.0f);
-    push.sky_ground = glm::vec4(scene_->sky_ground_, 0.0f);
+    push.sky_zenith = glm::vec4(bridge_->frame().env.sky_zenith, 0.0f);
+    push.sky_ground = glm::vec4(bridge_->frame().env.sky_ground, 0.0f);
     push.cap_gbuf_slot = ctx.slot(res_.capture_gbuf);
     push.cap_albedo_slot = ctx.slot(res_.capture_albedo);
     push.irrad_prev_slot = ctx.slot(res_.irradiance, ::string::access::sampled_read);
@@ -706,13 +708,13 @@ void probe_gi_component::record_debug(::string::pass_context& ctx)
     const ::string::gpu::pipeline& p = debug_program_->current();
 
     ProbeDebugPush push{};
-    push.view_proj = scene_->camera_.view_proj();
+    push.view_proj = bridge_->frame().view_proj;
     const float min_sp = std::min(probe_volume_.spacing.x,
                                   std::min(probe_volume_.spacing.y, probe_volume_.spacing.z));
     push.origin_spacing = glm::vec4(probe_volume_.origin, min_sp * 0.15f);   // sphere radius
     push.spacing = glm::vec4(probe_volume_.spacing, 0.0f);
     push.counts = glm::uvec4(probe_volume_.counts, debug_mode_);   // 1 grey, 2 irradiance, 3 vis
-    push.camera_pos = glm::vec4(scene_->camera_.position(), composite_pass::exposure_scale());
+    push.camera_pos = glm::vec4(bridge_->frame().camera_pos, composite_->exposure_scale());
     push.irrad_slot = ctx.slot(res_.irradiance);
     push.vis_slot = ctx.slot(res_.visibility);
     push.active = ctx.address(res_.active);
@@ -734,7 +736,7 @@ void probe_gi_component::record_debug(::string::pass_context& ctx)
 // atlas is zero-cleared before that — sampling it would darken instead of falling back).
 void probe_gi_component::fill_scene_data(SceneData& scene, ::string::pass_context& ctx) const
 {
-    const bool on = probe_volume_.valid && cv_gi_enabled().get() && !scene_->furnace_
+    const bool on = probe_volume_.valid && cv_gi_enabled().get() && !bridge_->frame().env.furnace
                  && captured_ && primed_;
     scene.probe_origin = probe_volume_.origin;
     scene.probe_spacing = probe_volume_.spacing;

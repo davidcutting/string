@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <filesystem>
 #include <vector>
 
@@ -54,18 +56,30 @@ struct SkinSource
     // AABB/bounds of every draw referencing that skin (GltfDraw::skin).
     std::vector<glm::vec3> skin_anim_min;
     std::vector<glm::vec3> skin_anim_max;
+    // v5: authored skin names (glTF skin.name), indexed like `skins`; empty = all unnamed.
+    std::vector<std::string> names;
 };
+
+// Intern `name` into the scene's v5 name blob and return its byte offset (0 for the empty
+// string — unnamed). Seeds the blob's leading '\0' on first use. Append-only and deterministic:
+// identical intern sequences produce identical blobs.
+uint32_t intern_cooked_name(CookedScene& scene, std::string_view name);
 
 // Core bake entry (procgen-shaped): meshletize + LOD-chain + optional spatial chunking of the
 // flattened geometry. `vertices`/`indices`/`draws` are the flatten output (indices are transient —
 // consumed here, never serialized). Returns a CookedScene with geometry sections filled and
 // source_content_hash set; the CALLER fills materials/textures (front-end policy). Deterministic:
 // identical inputs -> identical output arrays (padding zeroed, no iteration-order nondeterminism).
+// `draw_names` (v5) is empty or parallel to `draws` — authored names for the inspector. GltfDraw
+// itself stays a POD (content_hash folds its raw bytes; a std::string member would make that
+// nondeterministic), so names ride beside the draw list. Chunk-split pieces inherit their parent
+// draw's name.
 CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
                        const std::vector<uint32_t>& indices,
                        const std::vector<GltfDraw>& draws,
                        const BakeParams& params,
-                       const SkinSource& skin = {});
+                       const SkinSource& skin = {},
+                       const std::vector<std::string>& draw_names = {});
 
 // glTF front-end: parse + flatten + bake + fill materials/textures. Produces a complete CookedScene
 // for one source glTF (textures reference paths relative to the glTF's directory). This is the

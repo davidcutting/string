@@ -64,7 +64,9 @@ render_lib = static_library(
         'src/grid_2d_pass.cpp',
         'src/render_cvars.cpp',
         'src/render_debug.cpp',
+        'src/forward_renderer.cpp',
         'src/scene_bridge.cpp',
+        'src/scene_uniforms.cpp',
     ],
     include_directories : include_dir,
     dependencies : [ string_dep, ui_dep, asset_dep, scene_dep ],
@@ -72,6 +74,18 @@ render_lib = static_library(
 )
 
 install_subdir('include/string', install_dir : 'include')
+
+# pkg-config, so an OFF-MESON client (CMake, plain make) can resolve this library and its
+# String siblings by name; meson consumers keep using the subproject override.
+pkg_mod = import('pkgconfig')
+pkg_mod.generate(
+    name : meson.project_name(),
+    filebase : meson.project_name(),
+    description : 'String engine forward+ renderer preset + pass stack',
+    libraries : render_lib,
+    requires : [ 'string-core', 'string-ui', 'string-asset', 'string-scene' ],
+    version : meson.project_version(),
+)
 
 project_deps = declare_dependency(
     include_directories : include_dir,

@@ -616,6 +616,7 @@ SkinCook cook_skins(const GltfParsed& parsed, const GltfGeometry& geometry)
         out.skin_anim_min.push_back(bound_min);
         out.skin_anim_max.push_back(bound_max);
         out.skins.push_back(cooked);
+        out.names.push_back(std::move(skin_name));   // v5
     }
 
     // --- Quantize the vertex stream ----------------------------------------------------------

@@ -9,6 +9,7 @@
 #include <string/ui/widgets.hpp>
 
 #include <string/render/render_cvars.hpp>
+#include <string/scene/world.hpp>
 
 namespace string::render
 {
@@ -43,12 +44,36 @@ void RenderDebug::hud_rows(::string::ui::Ui& p, const MeshOverlayStats* mesh_sta
         + std::to_string(mesh_stats->lights.size()));
 }
 
+// The ENTITY list, enumerated from the world (brief 18/S8: the scene layer is the authority on
+// what exists; the draw table below is the renderer's derived view of it).
+static void entity_rows(::string::ui::Ui& p, const ::string::scene::world& world)
+{
+    using namespace ::string::ui;
+    const std::span<const ::string::scene::entity> live = world.entities();
+    p.text(p.own("entities: " + std::to_string(live.size()))).color(theme().text_dim).font(14);
+    const int emax = std::min<int>(8, static_cast<int>(live.size()));
+    for (int i = 0; i < emax; ++i)
+    {
+        const ::string::scene::entity e = live[i];
+        const std::string_view name = world.name_of(e);
+        const uint64_t sid = world.server_id_of(e);
+        std::string row = "e" + std::to_string(e.index) + " "
+                        + (name.empty() ? std::string("(unnamed)") : std::string(name));
+        if (sid != 0) row += " sid=" + std::to_string(sid);
+        p.text(p.own(std::move(row))).color(theme().text).font(13).width(grow());
+    }
+    if (static_cast<int>(live.size()) > emax)
+        p.text(p.own("… +" + std::to_string(live.size() - emax) + " more"))
+         .color(theme().text_dim).font(13);
+}
+
 // Default rect, named because BOTH the panel and its row-budget calculation need it (the store is
 // keyed on it, and reading the stored rect is how the table sizes itself to the panel). Must match
 // the rect string-debug opens the inspector panel with.
 static constexpr ::string::ui::panel_rect kInspectorRect{ 820.0f, 16.0f, 360.0f, 460.0f };
 
-void RenderDebug::inspector(::string::ui::Ui& p, const MeshOverlayStats* mesh_stats)
+void RenderDebug::inspector(::string::ui::Ui& p, const MeshOverlayStats* mesh_stats,
+                            const ::string::scene::world* world)
 {
     using namespace ::string::ui;
 
@@ -57,6 +82,8 @@ void RenderDebug::inspector(::string::ui::Ui& p, const MeshOverlayStats* mesh_st
         p.text("no scene loaded").color(theme().text_dim).font(15);
         return;
     }
+
+    if (world != nullptr) entity_rows(p, *world);
 
     const int isolate = cv_isolate_draw().get();
     p.text(p.own("hover to highlight · wheel to scroll · isolate=" + std::to_string(isolate)))
@@ -71,7 +98,7 @@ void RenderDebug::inspector(::string::ui::Ui& p, const MeshOverlayStats* mesh_st
     // scrolling a fixed window inside a bigger box. Read from the store, so one frame stale
     // during an active resize drag — invisible at drag speed.
     static const table_column kCols[] = {
-        { "idx", 44 }, { "meshlets", 74 }, { "lod", 36 }, { "res", 34 } };
+        { "idx", 40 }, { "name", 120 }, { "meshlets", 64 }, { "lod", 32 }, { "res", 30 } };
     const panel_state& st = p.panels().panel(make_id("dbg_inspector").hash, kInspectorRect);
     const auto rows = static_cast<std::size_t>(
         std::clamp((st.rect.height - 150.0f) / 22.0f, 3.0f, 60.0f));
@@ -93,8 +120,9 @@ void RenderDebug::inspector(::string::ui::Ui& p, const MeshOverlayStats* mesh_st
          switch (col)
          {
              case 0: std::snprintf(buf, sizeof(buf), "%u", d.index); break;
-             case 1: std::snprintf(buf, sizeof(buf), "%u", d.meshlet_count); break;
-             case 2: std::snprintf(buf, sizeof(buf), "%u", d.lod_count); break;
+             case 1: std::snprintf(buf, sizeof(buf), "%s", d.name.c_str()); break;
+             case 2: std::snprintf(buf, sizeof(buf), "%u", d.meshlet_count); break;
+             case 3: std::snprintf(buf, sizeof(buf), "%u", d.lod_count); break;
              default: std::snprintf(buf, sizeof(buf), "%s", d.resident ? "Y" : "-"); break;
          }
          c.text(c.own(std::string(buf)))

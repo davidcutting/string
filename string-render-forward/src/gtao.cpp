@@ -20,15 +20,14 @@ namespace string::render
 {
 using namespace string;
 
-gtao_chain::gtao_chain(string::engine_context& ctx, GeometryScene* scene)
+gtao_chain::gtao_chain(string::engine_context& ctx, const scene_bridge* bridge)
 : device_(&ctx.device)
 , descriptors_(&ctx.descriptor_table)
-, scene_(scene)
-, frames_in_flight_(scene->frames_in_flight_)
+, bridge_(bridge)
+, frames_in_flight_(ctx.frames_in_flight)
 {
     // Published so GeometryPass's SceneData can read runs()/size(). The AO IMAGE is not published:
     // its consumer declares its own read and resolves the slot through pass_context.
-    scene_->gtao = this;
 
     // No vkCreateSampler: the linear-clamp configuration the half-res upsample needs is declared on
     // the targets themselves (image_info::sampler), so bind() writes the right descriptor by itself.
@@ -58,7 +57,6 @@ gtao_chain::gtao_chain(string::engine_context& ctx, GeometryScene* scene)
 
 gtao_chain::~gtao_chain()
 {
-    if (scene_ != nullptr) scene_->gtao = nullptr;
     if (device_ == nullptr) return;
     const auto destroy_program = [this](::string::gpu::shader_program* prog) {
         if (prog == nullptr) return;
@@ -80,7 +78,7 @@ uint16_t gtao_chain::prev_slot(uint16_t current_frame) const
 void gtao_chain::tick(VkExtent2D extent, uint16_t current_frame)
 {
     runs_this_frame_ = false;
-    if (scene_ == nullptr) return;
+    if (bridge_ == nullptr) return;
 
     if (extent.width != 0 && extent.height != 0)
     {
@@ -95,11 +93,11 @@ void gtao_chain::tick(VkExtent2D extent, uint16_t current_frame)
     }
 
     // r.furnace validates the BRDF against an analytic environment, so AO must be off under it.
-    const bool allowed = cv_gtao_enabled().get() && !scene_->furnace_;
+    const bool allowed = cv_gtao_enabled().get() && !bridge_->frame().env.furnace;
     const uint16_t prev = prev_slot(current_frame);
     runs_this_frame_ = allowed && program_ != nullptr && denoise_program_ != nullptr
         && size_.x != 0 && size_.y != 0
-        && prev < scene_->depth_history_.size() && scene_->depth_history_[prev].valid != 0;
+        && prev < bridge_->depth_history().size() && bridge_->depth_history()[prev].valid != 0;
     if (runs_this_frame_) has_output_ = true;
     // STRING_STATS_LOG: name the conjunct keeping GTAO off (one line per second at 60fps).
     static const bool stats_log = std::getenv("STRING_STATS_LOG") != nullptr;
@@ -107,8 +105,8 @@ void gtao_chain::tick(VkExtent2D extent, uint16_t current_frame)
     if (stats_log && !runs_this_frame_ && (++gtao_log_frame % 60u) == 0u)
         STRING_LOG_INFO("[gtao] OFF: allowed {} program {} denoise {} size {}x{} prev {} hist_size {} valid {}",
                         allowed, program_ != nullptr, denoise_program_ != nullptr, size_.x, size_.y,
-                        prev, scene_->depth_history_.size(),
-                        prev < scene_->depth_history_.size() ? scene_->depth_history_[prev].valid : 999);
+                        prev, bridge_->depth_history().size(),
+                        prev < bridge_->depth_history().size() ? bridge_->depth_history()[prev].valid : 999);
 }
 
 // Author both halves of the chain.
@@ -145,12 +143,12 @@ void gtao_chain::declare(::string::frame_graph& fg, ::string::gpu::image depth_p
 
 bool gtao_chain::base_push(::string::pass_context& ctx, GtaoPush& out) const
 {
-    if (scene_ == nullptr) return false;
+    if (bridge_ == nullptr) return false;
     const uint16_t prev = prev_slot(static_cast<uint16_t>(ctx.frame_slot));
-    if (prev >= scene_->depth_history_.size() || scene_->depth_history_[prev].valid == 0) return false;
+    if (prev >= bridge_->depth_history().size() || bridge_->depth_history()[prev].valid == 0) return false;
     // The depth IMAGE comes from the graph (ctx.slot(depth_prev), in the caller); only the camera it
     // was rendered with is read here — CPU state captured alongside the slot, not a GPU resource.
-    const DepthHistorySlot& hist = scene_->depth_history_[prev];
+    const DepthHistorySlot& hist = bridge_->depth_history()[prev];
 
     const glm::mat4& proj = hist.proj;
     out = GtaoPush{};

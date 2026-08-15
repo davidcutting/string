@@ -29,7 +29,6 @@
 #include <string/render/probe_gi.hpp>
 #include <string/render/meshlet_builder.hpp>
 #include <string/render/render_cvars.hpp>
-#include <string/render/geometry/geometry_scene.hpp>
 #include <string/render/shadow_maps.hpp>
 #include <string/render/sorted_transparency.hpp>
 #include <string/render/gtao.hpp>
@@ -48,8 +47,9 @@ namespace string::render
 {
 
 // FroxelPush moved to geometry/froxel_component.hpp (brief 11 FroxelComponent extraction).
-// LightingSettings + the shared scene state moved to geometry/geometry_scene.hpp (brief 11 P2
-// GeometryScene extraction); GeometryPass privately inherits GeometryScene below.
+// GeometryScene is DELETED (scene-layer split): LightingSettings/WorklistSet/WorklistLayout/
+// DepthHistorySlot live in scene_bridge.hpp; scene state lives in the world.
+class scene_uniforms;
 
 // SkyPush moved to geometry/sky_component.hpp (brief 11 SkyComponent extraction).
 
@@ -210,8 +210,10 @@ struct ResetPush
 // primitive's transform and material inline. Content-agnostic — the model path is supplied by
 // the application, resolved under context.resources_path.
 // Brief 20: no base class. This is a plain object the application owns; its callbacks capture it.
-// It still privately inherits GeometryScene, which is shared technique state, not a graph concept.
-class geometry_pass final : private GeometryScene
+// GeometryScene is DELETED (scene-layer split): scene state lives in the world, the shared
+// per-frame surface is the bridge's scene_frame VALUE snapshot, and what remains here is the
+// meshlet technique's own state.
+class geometry_pass final
 {
     ::string::gpu::device& device_;
     ::string::gpu::resource_allocator& allocator_;
@@ -229,6 +231,42 @@ class geometry_pass final : private GeometryScene
     ::string::assets::registry& assets_;
     scene_bridge& bridge_;
 
+    // --- state that lived on the deleted GeometryScene base, now the technique's own -----------
+    // Mirrors of bridge/frame state, refreshed at construction + each tick so the record bodies
+    // read plain members (they run strictly after tick).
+    MeshletModel meshlet_model_;   // CPU meshlet tables (dump/diagnostics; the GPU side is the registry's)
+    uint32_t draw_count_ = 0;
+    uint32_t base_draw_count_ = 0;
+    uint32_t active_draw_count_ = 0;
+    ::string::gpu::resource_id draw_info_buffer_ = 0;
+    GpuDrawInfo* draw_info_mapped_ = nullptr;
+    glm::vec3 scene_aabb_min_{ 0.0f };
+    glm::vec3 scene_aabb_max_{ 0.0f };
+    VkExtent2D screen_size{ 0, 0 };
+    // Content-heap graph handles (latched from the registry's gpu_view).
+    ::string::gpu::buffer vertex_buffer_{};
+    ::string::gpu::buffer meshlet_buffer_{};
+    ::string::gpu::buffer meshlet_vertices_{};
+    ::string::gpu::buffer meshlet_triangles_{};
+    ::string::gpu::buffer skin_buffer_{};
+    ::string::gpu::buffer joint_palette_{};
+    // Worklist format + capacity (computed in build_meshlet_gpu, published to the bridge frame).
+    WorklistLayout wl_layout_;
+    uint32_t cull_max_draws_ = 0;
+    // Renderer debug toggles (key-driven; published to the bridge frame for the record-side
+    // consumers). hiz/lod live further down with the technique state that reads them.
+    bool cull_enabled_ = true;
+    bool mesh_cull_frozen_ = false;
+    glm::mat4 mesh_frozen_view_proj_{ 1.0f };
+    glm::vec3 mesh_frozen_camera_pos_{ 0.0f };
+    int debug_view_ = 0;
+    bool froxel_heatmap_ = false;
+    uint16_t frames_in_flight_ = 0;
+    bool lookdev_ = false;
+    std::shared_ptr<MeshOverlayStats> overlay_stats_;
+    // The stats source (scene.upload owns the readback now); wired by the app.
+    const scene_uniforms* uniforms_ = nullptr;
+
     // Cascaded shadow maps. A depth-only prepass (ShadowPass) renders the scene from the sun's
     // orthographic view into cascade_count per-frame-in-flight D32 images (one per cascade), sampled
     // by the lit fragment shader with 5x5 PCF. Cascades are stabilized (texel-snapped) and refit each
@@ -239,16 +277,11 @@ class geometry_pass final : private GeometryScene
     // scene().ibl — GeometryPass reads sh_address/env/dfg slots for SceneData and probe GI reads the
     // SH. Probe GI is GiPass (scene().gi); shadow maps are ShadowPass (scene().shadow).
     // Recompute the per-cascade stabilized ortho fits from the live camera + sun (called per frame).
-    void compute_cascades();
 
     // --- Forward+ lighting: scene data + local lights + froxels --------------------------------
-    // Forward+ froxel light-binning is its own FroxelPass now (brief 11 step 3); the component it owns
-    // is published into GeometryScene (scene().froxel) so SceneData can read its grid dims + address.
-    void animate_lights(float delta_time);
-    struct LightAnim { glm::vec3 center; float radius; float speed; float phase; float height; };
-    std::vector<LightAnim> light_anim_;
-    bool froxel_heatmap_ = false;  // H toggles the froxel light-count heatmap
 
+    // The persistent per-meshlet visibility bitfield physical (graph handle minted in declare).
+    ::string::gpu::resource_id visbits_buffer_ = 0;
     // Scratch reused each frame: the visibility samples fed to the registry (frustum-visible parts
     // + their projected screen coverage — the registry turns coverage into texture mip wants).
     std::vector<::string::assets::visibility_sample> visibility_scratch_;
@@ -347,14 +380,7 @@ class geometry_pass final : private GeometryScene
     // Runtime state.
     bool hiz_enabled_ = true;        // O toggles two-pass HiZ occlusion on the meshlet path
     bool lod_enabled_ = true;        // (LOD select on by default)
-    // dbg.orbit motion lever: continuously sways the camera around a captured base pose so headless
-    // captures exercise per-frame disocclusion (the two-phase interleaved phase-1/phase-2 path).
-    // Base pose is latched on the first orbiting frame; the sway is applied AFTER camera_.update.
-    bool orbit_base_latched_ = false;
-    glm::vec3 orbit_base_pos_{ 0.0f };
-    float orbit_base_yaw_ = 0.0f;
-    float orbit_base_pitch_ = 0.0f;
-    float orbit_phase_ = 0.0f;       // accumulated angle (rad)
+    // (dbg.orbit moved to the app: it drives world.camera() now.)
     // Crowd stress scene (K): the base draws duplicated across a grid with varied transforms, to
     // prove 500+-crowd geometry throughput (brief M6). Crowd draws are extra DrawInfo entries that
     // reference the SAME meshlet buffers (only the transform differs); active_draw_count_ switches
@@ -394,18 +420,14 @@ class geometry_pass final : private GeometryScene
 
 
 public:
-    // Latest GPU culling stats (read back one frame late) for the UI overlay.
-    const GpuMeshStats& mesh_stats() const { return stats_latest_; }
+    // Latest GPU culling stats (read back one frame late by scene.upload) for the UI overlay.
+    const GpuMeshStats& mesh_stats() const;
 
     // The app's crowd hook (spawn/despawn the stress-scene entities in the world).
     void set_crowd_hook(std::function<void(bool)> hook) { crowd_hook_ = std::move(hook); }
 
-    // --- Brief 23: the skinning tables the app's animation driver needs, forwarded from their
-    // owners (palette windows: the bridge; IBM/remap tables: the asset registry) ----------------
-    std::span<const scene_bridge::skin_instance> skins() const { return bridge_.skins(); }
-    std::span<const glm::mat4> skin_inverse_bind() const { return assets_.inverse_bind(); }
-    std::span<const uint32_t> skin_joint_remap() const { return assets_.joint_remap(); }
-    // Ring sizing: total palette joints across all skins (mat4 units per frame slot).
+    // Ring sizing: the palette-ring joint BUDGET (mat4 units per frame slot; per-instance
+    // windows are the bridge's).
     uint32_t palette_joints_total() const { return bridge_.palette_joints_total(); }
     // `assets` is the app-owned asset registry with this scene's content already loaded (the app
     // loads models / generated content before constructing the pass); the pass renders EVERY mesh
@@ -496,7 +518,6 @@ public:
     // geometry.phase2 pass). When HiZ is off / warming up, two_phase_active_ is false: record() renders
     // everything single-pass and record_hiz()/record_phase2() no-op. These are ordinary public methods
     // now (the HizBuildPass / GeometryPhase2Pass sub-passes call them) — no base-Pass hooks.
-    void record_scene_upload(string::pass_context& ctx);
     void record_phase1(string::pass_context& ctx);
     // The three per-frame resets, one declared pass each (see declare()).
     void record_reset_lists(string::pass_context& ctx);
@@ -504,10 +525,8 @@ public:
     void record_reset_visbits(string::pass_context& ctx);
     void record_phase2(string::pass_context& ctx);
     bool two_phase_active() const { return two_phase_active_; }
-    // Brief 11 step 3: hand out the shared scene state (the privately-inherited GeometryScene) so the
-    // decomposed sub-passes (sky, ... ) reference it directly instead of reaching back into GeometryPass.
-    // GeometryPass keeps inheriting it (zero body churn); the upcast is legal from within this member.
-    GeometryScene* scene() { return this; }
+    // The stats source for the overlay publish (scene.upload owns the readback now); app-wired.
+    void set_uniforms(const scene_uniforms* uniforms) { uniforms_ = uniforms; }
     // Brief 11 step 2b: per-slot HiZ resources + the visibility bitfield, so the hiz.build / phase2
     // sub-passes declare real usages and the graph derives their barriers (resolve->read, pyramid
     // producer->consumer, phase1->phase2 bitfield RMW) instead of record_hiz hand-rolling them.

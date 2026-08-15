@@ -26,6 +26,11 @@
 
 #include <volk.h>
 
+namespace string
+{
+class composite_pass;
+}
+
 namespace string::render
 {
 
@@ -119,7 +124,9 @@ public:
     // glyphs are seen. `author` declares the whole UI (shapes + text) each frame. `samples` is the
     // MSAA sample count of the scene target this overlay draws into: pipeline fixed state, supplied
     // by the app exactly like composite_pass's colour format (engine_context no longer carries it).
+    // `composite` is the display chain this overlay pre-divides its colors against (see record).
     ui_pass(string::engine_context& context, VkSampleCountFlagBits samples,
+            const string::composite_pass* composite,
             std::shared_ptr<::string::dynamic_font_atlas> atlas,
             Author author, PostLayout post_layout = {}, DeferredAuthor deferred = {});
     ~ui_pass();
@@ -195,6 +202,8 @@ private:
     ::string::gpu::resource_allocator& allocator_;
     ::string::gpu::descriptor_table& descriptor_table_;
 
+    // The display chain this overlay pre-divides its colors against (ctor-injected; never null).
+    const string::composite_pass* composite_ = nullptr;
     std::shared_ptr<::string::dynamic_font_atlas> atlas_;
     Author author_;
     PostLayout post_layout_;

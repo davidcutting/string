@@ -145,4 +145,36 @@ TEST(AssetRegistry, AssetRangesAndBounds)
     EXPECT_EQ(rec->bounds_max(), glm::vec3(1.0f));
 }
 
+// v5 names: the cooked name blob survives the merge — parts/materials/skins carry the authored
+// name; offset 0 (or a scene with no blob at all) reads as unnamed, never as garbage.
+TEST(AssetRegistry, V5NamesSurviveTheMerge)
+{
+    CookedScene s = tiny_scene(10, true);
+    const auto intern = [&s](std::string_view n) {
+        if (s.names.empty()) s.names.push_back('\0');
+        const auto off = static_cast<uint32_t>(s.names.size());
+        s.names.insert(s.names.end(), n.begin(), n.end());
+        s.names.push_back('\0');
+        return off;
+    };
+    s.draws[0].name_offset = intern("hero_body");
+    s.materials[0].name_offset = intern("hero_skin_mat");
+    s.skins[0].name_offset = intern("hero_rig");
+
+    registry reg(registry_config{});
+    // An UNNAMED scene first, so the named one's parts land rebased (names must not be
+    // offset-coupled to table position).
+    reg.load_baked(tiny_scene(4, false), "plain");
+    const asset_id id = reg.load_baked(std::move(s), "named");
+    ASSERT_TRUE(id.valid());
+
+    const asset* rec = reg.get(id);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(reg.mesh_parts()[rec->first_mesh().index].name, "hero_body");
+    EXPECT_EQ(reg.materials()[rec->first_material().index].name, "hero_skin_mat");
+    EXPECT_EQ(reg.skins()[rec->first_skin().index].name, "hero_rig");
+    // The unnamed scene's records stay empty, not aliased into someone else's blob.
+    EXPECT_TRUE(reg.mesh_parts()[0].name.empty());
+}
+
 }  // namespace

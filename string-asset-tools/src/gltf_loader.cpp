@@ -243,6 +243,7 @@ GltfParsed parse_gltf(const std::filesystem::path& path)
     for (const auto& material : asset.materials)
     {
         GltfMaterial out;
+        out.name = std::string(material.name);
         const auto& factor = material.pbrData.baseColorFactor;
         out.base_color_factor = { factor[0], factor[1], factor[2], factor[3] };
         out.metallic_factor = material.pbrData.metallicFactor;
@@ -271,6 +272,12 @@ GltfParsed parse_gltf(const std::filesystem::path& path)
     }
 
     return parsed;
+}
+
+// v5: the authored draw name — the NODE's (what the artist sees in the outliner), else the mesh's.
+static std::string draw_name_for(const fastgltf::Node& node, const fastgltf::Mesh& mesh)
+{
+    return !node.name.empty() ? std::string(node.name) : std::string(mesh.name);
 }
 
 GltfGeometry flatten_geometry(GltfParsed& parsed)
@@ -557,6 +564,9 @@ GltfGeometry flatten_geometry(GltfParsed& parsed)
                         world_max,
                         skinned ? static_cast<int32_t>(node.skinIndex.value()) : -1,
                     });
+                    // Parallel to model.draws by construction.
+                    model.draw_names.push_back(
+                        draw_name_for(node, asset.meshes[node.meshIndex.value()]));
                 }
             });
     }

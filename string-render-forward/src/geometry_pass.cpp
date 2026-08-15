@@ -21,6 +21,7 @@
 #include <string/core/logger.hpp>
 #include <string/gpu/command_recorder.hpp>
 #include <string/render/geometry_pass.hpp>
+#include <string/render/scene_uniforms.hpp>
 #include <string/render/render_cvars.hpp>
 #include <glm/gtc/constants.hpp>
 #include <string/gpu/pipeline_builder.hpp>
@@ -107,6 +108,27 @@ bool aabb_in_frustum(const glm::mat4& vp, const glm::vec3& mn, const glm::vec3& 
         }
     }
     return true;
+}
+
+// One inspector row: static per-draw geometry + the v5 authored name from the cooked blob (via
+// the bridge row's registry part); "draw N" only when unnamed.
+InspectorDraw make_inspector_draw(uint32_t d, const GpuDrawInfo& info,
+                                  std::span<const scene_bridge::row_meta> rows,
+                                  std::span<const ::string::assets::mesh_part> parts)
+{
+    const ::string::assets::mesh_part* part =
+        d < rows.size() && rows[d].mesh.index < parts.size() ? &parts[rows[d].mesh.index]
+                                                             : nullptr;
+    InspectorDraw id;
+    id.name = part != nullptr && !part->name.empty() ? part->name : "draw " + std::to_string(d);
+    id.index = d;
+    id.material =
+        part != nullptr && part->material.valid() ? static_cast<int32_t>(part->material.index) : -1;
+    id.meshlet_count = info.total_meshlets;
+    id.lod_count = info.lod_count;
+    id.aabb_min = info.center - glm::vec3(info.radius);
+    id.aabb_max = info.center + glm::vec3(info.radius);
+    return id;
 }
 
 }  // namespace
@@ -199,43 +221,26 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
     STRING_LOG_INFO("[scene] world bounds ({:.2f},{:.2f},{:.2f}) .. ({:.2f},{:.2f},{:.2f})",
                     aabb_min.x, aabb_min.y, aabb_min.z, aabb_max.x, aabb_max.y, aabb_max.z);
 
-    // Frame the whole model with the engine camera using the AABB computed above, then let it
-    // position itself to fit. Bind the conventional fly controls (WASD + Space/Ctrl + Shift) onto
-    // the shared InputMap so update() can read them by action name.
-    string::Camera::bind_default_controls(input_map_);
+    // The CAMERA is the world's now (scene-layer split): framing, the fly-control bindings, the
+    // STRING_CAM pose and the TOD/lights levers are the APP's to apply against world.camera()/
+    // env(). What this pass binds is its own renderer-debug keys.
+    (void)aabb_min;
+    (void)aabb_max;
     input_map_.bind_button("freeze_culling", string::KeyCode::F);
     input_map_.bind_button("toggle_culling", string::KeyCode::C);
     input_map_.bind_button("toggle_hiz", string::KeyCode::O);
     input_map_.bind_button("cycle_debug_view", string::KeyCode::V);
     input_map_.bind_button("toggle_crowd", string::KeyCode::K);
     input_map_.bind_button("toggle_lod", string::KeyCode::G);
-    camera_.frame_bounds(aabb_min, aabb_max);
 
-    // Brief 06: the improvised STRING_* levers are now CVar-backed (legacy env names kept as aliases,
-    // see debug_cvars.*). Seed the runtime-mutable toggles from the CVars; the F/C/O/L/V/G/K keys
-    // still flip the members live in update(). Recipes like STRING_HIZ=0 / STRING_CAM=... work verbatim.
+    // Brief 06: the improvised STRING_* levers are CVar-backed. Seed the runtime-mutable toggles;
+    // the F/C/O/V/G/K keys still flip the members live in tick().
     hiz_enabled_ = cv_hiz_enabled().get();
     lod_enabled_ = cv_lod_enabled().get();
     cull_enabled_ = cv_cull_enabled().get();
-    lights_enabled_ = cv_lights_enabled().get();
     debug_view_ = cv_debug_view().get();
-    // STRING_CAM="px,py,pz,yaw,pitch" (radians); empty CVar = keep the scene-framed default pose.
-    if (const std::string cam = cv_camera_pose().get(); !cam.empty())
-    {
-        glm::vec3 pos{}; float yaw = 0.0f, pitch = 0.0f;
-        if (std::sscanf(cam.c_str(), "%f,%f,%f,%f,%f", &pos.x, &pos.y, &pos.z, &yaw, &pitch) == 5)
-            camera_.set_pose(pos, yaw, pitch);
-    }
-    // r.crowd.enabled (STRING_CROWD) triggers the K-toggle crowd stress path at first update
-    // (headless benchmark). The build is deferred to update() (needs residency known).
+    // r.crowd.enabled (STRING_CROWD) arms the crowd hook at first tick (headless benchmark).
     crowd_enabled_ = cv_crowd_enabled().get();
-    // Brief 07: headless TOD sequence lever (the T key toggle, pre-armed).
-    sun_animate_ = cv_sun_animate().get();
-    // The lookdev probe scene reads material response under sun + sky IBL only — the local-light
-    // stress set would pollute it (L / STRING_LIGHTS=1 still re-enable it explicitly).
-    if (lookdev_ && std::getenv("STRING_LIGHTS") == nullptr) lights_enabled_ = false;
-    // (STRING_DRAW_MIN/MAX bisection removed with brief 03b: draws are now GPU-generated into one
-    //  indirect list, so a CPU draw-index window no longer maps to the dispatch loop.)
 
     // Brief 20: the hand-written `usages` vector is GONE. What this pass touches is stated once, in
     // declare(), and that single statement drives both ordering and barrier derivation.
@@ -255,10 +260,8 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
 
         // Debug controls: T animate sun (time-of-day), [ / ] scrub it, L toggle local lights,
         // H toggle the froxel heatmap.
-        input_map_.bind_button("sun_animate", string::KeyCode::T);
-        input_map_.bind_button("time_back", string::KeyCode::LEFT_BRACKET);
-        input_map_.bind_button("time_fwd", string::KeyCode::RIGHT_BRACKET);
-        input_map_.bind_button("toggle_lights", string::KeyCode::L);
+        // T/[/]/L (time-of-day + lights) are SCENE controls — the app binds them against
+        // world.env() now. The froxel heatmap stays: it is this renderer's debug view.
         input_map_.bind_button("toggle_heatmap", string::KeyCode::H);
     }
 }
@@ -339,43 +342,6 @@ geometry_pass::geometry_pass(engine_context& context, VkSampleCountFlagBits samp
 // use the main-queue context and produce bogus timestamps on the async queue).
 
 
-// Time-of-day 0..1 -> a sun direction arc (east low -> zenith -> west low) and the sky/sun palette.
-namespace
-{
-struct SunState { glm::vec3 dir; glm::vec3 sun_color; float sun_intensity; glm::vec3 sky_zenith; glm::vec3 sky_ground; };
-SunState sun_for_time(float t)
-{
-    // Great-circle day path: the sun rides a single TILTED CIRCLE from the east horizon, arcing up
-    // and leaning south, down to the west horizon — a natural wide arc (the old model computed a
-    // half-sine elevation and a linear azimuth INDEPENDENTLY, which isn't a circle and read as a
-    // steep "^" tent because the azimuth barely swept). `lean` (r.sun.lean) tilts the arc toward
-    // south: smaller = higher noon sun (~0 = straight overhead), larger = a lower, flatter arc.
-    const float p = t * glm::pi<float>();               // 0 (east horizon) .. pi (west horizon)
-    const float lean = cv_sun_lean().get();
-    glm::vec3 d(-std::cos(p),                            // east -> west
-                std::sin(p) * std::cos(lean),            // up (arcs over the day)
-                std::sin(p) * std::sin(lean));           // south lean
-    d.y = d.y * 0.94f + 0.06f;                           // keep the "never fully below horizon" floor
-    SunState s;
-    s.dir = glm::normalize(d);
-    // Warm at the horizon (sunrise/sunset), neutral-bright at noon. Drive off the actual elevation.
-    const float noon = glm::clamp(s.dir.y, 0.0f, 1.0f);
-    s.sun_color = glm::mix(glm::vec3(1.0f, 0.55f, 0.28f), glm::vec3(1.0f, 0.96f, 0.9f), noon);
-    // Brief 07 M4 units (self-consistent, "physical-ish"): illuminance in KILOLUX, luminance /
-    // radiance in KILO-NITS (1 unit = 1000 lx / 1000 cd/m^2 — see r.exposure.ev100 for the
-    // matching EV100 exposure). Sun: ~100 klx perpendicular at noon, ~7 klx at the horizon.
-    // Sky radiance: clear-day zenith ~6 knits at noon falling toward dusk (consistency: pi * mean
-    // sky radiance ~= 15-25 klx of diffuse skylight, the right fraction of the 100 klx global).
-    s.sun_intensity = glm::mix(7.0f, 100.0f, noon);
-    s.sky_zenith = glm::mix(glm::vec3(0.24f, 0.40f, 0.96f), glm::vec3(2.8f, 6.0f, 12.4f), noon);
-    // Ground band is a constant ALBEDO; its radiance is derived per-direction in the shader from
-    // the CURRENT sun + sky (sky_ground_radiance in sky.slang), so it dims/warms with time of day
-    // instead of radiating noon-warm at dusk. Calibrated to reproduce the old noon ground
-    // radiance (2.64, 2.28, 1.80 knits) at t=0.5.
-    s.sky_ground = glm::vec3(0.0824f, 0.0699f, 0.0503f);
-    return s;
-}
-}  // namespace
 
 
 
@@ -399,20 +365,17 @@ geometry_pass::~geometry_pass()
     destroy_program(expand_fill_program_);
     // Brief 09b probe GI programs.
 
-    // Brief 03 meshlet resources.
-    if (meshlet_model_.total_meshlets > 0)
-    {
-        // Brief 20: the HiZ pyramid and its per-mip slots are graph resources — nothing to unbind.
-        // Brief 21 D4: the work lists are graph transients — the graph frees them.
-        // The content heaps (vertex/meshlet/skin) and EVERY texture — streamed, stb-decoded and the
-        // white/flat-normal fallbacks — are owned and destroyed by the ASSET REGISTRY: one owner,
-        // one destructor, no set-difference over who created what.
-        allocator_.destroy_resource(draw_info_buffer_);
-    }
+    // Brief 20: the HiZ pyramid and its per-mip slots are graph resources — nothing to unbind.
+    // Brief 21 D4: the work lists are graph transients — the graph frees them.
+    // The content heaps + every texture are the ASSET REGISTRY's; the DrawInfo table is the SCENE
+    // BRIDGE's (it destroys it — destroying the wired copy here was a double-destroy).
 }
 
 void geometry_pass::tick(float delta_time, uint32_t current_frame)
 {
+    // Mirror this frame's presentation extent from the bridge snapshot FIRST — the HiZ shape below
+    // derives from it.
+    screen_size = bridge_.frame().screen_size;
     // The HiZ dispatch shape and the two-phase decision are CPU state, and they belong HERE rather
     // than inside a recording callback: the graph's toggles are evaluated at execute, which is after
     // tick, so a predicate reading state that a record body sets is reading last frame's answer.
@@ -422,42 +385,6 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
     // renders single-pass (phase 0), everything unconditionally — exactly like HiZ-off.
     two_phase_active_ = hiz_enabled_ && hiz_program_ != nullptr && stream_frame_ > 1;
 
-    const float aspect = screen_size.height == 0
-        ? 1.0f
-        : screen_size.width / static_cast<float>(screen_size.height);
-    camera_.update(input_map_, delta_time, aspect);
-
-    // dbg.orbit (STRING_ORBIT): continuously sway the camera around a latched base pose so headless
-    // captures exercise per-frame disocclusion — the two-phase phase-1/phase-2 interleaved path that
-    // no static capture reaches. Small radius + yaw/pitch sweep = enough new pixels each frame to make
-    // phase 2 non-empty. Applied AFTER camera_.update so it fully overrides the (idle) input path.
-    if (const float orbit_speed = cv_orbit().get(); orbit_speed != 0.0f)
-    {
-        if (!orbit_base_latched_)
-        {
-            orbit_base_pos_ = camera_.position();
-            orbit_base_yaw_ = camera_.yaw();
-            orbit_base_pitch_ = camera_.pitch();
-            orbit_base_latched_ = true;
-        }
-        orbit_phase_ += orbit_speed * delta_time;
-        // Small lateral/vertical circle around the base position + a coupled yaw/pitch sweep so both
-        // the eye point AND the view direction change every frame (maximal disocclusion, no degenerate
-        // pure-roll where the depth buffer barely changes).
-        const float radius = 0.35f;              // world units — small, enough for per-frame reveal
-        const float yaw_amp = 0.06f;             // radians (~3.4 deg) view sweep
-        const float pitch_amp = 0.03f;
-        const glm::vec3 pos = orbit_base_pos_
-            + glm::vec3(std::cos(orbit_phase_) * radius, std::sin(orbit_phase_ * 0.5f) * radius * 0.4f,
-                        std::sin(orbit_phase_) * radius);
-        camera_.set_pose(pos,
-                         orbit_base_yaw_ + std::sin(orbit_phase_) * yaw_amp,
-                         orbit_base_pitch_ + std::sin(orbit_phase_ * 0.7f) * pitch_amp);
-        // Re-run the matrix build with the swayed pose (update() built view_proj from the pre-sway
-        // pose). A zero-delta update with no input just rebuilds the matrices from the members.
-        camera_.update(input_map_, 0.0f, aspect);
-    }
-
     // Toggle the debug frozen culling frustum. On freeze, snapshot the current view-projection;
     // the camera keeps moving but the cull test stays against the snapshot, so culled geometry
     // becomes visible as it leaves the frozen view.
@@ -466,8 +393,8 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
         mesh_cull_frozen_ = !mesh_cull_frozen_;
         if (mesh_cull_frozen_)
         {
-            mesh_frozen_view_proj_ = camera_.view_proj();
-            mesh_frozen_camera_pos_ = camera_.position();  // cone/HiZ/LOD eye freezes too
+            mesh_frozen_view_proj_ = bridge_.frame().view_proj;
+            mesh_frozen_camera_pos_ = bridge_.frame().camera_pos;  // cone/HiZ/LOD eye freezes too
         }
         STRING_LOG_INFO("Cull frustum {}", mesh_cull_frozen_ ? "FROZEN (debug)" : "live");
     }
@@ -503,51 +430,19 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
         STRING_LOG_INFO("Crowd stress scene {}", crowd_enabled_ ? "ON" : "OFF");
     }
 
-    // --- Time-of-day sun + Forward+ debug controls ---
-    if (input_map_.pressed(debug_actions::sun_animate))
-    {
-        sun_animate_ = !sun_animate_;
-        STRING_LOG_INFO("Time-of-day {}", sun_animate_ ? "ANIMATING" : "paused");
-    }
-    if (sun_animate_) time_of_day_ = std::fmod(time_of_day_ + delta_time * 0.03f, 1.0f);
-    if (input_map_.held(debug_actions::time_back)) time_of_day_ = glm::clamp(time_of_day_ - delta_time * 0.15f, 0.0f, 1.0f);
-    if (input_map_.held(debug_actions::time_fwd))  time_of_day_ = glm::clamp(time_of_day_ + delta_time * 0.15f, 0.0f, 1.0f);
-    if (input_map_.pressed(debug_actions::toggle_lights))
-    {
-        lights_enabled_ = !lights_enabled_;
-        STRING_LOG_INFO("Local lights {}", lights_enabled_ ? "ON" : "OFF");
-    }
+    // (Time-of-day + lights keys moved to the app — they drive world.env() now.)
     if (input_map_.pressed(debug_actions::toggle_heatmap))
     {
         froxel_heatmap_ = !froxel_heatmap_;
         STRING_LOG_INFO("Froxel heatmap {}", froxel_heatmap_ ? "ON" : "OFF");
     }
-    // Brief 07: headless TOD pin (r.tod / STRING_TOD) — wins over the scrub keys/animation so
-    // captures are deterministic.
-    if (const float tod = cv_time_of_day().get(); tod >= 0.0f)
-        time_of_day_ = glm::clamp(tod, 0.0f, 1.0f);
-    // Brief 07 furnace test lever (r.furnace): shader-side it forces a uniform white environment
-    // + white albedo and skips sun/local lights; here it also drives the IBL capture + sky pass.
-    furnace_ = cv_furnace().get();
-    // The furnace PINS exposure (over auto AND manual) so a radiance-1 environment reads as flat
-    // white, not grey. Target is exposed = 4.0, NOT 1.0: filmic transforms map scene 1.0 to only
-    // ~80-85% display, so two stops up lands the flat field at display white through both tonemap
-    // curves while staying on the shoulder — non-uniformities, the gate's actual signal, stay visible.
-    string::composite_pass::set_exposure_override(std::log2(1000.0f / (1.2f * 4.0f)), furnace_);
-    // Drive the sun direction + sky palette from the time of day, then refit the cascades to the live
-    // camera + sun. Both move, so the cascades are recomputed every frame (stabilization keeps them
-    // from shimmering).
-    const SunState sun = sun_for_time(time_of_day_);
-    sun_dir_ = sun.dir;
-    sun_color_ = sun.sun_color;
-    sun_intensity_ = sun.sun_intensity;
-    sky_zenith_ = sun.sky_zenith;
-    sky_ground_ = sun.sky_ground;
-    if (draw_count_ > 0)
-    {
-        compute_cascades();
-        animate_lights(delta_time);
-    }
+    // (Time-of-day, sun palette + the cascade fit are the world's/bridge's now; the furnace
+    // exposure pin lives in scene_uniforms; light animation died with the vestigial stress set.)
+
+    // Publish this pass's cull-debug toggles into the bridge frame — the transparency pass and
+    // scene.upload read them at record, and the pass no longer shares a struct with anyone.
+    bridge_.set_cull_debug(cull_enabled_, mesh_cull_frozen_, mesh_frozen_view_proj_,
+                           mesh_frozen_camera_pos_, debug_view_, froxel_heatmap_);
 
     // The bridge already re-derived this frame's rows (the app ticks world -> bridge -> passes);
     // refresh the shared counts + the residency-driven visbits invalidation.
@@ -564,7 +459,7 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
     // visibility, through the asset registry (which owns the streamers, the budgets and the
     // texture-LOD heuristic): the pass reports "this part is on screen at this coverage", the
     // registry does the rest.
-    const glm::mat4 vp = camera_.view_proj();
+    const glm::mat4 vp = bridge_.frame().view_proj;
     assets_.begin_frame();
     visibility_scratch_.clear();
     const std::span<const scene_bridge::row_meta> rows = bridge_.rows();
@@ -589,13 +484,12 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
     // read back the stats the GPU wrote earlier + publish the overlay state. ---
     if (draw_info_mapped_)
     {
-        // stats_latest_ is refreshed at RECORD time by record_scene_upload (which has the
-        // pass_context this tick lacks); here we only publish it.
+        // The stats readback lives in scene.upload (scene_uniforms) now; publish its latest here.
 
         // Publish the overlay state for the UI author (shared_ptr seam; same render thread).
         if (overlay_stats_)
         {
-            overlay_stats_->stats = stats_latest_;
+            if (uniforms_ != nullptr) overlay_stats_->stats = uniforms_->stats_latest();
             overlay_stats_->hiz_enabled = hiz_enabled_;
             overlay_stats_->crowd_enabled = crowd_enabled_;
             overlay_stats_->debug_view = debug_view_;
@@ -606,26 +500,15 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
             // scene/draw inspector. view_proj/camera + lights refresh every frame; the draw table is
             // rebuilt only when its size changes (load / crowd toggle) — the per-draw geometry
             // (bounds, meshlet/LOD counts) is static, only the resident flag is live.
-            overlay_stats_->view_proj = camera_.view_proj();
-            overlay_stats_->camera_pos = camera_.position();
 
             if (draw_info_mapped_ && overlay_stats_->draws.size() != draw_count_)
             {
                 overlay_stats_->draws.clear();
                 overlay_stats_->draws.reserve(draw_count_);
                 for (uint32_t d = 0; d < draw_count_; ++d)
-                {
-                    const GpuDrawInfo& info = draw_info_mapped_[d];
-                    InspectorDraw id;
-                    id.name = "draw " + std::to_string(d);
-                    id.index = d;
-                    id.material = -1;
-                    id.meshlet_count = info.total_meshlets;
-                    id.lod_count = info.lod_count;
-                    id.aabb_min = info.center - glm::vec3(info.radius);
-                    id.aabb_max = info.center + glm::vec3(info.radius);
-                    overlay_stats_->draws.push_back(std::move(id));
-                }
+                    overlay_stats_->draws.push_back(
+                        make_inspector_draw(d, draw_info_mapped_[d], bridge_.rows(),
+                                            assets_.mesh_parts()));
             }
             // Live residency flag per draw (streamer writes it into draw_info_mapped_).
             if (draw_info_mapped_)
@@ -633,8 +516,8 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
                     overlay_stats_->draws[d].resident = draw_info_mapped_[d].resident != 0;
 
             overlay_stats_->lights.clear();
-            overlay_stats_->lights.reserve(lights_.size());
-            for (const GpuLight& L : lights_)
+            overlay_stats_->lights.reserve(bridge_.frame().lights.size());
+            for (const GpuLight& L : bridge_.frame().lights)
             {
                 InspectorLight il;
                 il.position = glm::vec3(L.position_radius);
@@ -649,7 +532,8 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
         // the smoke run captures meaningful frustum/cone/HiZ reductions without spamming.
         if (stream_frame_ == 30 || stream_frame_ == 120 || stream_frame_ == 600)
         {
-            const GpuMeshStats& s = stats_latest_;
+            static const GpuMeshStats none{};
+            const GpuMeshStats& s = uniforms_ != nullptr ? uniforms_->stats_latest() : none;
             // Brief 04d: with two-phase active, meshlets_total/after_frustum/after_cone DOUBLE-count
             // (the task shader runs once per phase per meshlet). after_hiz = phase1+phase2 DRAWN
             // (the union == the visible set); phase2 = the disocclusion complement drawn this frame.
@@ -662,13 +546,10 @@ void geometry_pass::tick(float delta_time, uint32_t current_frame)
             // Brief 04 M4: per-cascade shadow draw-cull. "before" = every resident draw dispatched for
             // every cascade (resident_draws x cascade_count); "after" = draws surviving the per-cascade
             // light-frustum reject (stats[9], summed across cascades).
-            const uint32_t shadow_before = active_draw_count_ * settings_.cascade_count;
+            const uint32_t shadow_before = active_draw_count_ * bridge_.settings().cascade_count;
             STRING_LOG_INFO("[shadow-cull] cascades {}: shadow draws {} -> {} (per-cascade light-sphere reject)",
-                            settings_.cascade_count, shadow_before, s.shadow_draws);
-            // Brief 07 amortization honesty: how many frames actually re-ran the IBL chain.
-            if (ibl != nullptr)
-                STRING_LOG_INFO("[ibl] frame {}: {} env updates so far ({} static sun -> 1 expected)",
-                                stream_frame_, ibl->update_count(), sun_animate_ ? "animating" : "");
+                            bridge_.settings().cascade_count, shadow_before, s.shadow_draws);
+            // (The IBL amortization log moved out with the back-pointer bus.)
         }
     }
 
@@ -835,27 +716,8 @@ void geometry_pass::declare(string::frame_graph& fg, string::gpu::image color, s
         visbits_ = fg.use_persistent(string::persistent_buffer_info{
             .name = "meshlet.visbits", .physical = { visbits_buffer_ } });
 
-    // SceneData + the light ring, written before anything reads them. Declaring this is what makes
-    // the froxel/shadow-slot addresses inside SceneData safe: they are resolved while this records,
-    // against this frame's backing, and every consumer's read is a derived edge against this write.
-    string::pass_spec upload = fg.pass("scene.upload");
-    upload.writes(scene_data).writes(lights)
-          .reads(gtao_ao).reads(env_prefiltered).reads(dfg_lut)
-          .reads(ibl_sh).reads(froxels);
-    // Brief 23: the palette ring. The CPU-side write safety is the RING (frames_in_flight
-    // physicals + the per-slot fence), not this declaration — declaring the write here is what
-    // orders the GPU-side readers and keeps this slot's address resolvable at record time.
-    if (joint_palette_.valid()) upload.writes(joint_palette_);
-    // The registry's skin heap: scene.upload resolves its address into SceneData, so it declares
-    // the handle (the mesh-stage consumption is declared on phase1/phase2 below with the rest of
-    // the heaps).
-    if (skin_buffer_.valid()) upload.reads(skin_buffer_, string::access::storage_read);
-    for (std::size_t c = 0; c < cascades.size(); ++c) upload.reads(cascades[c]);
-    // COMPUTE, not transfer: this pass records no GPU commands at all (it fills a host-visible ring
-    // and resolves slots), so its kind is nominal — but the kind picks the default stage for its
-    // reads, and a sampled read at the COPY stage is illegal. Compute is where those slots are
-    // legitimately readable.
-    upload.compute([this](string::pass_context& ctx) { record_scene_upload(ctx); });
+    // scene.upload is the scene_uniforms component's pass now (declared by the app immediately
+    // before this declare, preserving the authoring order).
 
     // Per-frame reset: zero the stats block and, on demand, the persistent visibility bitfield and
     // last-frame LOD. Authored BEFORE the cull so the graph derives reset->cull; without it the cull
@@ -1062,13 +924,13 @@ void geometry_pass::record_hiz_mip(string::pass_context& ctx, uint32_t m, string
     // matrices GTAO will reproject through when it consumes this slot NEXT frame. Rendering uses
     // the LIVE camera even under freeze-cull, so these are the true depth-buffer transforms.
     // Only on the last mip, so it happens once per frame rather than once per dispatch.
-    if (m + 1 == hz.mips && ctx.frame_slot < depth_history_.size())
+    if (m + 1 == hz.mips && ctx.frame_slot < bridge_.depth_history().size())
     {
-        DepthHistorySlot& h = depth_history_[ctx.frame_slot];
+        DepthHistorySlot& h = bridge_.depth_history()[ctx.frame_slot];
         h.valid = 1;
-        h.view = camera_.view();
-        h.view_proj = camera_.view_proj();
-        h.proj = camera_.view_proj() * glm::inverse(camera_.view());
+        h.view = bridge_.frame().view;
+        h.view_proj = bridge_.frame().view_proj;
+        h.proj = bridge_.frame().view_proj * glm::inverse(bridge_.frame().view);
     }
 }
 
@@ -1088,158 +950,10 @@ void geometry_pass::record_phase2(string::pass_context& ctx)
 }
 
 
-// Fill this frame's SceneData + light ring. A declared pass, because it WRITES two buffers the
-// lit draws read — so the graph derives that edge instead of it resting on update() ordering.
-void geometry_pass::record_scene_upload(string::pass_context& ctx)
+const GpuMeshStats& geometry_pass::mesh_stats() const
 {
-    const uint32_t current_frame = ctx.frame_slot;
-
-    // Read back the stats the GPU wrote when this slot last ran (frames_in_flight frames ago —
-    // its fence passed in begin_frame, so no stall). This must happen at RECORD time because only
-    // pass_context can resolve the slot's mapped pointer; tick() publishes the value it finds in
-    // stats_latest_. (Restores the readback the brief-20 rewrite stubbed out — the HUD, the
-    // inspector and every culling number were silently zero without it.)
-    if (stats_.valid() && draw_count_ > 0)
-    {
-        if (const void* stats_mapped = ctx.mapped(stats_))
-        {
-            std::memcpy(&stats_latest_, stats_mapped, sizeof(GpuMeshStats));
-            // STRING_STATS_LOG=1: periodic cull-funnel dump, for diagnosing meshlet loss without a
-            // GPU capture — which stage kills geometry shows up directly in the funnel.
-            static const bool log_stats = std::getenv("STRING_STATS_LOG") != nullptr;
-            static uint32_t stats_log_frame = 0;
-            if (log_stats && (++stats_log_frame % 60u) == 0u)
-            {
-                const GpuMeshStats& s = stats_latest_;
-                STRING_LOG_INFO("[stats] f{} total {} frustum {} cone {} hiz(drawn) {} phase2 {} "
-                                "shadow {} tris {}",
-                                stats_log_frame, s.meshlets_total, s.after_frustum, s.after_cone,
-                                s.after_hiz, s.phase2_drawn, s.shadow_draws, s.triangles);
-            }
-        }
-    }
-    // --- Forward+ per-frame GPU data (this frame's ring slot) ----------------------------------
-    if (draw_count_ > 0 && scene_data_.valid() && current_frame < frames_in_flight_)
-    {
-        // froxel index-buffer capacity is ensured in FroxelPass::update now (brief 11 step 3).
-
-        // Upload this frame's animated lights (or none, if the stress set is toggled off).
-        const uint32_t light_count = lights_enabled_ ? static_cast<uint32_t>(lights_.size()) : 0u;
-        if (light_count > 0)
-        {
-            std::memcpy(ctx.mapped(lights_buffer_), lights_.data(),
-                        sizeof(GpuLight) * light_count);
-        }
-
-        // Fill SceneData for this frame. The lit shader reads sun/ambient/CSM/froxel state from here.
-        SceneData scene{};
-        scene.camera_pos = camera_.position();
-        scene.exposure = string::composite_pass::exposure_scale();   // for display-referred debug views
-        scene.sun_dir = sun_dir_;
-        scene.sun_intensity = sun_intensity_;
-        scene.sun_color = sun_color_;
-        scene.ambient_sky = sky_zenith_;
-        // sky_ground_ is an ALBEDO now; mirror sky_ground_radiance() (sky.slang) so this field
-        // keeps its "hemispheric ambient, down" radiance meaning (unused by the lit shader since
-        // the brief-07 IBL, but kept coherent).
-        {
-            const float lum = glm::dot(sky_zenith_, glm::vec3(0.2126f, 0.7152f, 0.0722f));
-            const glm::vec3 horizon = glm::mix(sky_zenith_, glm::vec3(lum), 0.6f) * 2.0f;
-            const glm::vec3 e_sun = sun_color_ * sun_intensity_
-                                    * glm::clamp(glm::normalize(sun_dir_).y, 0.0f, 1.0f);
-            const glm::vec3 e_sky = glm::pi<float>() * 0.5f * (sky_zenith_ + horizon);
-            scene.ambient_ground = sky_ground_ / glm::pi<float>() * (e_sun + e_sky);
-        }
-        for (uint32_t c = 0; c < settings_.cascade_count; ++c)
-        {
-            scene.cascade_view_proj[c] = cascade_view_proj_[c];
-            scene.cascade_split[c] = glm::vec4(cascade_split_[c], 0, 0, 0);
-            scene.cascade_texel[c] = glm::vec4(cascade_world_texel_[c], 0, 0, 0);
-            scene.cascade_slot[c] = glm::uvec4(shadow != nullptr ? ctx.slot(cascades_[c]) : 0u, 0, 0, 0);
-        }
-        // No shadow-off special case. The cascades are TRANSIENTS declaring `neutral = 1.0`, so when
-        // the cascade passes are toggled off ctx.slot() above already resolves to the neutral
-        // fallback and the shadow term reads unshadowed — the graph's degrade, not a second one
-        // written by hand in the data (brief 21 step 4).
-        scene.cascade_count = settings_.cascade_count;
-        // STRING_STATS_LOG: one-shot cascade slot identity — distinct slots per cascade proves the
-        // consumers resolve three real maps; equal slots proves a collapse (fallback or slot mixup).
-        {
-            static const bool log_slots = std::getenv("STRING_STATS_LOG") != nullptr;
-            static bool slots_logged = false;
-            if (log_slots && !slots_logged)
-            {
-                slots_logged = true;
-                STRING_LOG_INFO("[slots] cascade slots {} {} {} count {} | gtao {} env {} dfg {}",
-                                scene.cascade_slot[0].x, scene.cascade_slot[1].x,
-                                scene.cascade_slot[2].x, scene.cascade_count, scene.gtao_slot,
-                                scene.env_slot, scene.dfg_slot);
-            }
-        }
-        scene.shadow_texel = 1.0f / static_cast<float>(settings_.shadow_resolution);
-        scene.shadow_bias = cv_shadow_bias().get();
-        scene.shadow_normal_offset_scale = cv_shadow_normal_offset().get();
-        scene.cascade_blend = settings_.cascade_blend;
-        scene.view = camera_.view();
-        // froxel grid dims + buffer address come from FroxelPass's component, published in the scene.
-        const uint32_t froxel_tx = froxel ? froxel->tiles_x(ctx.extent) : 0;
-        const uint32_t froxel_ty = froxel ? froxel->tiles_y(ctx.extent) : 0;
-        scene.froxel_dims = glm::uvec4(froxel_tx, froxel_ty, kFroxelDepthSlices, kFroxelTileSize);
-        const float near_p = camera_.near_plane();
-        const float far_p = std::min(settings_.shadow_depth_range, camera_.far_plane());
-        scene.froxel_planes = glm::vec4(near_p, far_p, 1.0f / std::log(far_p / near_p),
-                                        static_cast<float>(light_count));
-        scene.lights = light_count > 0 ? ctx.address(lights_buffer_) : 0;
-        // The froxel list's address. This pass DECLARES it (`.reads(froxels)` above), so resolving it
-        // here is exactly what the declaration licenses — the address is this frame's backing, at
-        // record time, ordered against the froxel pass by the graph.
-        //
-        // This MUST be set: `lighting.slang` dereferences it the moment a scene has local lights
-        // (`froxel_planes.w > 0`), and a null device address is a GPU fault, not a wrong colour.
-        scene.froxels = ctx.address(froxels_);
-        scene.max_lights_per_froxel = kMaxLightsPerFroxel;
-        scene.debug_flags = (froxel_heatmap_ ? 1u : 0u) | (furnace_ ? 2u : 0u)
-                          | (cv_gtao_spec_occ().get() ? 0u : 4u)    // bit2: disable bent-normal spec-occ
-                          | ((static_cast<uint32_t>(std::max(cv_light_debug().get(), 0)) & 0xFu) << 4);  // bits4-7: lighting isolate
-        // Brief 07: the sky-IBL products (single-buffered; the update chain is ordered against
-        // in-flight readers by the declared SH usages).
-        scene.sh = ctx.address(ibl_sh_);
-        scene.env_slot = ctx.slot(env_prefiltered_);
-        scene.env_mips = ibl->env_mips();
-        scene.dfg_slot = ctx.slot(dfg_lut_);
-
-        // Ensure the HiZ pyramid HERE, in update() — its (re)build binds new
-        // per-mip storage views into the bindless set, and now that IblPass records its compute BEFORE
-        // this pass, that descriptor update must land in the update phase (before any set bind this
-        // frame), not at record time. ensure_hiz is idempotent, so the later calls no-op.
-        if (meshlet_program_ && draw_info_mapped_)
-            ensure_hiz(current_frame);
-        // GtaoPass decided the go/no-go in its own update (it runs before this pass); read it here.
-        const bool gtao_runs = gtao != nullptr && gtao->runs();
-        const uint16_t gtao_prev = gtao != nullptr ? gtao->prev_slot(current_frame) : 0;
-        scene.prev_view_proj = gtao_runs && gtao_prev < depth_history_.size()
-            ? depth_history_[gtao_prev].view_proj : glm::mat4(1.0f);
-        // The ~0u sentinel is gtao's ONLY sound degrade — the shader branches to the clean no-AO
-        // path. A neutral texture cannot stand in: gtao.ao holds an ENCODED bent normal, and any
-        // constant decodes to a degenerate vector (0.5s -> the zero vector, which collapsed the
-        // sun/spec terms into the giant black regions that presented as broken shadows).
-        scene.gtao_slot = gtao != nullptr && gtao->has_output() ? ctx.slot(gtao_ao_) : 0xFFFFFFFFu;
-        scene.gtao_strength = std::clamp(cv_gtao_strength().get(), 0.0f, 1.0f);
-        const glm::uvec2 gtao_extent = gtao != nullptr ? gtao->size() : glm::uvec2(0);
-        scene.gtao_w = gtao_extent.x;   // half-res AO extent for the lit shader.s joint upsample
-        scene.gtao_h = gtao_extent.y;
-
-        // Brief 09b probe GI: the component owns the gate + volume + atlas slots.
-        if (gi != nullptr) gi->fill_scene_data(scene, ctx); else scene.probe_gi = 0u;
-
-        // Brief 23 skinning: the compact skin heap + THIS frame slot's palette ring physical.
-        // Resolved at record time like every address here (never latched). Zero = no skinned
-        // geometry; load_vertex never dereferences behind skinned == 0 draws.
-        scene.skin_stream = skin_buffer_.valid() ? ctx.address(skin_buffer_) : 0;
-        scene.joint_palette = joint_palette_.valid() ? ctx.address(joint_palette_) : 0;
-
-        std::memcpy(ctx.mapped(scene_data_), &scene, sizeof(SceneData));
-    }
+    static const GpuMeshStats none{};
+    return uniforms_ != nullptr ? uniforms_->stats_latest() : none;
 }
 
 }  // namespace string::render

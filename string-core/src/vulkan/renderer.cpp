@@ -580,7 +580,8 @@ void write_capture_depth(const std::string& path, const void* d32, uint32_t w, u
     out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
 }
 
-void write_capture(const std::string& path, const void* rgba16f, uint32_t w, uint32_t h)
+void write_capture(const std::string& path, const void* rgba16f, uint32_t w, uint32_t h,
+                   const string::composite_pass* encode)
 {
     const auto* src = static_cast<const uint16_t*>(rgba16f);
     const auto half_to_float = [](uint16_t v) -> float {
@@ -602,8 +603,9 @@ void write_capture(const std::string& path, const void* rgba16f, uint32_t w, uin
             // Per-PIXEL, not per-channel — the aces2 CAM DRT mixes channels.
             const glm::vec3 hdr(half_to_float(src[si + 0]), half_to_float(src[si + 1]),
                                 half_to_float(src[si + 2]));
-            const glm::vec3 enc =
-                glm::pow(string::composite_pass::encode_display(hdr), glm::vec3(1.0f / 2.2f));
+            // Raw linear when no composite was declared (a scene with its own display chain).
+            const glm::vec3 enc = glm::pow(encode != nullptr ? encode->encode_display(hdr) : hdr,
+                                           glm::vec3(1.0f / 2.2f));
             for (int c = 0; c < 3; ++c)
                 rgb[di + c] = static_cast<uint8_t>(std::clamp(enc[c], 0.0f, 1.0f) * 255.0f + 0.5f);
         }
@@ -678,7 +680,7 @@ void renderer::capture(const std::string& path)
     void* mapped = allocator_.get_buffer(capture_staging_).allocation_info.pMappedData;
     if (mapped == nullptr) return;
     if (depth_source) write_capture_depth(path, mapped, size.width, size.height);
-    else              write_capture(path, mapped, size.width, size.height);
+    else              write_capture(path, mapped, size.width, size.height, capture_encode_);
 }
 
 // The capture's GPU half, as a DECLARED pass the app authors. Declaring `.reads(source,
@@ -725,9 +727,10 @@ bool renderer::capture_armed() const
     return every > 0 && (frame_count_ % static_cast<uint64_t>(every)) == 0;
 }
 
-void renderer::declare_capture(frame_graph& fg, gpu::image source)
+void renderer::declare_capture(frame_graph& fg, gpu::image source, const composite_pass* encode)
 {
     capture_source_ = source;
+    capture_encode_ = encode;
     fg.pass("debug.capture")
       .reads(source, access::transfer_read)
       .toggle([this] { return capture_armed(); })

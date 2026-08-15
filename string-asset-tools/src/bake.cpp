@@ -55,6 +55,7 @@ struct BakeChunk
     uint32_t src_index_offset = 0;   // for the streamer-window parity (CookedDraw.index_offset)
     uint32_t src_index_count = 0;
     int32_t skin = -1;               // brief 23: source draw's skin; split pieces inherit it
+    uint32_t name_offset = 0;        // v5: interned source-draw name; split pieces inherit it
 };
 
 // Append the meshlets from one already-built meshopt result (LOD-local vertex/triangle heaps) into
@@ -145,6 +146,7 @@ void build_lods_for_chunk(CookedScene& scene, const std::vector<float>& all_posi
     draw.vertex_count = chunk.indices.empty() ? 0u : (chunk.vmax - chunk.vmin + 1);
     draw.index_offset = chunk.src_index_offset;
     draw.index_count = chunk.src_index_count;
+    draw.name_offset = chunk.name_offset;
 
     if (chunk.indices.empty())
     {
@@ -356,6 +358,23 @@ void repack_vertices(std::vector<BakeChunk>& chunks,
 
 }  // namespace
 
+// Fold a name list (with NUL terminators, so {"ab",""} != {"a","b"}) into a running FNV state.
+static uint64_t fold_names(uint64_t h, const std::vector<std::string>& names)
+{
+    for (const std::string& n : names) h = fnv1a(n.c_str(), n.size() + 1, h);
+    return h;
+}
+
+uint32_t intern_cooked_name(CookedScene& scene, std::string_view name)
+{
+    if (name.empty()) return 0;
+    if (scene.names.empty()) scene.names.push_back('\0');   // offset 0 = unnamed, always
+    const uint32_t offset = static_cast<uint32_t>(scene.names.size());
+    scene.names.insert(scene.names.end(), name.begin(), name.end());
+    scene.names.push_back('\0');
+    return offset;
+}
+
 uint64_t content_hash(const std::vector<string::Vertex>& vertices,
                       const std::vector<uint32_t>& indices,
                       const std::vector<GltfDraw>& draws)
@@ -377,8 +396,11 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
                        const std::vector<uint32_t>& indices,
                        const std::vector<GltfDraw>& draws,
                        const BakeParams& params,
-                       const SkinSource& skin)
+                       const SkinSource& skin,
+                       const std::vector<std::string>& draw_names)
 {
+    if (!draw_names.empty() && draw_names.size() != draws.size())
+        throw std::runtime_error("bake: draw_names is not parallel to the draw list");
     if (!skin.vertices.empty() && skin.vertices.size() != vertices.size())
         throw std::runtime_error("bake: skin stream is not parallel to the vertex stream");
 
@@ -395,6 +417,10 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
         h = fnv1a(skin.joint_remap.data(), skin.joint_remap.size() * sizeof(uint32_t), h);
         scene.source_content_hash = h;
     }
+    // v5: names change the cooked bytes, so a RENAME must read as stale to the incremental cook
+    // (the manifest skips on a matching hash).
+    scene.source_content_hash =
+        fold_names(fold_names(scene.source_content_hash, draw_names), skin.names);
 
     // Extract xyz positions once (meshopt wants a tightly-strided float array).
     std::vector<float> all_positions(vertices.size() * 3);
@@ -428,8 +454,13 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
     };
 
     std::vector<BakeChunk> chunks;
-    for (const GltfDraw& d : draws)
+    for (size_t di = 0; di < draws.size(); ++di)
     {
+        const GltfDraw& d = draws[di];
+        // Interned once per SOURCE draw, in draw order (deterministic); every split piece points
+        // at the same blob entry.
+        const uint32_t name_offset =
+            di < draw_names.size() ? intern_cooked_name(scene, draw_names[di]) : 0u;
         if (d.index_count == 0)
         {
             BakeChunk empty;
@@ -439,6 +470,7 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
             empty.aabb_max = d.aabb_max;
             empty.src_index_offset = d.index_offset;
             empty.src_index_count = 0;
+            empty.name_offset = name_offset;
             skinned_bounds(d, empty);
             chunks.push_back(std::move(empty));
             continue;
@@ -459,6 +491,7 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
             chunk.aabb_max = d.aabb_max;
             chunk.src_index_offset = d.index_offset;
             chunk.src_index_count = d.index_count;
+            chunk.name_offset = name_offset;
             skinned_bounds(d, chunk);
             chunks.push_back(std::move(chunk));
             continue;
@@ -481,6 +514,7 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
             chunk.transform = d.transform;
             chunk.src_index_offset = d.index_offset;
             chunk.src_index_count = static_cast<uint32_t>(chunk.indices.size());
+            chunk.name_offset = name_offset;
             if (!skinned_bounds(d, chunk))
                 chunk_aabb(chunk.indices, all_positions, d.transform, chunk.aabb_min, chunk.aabb_max);
             chunks.push_back(std::move(chunk));
@@ -520,6 +554,8 @@ CookedScene bake_scene(const std::vector<string::Vertex>& vertices,
     // repack_vertices for the contract.
     repack_vertices(chunks, vertices, skin.vertices, scene.vertices, scene.skin_vertices);
     scene.skins = skin.skins;
+    for (size_t si = 0; si < scene.skins.size() && si < skin.names.size(); ++si)
+        scene.skins[si].name_offset = intern_cooked_name(scene, skin.names[si]);
     scene.inverse_bind = skin.inverse_bind;
     scene.joint_remap = skin.joint_remap;
 

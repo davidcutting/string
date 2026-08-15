@@ -8,9 +8,9 @@ namespace string::render
 {
 using namespace string;
 
-debug_line_pass::debug_line_pass(engine_context& ctx, std::shared_ptr<const MeshOverlayStats> stats,
+debug_line_pass::debug_line_pass(engine_context& ctx, const scene_bridge* bridge,
                                  VkSampleCountFlagBits samples)
-: device_(ctx.device), allocator_(ctx.allocator), stats_(std::move(stats)),
+: device_(ctx.device), allocator_(ctx.allocator), bridge_(bridge),
   frames_in_flight_(ctx.frames_in_flight)
 {
     push_range_ = { VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4) };
@@ -119,7 +119,7 @@ void debug_line_pass::record(::string::pass_context& pctx)
     }
     upload(pctx.frame_slot, depth, overlay);
 
-    const glm::mat4 view_proj = stats_ ? stats_->view_proj : glm::mat4(1.0f);
+    const glm::mat4 view_proj = bridge_ != nullptr ? bridge_->frame().view_proj : glm::mat4(1.0f);
     const VkDeviceSize depth_off = 0;
     const VkDeviceSize overlay_off = VkDeviceSize(kMaxVerts) * sizeof(::string::debug::LineVertex);
     const VkBuffer vb = allocator_.get_buffer(vertex_buffers_[pctx.frame_slot]).buffer;

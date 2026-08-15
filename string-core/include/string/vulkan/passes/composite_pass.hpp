@@ -53,6 +53,12 @@ class composite_pass
     std::vector<float> lut_cpu_;
     string::core::tonemap::Curve baked_curve_{};
     string::core::tonemap::Grading baked_grading_{};
+    // Exposure state (see exposure_scale): the post chain's published auto EV and the furnace
+    // calibration override.
+    float auto_ev100_ = 0.0f;
+    bool auto_valid_ = false;
+    float override_ev100_ = 0.0f;
+    bool override_active_ = false;
     void bake_and_upload_lut(bool first);
 
 public:
@@ -67,24 +73,26 @@ public:
     // The linear exposure scale the composite applies before its tonemap (EV100 CVar
     // r.exposure.ev100, or the auto-exposure value when r.exposure.auto is on, + the brief-07
     // kilo-unit factor). Exposed so the headless capture writer encodes the SAME image the
-    // screen shows.
-    static float exposure_scale();
+    // screen shows. INSTANCE state (it was a file-static trio once): every consumer holds the
+    // composite it renders through, so a never-wired consumer fails to compile instead of
+    // silently reading someone else's exposure.
+    float exposure_scale() const;
 
     // Brief 09 auto-exposure: the post chain's histogram metering publishes its smoothed EV100
     // here each frame; exposure_scale() uses it while r.exposure.auto (STRING_EXPOSURE_AUTO) is
     // on. Before the first publish (warmup) the manual CVar value is used.
-    static void set_auto_ev100(float ev100);
+    void set_auto_ev100(float ev100);
 
     // Calibration override: while active, exposure_scale() uses THIS EV100 and ignores both the
     // manual CVar and auto-exposure. The white-furnace test pins EV100 = log2(1000/1.2) (~9.70,
     // exposure scale exactly 1.0) so the radiance-1 furnace environment hits the tonemap at 1.0
     // and renders flat white — under scene exposure it reads as uniform grey instead, which
     // defeats the visual gate. Pass active = false to clear.
-    static void set_exposure_override(float ev100, bool active);
+    void set_exposure_override(float ev100, bool active);
 
     // Full display encode for the capture writer: exposure + grading + output transform via the
     // SAME baked LUT the composite samples (CPU trilinear). Returns display-linear [0,1].
-    static glm::vec3 encode_display(glm::vec3 hdr);
+    glm::vec3 encode_display(glm::vec3 hdr) const;
 
     // Per-frame CPU work: re-bake the output-transform LUT when a grading/tonemap CVar changed.
     // Ordinary app code, called before the graph executes.

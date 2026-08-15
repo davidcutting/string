@@ -46,6 +46,7 @@ include_dir = include_directories('include')
 scene_lib = static_library(
     'string-scene',
     [
+        'src/animator.cpp',
         'src/asset_registry.cpp',
         'src/camera.cpp',
         'src/mesh_heap.cpp',
@@ -58,6 +59,18 @@ scene_lib = static_library(
 )
 
 install_subdir('include/string', install_dir : 'include')
+
+# pkg-config, so an OFF-MESON client (CMake, plain make) can resolve this library and its
+# String siblings by name; meson consumers keep using the subproject override.
+pkg_mod = import('pkgconfig')
+pkg_mod.generate(
+    name : meson.project_name(),
+    filebase : meson.project_name(),
+    description : 'String engine asset registry + scene world',
+    libraries : scene_lib,
+    requires : [ 'string-core', 'string-asset' ],
+    version : meson.project_version(),
+)
 
 project_deps = declare_dependency(
     include_directories : include_dir,

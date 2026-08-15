@@ -10,7 +10,7 @@
 #include <string/vulkan/engine_context.hpp>
 #include <string/vulkan/frame_graph.hpp>
 
-#include <string/render/geometry/geometry_scene.hpp>
+#include <string/render/scene_bridge.hpp>
 #include <string/render/lighting_data.hpp>
 
 namespace string::render
@@ -39,7 +39,7 @@ class shadow_maps
 public:
     // Builds the depth-only meshlet program. The per-cascade work lists are graph transients the app
     // declares and hands to declare() — this owns the shadow RENDER, not any allocation.
-    shadow_maps(string::engine_context& ctx, GeometryScene* scene);
+    shadow_maps(string::engine_context& ctx, const scene_bridge* bridge);
     ~shadow_maps();
 
     shadow_maps(const shadow_maps&) = delete;
@@ -55,7 +55,7 @@ public:
                  const WorklistSet& worklists, ::string::gpu::buffer scene_data,
                  ::string::gpu::buffer joint_palette = {});
 
-    uint32_t cascade_count() const { return scene_ != nullptr ? scene_->settings_.cascade_count : 0u; }
+    uint32_t cascade_count() const { return bridge_ != nullptr ? bridge_->frame().settings_.cascade_count : 0u; }
 
 private:
     // Is there anything to draw? Folded into the graph conditional, so a scene with no resident
@@ -68,7 +68,7 @@ private:
     ::string::gpu::device* device_ = nullptr;
     ::string::gpu::resource_allocator* allocator_ = nullptr;
     ::string::gpu::descriptor_table* descriptors_ = nullptr;
-    GeometryScene* scene_ = nullptr;
+    const scene_bridge* bridge_ = nullptr;
     ::string::gpu::shader_program* program_ = nullptr;
     // Brief 23: SceneData's graph handle, resolved per cascade record for the push (the skin
     // stream + palette pointers live in it).

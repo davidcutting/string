@@ -26,7 +26,6 @@
 #include <string/vulkan/frame_graph.hpp>
 #include <string/vulkan/content_root.hpp>
 #include <string/vulkan/scene_registry.hpp>
-#include "anim_demo.hpp"
 #include "debug_cvars.hpp"
 #include <string/render/debug_line_pass.hpp>
 #include <string/render/geometry_pass.hpp>
@@ -40,12 +39,27 @@
 #include <string/render/render_debug.hpp>
 #include <string/render/render_cvars.hpp>
 #include <string/render/scene_bridge.hpp>
+#include <string/render/scene_uniforms.hpp>
+#include <string/render/forward_renderer.hpp>
 #include <string/scene/asset_registry.hpp>
 #include <string/scene/world.hpp>
 #include <string/asset/tools/scene_cook.hpp>
 #include "content_tools.hpp"
 #include <glm/gtc/matrix_transform.hpp>
 #include <nlohmann/json.hpp>
+
+namespace sandbox
+{
+// The SCENE-state keys the app binds against world.env() (interned once; the geometry pass keeps
+// only its renderer-debug keys).
+namespace scene_actions
+{
+inline constexpr ::string::ActionId sun_animate   = ::string::action_id("sun_animate");
+inline constexpr ::string::ActionId time_back     = ::string::action_id("time_back");
+inline constexpr ::string::ActionId time_fwd      = ::string::action_id("time_fwd");
+inline constexpr ::string::ActionId toggle_lights = ::string::action_id("toggle_lights");
+}  // namespace scene_actions
+}  // namespace sandbox
 
 namespace sandbox
 {
@@ -81,28 +95,21 @@ VkExtent2D scene_viewport()
 }
 
 
-// Defined below; the content-scan registry lambdas above call them.
-struct scene_resources;
+// Defined below; the content-scan registry lambdas above call them. The forward technique stack
+// (scene_resources / declare_resources / declare_stream_uploads / forward_renderer) is the
+// RENDERER library's now.
+using ::string::render::scene_resources;
+using ::string::render::scene_backing;
+using ::string::render::declare_resources;
+using ::string::render::declare_stream_uploads;
+using ::string::render::forward_renderer;
 std::function<void(float)> make_geometry_scene(
     string::frame_graph& fg, string::engine_context& ctx, VkExtent2D viewport,
     VkSampleCountFlagBits samples, VkFormat swapchain_format,
     std::vector<std::filesystem::path> models,
     std::shared_ptr<string::dynamic_font_atlas> atlas, std::size_t np_stress, string::renderer& rr,
     bool lookdev = false);
-struct scene_resources;
-// Per-frame streaming uploads, INSIDE the frame (brief 21 step 5). Authored first so the copies land
-// before anything samples this frame; they touch resources the graph does not own — streamed
-// textures reached through bindless slots, the geometry heaps — so there is nothing for it to
-// declare, and the pass states that undeclarable edge itself with one conservative barrier (see
-// TransferBatch::record). It replaced a second submission path that ran beside the frame.
-//
-// EVERY SCENE MUST DECLARE THIS, which is why it is a shared helper rather than a block inside one
-// scene. It is engine plumbing, not geometry plumbing: TransferBatch is an engine service that
-// stages uploads for anyone, and this pass is the ONLY thing that records them. It used to live only
-// in make_geometry_scene, so the UI scene staged composite_pass's tonemap LUT and nothing ever
-// copied it — the composite sampled an empty LUT and presented BLACK. Captures hid it completely,
-// because declare_capture tonemaps on the CPU through lut_cpu_ and never touches the GPU LUT.
-void declare_stream_uploads(string::frame_graph& fg, string::engine_context& ctx);
+// (declare_stream_uploads moved to the renderer library with the preset.)
 std::function<void(float)> make_shader_scene(
     string::frame_graph& fg, string::engine_context& ctx, const std::filesystem::path& shader,
     std::shared_ptr<string::dynamic_font_atlas> atlas, string::renderer& rr);
@@ -165,9 +172,10 @@ ui_pass::PostLayout make_ui_observer(SharedUi fluent,
 
 ui_pass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stats,
                               SharedPanels panels,
-                              std::size_t nameplate_stress, SharedUi fluent)
+                              std::size_t nameplate_stress, SharedUi fluent,
+                              const ::string::scene::world* world = nullptr)
 {
-    return [mesh_stats,
+    return [mesh_stats, world,
             np_driver = UiSceneDriver(static_cast<std::uint32_t>(nameplate_stress)),
             np_scene = UiScene{}, motion = ui::Motion{}, ui_panels = string::ui::PanelStore{},
             fluent = std::move(fluent), nameplate_stress,
@@ -202,7 +210,7 @@ ui_pass::Author make_ui_author(std::shared_ptr<const MeshOverlayStats> mesh_stat
         // frame keeps `mesh_stats` (a shared_ptr the pass refreshes) current without the shell
         // ever holding a renderer type.
         panels->set_hud_extra([&](ui::Ui& p) { render_dbg.hud_rows(p, mesh_stats.get()); });
-        panels->set_inspector([&](ui::Ui& p) { render_dbg.inspector(p, mesh_stats.get()); });
+        panels->set_inspector([&](ui::Ui& p) { render_dbg.inspector(p, mesh_stats.get(), world); });
         panels->update_and_author(u, ctx.input, ctx.input_map);
 
         u.end_frame();
@@ -301,428 +309,6 @@ ui_pass::Author make_ui_dev_author(std::shared_ptr<UiScene> scene, std::uint32_t
 //
 // Everything the scene renders into or through is stated HERE, once, as logical handles: the
 // renderer creates no render targets, and no pass owns a viewport-sized image any more. Sizes that
-// follow the window are declared as RELATIONSHIPS (viewport_fit / tile_pixels) rather than computed,
-// which is what lets a resize be a backing swap instead of a re-author.
-struct scene_resources
-{
-    string::gpu::image swapchain, color, depth, hdr;
-    string::gpu::image hiz_depth, hiz_pyramid;
-    string::gpu::image gtao_raw, gtao_ao;
-    string::gpu::image bloom;
-    string::gpu::image shadow[::string::render::kMaxCascades];
-    string::gpu::image env_capture, env_prefiltered, dfg_lut;
-    string::gpu::image hiz_depth_prev;
-    string::gpu::image gi_irradiance, gi_cap_gbuf, gi_cap_albedo, gi_visibility;
-    string::gpu::image gi_cube_albedo, gi_cube_nd, gi_cube_depth;
-    string::gpu::buffer froxels, ibl_sh, transparency_list, histogram_bins;
-    ::string::render::WorklistSet worklists;
-    string::gpu::buffer scene_data, lights, stats;
-    string::gpu::buffer gi_active, gi_offset, gi_meshlet_table;
-    string::gpu::buffer joint_palette;   // brief 23: the anim tick's palette ring
-    uint32_t bloom_mips = 0;
-};
-
-// Brief 21 D3 — time lives OUTSIDE the graph. Every resource whose CONTENTS outlive the frame
-// (cross-frame history, host-write pacing rings, in-place accumulators) has a lifetime beyond the
-// graph's scope, so the APP creates and destroys its backing and hands it in as a persistent; the
-// graph tracks usage only. This struct is that owner for the geometry scene. The category test:
-// contents outlive the frame -> persistent (here); frame-scoped -> transient (fg.image/fg.buffer).
-struct scene_backing
-{
-    string::engine_context* ctx = nullptr;
-    // The depth-history ring: GTAO reprojection reads LAST frame's resolved depth, so the app backs
-    // one image per frame in flight and declares TWO handles over them — identity order for this
-    // frame's write, rotated one slot back for last frame's read. The rotation is static: resolved
-    // by frame slot, no per-frame swap call, no reach into graph records.
-    std::vector<string::gpu::resource_id> hiz_depth;
-    // Host-write pacing rings: the CPU fills frame N+1's slot while the GPU still reads frame N's.
-    std::vector<string::gpu::resource_id> scene_data, lights, stats, transparency_list;
-    // Brief 23: the joint-palette ring — the anim tick writes slot N+1's palettes while the GPU
-    // skins with slot N's. Identical layout every slot (palette offsets are load-time constants;
-    // only the base address rotates, through SceneData).
-    std::vector<string::gpu::resource_id> joint_palette;
-    // Probe-GI accumulators: captured/relit tiles persist across the amortized rounds, and readers
-    // must see REAL accumulated data on frames when no producer pass runs — as transients they were
-    // degrade-substituted with the 1x1 neutral on exactly those frames.
-    string::gpu::resource_id gi_irradiance = 0, gi_cap_gbuf = 0, gi_cap_albedo = 0, gi_visibility = 0;
-    string::gpu::resource_id gi_active = 0, gi_offset = 0, gi_meshlet_table = 0;
-    // IBL products: the bake is AMORTIZED — it re-runs only when the sun moves, so on nearly every
-    // frame nothing writes them and everything reads them. Same category as the GI atlases, and the
-    // same failure when they were transients: a resize destroyed their backing, no bake re-ran, and
-    // the whole scene shaded against 1x1 neutral env/DFG until the sun happened to move.
-    string::gpu::resource_id env_capture = 0, env_prefiltered = 0, dfg_lut = 0, ibl_sh = 0;
-
-    void create(string::engine_context& c, VkExtent2D viewport, uint32_t max_draws,
-                const ::string::render::ProbeVolume& gi_volume, std::size_t gi_table_entries,
-                uint32_t palette_joints)
-    {
-        ctx = &c;
-        const uint32_t slots = c.frames_in_flight;
-
-        create_hiz_depth(viewport);
-
-        const VkBufferUsageFlags host_ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                           | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        const VmaAllocationCreateFlags mapped = VMA_ALLOCATION_CREATE_MAPPED_BIT
-                                              | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-        const auto ring = [&](std::vector<string::gpu::resource_id>& out, string::gpu::buffer_info info) {
-            for (uint32_t s = 0; s < slots; ++s) out.push_back(c.allocator.create_resource(info));
-        };
-        ring(scene_data, { .size = sizeof(::string::render::SceneData), .usage = host_ssbo,
-                           .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU, .allocation_flags = mapped });
-        ring(lights, { .size = sizeof(::string::render::GpuLight) * 1024u, .usage = host_ssbo,
-                       .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU, .allocation_flags = mapped });
-        ring(stats, { .size = sizeof(::string::render::GpuMeshStats),
-                      .usage = host_ssbo | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                      .memory_usage = VMA_MEMORY_USAGE_GPU_TO_CPU,
-                      .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT });
-        ring(transparency_list, { .size = ::string::render::sorted_transparency::layout_for(max_draws).bytes,
-                                  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                         | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                                         | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                                  .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-                                  .allocation_flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
-                                                    | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT });
-        // Brief 23: sized to the loaded scene's total palette joints (a scene with no skins gets
-        // one identity-sized slot so the handle stays valid and the graph stays static).
-        ring(joint_palette, { .size = sizeof(glm::mat4) * std::max(1u, palette_joints),
-                              .usage = host_ssbo,
-                              .memory_usage = VMA_MEMORY_USAGE_CPU_TO_GPU,
-                              .allocation_flags = mapped });
-        // Every slot defaults to IDENTITY palettes — an identity palette skins the bind pose (the
-        // skinned vertices are authored in bind space), so a character whose animation never
-        // arrives (no driver yet, skeleton-hash mismatch) stands in bind pose instead of
-        // rendering whatever VMA recycled into the ring.
-        for (string::gpu::resource_id id : joint_palette)
-        {
-            auto* mats = static_cast<glm::mat4*>(
-                c.allocator.get_buffer(id).allocation_info.pMappedData);
-            for (uint32_t j = 0; j < std::max(1u, palette_joints); ++j) mats[j] = glm::mat4(1.0f);
-        }
-
-        const glm::uvec2 gi_tiles = gi_volume.tile_grid();
-        const string::gpu::sampler_info gi_sampler{ .mag_filter = VK_FILTER_LINEAR,
-                                                    .min_filter = VK_FILTER_LINEAR,
-                                                    .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-                                                    .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                                    .anisotropy = false };
-        const auto gi_atlas = [&](uint32_t stride) {
-            string::gpu::image_info info{};
-            info.extent = { std::max(1u, gi_tiles.x * stride), std::max(1u, gi_tiles.y * stride), 1 };
-            info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-            info.tiling = VK_IMAGE_TILING_OPTIMAL;
-            info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-                       | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-            info.aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT;
-            info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
-            info.sampler = gi_sampler;
-            return c.allocator.create_resource(info);
-        };
-        gi_irradiance = gi_atlas(::string::render::kProbeIrradStride);
-        gi_cap_gbuf   = gi_atlas(::string::render::kProbeVisStride);
-        gi_cap_albedo = gi_atlas(::string::render::kProbeVisStride);
-        gi_visibility = gi_atlas(::string::render::kProbeVisStride);
-
-        const VkBufferUsageFlags gi_buf = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                        | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                                        | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        gi_active = c.allocator.create_resource(string::gpu::buffer_info{
-            .size = std::max<VkDeviceSize>(4 * gi_volume.total(), 4), .usage = gi_buf,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY, .allocation_flags = 0 });
-        gi_offset = c.allocator.create_resource(string::gpu::buffer_info{
-            .size = std::max<VkDeviceSize>(16 * gi_volume.total(), 16), .usage = gi_buf,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY, .allocation_flags = 0 });
-        gi_meshlet_table = c.allocator.create_resource(string::gpu::buffer_info{
-            .size = 8 * std::max<VkDeviceSize>(gi_table_entries, 1), .usage = gi_buf,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY, .allocation_flags = 0 });
-
-        // IBL: two 128^3 cubes with a 6-mip roughness ladder, the split-sum BRDF LUT, and the SH
-        // buffer. Viewport-INDEPENDENT, so a resize leaves them alone — which is the point: the bake
-        // that fills them is amortized and will not re-run just because the window changed.
-        const string::gpu::sampler_info env_sampler{
-            .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
-            .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-            .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .anisotropy = false,
-            .border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE };
-        const auto env_cube = [&] {
-            string::gpu::image_info info{};
-            info.extent = { 128, 128, 1 };
-            info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-            info.tiling = VK_IMAGE_TILING_OPTIMAL;
-            info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            info.aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT;
-            info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
-            info.sampler = env_sampler;
-            info.mip_levels = 6;
-            info.cube = true;   // 6 array layers + CUBE_COMPATIBLE, per image_info::cube
-            return c.allocator.create_resource(info);
-        };
-        env_capture = env_cube();
-        env_prefiltered = env_cube();
-        {
-            string::gpu::image_info info{};
-            info.extent = { 128, 128, 1 };
-            info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-            info.tiling = VK_IMAGE_TILING_OPTIMAL;
-            info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-                       | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-            info.aspect_flags = VK_IMAGE_ASPECT_COLOR_BIT;
-            info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
-            info.sampler = env_sampler;
-            dfg_lut = c.allocator.create_resource(info);
-        }
-        ibl_sh = c.allocator.create_resource(string::gpu::buffer_info{
-            .size = sizeof(float) * 4 * 9,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                   | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            .memory_usage = VMA_MEMORY_USAGE_GPU_ONLY, .allocation_flags = 0 });
-    }
-
-    // The depth-history ring is viewport-sized, so ITS OWNER re-creates it on resize (the graph
-    // only re-backs what it owns — the viewport-scaled transients). Called at creation and from the
-    // renderer's resize callback, under device idle.
-    void create_hiz_depth(VkExtent2D viewport)
-    {
-        for (string::gpu::resource_id id : hiz_depth) ctx->allocator.destroy_resource(id);
-        hiz_depth.clear();
-        string::gpu::image_info depth_info{};
-        depth_info.extent = { viewport.width, viewport.height, 1 };
-        depth_info.format = VK_FORMAT_D32_SFLOAT;
-        depth_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        depth_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        depth_info.aspect_flags = VK_IMAGE_ASPECT_DEPTH_BIT;
-        depth_info.memory_usage = VMA_MEMORY_USAGE_GPU_ONLY;
-        for (uint32_t s = 0; s < ctx->frames_in_flight; ++s)
-            hiz_depth.push_back(ctx->allocator.create_resource(depth_info));
-    }
-
-    ~scene_backing()
-    {
-        if (ctx == nullptr) return;
-        for (string::gpu::resource_id id : hiz_depth) ctx->allocator.destroy_resource(id);
-        for (auto* v : { &scene_data, &lights, &stats, &transparency_list, &joint_palette })
-            for (string::gpu::resource_id id : *v) ctx->allocator.destroy_resource(id);
-        for (string::gpu::resource_id id : { gi_irradiance, gi_cap_gbuf, gi_cap_albedo, gi_visibility,
-                                             gi_active, gi_offset, gi_meshlet_table,
-                                             env_capture, env_prefiltered, dfg_lut, ibl_sh })
-            if (id != 0) ctx->allocator.destroy_resource(id);
-    }
-};
-
-scene_resources declare_resources(string::frame_graph& fg, VkExtent2D viewport,
-                                  VkSampleCountFlagBits samples, uint32_t shadow_res,
-                                  uint32_t cascades, VkDeviceSize worklist_bytes,
-                                  VkDeviceSize draw_lod_bytes, const scene_backing* backing)
-{
-    using namespace string;
-    scene_resources r;
-
-    // The one image whose backing the renderer still latches — it is not known until the frame
-    // acquires it. Everything else the graph owns outright.
-    r.swapchain = fg.use_persistent(string::persistent_image_info{ .name = "swapchain", .swapchain = true });
-
-    // The multisampled scene targets and the single-sample HDR they resolve into. Declaring both as
-    // colour writes on one pass is what tells the graph there is a resolve; there is no marker and no
-    // hook.
-    r.color = fg.image({ .name = "scene.color", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                         .fit = string::viewport_fit::scaled, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-                         .samples = samples });
-    r.depth = fg.image({ .name = "scene.depth", .format = VK_FORMAT_D32_SFLOAT,
-                         .fit = string::viewport_fit::scaled,
-                         .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                         .aspect = VK_IMAGE_ASPECT_DEPTH_BIT, .samples = samples });
-    r.hdr = fg.image({ .name = "scene.hdr", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                       .fit = string::viewport_fit::scaled,
-                       .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                              | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-                              | VK_IMAGE_USAGE_STORAGE_BIT });
-
-    // HiZ. The depth history is the one genuinely temporal image in the renderer — GTAO reprojection
-    // reads the PREVIOUS frame slot's resolved depth. Its contents outlive the frame, so per brief
-    // 21 D3 the APP backs it (scene_backing, one image per frame in flight) and declares TWO
-    // persistent handles over the same physicals: identity order for this frame's write, rotated
-    // one slot back for last frame's read. The rotation is STATIC — declared once, resolved by
-    // frame slot, no per-frame wiring and no reach into graph records.
-    {
-        std::vector<gpu::resource_id> ring, rotated;
-        if (backing != nullptr)
-        {
-            ring = backing->hiz_depth;
-            rotated.resize(ring.size());
-            for (std::size_t i = 0; i < ring.size(); ++i)
-                rotated[i] = ring[(i + ring.size() - 1) % ring.size()];
-        }
-        r.hiz_depth = fg.use_persistent(string::persistent_image_info{
-            .name = "hiz.depth", .physical = ring });
-        r.hiz_depth_prev = fg.use_persistent(string::persistent_image_info{
-            .name = "hiz.depth_prev", .physical = rotated });
-    }
-    // The occlusion pyramid FOLLOWS THE WINDOW: half the next power of two, full chain. Both halves
-    // of that are declared relationships, not numbers, so a resize re-backs it without re-authoring —
-    // and the reduction chain that builds it is authored once at the maximum depth with the levels
-    // this extent does not reach conditioned off (geometry_pass::declare_hiz).
-    r.hiz_pyramid = fg.image({ .name = "hiz.pyramid", .format = VK_FORMAT_R32_SFLOAT,
-                               .fit = string::viewport_fit::half_pow2,
-                               .mip_levels = string::transient_image_info::all_mips,
-                               .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-                               .sampler = { .mag_filter = VK_FILTER_NEAREST,
-                                            .min_filter = VK_FILTER_NEAREST,
-                                            .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-                                            .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                            .anisotropy = false } });
-
-    // GTAO, half res. `neutral` on the AO target is what a consumer gets when GTAO is toggled off:
-    // a flat encoded bent normal with visibility 1, i.e. no occlusion — not black.
-    const gpu::sampler_info clamp_linear{ .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
-                                          .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-                                          .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                          .anisotropy = false };
-    r.gtao_raw = fg.image({ .name = "gtao.raw", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                            .fit = string::viewport_fit::scaled, .viewport_scale = 0.5f,
-                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-                            .sampler = clamp_linear });
-    r.gtao_ao = fg.image({ .name = "gtao.ao", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                           .fit = string::viewport_fit::scaled, .viewport_scale = 0.5f,
-                           .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-                           .sampler = clamp_linear,
-                           .neutral = {{ 0.5f, 0.5f, 0.5f, 1.0f }} });
-
-    // Shadow cascades: ONE image each, no ring. The three-deep ring was pure frames-in-flight
-    // write-after-read avoidance, which the graph derives — 144 MB down to 48 MB. `neutral` 1.0 is
-    // what makes toggling shadows off produce a lit unshadowed scene rather than a black one.
-    for (uint32_t c = 0; c < cascades; ++c)
-        r.shadow[c] = fg.image({
-            .name = "shadow.cascade" + std::to_string(c), .format = VK_FORMAT_D32_SFLOAT,
-            .extent = { shadow_res, shadow_res, 1 },
-            // TRANSFER_SRC so STRING_CAPTURE_SOURCE=shadowN can actually read one. Without it the
-            // copy is invalid usage, which is why that lever never produced a real depth dump.
-            .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-                   | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-            .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
-            .sampler = { .mag_filter = VK_FILTER_NEAREST, .min_filter = VK_FILTER_NEAREST,
-                         .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-                         .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                         .anisotropy = false,
-                         .border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE },
-            // REVERSE-Z: 0.0 is the far plane, so 0.0 means "no occluder anywhere" and reads as LIT.
-            // It was declared 1.0 — the near plane — which is an occluder in front of everything, so
-            // degrading to it shadowed the entire scene. The old `cascade_count = 0` ternary hid that
-            // by making the shader skip the lookup entirely; deleting the ternary (step 4) is what
-            // exposed it, which is exactly what the per-toggle gate is for.
-            .neutral = {{ 0.0f, 0.0f, 0.0f, 0.0f }} });
-
-    // Bloom's mip count is fixed at author time, from the initial viewport — authored-once means the
-    // number of declared passes cannot change on resize.
-    r.bloom_mips = ::string::render::post_pass::bloom_mip_count(viewport);
-    r.bloom = fg.image({ .name = "post.bloom", .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-                         .fit = string::viewport_fit::scaled, .viewport_scale = 0.5f, .mip_levels = r.bloom_mips,
-                         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-                         .sampler = clamp_linear });
-
-    // --- buffers ---------------------------------------------------------------------------------
-    r.froxels = fg.buffer({ .name = "froxels",
-                            // One [count, light indices...] record per froxel, and a froxel column
-                            // per screen tile — the relationship, stated rather than computed.
-                            .tile_pixels = ::string::render::kFroxelTileSize,
-                            .bytes_per_tile = ::string::render::froxel_component::bytes_per_tile(),
-                            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT });
-    // Host-write pacing rings (brief 21 D3): the CPU fills frame N+1's slot while the GPU reads
-    // frame N's, so their contents outlive the frame and the APP backs them, one slot per frame in
-    // flight. The graph resolves them by slot.
-    const auto persist_buf = [&](const char* name, const std::vector<gpu::resource_id>* phys) {
-        return fg.use_persistent(string::persistent_buffer_info{
-            .name = name, .physical = phys != nullptr ? *phys : std::vector<gpu::resource_id>{} });
-    };
-    r.transparency_list = persist_buf("transparency.list",
-                                      backing != nullptr ? &backing->transparency_list : nullptr);
-    // Probe GI accumulators (brief 21 D3): captured and relit tiles PERSIST across the amortized
-    // rounds — most frames run neither capture nor relight, and readers must see the real
-    // accumulated data on exactly those frames. As transients they were degrade-substituted with
-    // the 1x1 neutral whenever no producer pass survived, which blanked a bake that was perfectly
-    // good. Contents outlive the frame -> the app backs them (scene_backing), sized from the SAME
-    // fit the component uses (probe_gi_component::fit_volume), so neither side can drift.
-    const auto persist_img = [&](const char* name, gpu::resource_id id) {
-        return fg.use_persistent(string::persistent_image_info{
-            .name = name,
-            .physical = id != 0 ? std::vector<gpu::resource_id>{ id } : std::vector<gpu::resource_id>{} });
-    };
-    // IBL products, same category and the same reason (see scene_backing): amortized producers whose
-    // contents must survive both an idle frame and a resize.
-    r.env_capture     = persist_img("ibl.env_capture",     backing != nullptr ? backing->env_capture : 0);
-    r.env_prefiltered = persist_img("ibl.env_prefiltered", backing != nullptr ? backing->env_prefiltered : 0);
-    r.dfg_lut         = persist_img("ibl.dfg",             backing != nullptr ? backing->dfg_lut : 0);
-
-    r.gi_irradiance = persist_img("gi.irradiance",     backing != nullptr ? backing->gi_irradiance : 0);
-    r.gi_cap_gbuf   = persist_img("gi.capture_gbuf",   backing != nullptr ? backing->gi_cap_gbuf : 0);
-    r.gi_cap_albedo = persist_img("gi.capture_albedo", backing != nullptr ? backing->gi_cap_albedo : 0);
-    r.gi_visibility = persist_img("gi.visibility",     backing != nullptr ? backing->gi_visibility : 0);
-
-    // The per-probe cube G-buffer, destructively reused between probes — pure write-after-read, no
-    // history, so one set serves every probe. Genuinely frame-scoped -> stays a graph transient.
-    const gpu::sampler_info gi_sampler{ .mag_filter = VK_FILTER_LINEAR, .min_filter = VK_FILTER_LINEAR,
-                                        .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-                                        .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                        .anisotropy = false };
-    const auto gi_cube = [&](const char* name, VkFormat fmt, VkImageUsageFlags use, VkImageAspectFlags asp) {
-        return fg.image({ .name = name, .format = fmt, .extent = { 32, 32, 1 },
-                          .array_layers = 6, .cube = true, .usage = use, .aspect = asp,
-                          .sampler = gi_sampler });
-    };
-    r.gi_cube_albedo = gi_cube("gi.cube_albedo", VK_FORMAT_R16G16B16A16_SFLOAT,
-                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                               VK_IMAGE_ASPECT_COLOR_BIT);
-    r.gi_cube_nd     = gi_cube("gi.cube_nd", VK_FORMAT_R16G16B16A16_SFLOAT,
-                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                               VK_IMAGE_ASPECT_COLOR_BIT);
-    r.gi_cube_depth  = gi_cube("gi.cube_depth", VK_FORMAT_D32_SFLOAT,
-                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                               VK_IMAGE_ASPECT_DEPTH_BIT);
-
-    // GI table/state buffers: uploaded at bake start, read for the volume's whole lifetime —
-    // contents outlive the frame, app-backed like the atlases.
-    const auto persist_one_buf = [&](const char* name, gpu::resource_id id) {
-        return fg.use_persistent(string::persistent_buffer_info{
-            .name = name,
-            .physical = id != 0 ? std::vector<gpu::resource_id>{ id } : std::vector<gpu::resource_id>{} });
-    };
-    r.gi_active        = persist_one_buf("gi.active",        backing != nullptr ? backing->gi_active : 0);
-    r.gi_offset        = persist_one_buf("gi.offset",        backing != nullptr ? backing->gi_offset : 0);
-    r.gi_meshlet_table = persist_one_buf("gi.meshlet_table", backing != nullptr ? backing->gi_meshlet_table : 0);
-    r.ibl_sh           = persist_one_buf("ibl.sh",           backing != nullptr ? backing->ibl_sh : 0);
-
-    // Histogram bins are written and consumed within one frame — a true transient; the cross-frame
-    // write-after-read against last frame's resolve derives from tracked state.
-    r.histogram_bins = fg.buffer({ .name = "post.histogram.bins", .bytes = 256 * sizeof(uint32_t),
-                                   .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT });
-
-    // SceneData, the animated light ring and the GPU stats block — host-write pacing rings,
-    // app-backed (see scene_backing).
-    r.scene_data = persist_buf("scene.data",   backing != nullptr ? &backing->scene_data : nullptr);
-    r.joint_palette = persist_buf("anim.palette",
-                                  backing != nullptr ? &backing->joint_palette : nullptr);
-    r.lights     = persist_buf("scene.lights", backing != nullptr ? &backing->lights : nullptr);
-    r.stats      = persist_buf("scene.stats",  backing != nullptr ? &backing->stats : nullptr);
-
-    // The GPU work lists (brief 21 D4): ONE TRANSIENT PER LIST — the camera's opaque and two-sided
-    // lists, one per possible cascade, and the shared per-draw LOD. They were regions of a per-frame
-    // scratch arena the app had to wire in after the fact; as declarations the graph owns their
-    // lifetime, their aliasing and the edges between them, and the cascade chains stop serialising
-    // behind the camera's just because they shared an allocation.
-    const VkBufferUsageFlags wl_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                      | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                                      | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
-                                      | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    const auto list = [&](const std::string& name, VkDeviceSize bytes) {
-        return fg.buffer({ .name = name, .bytes = bytes, .usage = wl_usage });
-    };
-    r.worklists.opaque   = list("meshlet.worklist.opaque", worklist_bytes);
-    r.worklists.twosided = list("meshlet.worklist.twosided", worklist_bytes);
-    for (uint32_t c = 0; c < ::string::render::kMaxCascades; ++c)
-        r.worklists.cascade[c] = list("meshlet.worklist.cascade" + std::to_string(c), worklist_bytes);
-    r.worklists.draw_lod = list("meshlet.draw_lod", draw_lod_bytes);
-
-    return r;
-}
 
 
 // A `.scene.json` descriptor: the manifest for a scene glTF alone cannot express — several files
@@ -955,51 +541,35 @@ void register_content_scenes(string::SceneRegistry& registry,
 }
 
 
-// The geometry scene: construct every component, declare them onto the graph in execution order,
-// and return the per-frame CPU tick.
-//
-// DECLARATION ORDER IS EXECUTION ORDER. The toposort breaks ties by authoring index, so this
-// sequence is what the graph falls back on wherever two passes do not genuinely depend on each
-// other. Two orderings here are LOAD-BEARING rather than cosmetic:
-//   * ibl before gi     — GI relight reads this frame's sky SH (a read-after-write edge);
-//   * gi  before shadow — GI relight SAMPLES the cascades the shadow passes then REWRITE, so the
-//                         write-after-read edge only exists in that direction.
-// Getting either wrong now yields a wrong derived barrier, which sync validation catches. The old
-// push-order equivalent yielded a null device address on frame 0 and took the machine down.
+// The geometry scene, post-preset: load content, spawn it, hand the world to forward_renderer,
+// and keep only what is genuinely the APP's — input bindings, the camera/environment drive, the
+// crowd/clip demo drivers. The component zoo, the persistent backing and the load-bearing
+// declaration order all live inside the preset now (see forward_renderer.cpp for why the order
+// matters).
 
 struct geometry_scene_state
 {
-    // Declared FIRST so it is destroyed LAST: passes may record against these backings up to the
-    // wait_idle that precedes scene teardown, and the ids must outlive every pass that named them.
-    scene_backing backing;
-    // The asset registry (declared before the passes so it outlives them: the geometry streamer
-    // uploads from a non-owning view of its vertex heap). Per-scene for now; the application-level
-    // registry that survives scene switches arrives with the public-API step.
+    // The asset registry (declared before the renderer so it outlives it: passes upload from
+    // non-owning views of its heaps). Per-scene for now; the application-level registry that
+    // survives scene switches arrives with the public-API step.
     tools_cook_provider cook;
     std::unique_ptr<string::assets::registry> assets;
-    // The WORLD (what exists, where) and the BRIDGE (its GPU mirror: the DrawInfo rows) — the
-    // scene-layer split. Declared before the passes: every pass consumes what the bridge derives.
+    // The WORLD: what exists, where. The app's half of the scene-layer split — everything GPU-side
+    // (bridge, backing, all thirteen passes, their declaration order) is the preset's now.
     std::unique_ptr<string::scene::world> world;
-    std::unique_ptr<string::render::scene_bridge> bridge;
     std::vector<string::scene::entity> base_entities;    // one per loaded asset, spawn order
     std::vector<string::scene::entity> crowd_entities;   // the K-toggle stress grid
-    std::shared_ptr<MeshOverlayStats> mesh_stats = std::make_shared<MeshOverlayStats>();
-    std::unique_ptr<geometry_pass> geo;
-    std::unique_ptr<froxel_component> froxel;
-    std::unique_ptr<ibl_component> ibl;
-    std::unique_ptr<gtao_chain> gtao;
-    std::unique_ptr<probe_gi_component> gi;
-    std::unique_ptr<sky_component> sky;
-    std::unique_ptr<shadow_maps> shadow;
-    std::unique_ptr<sorted_transparency> transparency;
-    std::unique_ptr<debug_line_pass> debug_lines;
-    std::unique_ptr<ui_pass> ui;
-    std::unique_ptr<post_pass> post;
-    std::unique_ptr<string::composite_pass> composite;
-    std::unique_ptr<sandbox::anim_demo> anim;   // brief 23: null when the scene has no skins
-    scene_resources res;
-    string::frame_graph* graph = nullptr;
-
+    // dbg.orbit motion lever state (drives world.camera() for headless disocclusion captures).
+    bool orbit_latched = false;
+    glm::vec3 orbit_pos{ 0.0f };
+    float orbit_yaw = 0.0f;
+    float orbit_pitch = 0.0f;
+    float orbit_phase = 0.0f;
+    // demo clip-driver state (brief 23: the state machine is game code)
+    std::string active_clip;
+    float demo_timer = 0.0f;
+    bool demo_walking = false;
+    std::unique_ptr<forward_renderer> fr;
 };
 
 // The shadertoy scene: one fullscreen pass, the UI overlay, and the composite. Deliberately NO post
@@ -1021,16 +591,17 @@ std::function<void(float)> make_shader_scene(
     s->toy = std::make_unique<shadertoy_pass>(ctx, shader, kSceneSamples);
     auto toy_ui_slot = std::make_shared<std::optional<ui::Ui>>();
     auto toy_panels = std::make_shared<debug::DebugPanels>();
+    // The composite is constructed before the UI pass, which holds it for its exposure pre-divide.
+    s->composite = std::make_unique<string::composite_pass>(ctx, rr.swapchain_format());
     s->ui = std::make_unique<ui_pass>(
-        ctx, kSceneSamples, atlas,
+        ctx, kSceneSamples, s->composite.get(), atlas,
         make_ui_author(std::make_shared<MeshOverlayStats>(), toy_panels, 0, toy_ui_slot),
         make_ui_observer(toy_ui_slot), make_deferred_author(toy_ui_slot));
-    s->composite = std::make_unique<string::composite_pass>(ctx, rr.swapchain_format());
 
     s->toy->declare(fg, s->res.color, s->res.depth);
     s->ui->declare(fg, s->res.color);
     s->composite->declare(fg, s->res.hdr, s->res.swapchain);
-    rr.declare_capture(fg, s->res.hdr);
+    rr.declare_capture(fg, s->res.hdr, s->composite.get());
 
     string::renderer* rp = &rr;
     return [s, rp](float dt) {
@@ -1054,13 +625,6 @@ struct ui_scene_state
     scene_resources res;
 };
 
-void declare_stream_uploads(string::frame_graph& fg, string::engine_context& ctx)
-{
-    string::TransferBatch* transfer = &ctx.transfer;
-    fg.pass("uploads.stream")
-      .toggle([transfer] { return transfer->pending(); })
-      .transfer([transfer](string::pass_context& pc) { transfer->record(pc.rec); });
-}
 
 std::function<void(float)> make_ui_scene(
     string::frame_graph& fg, string::engine_context& ctx,
@@ -1095,19 +659,20 @@ std::function<void(float)> make_ui_scene(
         client::seed_workspace(*ws);
     auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
     auto dbg_panels = std::make_shared<debug::DebugPanels>();
+    // The composite is constructed before the UI pass, which holds it for its exposure pre-divide.
+    s->composite = std::make_unique<string::composite_pass>(ctx, rr.swapchain_format());
     s->ui = std::make_unique<ui_pass>(
-        ctx, VK_SAMPLE_COUNT_1_BIT, atlas,
+        ctx, VK_SAMPLE_COUNT_1_BIT, s->composite.get(), atlas,
         make_ui_dev_author(std::make_shared<UiScene>(), anchor_count, dbg_panels, np_budget, screen,
                            ws, ui_slot),
         make_ui_observer(ui_slot, ws), make_deferred_author(ui_slot));
-    s->composite = std::make_unique<string::composite_pass>(ctx, rr.swapchain_format());
 
     // Straight into hdr: it is what composite and the capture read, and with no geometry pass in
     // this scene nothing else would ever write it.
     s->bg->declare(fg, s->res.hdr, s->res.depth);
     s->ui->declare(fg, s->res.hdr);
     s->composite->declare(fg, s->res.hdr, s->res.swapchain);
-    rr.declare_capture(fg, s->res.hdr);
+    rr.declare_capture(fg, s->res.hdr, s->composite.get());
 
     string::renderer* rp = &rr;
     return [s, rp](float dt) {
@@ -1115,6 +680,123 @@ std::function<void(float)> make_ui_scene(
         s->ui->tick(dt, rp->extent(), rp->frame_slot());
         s->composite->tick();
     };
+}
+
+// The crowd stress scene as CONTENT: the K toggle (or r.crowd.enabled) spawns/despawns a
+// kCrowdGrid x kCrowdGrid grid of copies of every base entity around the origin cell.
+void toggle_crowd(geometry_scene_state& s, bool on)
+{
+    constexpr uint32_t kCrowdGrid = 6;
+    if (!on)
+    {
+        for (const string::scene::entity e : s.crowd_entities) s.world->despawn(e);
+        s.crowd_entities.clear();
+        return;
+    }
+    if (!s.crowd_entities.empty()) return;
+    const glm::vec3 extent = s.fr->bridge().bounds_max() - s.fr->bridge().bounds_min();
+    const float spacing_x = extent.x * 1.1f;
+    const float spacing_z = extent.z * 1.1f;
+    const int side = static_cast<int>(kCrowdGrid);
+    for (int gx = 0; gx < side; ++gx)
+        for (int gz = 0; gz < side; ++gz)
+        {
+            const int cx = gx - side / 2;
+            const int cz = gz - side / 2;
+            if (cx == 0 && cz == 0) continue;   // the base scene occupies the origin cell
+            const glm::mat4 offset = glm::translate(
+                glm::mat4(1.0f), glm::vec3(static_cast<float>(cx) * spacing_x, 0.0f,
+                                           static_cast<float>(cz) * spacing_z));
+            for (const string::scene::entity base : s.base_entities)
+            {
+                s.crowd_entities.push_back(s.world->spawn(
+                    { .asset = s.world->asset_of(base), .transform = offset,
+                      .debug_name = "crowd" }));
+            }
+        }
+    STRING_LOG_INFO("[crowd] {} entities spawned ({} base x {} grid cells)",
+                    s.crowd_entities.size(), s.base_entities.size(), kCrowdGrid * kCrowdGrid);
+}
+
+// dbg.orbit (STRING_ORBIT): sway the camera around a latched base pose so headless captures
+// exercise per-frame disocclusion. Applied AFTER Camera::update so it overrides input.
+void drive_orbit(geometry_scene_state& s, string::engine_context& ctx, float dt, float aspect)
+{
+    const float orbit_speed = ::string::render::cv_orbit().get();
+    if (orbit_speed == 0.0f) return;
+    string::Camera& cam = s.world->camera();
+    if (!s.orbit_latched)
+    {
+        s.orbit_pos = cam.position();
+        s.orbit_yaw = cam.yaw();
+        s.orbit_pitch = cam.pitch();
+        s.orbit_latched = true;
+    }
+    s.orbit_phase += orbit_speed * dt;
+    const float radius = 0.35f;
+    const float yaw_amp = 0.06f;
+    const float pitch_amp = 0.03f;
+    const glm::vec3 pos = s.orbit_pos
+        + glm::vec3(std::cos(s.orbit_phase) * radius,
+                    std::sin(s.orbit_phase * 0.5f) * radius * 0.4f,
+                    std::sin(s.orbit_phase) * radius);
+    cam.set_pose(pos, s.orbit_yaw + std::sin(s.orbit_phase) * yaw_amp,
+                 s.orbit_pitch + std::sin(s.orbit_phase * 0.7f) * pitch_amp);
+    cam.update(ctx.input_map, 0.0f, aspect);
+}
+
+// The scene keys (T/[/]/L) + the headless TOD/furnace levers, applied to world.env(). Brief 07:
+// the r.tod pin wins over keys/animation so captures are deterministic.
+void drive_environment(geometry_scene_state& s, string::engine_context& ctx, float dt)
+{
+    string::scene::environment& env = s.world->env();
+    env.sun_lean = ::string::render::cv_sun_lean().get();
+    if (ctx.input_map.pressed(scene_actions::sun_animate))
+    {
+        env.animate_sun = !env.animate_sun;
+        STRING_LOG_INFO("Time-of-day {}", env.animate_sun ? "ANIMATING" : "paused");
+    }
+    if (ctx.input_map.held(scene_actions::time_back))
+        env.time_of_day = glm::clamp(env.time_of_day - dt * 0.15f, 0.0f, 1.0f);
+    if (ctx.input_map.held(scene_actions::time_fwd))
+        env.time_of_day = glm::clamp(env.time_of_day + dt * 0.15f, 0.0f, 1.0f);
+    if (ctx.input_map.pressed(scene_actions::toggle_lights))
+    {
+        env.lights_enabled = !env.lights_enabled;
+        STRING_LOG_INFO("Local lights {}", env.lights_enabled ? "ON" : "OFF");
+    }
+    if (const float tod = ::string::render::cv_time_of_day().get(); tod >= 0.0f)
+        env.time_of_day = glm::clamp(tod, 0.0f, 1.0f);
+    env.furnace = ::string::render::cv_furnace().get();
+}
+
+// Brief 23: the demo's clip driver — anim.clip requests, else the auto idle<->walk demo. GAME
+// code by design (the engine samples + blends; this decides WHAT plays).
+void drive_clip_demo(geometry_scene_state& s, float dt)
+{
+    s.world->set_animation_rate(cv_anim_rate().get());
+    const float fade_seconds = std::max(0.0f, cv_anim_blend().get());
+    const std::string request = cv_anim_clip().get();
+    if (request != s.active_clip)
+    {
+        s.active_clip = request;
+        if (!request.empty())
+            for (const string::scene::entity e : s.base_entities)
+                if (!s.world->play(e, request, fade_seconds)
+                    && !s.world->animators_of(e).empty())
+                    STRING_LOG_WARN("[anim] no clip '{}' in this entity's pack", request);
+    }
+    if (request.empty() && cv_anim_demo().get() != 0)
+    {
+        s.demo_timer += dt;
+        if (s.demo_timer >= 3.0f)   // idle <-> walk cadence
+        {
+            s.demo_timer = 0.0f;
+            s.demo_walking = !s.demo_walking;
+            for (const string::scene::entity e : s.base_entities)
+                s.world->play(e, s.demo_walking ? "Walk_Loop" : "Idle_Loop", fade_seconds);
+        }
+    }
 }
 
 std::function<void(float)> make_geometry_scene(
@@ -1125,7 +807,6 @@ std::function<void(float)> make_geometry_scene(
     bool lookdev)
 {
     auto s = std::make_shared<geometry_scene_state>();
-    s->graph = &fg;
 
     // Load this scene's content into the app-owned asset registry BEFORE any renderer object
     // exists (asset-layer split): models via the cooked path (cook-on-load through the injected
@@ -1155,10 +836,6 @@ std::function<void(float)> make_geometry_scene(
         const string::assets::asset_id id = load_transp_test_asset(*s->assets);
         if (id.valid()) loaded.push_back(id);
     }
-    // Mint the content heaps' graph handles + upload their backing (rides the construction-upload
-    // flush). Before any pass exists: the geometry pass latches these handles at construction.
-    s->assets->declare(fg);
-
     // The world: one entity per loaded asset, identity placement, in load order — which is what
     // keeps the bridge's row order identical to the old merged draw order (byte parity).
     s->world = std::make_unique<string::scene::world>(*s->assets);
@@ -1169,177 +846,66 @@ std::function<void(float)> make_geometry_scene(
             { .asset = id, .debug_name = a != nullptr ? a->name() : std::string_view{} }));
     }
 
-    // The bridge: the world's GPU mirror. Row budget = base parts x the crowd grid (the K-toggle
-    // stress scene spawns kCrowdGrid^2-1 extra copies of every base entity).
-    constexpr uint32_t kCrowdGrid = 6;
-    const uint32_t base_parts = static_cast<uint32_t>(s->assets->mesh_parts().size());
-    s->bridge = std::make_unique<string::render::scene_bridge>(
-        ctx, *s->assets, *s->world, std::max(1u, base_parts * kCrowdGrid * kCrowdGrid));
-
-    s->geo = std::make_unique<geometry_pass>(ctx, samples, *s->assets, *s->bridge, s->mesh_stats,
-                                             lookdev);
-
-    // The crowd stress scene as CONTENT: the K toggle (or r.crowd.enabled) spawns/despawns a
-    // kCrowdGrid x kCrowdGrid grid of copies of every base entity around the origin cell.
-    s->geo->set_crowd_hook([sp = s.get(), kCrowdGrid](bool on) {
-        if (!on)
-        {
-            for (const string::scene::entity e : sp->crowd_entities) sp->world->despawn(e);
-            sp->crowd_entities.clear();
-            return;
-        }
-        if (!sp->crowd_entities.empty()) return;
-        const glm::vec3 extent = sp->bridge->bounds_max() - sp->bridge->bounds_min();
-        const float spacing_x = extent.x * 1.1f;
-        const float spacing_z = extent.z * 1.1f;
-        const int side = static_cast<int>(kCrowdGrid);
-        for (int gx = 0; gx < side; ++gx)
-            for (int gz = 0; gz < side; ++gz)
-            {
-                const int cx = gx - side / 2;
-                const int cz = gz - side / 2;
-                if (cx == 0 && cz == 0) continue;   // the base scene occupies the origin cell
-                const glm::mat4 offset = glm::translate(
-                    glm::mat4(1.0f), glm::vec3(static_cast<float>(cx) * spacing_x, 0.0f,
-                                               static_cast<float>(cz) * spacing_z));
-                for (const string::scene::entity base : sp->base_entities)
-                {
-                    sp->crowd_entities.push_back(sp->world->spawn(
-                        { .asset = sp->world->asset_of(base), .transform = offset,
-                          .debug_name = "crowd" }));
-                }
-            }
-        STRING_LOG_INFO("[crowd] {} entities spawned ({} base x {} grid cells)",
-                        sp->crowd_entities.size(), sp->base_entities.size(),
-                        kCrowdGrid * kCrowdGrid);
-    });
-    ::string::render::GeometryScene* scene = s->geo->scene();
-
-    const ::string::render::ProbeVolume gi_volume =
-        probe_gi_component::fit_volume(scene->scene_aabb_min_, scene->scene_aabb_max_);
-    // The app allocates the temporal backings BEFORE declaring, so every persistent handle is
-    // backed at compile and its descriptor slots bind once, up front (brief 21 D3).
-    s->backing.create(ctx, viewport, scene->cull_max_draws_, gi_volume, s->geo->gi_capture_entries(),
-                      s->geo->palette_joints_total());
-    // The work-list sizes come from the meshlet build (which has already run, in the geometry_pass
-    // constructor above): both sides read the SAME numbers, so a declaration cannot drift from the
-    // layout the shaders index with.
-    s->res = declare_resources(fg, viewport, samples, scene->settings_.shadow_resolution,
-                               scene->settings_.cascade_count, scene->wl_layout_.size,
-                               VkDeviceSize{ sizeof(uint32_t) } * scene->cull_max_draws_,
-                               &s->backing);
-    const scene_resources& r = s->res;
-
-    s->froxel       = std::make_unique<froxel_component>(ctx);
-    s->ibl          = std::make_unique<ibl_component>(ctx);
-    s->gtao         = std::make_unique<gtao_chain>(ctx, scene);
-    s->gi           = std::make_unique<probe_gi_component>(ctx, scene, samples);
-    s->sky          = std::make_unique<sky_component>(ctx, samples);
-    s->shadow       = std::make_unique<shadow_maps>(ctx, scene);
-    s->transparency = std::make_unique<sorted_transparency>(ctx, scene, samples);
-    s->debug_lines  = std::make_unique<debug_line_pass>(ctx, s->mesh_stats, samples);
+    // The preset: registry heaps, bridge, backing, all thirteen passes, the capture target and
+    // the resize hook. The app hands it the world + its UI closures and keeps nothing
+    // renderer-shaped. Budgets stay defaulted: base content x the 6x6 crowd grid, which is
+    // exactly what this demo can spawn.
     auto ui_slot = std::make_shared<std::optional<ui::Ui>>();
     auto dbg_panels = std::make_shared<debug::DebugPanels>();
-    s->ui = std::make_unique<ui_pass>(
-        ctx, samples, atlas,
-        make_ui_author(s->mesh_stats, dbg_panels, np_stress, ui_slot),
-        make_ui_observer(ui_slot), make_deferred_author(ui_slot));
-    s->post         = std::make_unique<post_pass>(ctx);
-    s->composite    = std::make_unique<string::composite_pass>(ctx, swapchain_format);
-    // Brief 23: the animation driver, only when the loaded scene actually has skins (a null
-    // pointer keeps the tick free for every static scene).
-    if (!s->geo->skins().empty())
+    s->fr = std::make_unique<forward_renderer>(
+        ctx, rr, *s->assets, *s->world,
+        forward_renderer::settings{ .samples = samples, .viewport = viewport,
+                                    .swapchain_format = swapchain_format, .lookdev = lookdev });
+    s->fr->set_ui({ atlas,
+                    make_ui_author(s->fr->overlay_stats(), dbg_panels, np_stress, ui_slot,
+                                   s->world.get()),
+                    make_ui_observer(ui_slot), make_deferred_author(ui_slot) });
+    s->fr->declare(fg);
+
+    s->fr->set_crowd_hook([sp = s.get()](bool on) { toggle_crowd(*sp, on); });
+    // The camera + environment are the WORLD's now: frame it, bind the fly controls + the scene
+    // keys (T/[/]/L), and apply the headless pose/animation levers. The app owns every input
+    // binding for SCENE state; the geometry pass keeps only its renderer-debug keys.
+    string::Camera::bind_default_controls(ctx.input_map);
+    ctx.input_map.bind_button("sun_animate", string::KeyCode::T);
+    ctx.input_map.bind_button("time_back", string::KeyCode::LEFT_BRACKET);
+    ctx.input_map.bind_button("time_fwd", string::KeyCode::RIGHT_BRACKET);
+    ctx.input_map.bind_button("toggle_lights", string::KeyCode::L);
+    s->world->camera().frame_bounds(s->fr->bridge().bounds_min(), s->fr->bridge().bounds_max());
+    // STRING_CAM="px,py,pz,yaw,pitch" (radians); empty CVar = keep the scene-framed default pose.
+    if (const std::string cam = ::string::render::cv_camera_pose().get(); !cam.empty())
     {
-        s->anim = std::make_unique<sandbox::anim_demo>(*s->geo);
-        if (s->anim->empty()) s->anim.reset();
+        glm::vec3 pos{}; float yaw = 0.0f, pitch = 0.0f;
+        if (std::sscanf(cam.c_str(), "%f,%f,%f,%f,%f", &pos.x, &pos.y, &pos.z, &yaw, &pitch) == 5)
+            s->world->camera().set_pose(pos, yaw, pitch);
     }
-
-    const std::span<const string::gpu::image> cascades{ r.shadow, scene->settings_.cascade_count };
-    const probe_gi_component::resources gi_res{
-        r.gi_irradiance, r.gi_cap_gbuf, r.gi_cap_albedo, r.gi_visibility,
-        r.gi_cube_albedo, r.gi_cube_nd, r.gi_cube_depth,
-        r.gi_active, r.gi_offset, r.gi_meshlet_table };
-
-    declare_stream_uploads(fg, ctx);
-
-    s->froxel->declare(fg, r.froxels, r.lights);
-    s->ibl->declare(fg, r.env_capture, r.env_prefiltered, r.dfg_lut, r.ibl_sh);
-    s->gtao->declare(fg, r.hiz_depth_prev, r.gtao_raw, r.gtao_ao);
-    s->gi->declare(fg, gi_res, r.ibl_sh, r.scene_data, cascades, r.color, r.depth);
-    s->shadow->declare(fg, cascades, r.worklists, r.scene_data, r.joint_palette);
-    s->sky->declare(fg, r.color, r.depth, [] { return ::string::render::cv_pass_sky().get(); });
-    s->geo->declare(fg, r.color, r.hdr, r.depth, r.hiz_depth, r.hiz_pyramid,
-                    r.worklists, r.scene_data, r.lights, r.stats,
-                    cascades, r.gtao_ao, r.env_prefiltered, r.dfg_lut, r.ibl_sh, r.froxels,
-                    r.joint_palette);
-    s->transparency->declare(fg, r.color, r.depth, r.transparency_list, r.scene_data, r.stats);
-    s->debug_lines->declare(fg, r.color, r.depth);
-    s->ui->declare(fg, r.color);
-    s->post->declare(fg, r.hdr, r.bloom, r.bloom_mips, r.histogram_bins);
-    s->composite->declare(fg, r.hdr, r.swapchain);
-
-    // The headless gates capture the resolved HDR target — an app-declared transient, so the app is
-    // what names it. This is the seam the renderer cannot fill on its own.
-    // STRING_CAPTURE_SOURCE=shadow<N> redirects the capture at cascade N's raw depth map
-    // (grayscale; white = near occluder) — the headless eyes on shadow-map content.
-    string::gpu::image capture_target = r.hdr;
-    if (const char* csrc = std::getenv("STRING_CAPTURE_SOURCE");
-        csrc != nullptr && std::strncmp(csrc, "shadow", 6) == 0)
-    {
-        const int c = std::atoi(csrc + 6);
-        if (c >= 0 && c < static_cast<int>(scene->settings_.cascade_count))
-            capture_target = r.shadow[c];
-    }
-    rr.declare_capture(fg, capture_target);
-
-    // The OWNER half of a resize: re-back the viewport-sized depth-history ring and re-point both
-    // handles (identity + rotated-one-back), before the renderer's graph half re-binds. Raw pointer
-    // capture: the callback only fires inside the frame loop, while the scene state is alive.
-    geometry_scene_state* sp = s.get();
-    rr.on_resize([sp](VkExtent2D e) {
-        sp->backing.create_hiz_depth(e);
-        const std::vector<string::gpu::resource_id>& ring = sp->backing.hiz_depth;
-        std::vector<string::gpu::resource_id> rotated(ring.size());
-        for (std::size_t i = 0; i < ring.size(); ++i)
-            rotated[i] = ring[(i + ring.size() - 1) % ring.size()];
-        sp->graph->set_images(sp->res.hiz_depth, ring);
-        sp->graph->set_images(sp->res.hiz_depth_prev, rotated);
-    });
+    s->world->env().animate_sun = ::string::render::cv_sun_animate().get();
+    // The lookdev probe scene reads material response under sun + sky IBL only — the local-light
+    // stress set would pollute it (L / STRING_LIGHTS=1 still re-enable it explicitly).
+    if (lookdev && std::getenv("STRING_LIGHTS") == nullptr)
+        s->world->env().lights_enabled = false;
 
     // The per-frame tick. Ordinary app code: nothing here resolves a device address or a bindless
     // slot — every one of those is looked up through pass_context while its owning pass records.
-    ::string::render::GeometryScene* scene_ptr = scene;
     string::renderer* rp = &rr;
-    return [s, scene_ptr, rp](float dt) {
-        // The live viewport. This used to arrive via Pass::resize(); with that gone, the scene state
-        // carries it and the app is what knows it. Zero here means every viewport-derived layout —
-        // the UI most visibly — computes against a 0x0 screen and draws nothing.
-        scene_ptr->screen_size = rp->extent();
-        const std::uint32_t slot = rp->frame_slot();
-        // Brief 23: sample + blend + build palettes into THIS slot's ring physical BEFORE the
-        // geometry tick (geo derives culling/residency state that should see current poses). The
-        // per-frame safety is the RING — the GPU is reading an older slot behind its fence while
-        // this writes slot `slot`.
-        if (s->anim != nullptr)
-        {
-            auto* palettes = static_cast<glm::mat4*>(
-                s->backing.ctx->allocator.get_buffer(s->backing.joint_palette[slot])
-                    .allocation_info.pMappedData);
-            s->anim->tick(dt, { palettes, s->geo->palette_joints_total() });
-        }
-        // Scene-layer order: the world flushes its hierarchy + snapshot, the bridge re-derives
-        // the draw rows from it, THEN the passes tick against current rows.
+    string::engine_context* cp = &ctx;
+    return [s, rp, cp](float dt) {
+        const VkExtent2D ext = rp->extent();
+        // The live viewport, pushed into the world (the app is what knows the window). Zero here
+        // means every viewport-derived layout — the UI most visibly — draws nothing.
+        s->world->set_viewport(ext.width, ext.height);
+
+        // The app drives the world's camera + environment + clip choice (scene-layer split).
+        const float aspect = ext.height == 0 ? 1.0f : ext.width / static_cast<float>(ext.height);
+        s->world->camera().update(cp->input_map, dt, aspect);
+        drive_orbit(*s, *cp, dt, aspect);
+        drive_environment(*s, *cp, dt);
+        drive_clip_demo(*s, dt);
+
+        // Scene-layer order: the world flushes its hierarchy/sun/animators + snapshot, THEN the
+        // preset re-derives its GPU mirror and ticks every pass against the current frame.
         s->world->tick(dt);
-        s->bridge->tick();
-        s->geo->tick(dt, slot);
-        s->gtao->tick(rp->extent(), static_cast<uint16_t>(slot));
-        s->ibl->tick(scene_ptr->ibl_lighting(), false);
-        s->gi->tick();
-        s->froxel->tick(scene_ptr->froxel_params());
-        s->sky->tick(scene_ptr->sky_params());
-        s->ui->tick(dt, rp->extent(), slot);
-        s->post->tick(dt);
-        s->composite->tick();
+        s->fr->tick(dt);
     };
 }
 }  // namespace

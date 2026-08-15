@@ -40,7 +40,11 @@ inline constexpr char kCookedMagic[8] = { 'S', 'T', 'R', 'C', 'O', 'O', 'K', '1'
 // and CookedDraw's trailing pad becomes skin_plus_one (0 for static draws, so a static scene's
 // draw bytes are unchanged). Skinned draws' bounds carry the ANIMATED bound (union over sampled
 // clip poses), not the bind-pose geometry AABB.
-inline constexpr uint32_t kCookedFormatVersion = 4;
+// v5: authored NAMES for the inspector (brief 18: names come from the glTF). One new section —
+// kSecNames, a NUL-terminated UTF-8 string blob whose byte 0 is always '\0' — and a name_offset
+// into it on CookedDraw/CookedMaterial/CookedSkin, each taking an existing zero pad slot so no
+// struct changes size or field offsets (append-only). name_offset 0 = unnamed.
+inline constexpr uint32_t kCookedFormatVersion = 5;
 
 // A cooked draw: the geometry-only record the engine needs to reconstruct a GpuDrawInfo and to
 // register the draw's vertex window with the streamer. Material/transform come from CookedMaterial +
@@ -66,7 +70,7 @@ struct CookedDraw
     uint32_t lod_count;              // 140
     GpuMeshletLod lods[kMaxLods];    // 144 per-LOD {meshlet_offset, meshlet_count, error, _pad} (16B ea)
     uint32_t skin_plus_one;          // 208 0 = static; else index into kSecSkins + 1 (brief 23)
-    uint32_t _pad2;                  // 212 -> pad to 16-aligned 216
+    uint32_t name_offset;            // 212 byte offset into kSecNames (v5); 0 = unnamed
 };
 static_assert(sizeof(CookedDraw) == 216);
 static_assert(offsetof(CookedDraw, aabb_min) == 64);
@@ -95,8 +99,8 @@ struct CookedMaterial
     uint8_t alpha_mode;              // 44 (CookedAlphaMode)
     uint8_t double_sided;            // 45
     uint8_t _pad0[2];                // 46
-    uint32_t _pad1;                  // 48 -> pad to 16-aligned 64
-    uint32_t _pad2[3];               // 52
+    uint32_t name_offset;            // 48 byte offset into kSecNames (v5); 0 = unnamed
+    uint32_t _pad2[3];               // 52 -> pad to 16-aligned 64
 };
 static_assert(sizeof(CookedMaterial) == 64);
 static_assert(offsetof(CookedMaterial, metallic_factor) == 16);
@@ -147,7 +151,8 @@ struct CookedSkin
     uint32_t joint_count;     // 8   == glTF skin.joints.size()
     uint32_t ibm_offset;      // 12  first element in kSecInverseBind
     uint32_t remap_offset;    // 16  first element in kSecJointRemap
-    uint32_t _pad[3];         // 20 -> 32
+    uint32_t name_offset;     // 20  byte offset into kSecNames (v5); 0 = unnamed
+    uint32_t _pad[2];         // 24 -> 32
 };
 static_assert(sizeof(CookedSkin) == 32);
 
@@ -165,6 +170,7 @@ enum CookedSection : uint32_t
     kSecSkins,          // CookedSkin[]        one per distinct glTF skin in this file
     kSecInverseBind,    // glm::mat4[]         inverse-bind matrices, glTF skin.joints[] order
     kSecJointRemap,     // uint32_t[]          remap[gltf_joint] = ozz joint index (depth-first)
+    kSecNames,          // char[]              NUL-terminated name blob (v5); byte 0 is always '\0'
     kSecCount
 };
 

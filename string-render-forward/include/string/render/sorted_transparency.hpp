@@ -8,7 +8,7 @@
 #include <string/vulkan/engine_context.hpp>
 #include <string/vulkan/frame_graph.hpp>
 
-#include <string/render/geometry/geometry_scene.hpp>
+#include <string/render/scene_bridge.hpp>
 
 namespace string::render
 {
@@ -41,7 +41,7 @@ public:
     };
     static list_layout layout_for(uint32_t max_draws);
 
-    sorted_transparency(string::engine_context& ctx, GeometryScene* scene, VkSampleCountFlagBits samples);
+    sorted_transparency(string::engine_context& ctx, const scene_bridge* bridge, VkSampleCountFlagBits samples);
     ~sorted_transparency();
 
     sorted_transparency(const sorted_transparency&) = delete;
@@ -74,7 +74,7 @@ private:
     ::string::gpu::device* device_ = nullptr;
     ::string::gpu::resource_allocator* allocator_ = nullptr;
     ::string::gpu::descriptor_table* descriptors_ = nullptr;
-    GeometryScene* scene_ = nullptr;
+    const scene_bridge* bridge_ = nullptr;
     ::string::gpu::shader_program* program_ = nullptr;
 
     list_layout layout_{};

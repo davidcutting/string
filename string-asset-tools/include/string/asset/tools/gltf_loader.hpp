@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -39,6 +40,7 @@ enum class GltfAlphaMode : uint8_t { Opaque = 0, Mask = 1, Blend = 2 };
 
 struct GltfMaterial
 {
+    std::string name;                 // v5: authored material name (may be empty)
     glm::vec4 base_color_factor{ 1.0f };
     float metallic_factor = 1.0f;   // scales the MR texture's blue channel (glTF metalness)
     float roughness_factor = 1.0f;  // scales the MR texture's green channel
@@ -77,6 +79,9 @@ struct GltfGeometry
     std::vector<string::Vertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<GltfDraw> draws;
+    // v5: authored per-draw names (node name, else mesh name), parallel to `draws`. Beside the
+    // draw list, not on GltfDraw — content_hash folds GltfDraw's raw bytes and must stay POD.
+    std::vector<std::string> draw_names;
     // Skinning attributes (brief 23), parallel to `vertices`; EMPTY when the source has no
     // skinned primitives. Joints are glTF skin-local indices (u8/u16 sources widened to u16);
     // weights are normalized floats (unorm sources converted by fastgltf). Vertices of static

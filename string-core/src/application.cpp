@@ -4,6 +4,7 @@
 #include <string/core/cvar.hpp>
 #include <string/core/logger.hpp>
 #include <string/platform/signals.hpp>
+#include <string/platform/user_dirs.hpp>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +18,13 @@ namespace string {
 
 void Application::initialize(const ApplicationInfo& info, scene_fn scene)
 {
+    // Resolve the directory fields the caller left empty from the platform, so everything
+    // downstream (and the client, via info()) reads one consistent set of paths.
+    info_ = info;
+    if (info_.executable_directory.empty()) info_.executable_directory = core::executable_dir();
+    if (info_.user_config_directory.empty()) info_.user_config_directory = core::user_config_dir();
+    if (info_.user_cache_directory.empty()) info_.user_cache_directory = core::user_cache_dir();
+
     event_handler_.sink<WindowEvent>().connect<&Application::on_window_event>(*this);
     // STRING_WINDOW_SIZE=WxH overrides the initial window size — headless repro tooling: bugs can
     // be resolution/timing dependent (window managers also resize real sessions at map time), so
@@ -30,7 +38,7 @@ void Application::initialize(const ApplicationInfo& info, scene_fn scene)
     }
     window_ = std::make_shared<Window>(Window::Properties{.title = info.application_name, .extent = extent});
     init_signal_handling();
-    renderer_ = std::make_unique<string::renderer>(info, window_);
+    renderer_ = std::make_unique<string::renderer>(info_, window_);
 
     // Brief 20: the application authors its graph ONCE, here, and compiles it ONCE. Nothing after
     // this point re-authors or re-plans — a toggle is an in-graph conditional and a resize is a
@@ -109,6 +117,10 @@ Application::~Application()
     // dropping both is what releases them.
     tick_ = nullptr;
     frame_ = {};
+    // Adopted app services (asset registry, game state) die HERE: after the passes that recorded
+    // against their GPU state, before the renderer whose allocator their destructors free through.
+    // Reverse adoption order, for the same reason destructors run bottom-up.
+    while (!adopted_.empty()) adopted_.pop_back();
     renderer_.reset();
     window_.reset();
     event_handler_.sink<WindowEvent>().disconnect();

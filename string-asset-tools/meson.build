@@ -74,6 +74,14 @@ if not ozz_offline_dep.found()
     ])
 endif
 
+# fastgltf: the glTF 2.0 importer — TOOL-SIDE only since the scene/asset split (string-core no
+# longer links it; a shipped client never sees a source format). Nix resolves the custom
+# derivation's CMake config; off-nix the wrap drives fastgltf's own CMakeLists.
+fastgltf_dep = dependency('fastgltf')
+# simdjson is fastgltf's private dep: the wrap build fetches its pinned single-header itself, but
+# a system/nixpkgs fastgltf does not bundle it and needs it linked alongside.
+simdjson_dep = dependency('simdjson', required : false)
+
 # Vendored MikkTSpace reference lib (tangent generation for meshes without glTF TANGENT). Built as
 # its own static lib so the project's -Wall/-Wextra don't drown in this third-party C file.
 mikktspace_lib = static_library(
@@ -100,16 +108,30 @@ asset_tools_lib = static_library(
     ],
     include_directories : [ include_dir, private_inc ],
     link_with : [ mikktspace_lib ],
-    dependencies : [ string_dep, asset_dep, meshopt_dep, ktx_dep, ozz_offline_dep ],
+    dependencies : [ string_dep, asset_dep, meshopt_dep, ktx_dep, ozz_offline_dep,
+                     fastgltf_dep, simdjson_dep ],
     install : true,
 )
 
 install_subdir('include/string', install_dir : 'include')
 
+# pkg-config, so an OFF-MESON client (CMake, plain make) can resolve this library and its
+# String siblings by name; meson consumers keep using the subproject override.
+pkg_mod = import('pkgconfig')
+pkg_mod.generate(
+    name : meson.project_name(),
+    filebase : meson.project_name(),
+    description : 'String engine source-asset importers + cooked writer (tool-side)',
+    libraries : asset_tools_lib,
+    requires : [ 'string-core', 'string-asset' ],
+    version : meson.project_version(),
+)
+
 project_deps = declare_dependency(
     include_directories : include_dir,
     link_with : [ asset_tools_lib, mikktspace_lib ],
-    dependencies : [ string_dep, asset_dep, meshopt_dep, ktx_dep, ozz_offline_dep ],
+    dependencies : [ string_dep, asset_dep, meshopt_dep, ktx_dep, ozz_offline_dep,
+                     fastgltf_dep, simdjson_dep ],
 )
 
 meson.override_dependency(meson.project_name(), project_deps)

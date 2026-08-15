@@ -11,6 +11,7 @@
 #include <string/gpu/device.hpp>
 #include <string/gpu/resource_allocator.hpp>
 #include <string/debug_draw.hpp>
+#include <string/render/scene_bridge.hpp>
 
 #include <string/render/meshlet_data.hpp>
 
@@ -26,7 +27,7 @@ namespace string::render
 // (::string::debug::context()) each frame into a per-frame-in-flight mapped vertex buffer and draws
 // it as a world-space line list into the scene color target, AFTER geometry and BEFORE the UI (it
 // shares geometry's MSAA color+depth group). Two pipelines: depth-tested (occluded by geometry) and
-// overlay (always on top). The camera view_proj comes from the shared MeshOverlayStats the geometry
+// overlay (always on top). The camera view_proj comes straight from the bridge's frame snapshot
 // pass publishes, so this pass stays decoupled from the geometry pass's internals.
 //
 // Brief 20: a plain app-owned object. declare() authors it onto the app's graph; the depth
@@ -35,7 +36,7 @@ class debug_line_pass
 {
 public:
     // `samples` is the MSAA sample count of the scene attachments this shares with geometry.
-    debug_line_pass(string::engine_context& ctx, std::shared_ptr<const MeshOverlayStats> stats,
+    debug_line_pass(string::engine_context& ctx, const scene_bridge* bridge,
                     VkSampleCountFlagBits samples);
     ~debug_line_pass();
 
@@ -55,7 +56,7 @@ private:
 
     ::string::gpu::device& device_;
     ::string::gpu::resource_allocator& allocator_;
-    std::shared_ptr<const MeshOverlayStats> stats_;
+    const scene_bridge* bridge_ = nullptr;
 
     ::string::gpu::pipeline depth_pipeline_{};    // depth-tested
     ::string::gpu::pipeline overlay_pipeline_{};  // always on top

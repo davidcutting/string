@@ -17,16 +17,15 @@ namespace string::render
 {
 using namespace string;
 
-shadow_maps::shadow_maps(string::engine_context& ctx, GeometryScene* scene)
+shadow_maps::shadow_maps(string::engine_context& ctx, const scene_bridge* bridge)
 : device_(&ctx.device)
 , allocator_(&ctx.allocator)
 , descriptors_(&ctx.descriptor_table)
-, scene_(scene)
+, bridge_(bridge)
 {
     // Published so the meshlet culler can reach the per-cascade work lists it FILLS but does not own,
     // and so SceneData can read the cascade count. The cascade IMAGES are no longer published here —
     // they are the application's graph handles and every consumer declares its own read of them.
-    scene_->shadow = this;
 
     // Depth-only meshlet shadow pipeline (no cull; depth bias handles acne, off-frustum casters kept).
     const VkDescriptorSetLayout layout = descriptors_->get_layout();
@@ -65,7 +64,6 @@ shadow_maps::shadow_maps(string::engine_context& ctx, GeometryScene* scene)
 
 shadow_maps::~shadow_maps()
 {
-    if (scene_ != nullptr) scene_->shadow = nullptr;
     if (program_ != nullptr)
     {
         const ::string::gpu::pipeline& p = program_->current();
@@ -77,8 +75,8 @@ shadow_maps::~shadow_maps()
 
 bool shadow_maps::ready() const
 {
-    return program_ != nullptr && scene_ != nullptr
-        && scene_->draw_count_ != 0 && scene_->draw_info_mapped_ != nullptr;
+    return program_ != nullptr && bridge_ != nullptr
+        && bridge_->frame().draw_count_ != 0 && bridge_->frame().draw_info_mapped_ != nullptr;
 }
 
 // Author onto the graph. One pass per cascade, because one pass per cascade is what it IS: each
@@ -116,10 +114,10 @@ void shadow_maps::declare(::string::frame_graph& fg, std::span<const ::string::g
         // shadow task shader culls against the meshlets, the mesh shader pulls geometry (+ skin).
         // Declared so the pushed addresses resolve through this pass's context.
         {
-            const ::string::gpu::buffer heaps[] = { scene_->vertex_buffer_, scene_->meshlet_buffer_,
-                                                    scene_->meshlet_vertices_,
-                                                    scene_->meshlet_triangles_,
-                                                    scene_->skin_buffer_ };
+            const ::string::gpu::buffer heaps[] = { bridge_->frame().vertex_buffer_, bridge_->frame().meshlet_buffer_,
+                                                    bridge_->frame().meshlet_vertices_,
+                                                    bridge_->frame().meshlet_triangles_,
+                                                    bridge_->frame().skin_buffer_ };
             for (const ::string::gpu::buffer& h : heaps)
             {
                 if (!h.valid()) continue;
@@ -139,7 +137,7 @@ void shadow_maps::record_cascade(::string::pass_context& ctx, uint32_t cascade,
                                  ::string::gpu::buffer list)
 {
     if (cascade >= cascade_count()) return;
-    GeometryScene& s = *scene_;
+    const scene_frame& s = bridge_->frame();
     ::string::gpu::command_recorder& recorder = ctx.rec;
     const WorklistLayout& wl = s.wl_layout_;
 

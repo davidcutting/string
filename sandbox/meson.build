@@ -67,7 +67,6 @@ executable(
     'string_demo',
     [
         'main.cpp',
-        'anim_demo.cpp',
         'content_tools.cpp',
         'debug_cvars.cpp',
         'demo_scene.cpp',

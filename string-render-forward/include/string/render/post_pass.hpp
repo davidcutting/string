@@ -18,6 +18,11 @@
 
 #include <volk.h>
 
+namespace string
+{
+class composite_pass;
+}
+
 namespace string::render
 {
 
@@ -94,6 +99,8 @@ class post_pass
     uint32_t readback_slot_ = 0;
     float ev100_ = 14.6f;
     bool ev_valid_ = false;
+    // Where the smoothed auto EV100 is published (ctor-injected; never null).
+    string::composite_pass* composite_ = nullptr;
     uint64_t frame_index_ = 0;
     bool verify_logged_ = false;
     // Last recorded viewport, kept only so the one-shot r.exposure.verify log can state the pixel
@@ -116,7 +123,8 @@ class post_pass
                             ::string::gpu::image bloom);
 
 public:
-    explicit post_pass(string::engine_context& ctx);
+    // `composite` receives the histogram metering's smoothed auto EV100 each frame.
+    post_pass(string::engine_context& ctx, string::composite_pass* composite);
     ~post_pass();
 
     // The bloom pyramid's mip count for a given viewport: r.bloom.mips clamped to [1,8], then

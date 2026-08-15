@@ -350,6 +350,7 @@ asset_id registry::insert(CookedScene&& scene, std::string_view name,
         m.occlusion = tex(cm.occlusion_texture);
         m.alpha_mode = static_cast<::string::asset::CookedAlphaMode>(cm.alpha_mode);
         m.double_sided = cm.double_sided != 0;
+        m.name = scene.name_at(cm.name_offset);
         materials_.push_back(m);
     }
 
@@ -369,6 +370,7 @@ asset_id registry::insert(CookedScene&& scene, std::string_view name,
                 .ibm_offset = cs.ibm_offset + ibm_base,
                 .remap_offset = cs.remap_offset + remap_base,
                 .anim_pack = anim_pack,
+                .name = std::string(scene.name_at(cs.name_offset)),
             });
         }
         inverse_bind_.insert(inverse_bind_.end(), scene.inverse_bind.begin(),
@@ -407,6 +409,7 @@ asset_id registry::insert(CookedScene&& scene, std::string_view name,
         p.skin_delta = skinned ? static_cast<int32_t>(skin_vert_base)
                                      - static_cast<int32_t>(vertex_base)
                                : 0;
+        p.name = scene.name_at(cd.name_offset);
 
         bounds_min = glm::min(bounds_min, cd.aabb_min);
         bounds_max = glm::max(bounds_max, cd.aabb_max);
@@ -654,6 +657,20 @@ void registry::tick()
     }
 
     ++stream_frame_;
+}
+
+std::shared_ptr<::string::anim::AnimSet> registry::anim_set(skin_id id)
+{
+    if (!id.valid() || id.index >= skins_.size()) return nullptr;
+    const skin_binding& sb = skins_[id.index];
+    if (sb.anim_pack.empty()) return nullptr;
+    const std::string key = sb.anim_pack.generic_string();
+    if (const auto it = anim_cache_.find(key); it != anim_cache_.end()) return it->second;
+    // AnimSet::load WARNs on failure; cache the nullptr too so a broken pack warns once, not per
+    // spawn.
+    std::shared_ptr<::string::anim::AnimSet> set = ::string::anim::AnimSet::load(sb.anim_pack);
+    anim_cache_.emplace(key, set);
+    return set;
 }
 
 }  // namespace string::assets

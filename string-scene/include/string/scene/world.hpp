@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -13,6 +14,8 @@
 
 #include <string/scene/asset_handles.hpp>
 #include <string/scene/asset_registry.hpp>
+#include <string/scene/animator.hpp>
+#include <string/scene/camera.hpp>
 #include <string/scene/frame_view.hpp>
 
 namespace string::scene
@@ -82,6 +85,29 @@ public:
     void set_light(light_id id, const light_desc& desc);
     void remove_light(light_id id);
 
+    // --- animation (playback state is SCENE state; brief 23: state machines stay game code) -----
+    // Cross-fade every animator of the entity to `clip`. Returns true if ANY animator had it.
+    bool play(entity e, std::string_view clip, float fade_seconds = 0.15f);
+    std::span<const std::unique_ptr<animator>> animators_of(entity e) const;
+    // Renderer-bridge access by ROW index (frame_view::instance_row::entity_index).
+    std::span<const std::unique_ptr<animator>> animators_at(uint32_t row_index) const;
+    // Global playback-rate scale (a tuning lever the app mirrors from its cvars).
+    void set_animation_rate(float rate) { animation_rate_ = rate; }
+
+    // --- view + environment ----------------------------------------------------------------------
+    // THE camera (moved out of the renderer's GeometryScene). The client drives it: bind controls,
+    // call camera().update(input, dt, aspect) per frame, or set poses directly.
+    Camera& camera() { return camera_; }
+    const Camera& camera() const { return camera_; }
+    environment& env() { return env_; }
+    const environment& env() const { return env_; }
+    // The presentation extent, pushed by the app each frame (the world cannot know the window).
+    void set_viewport(uint32_t width, uint32_t height)
+    {
+        viewport_width_ = width;
+        viewport_height_ = height;
+    }
+
     // --- per-frame -------------------------------------------------------------------------------
     // Flush the transform hierarchy + refresh the published rows. (Animation sampling joins here
     // when playback state moves onto entities; sun/TOD when the environment moves out of the
@@ -106,6 +132,7 @@ private:
         entity parent{};
         std::string name;
         uint64_t server_id = 0;
+        std::vector<std::unique_ptr<animator>> animators;   // one per skin of the asset
         uint32_t generation = 0;
         bool visible = true;
         bool alive = false;
@@ -114,6 +141,11 @@ private:
     row* get(entity e);
 
     assets::registry& assets_;
+    Camera camera_;
+    environment env_;
+    uint32_t viewport_width_ = 0;
+    uint32_t viewport_height_ = 0;
+    float animation_rate_ = 1.0f;
     std::vector<row> rows_;
     std::vector<uint32_t> free_;
     std::vector<entity> live_;                 // dense, spawn order (rebuilt on spawn/despawn)

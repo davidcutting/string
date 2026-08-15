@@ -124,11 +124,12 @@ CookedScene bake_gltf(const std::filesystem::path& gltf_path, const BakeParams& 
     skin_source.joint_remap = std::move(skin_cook.joint_remap);
     skin_source.skin_anim_min = std::move(skin_cook.skin_anim_min);
     skin_source.skin_anim_max = std::move(skin_cook.skin_anim_max);
+    skin_source.names = std::move(skin_cook.names);
     if (!skin_cook.anim_pack.empty())
         write_anim_pack_file(skin_cook.anim_pack, anim_path_for(gltf_path));
 
-    CookedScene scene =
-        bake_scene(geometry.vertices, geometry.indices, geometry.draws, params, skin_source);
+    CookedScene scene = bake_scene(geometry.vertices, geometry.indices, geometry.draws, params,
+                                   skin_source, geometry.draw_names);
 
     // Materials (texture indices are file-local; the engine rebases them at merge, same as before).
     scene.materials.reserve(materials.size());
@@ -145,6 +146,7 @@ CookedScene bake_gltf(const std::filesystem::path& gltf_path, const BakeParams& 
         cm.alpha_cutoff = m.alpha_cutoff;
         cm.alpha_mode = static_cast<uint8_t>(to_cooked_alpha(m.alpha_mode));
         cm.double_sided = m.double_sided ? 1u : 0u;
+        cm.name_offset = intern_cooked_name(scene, m.name);   // v5
         scene.materials.push_back(cm);
     }
 
